@@ -140,17 +140,20 @@ impl Palette {
         // Cursor block after the query.
         write(&mut g, 1, 2 + prompt.chars().count(), " ", selected());
 
-        for (line, &idx) in self.filtered.iter().take(visible).enumerate() {
+        // Scroll the list so the cursor is always on screen, even past `visible`.
+        let scroll = self.cursor.saturating_sub(visible - 1);
+        for (line, &idx) in self.filtered.iter().skip(scroll).take(visible).enumerate() {
+            let sel = scroll + line == self.cursor;
             let (action, hint) = &self.all[idx];
             let row = 3 + line;
-            let pen = if line == self.cursor { selected() } else { normal() };
+            let pen = if sel { selected() } else { normal() };
             // Paint the whole selected row so the highlight is a bar, not just text.
-            if line == self.cursor {
+            if sel {
                 write(&mut g, row, 0, &" ".repeat(w), selected());
             }
             write(&mut g, row, 2, action.title(), pen);
             if !hint.is_empty() {
-                let hp = if line == self.cursor { selected() } else { dim() };
+                let hp = if sel { selected() } else { dim() };
                 let x = w.saturating_sub(hint.chars().count() + 2);
                 write(&mut g, row, x, hint, hp);
             }
@@ -350,8 +353,8 @@ impl AiPanel {
         let inner = w.saturating_sub(4);
         let mut wrapped: Vec<(Who, String)> = Vec::new();
         for line in &self.transcript {
-            for (i, chunk) in wrap(&line.text, inner).into_iter().enumerate() {
-                wrapped.push((if i == 0 { line.who } else { line.who }, chunk));
+            for chunk in wrap(&line.text, inner) {
+                wrapped.push((line.who, chunk));
             }
             wrapped.push((line.who, String::new()));
         }

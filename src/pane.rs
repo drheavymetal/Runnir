@@ -71,24 +71,27 @@ impl Pane {
             let g = self.grid.lock().unwrap();
             (g.command_seq(), g.command_running())
         };
-        // A new command started running: remember when and what.
-        if running && self.running_since.is_none() {
-            self.running_since = Some((std::time::Instant::now(), self.title.clone()));
-        }
-        // The command counter advanced past what we last saw: one finished.
+        let mut done = None;
+        // Check completion FIRST. Doing this after "start tracking" would let a C
+        // (new command) and a D (previous finished) landing in the same poll
+        // consume the just-set timer against the old command, restarting the new
+        // command's clock a poll late and undercounting it.
         if seq > self.last_command_seq {
             self.last_command_seq = seq;
             if let Some((started, name)) = self.running_since.take() {
                 let secs = started.elapsed().as_secs();
                 if secs >= threshold {
-                    return Some(format!("{name} finished after {secs}s"));
+                    done = Some(format!("{name} finished after {secs}s"));
                 }
             }
         }
-        if !running {
+        // Then start tracking a newly-running command.
+        if running && self.running_since.is_none() {
+            self.running_since = Some((std::time::Instant::now(), self.title.clone()));
+        } else if !running {
             self.running_since = None;
         }
-        None
+        done
     }
 
     pub fn alive(&self) -> bool {

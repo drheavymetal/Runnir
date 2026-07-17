@@ -67,8 +67,15 @@ impl Gpu {
             panes.push(PaneDraw { grid, selection: None, origin: (*ox, *oy), tint: None, focused: true, cursor: None });
         }
 
-        // Hint labels annotate the focused pane, drawn as a top chrome grid.
-        let hint_grid = self.build_hints(area, cell, focus);
+        // Hint labels annotate the focused pane, drawn as a top chrome grid. The
+        // focused grid is already locked in `guards`, so read its top row from
+        // there — locking it again on this thread would deadlock (Mutex is not
+        // reentrant).
+        let focus_top = guards
+            .iter()
+            .find(|(id, ..)| *id == focus)
+            .map(|(_, _, grid, ..)| grid.abs_row(0));
+        let hint_grid = focus_top.and_then(|top| self.build_hints(area, cell, focus, top));
         if let Some((grid, ox, oy)) = &hint_grid {
             panes.push(PaneDraw { grid, selection: None, origin: (*ox, *oy), tint: None, focused: true, cursor: None });
         }
@@ -135,15 +142,26 @@ impl Gpu {
                     break;
                 }
             }
-            // Broadcast indicator, right-aligned.
+            // Right-aligned indicators: broadcast, then the focused pane's context
+            // (ssh host / root / docker), so the tab bar always says where you are.
+            let mut right = cols;
             if self.broadcast {
                 let tag = " BROADCAST ";
-                let pen = Pen {
+                right = right.saturating_sub(tag.len() + 1);
+                bar.write_str(0, right, tag, Pen {
                     fg: Color::Rgb(0x0d, 0x0d, 0x0f),
                     bg: Color::Rgb(0xf1, 0x4c, 0x4c),
                     ..Pen::default()
-                };
-                bar.write_str(0, cols.saturating_sub(tag.len() + 1), tag, pen);
+                });
+            }
+            if let Some(label) = self.tabs[self.active].focused_ref().context.label() {
+                let tag = format!(" {label} ");
+                right = right.saturating_sub(tag.chars().count() + 1);
+                bar.write_str(0, right, &tag, Pen {
+                    fg: Color::Rgb(0xd4, 0xd6, 0xd9),
+                    bg: Color::Rgb(0x2a, 0x2c, 0x33),
+                    ..Pen::default()
+                });
             }
             out.push((bar, 0.0, 0.0));
             let _ = ch;
@@ -151,7 +169,13 @@ impl Gpu {
         out
     }
 
-    fn build_hints(&self, area: Rect, cell: (f32, f32), focus: u64) -> Option<(Grid, f32, f32)> {
+    fn build_hints(
+        &self,
+        area: Rect,
+        cell: (f32, f32),
+        focus: u64,
+        top_abs: usize,
+    ) -> Option<(Grid, f32, f32)> {
         let Some(Overlay::Hints(h)) = &self.overlay else { return None };
         let rect = self.tabs[self.active].layout(area).into_iter().find(|(id, _)| *id == focus)?.1;
         let (cw, ch) = cell;
@@ -162,9 +186,6 @@ impl Gpu {
         // label cells themselves.
         grid.fill(Pen { bg: Color::Default, ..Pen::default() });
 
-        let pane = &self.tabs[self.active].panes[&focus];
-        let g = pane.grid.lock().unwrap();
-        let top_abs = g.abs_row(0);
         for hint in &h.hints {
             if hint.abs_row < top_abs || hint.abs_row >= top_abs + rows {
                 continue;

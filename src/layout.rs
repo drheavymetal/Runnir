@@ -184,14 +184,16 @@ impl Node {
         true
     }
 
-    /// Whether `target` can still be split along `axis` inside `area`.
+    /// Whether `target` can still be split along `axis` inside `area`. The divider
+    /// gap is taken out first, matching `split_rect`, so the check reflects the
+    /// size each child would actually get rather than half the whole pane.
     pub fn can_split(&self, target: PaneId, axis: Axis, area: Rect, gap: f32) -> bool {
         self.layout(area, gap)
             .into_iter()
             .find(|(id, _)| *id == target)
             .is_some_and(|(_, r)| match axis {
-                Axis::Horizontal => r.w / 2.0 >= MIN_PANE,
-                Axis::Vertical => r.h / 2.0 >= MIN_PANE,
+                Axis::Horizontal => (r.w - gap) / 2.0 >= MIN_PANE,
+                Axis::Vertical => (r.h - gap) / 2.0 >= MIN_PANE,
             })
     }
 }

@@ -76,11 +76,13 @@ impl Gpu {
 }
 
 /// Clips long output so an AI prompt stays a reasonable size, keeping the tail —
-/// the error is almost always at the end.
+/// the error is almost always at the end. Snaps to a char boundary so non-ASCII
+/// output (common) cannot panic on a mid-codepoint slice.
 fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         return s.to_string();
     }
-    let tail = &s[s.len() - max..];
-    format!("…(truncated)…\n{tail}")
+    let cut = s.len() - max;
+    let start = (cut..=s.len()).find(|&i| s.is_char_boundary(i)).unwrap_or(s.len());
+    format!("…(truncated)…\n{}", &s[start..])
 }

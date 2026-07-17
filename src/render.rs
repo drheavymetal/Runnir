@@ -492,8 +492,12 @@ impl Renderer {
                 _ => None,
             };
             if let Some(bar_ch) = bar {
-                let row = cursor_abs.saturating_sub(grid.total_rows() - grid.rows());
-                if row < grid.rows() {
+                // Viewport row of the cursor, folding in the scrollback offset so a
+                // beam/underline bar tracks the cursor off-screen while scrolled
+                // back, exactly as the in-loop block cursor does.
+                let top = grid.abs_row(0);
+                if cursor_abs >= top && cursor_abs - top < grid.rows() {
+                    let row = cursor_abs - top;
                     let g = self.font.glyph(bar_ch, Style::REGULAR);
                     let cur = self.theme.cursor;
                     out.push(Instance {

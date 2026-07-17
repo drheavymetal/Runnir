@@ -230,6 +230,15 @@ impl Gpu {
 
     fn overlay_key(&mut self, event: &winit::event::KeyEvent, mods: ModifiersState, config: &Config) {
         let key = &event.logical_key;
+
+        // A character typed with ctrl/alt/super is a shortcut attempt, not text —
+        // ignore it so Ctrl+V inside a prompt does not insert a literal 'v'. Named
+        // keys (Escape, Enter, arrows) still act.
+        if matches!(key, Key::Character(_))
+            && (mods.control_key() || mods.alt_key() || mods.super_key())
+        {
+            return;
+        }
         match self.overlay.as_mut().unwrap() {
             Overlay::Palette(p) => match key {
                 Key::Named(NamedKey::Escape) => self.overlay = None,
@@ -316,9 +325,11 @@ impl Gpu {
     }
 
     fn run_palette_action(&mut self, action: Action, config: &Config) {
-        // The palette cannot quit the loop (no ActiveEventLoop here); those come
-        // through key chords. Everything else is safe to route.
+        // The palette has no ActiveEventLoop to exit cleanly, so Quit exits the
+        // process here — but must save the session first, exactly like the keyboard
+        // and window-close paths, or picking "Quit" from the palette would lose it.
         if action == Action::Quit {
+            self.save_session(config);
             std::process::exit(0);
         }
         // Reuse run_action by faking an event loop is not possible; inline the ones

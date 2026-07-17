@@ -263,6 +263,12 @@ impl<'de> Deserialize<'de> for Rgb {
 
 fn parse_hex(s: &str) -> Option<Rgb> {
     let s = s.strip_prefix('#').unwrap_or(s);
+    // Reject non-ASCII before slicing by byte offset below: a multibyte string of
+    // byte-length 3 or 6 would otherwise slice through a char boundary and panic,
+    // taking the whole terminal down over a typo in a colour.
+    if !s.is_ascii() {
+        return None;
+    }
     match s.len() {
         6 => Some(Rgb(
             u8::from_str_radix(&s[0..2], 16).ok()?,
@@ -435,6 +441,10 @@ mod tests {
         assert_eq!(toml::from_str::<T>(r##"c = "#f80""##).unwrap().c, Rgb(255, 136, 0));
         assert_eq!(toml::from_str::<T>(r#"c = "ff8000""#).unwrap().c, Rgb(255, 128, 0));
         assert!(toml::from_str::<T>(r#"c = "nope""#).is_err());
+        // Regression: a multibyte string of byte-length 3 or 6 used to panic on a
+        // mid-char slice, crashing the terminal at startup.
+        assert!(toml::from_str::<T>(r#"c = "€""#).is_err(), "3-byte non-ascii must not panic");
+        assert!(toml::from_str::<T>(r#"c = "aa€""#).is_err(), "6-byte non-ascii must not panic");
     }
 
     #[test]

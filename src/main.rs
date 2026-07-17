@@ -30,7 +30,7 @@ use crate::actions::{Action, Keymap};
 use crate::config::Config;
 use crate::grid::{Color, Grid, Pen};
 use crate::font::FontAtlas;
-use crate::layout::{Axis, Direction, Rect};
+use crate::layout::{Axis, Rect};
 use crate::overlay::{Overlay, Palette, Prompt, PromptKind};
 use crate::pty::Spawn;
 use crate::render::{Overlay as OverlayDraw, PaneDraw, Renderer};
@@ -218,6 +218,8 @@ struct Gpu {
     last_autosave: Instant,
     /// Process-start instant, the time base for cursor blink.
     start: Instant,
+    /// Last cursor-blink phase drawn, so an idle terminal repaints only on a flip.
+    last_blink_phase: u64,
     /// Last left-click time and cell, and the run length, for double/triple click.
     last_click: (Instant, selection::Point),
     click_count: u32,
@@ -316,7 +318,10 @@ impl App {
             last_context_refresh: Instant::now(),
             last_autosave: Instant::now(),
             start: Instant::now(),
-            last_click: (Instant::now(), (0, 0)),
+            last_blink_phase: 0,
+            // A sentinel cell no real click can match, so the first click is never
+            // mistaken for the second half of a double.
+            last_click: (Instant::now(), (usize::MAX, usize::MAX)),
             click_count: 0,
             proxy: self.proxy.clone(),
         }
@@ -401,18 +406,33 @@ impl ApplicationHandler<UserEvent> for App {
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         let Some(gpu) = self.gpu.as_mut() else { return };
         if !gpu.reap(&self.config) {
-            gpu.save_session(&self.config);
+            // Every shell exited: an intentional close. Clear the session so the
+            // next launch starts fresh rather than restoring a dead layout — and
+            // so this does not overwrite a good autosave with an empty state.
+            session::Session::clear();
             event_loop.exit();
             return;
         }
         gpu.periodic(&self.config);
 
-        // While the cursor blinks, wake at the next toggle so it keeps flashing on
-        // an idle terminal. Otherwise wait indefinitely for the next event.
+        // Drive cursor blink. A WaitUntil wake does not itself repaint, so redraw
+        // only when the blink phase actually flips — that keeps an idle terminal
+        // repainting at exactly the blink rate, not on every timer tick, and never
+        // busy-loops.
         if self.config.cursor.blink && gpu.overlay.is_none() {
             let interval = self.config.cursor.blink_interval.max(50);
+            let phase = gpu.start.elapsed().as_millis() as u64 / interval;
+            if phase != gpu.last_blink_phase {
+                gpu.last_blink_phase = phase;
+                gpu.window.request_redraw();
+            }
+            // Wake at the next toggle boundary, not a fixed interval from now, so
+            // the phase check above lands right when it changes.
+            let next = (phase + 1) * interval;
+            let since = gpu.start.elapsed().as_millis() as u64;
+            let wait = next.saturating_sub(since).max(1);
             event_loop.set_control_flow(ControlFlow::WaitUntil(
-                Instant::now() + Duration::from_millis(interval),
+                Instant::now() + Duration::from_millis(wait),
             ));
         } else {
             event_loop.set_control_flow(ControlFlow::Wait);
@@ -469,8 +489,10 @@ impl Gpu {
         while i < self.tabs.len() {
             if !self.tabs[i].reap_dead(area) {
                 self.tabs.remove(i);
-                if self.active >= self.tabs.len() && self.active > 0 {
-                    self.active -= 1;
+                // Removing a tab at or before `active` shifts it down. Without this
+                // the focus would silently jump to the next tab.
+                if self.active > i || self.active >= self.tabs.len() {
+                    self.active = self.active.saturating_sub(1);
                 }
             } else {
                 i += 1;

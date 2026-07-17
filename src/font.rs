@@ -365,6 +365,12 @@ impl FontAtlas {
     }
 
     fn alloc(&mut self, w: u32, h: u32) -> Option<(u32, u32)> {
+        // A glyph bigger than the atlas can never be placed; bail rather than
+        // return a position that would write out of bounds. Unreachable at real
+        // cell sizes, but a missing bound is a missing bound.
+        if w > ATLAS_SIZE || h > ATLAS_SIZE {
+            return None;
+        }
         if self.shelf_x + w > ATLAS_SIZE {
             self.shelf_x = 0;
             self.shelf_y += self.shelf_h + 1;

@@ -137,33 +137,67 @@ fn run_claude_code(
         .spawn()
         .map_err(|e| format!("could not run '{command}': {e} (is Claude Code installed?)"))?;
 
-    if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(prompt.as_bytes());
-    }
+    // Drain stdout and stderr on their own threads *while* the child runs. If we
+    // instead waited to read until after exit, a child that writes more than the
+    // OS pipe buffer (~64 KB) would block on write and never exit — so every large
+    // answer would look like a timeout. The prompt is written on a thread too, so
+    // a prompt larger than the pipe buffer cannot deadlock against unread output.
+    let mut stdin = child.stdin.take();
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
 
-    // A crude timeout: wait in a thread, kill if it overruns. Good enough for a
-    // helper that should answer in seconds.
-    let out = wait_with_timeout(child, timeout)?;
-    if out.status.success() {
-        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
-    } else {
-        let err = String::from_utf8_lossy(&out.stderr);
-        Err(format!("claude exited with {}: {}", out.status, err.trim()))
+    let prompt_owned = prompt.to_string();
+    let writer = std::thread::spawn(move || {
+        if let Some(stdin) = stdin.as_mut() {
+            let _ = stdin.write_all(prompt_owned.as_bytes());
+        }
+        // Dropping stdin closes it, signalling EOF so claude stops reading.
+        drop(stdin);
+    });
+    let out_reader = drain(stdout);
+    let err_reader = drain(stderr);
+
+    let status = wait_with_timeout(&mut child, timeout);
+    let _ = writer.join();
+    let stdout = out_reader.join().unwrap_or_default();
+    let stderr = err_reader.join().unwrap_or_default();
+
+    match status {
+        Ok(status) if status.success() => Ok(String::from_utf8_lossy(&stdout).trim().to_string()),
+        Ok(status) => Err(format!(
+            "claude exited with {status}: {}",
+            String::from_utf8_lossy(&stderr).trim()
+        )),
+        Err(e) => Err(e),
     }
 }
 
-fn wait_with_timeout(
-    mut child: std::process::Child,
-    timeout: u64,
-) -> Result<std::process::Output, String> {
+/// Reads a child pipe to the end on its own thread.
+fn drain<R: std::io::Read + Send + 'static>(
+    pipe: Option<R>,
+) -> std::thread::JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut pipe) = pipe {
+            let _ = pipe.read_to_end(&mut buf);
+        }
+        buf
+    })
+}
+
+/// Waits for the child, killing and reaping it if it overruns `timeout`. Reaping
+/// after kill matters: `Child::kill` sends the signal but does not wait, so
+/// skipping the `wait` would leave a zombie for every timed-out request.
+fn wait_with_timeout(child: &mut std::process::Child, timeout: u64) -> Result<std::process::ExitStatus, String> {
     use std::time::{Duration, Instant};
     let start = Instant::now();
     loop {
         match child.try_wait() {
-            Ok(Some(_)) => return child.wait_with_output().map_err(|e| e.to_string()),
+            Ok(Some(status)) => return Ok(status),
             Ok(None) => {
                 if start.elapsed() > Duration::from_secs(timeout) {
                     let _ = child.kill();
+                    let _ = child.wait(); // reap, or it becomes a zombie
                     return Err(format!("timed out after {timeout}s"));
                 }
                 std::thread::sleep(Duration::from_millis(50));

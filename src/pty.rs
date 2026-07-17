@@ -75,13 +75,17 @@ impl Pty {
             let mut buf = [0u8; 65536];
             loop {
                 match reader.read(&mut buf) {
-                    Ok(0) | Err(_) => break,
+                    Ok(0) => break, // EOF: the child closed its end.
                     Ok(n) => {
                         // Parse the whole chunk under one lock. Locking per byte
                         // would serialise the reader against the renderer.
                         parser.advance(&mut *grid.lock().unwrap(), &buf[..n]);
                         on_output();
                     }
+                    // A signal can interrupt the read; that is not the child
+                    // exiting, so retry rather than declaring it dead.
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
                 }
             }
             thread_alive.store(false, Ordering::Release);
@@ -153,8 +157,14 @@ impl Foreground {
         }
         let mut args = self.argv.iter().skip(1);
         while let Some(arg) = args.next() {
-            // Options that take a value: skip the value too.
-            if matches!(arg.as_str(), "-i" | "-p" | "-l" | "-o" | "-F" | "-J" | "-b" | "-c") {
+            // Options that take a value: skip the value too, or the tunnel spec of
+            // `-L 8080:host:80` would be misread as the host. This is every
+            // value-taking ssh flag, so an unlisted one cannot swallow the host.
+            if matches!(
+                arg.as_str(),
+                "-b" | "-c" | "-D" | "-E" | "-e" | "-F" | "-I" | "-i" | "-J" | "-L" | "-l"
+                    | "-m" | "-O" | "-o" | "-p" | "-Q" | "-R" | "-S" | "-W" | "-w"
+            ) {
                 args.next();
                 continue;
             }
@@ -203,6 +213,18 @@ mod tests {
         assert_eq!(
             fg(&["ssh", "-i", "key", "-o", "X=y", "user@box"]).ssh_host().as_deref(),
             Some("box")
+        );
+    }
+
+    #[test]
+    fn ssh_host_skips_tunnel_specs() {
+        // Regression: value-taking flags like -L/-R/-D used to leak their value as
+        // the host.
+        assert_eq!(fg(&["ssh", "-L", "8080:localhost:80", "box"]).ssh_host().as_deref(), Some("box"));
+        assert_eq!(fg(&["ssh", "-D", "1080", "proxy"]).ssh_host().as_deref(), Some("proxy"));
+        assert_eq!(
+            fg(&["ssh", "-R", "9000:localhost:9000", "-L", "80:x:80", "user@h"]).ssh_host().as_deref(),
+            Some("h")
         );
     }
 

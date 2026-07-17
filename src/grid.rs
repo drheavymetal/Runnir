@@ -279,19 +279,24 @@ impl Grid {
         self.dirty = true;
     }
 
-    /// Scrollback as plain text lines, oldest first, for session persistence.
-    /// Trailing blank lines are dropped so a mostly-empty screen does not save a
-    /// wall of nothing.
+    /// Scrollback *and the visible screen* as plain text, oldest first, for session
+    /// persistence. The on-screen rows matter: without them a session would drop
+    /// the last screenful of output — usually the part you most want back. Trailing
+    /// blank lines are dropped so a mostly-empty screen does not save a wall of
+    /// nothing. Skipped entirely on the alternate screen, whose content is a
+    /// full-screen app's transient UI, not history.
     pub fn scrollback_text(&self) -> Vec<String> {
-        let mut lines: Vec<String> = self
-            .scrollback
-            .iter()
-            .map(|row| {
-                let s: String =
-                    row.iter().filter(|c| !c.is_spacer()).map(|c| c.ch).collect();
-                s.trim_end().to_string()
-            })
-            .collect();
+        let row_text = |row: &[Cell]| -> String {
+            let s: String = row.iter().filter(|c| !c.is_spacer()).map(|c| c.ch).collect();
+            s.trim_end().to_string()
+        };
+        let mut lines: Vec<String> = self.scrollback.iter().map(|r| row_text(r)).collect();
+        if self.parked.is_none() {
+            for row in 0..self.rows {
+                let start = row * self.cols;
+                lines.push(row_text(&self.cells[start..start + self.cols]));
+            }
+        }
         while lines.last().is_some_and(|l| l.is_empty()) {
             lines.pop();
         }
@@ -418,16 +423,27 @@ impl Grid {
         }
     }
 
-    /// Scrolling only ever moves rows inside the scroll region, never the whole
-    /// screen. Full-screen apps rely on this to keep status lines pinned.
+    /// Scrolls the region up. `feed` decides whether the displaced top rows enter
+    /// scrollback: only a linefeed does that. Delete-lines and explicit scroll-up
+    /// (CSI M / S) discard the content instead — feeding it would archive lines the
+    /// program just deleted, and the eviction could even bump `dropped`.
     fn scroll_up(&mut self, n: usize) {
+        self.scroll_up_impl(n, true);
+    }
+
+    /// A region scroll that never touches scrollback (delete-lines, CSI S).
+    fn scroll_up_region(&mut self, n: usize) {
+        self.scroll_up_impl(n, false);
+    }
+
+    fn scroll_up_impl(&mut self, n: usize, feed: bool) {
         let n = n.min(self.scroll_bot - self.scroll_top + 1);
 
-        // Only a full-screen scroll of the primary screen feeds scrollback. A
-        // region scroll (htop's process list, a vim split) or anything on the
-        // alternate screen must not: one minute of htop would otherwise evict
-        // everything worth keeping.
-        if self.scroll_top == 0 && self.scroll_bot == self.rows - 1 && self.parked.is_none() {
+        // Only a full-screen linefeed scroll of the primary screen feeds
+        // scrollback. A region scroll (htop's process list, a vim split), anything
+        // on the alternate screen, or a delete/scroll-up control must not: one
+        // minute of htop would otherwise evict everything worth keeping.
+        if feed && self.scroll_top == 0 && self.scroll_bot == self.rows - 1 && self.parked.is_none() {
             for row in 0..n {
                 let start = row * self.cols;
                 self.scrollback.push_back(self.cells[start..start + self.cols].to_vec());
@@ -482,7 +498,7 @@ impl Grid {
         }
         let saved_top = self.scroll_top;
         self.scroll_top = self.row;
-        self.scroll_up(n);
+        self.scroll_up_region(n);
         self.scroll_top = saved_top;
     }
 
@@ -551,6 +567,13 @@ impl Grid {
     }
 
     fn erase_display(&mut self, mode: u16) {
+        // Mode 3 ("erase saved lines", xterm) additionally clears scrollback and
+        // the marks that point into it.
+        if mode == 3 {
+            self.scrollback.clear();
+            self.prompt_marks.clear();
+            self.display_offset = 0;
+        }
         let blank = self.blank();
         let idx = self.index();
         let range = match mode {
@@ -665,9 +688,15 @@ fn ext_color<'a>(sub: &[u16], iter: &mut impl Iterator<Item = &'a [u16]>) -> Opt
 
 impl Perform for Grid {
     fn print(&mut self, c: char) {
-        // Zero-width (combining marks) would need to attach to the previous cell;
-        // dropping them beats corrupting the layout. Proper handling is future work.
-        let width = c.width().unwrap_or(1).max(1);
+        // Zero-width (combining marks, ZWJ) attach to the previous cell; drawing
+        // them as their own width-1 cell would drift the cursor and split NFD text
+        // or emoji sequences. Dropping them keeps the layout correct until proper
+        // combining support lands. `unwrap_or(0)` (not the earlier `unwrap_or(1)`)
+        // ensures a control-ish char with no width is dropped, not widened.
+        let width = c.width().unwrap_or(0);
+        if width == 0 {
+            return;
+        }
 
         if self.wrap_pending {
             self.col = 0;
@@ -755,7 +784,7 @@ impl Perform for Grid {
             '@' => self.insert_chars(count(0)),
             'P' => self.delete_chars(count(0)),
             'X' => self.erase_chars(count(0)),
-            'S' => self.scroll_up(count(0)),
+            'S' => self.scroll_up_region(count(0)),
             'T' => self.scroll_down(count(0)),
             's' => self.saved = Some(Saved { row: self.row, col: self.col, pen: self.pen }),
             'u' => {
@@ -809,7 +838,17 @@ impl Perform for Grid {
                     self.pen = s.pen;
                 }
             }
-            b'c' => *self = Grid::new(self.cols, self.rows),
+            b'c' => {
+                // RIS: reset the screen but keep scrollback and the configured
+                // limit — real terminals do not wipe history on a reset.
+                let limit = self.scrollback_limit;
+                let scrollback = std::mem::take(&mut self.scrollback);
+                let dropped = self.dropped;
+                *self = Grid::new(self.cols, self.rows);
+                self.scrollback_limit = limit;
+                self.scrollback = scrollback;
+                self.dropped = dropped;
+            }
             _ => return,
         }
         self.wrap_pending = false;
@@ -1025,6 +1064,61 @@ mod tests {
         // Each glyph past the edge overwrites the last cell instead of wrapping.
         assert_eq!(g.dump(), "abcf");
         assert_eq!(g.cursor(), (0, 3));
+    }
+
+    #[test]
+    fn delete_lines_does_not_feed_scrollback() {
+        // Regression: DL (CSI M) at row 0 with no scroll region used to archive the
+        // deleted lines into history as if they had scrolled off.
+        let mut g = Grid::new(4, 3);
+        feed(&mut g, "a\r\nb\r\nc");
+        let before = g.total_rows();
+        feed(&mut g, "\x1b[1;1H\x1b[2M"); // home, delete 2 lines
+        assert_eq!(g.total_rows(), before, "deleted lines must not enter scrollback");
+    }
+
+    #[test]
+    fn combining_marks_are_dropped_not_widened() {
+        // Regression: width-0 chars used to be forced to width 1, drifting the
+        // cursor and splitting NFD text.
+        let mut g = Grid::new(10, 1);
+        feed(&mut g, "e\u{301}x"); // e + combining acute + x
+        assert_eq!(g.cell(0, 0).ch, 'e');
+        assert_eq!(g.cell(0, 1).ch, 'x', "the mark must not occupy its own cell");
+        assert_eq!(g.cursor(), (0, 2));
+    }
+
+    #[test]
+    fn ris_keeps_scrollback_and_limit() {
+        // Regression: ESC c rebuilt the grid from scratch, losing scrollback and
+        // reverting a configured limit.
+        let mut g = Grid::new(4, 2);
+        g.set_scrollback_limit(50);
+        feed(&mut g, "a\r\nb\r\nc\r\nd"); // pushes lines into scrollback
+        let sb = g.total_rows();
+        feed(&mut g, "\x1bc");
+        assert_eq!(g.scrollback_limit, 50, "the configured limit must survive RIS");
+        assert!(g.total_rows() >= sb - g.rows(), "scrollback must survive RIS");
+    }
+
+    #[test]
+    fn ed_mode_3_clears_scrollback() {
+        let mut g = Grid::new(4, 2);
+        feed(&mut g, "a\r\nb\r\nc\r\nd");
+        assert!(g.scrollback.len() > 0);
+        feed(&mut g, "\x1b[3J");
+        assert_eq!(g.scrollback.len(), 0, "3J must erase saved lines");
+    }
+
+    #[test]
+    fn scrollback_text_includes_the_visible_screen() {
+        // Regression: session save dropped the on-screen rows, losing the last
+        // screenful of output.
+        let mut g = Grid::new(10, 3);
+        feed(&mut g, "one\r\ntwo\r\nthree");
+        let text = g.scrollback_text();
+        assert!(text.contains(&"three".to_string()), "visible rows must be saved: {text:?}");
+        assert!(text.contains(&"one".to_string()));
     }
 
     #[test]

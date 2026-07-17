@@ -256,7 +256,16 @@ impl Tab {
                 command: None,
                 cwd: saved.and_then(|s| s.cwd.clone()),
             };
-            let mut pane = Pane::new(cols, rows, config.scrollback.lines, &spawn, wake(*id))?;
+            // A single pane that cannot spawn (e.g. its saved cwd is gone) must not
+            // discard the whole tab and everyone else's restored history. Retry in
+            // the home directory; only give up on the pane if that fails too.
+            let mut pane = match Pane::new(cols, rows, config.scrollback.lines, &spawn, wake(*id)) {
+                Ok(p) => p,
+                Err(_) => {
+                    let fallback = Spawn { command: None, cwd: dirs::home_dir() };
+                    Pane::new(cols, rows, config.scrollback.lines, &fallback, wake(*id))?
+                }
+            };
             if let Some(s) = saved {
                 pane.title_override = s.title.clone();
                 pane.grid.lock().unwrap().preload_scrollback(&s.scrollback);

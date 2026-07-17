@@ -19,8 +19,15 @@ pub fn encode(event: &KeyEvent, mods: ModifiersState, mode: KeyMode) -> Option<V
         Key::Named(named) => named_key(*named, mods, mode)?,
         Key::Character(s) => {
             if ctrl {
-                // Ctrl+key collapses to a C0 control code: @ABC.. -> 0x00,0x01,..
                 let c = s.chars().next()?.to_ascii_uppercase();
+                // Ctrl+Shift+letter is a terminal shortcut namespace, not a control
+                // code. If such a chord reaches here it was unbound; sending the C0
+                // code anyway would leak e.g. Ctrl+Shift+Z -> 0x1A (SIGTSTP) to the
+                // program. Only bare Ctrl+letter produces a control code.
+                if shift && c.is_ascii_alphabetic() {
+                    return None;
+                }
+                // Ctrl+key collapses to a C0 control code: @ABC.. -> 0x00,0x01,..
                 match c {
                     '@'..='_' => vec![c as u8 - 0x40],
                     'a'..='z' => vec![c as u8 - 0x60],
