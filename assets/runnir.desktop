@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=runnir
+GenericName=Terminal
+Comment=A GPU-accelerated terminal emulator
+Exec=runnir
+Icon=runnir
+Terminal=false
+Categories=System;TerminalEmulator;
+Keywords=terminal;shell;runnir;
+StartupWMClass=runnir

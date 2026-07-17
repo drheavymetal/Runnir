@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo.png" alt="runnir" width="640">
+</p>
+
 # runnir
 
 A GPU-accelerated terminal emulator, written from scratch in Rust.
