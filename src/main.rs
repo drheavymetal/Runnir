@@ -449,7 +449,14 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::MouseInput { state, button, .. } => {
                 gpu.on_click(state, button, self.mods)
             }
-            WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
+            // `is_synthetic` presses are emitted by winit for every key already held
+            // when the window *gains focus* — they exist only to sync key state, not
+            // to enter text. Forwarding them to the PTY double-sends the first typed
+            // character when a keystroke also brings the window into focus (the
+            // "ssh" -> "sssh" bug). Only real, non-synthetic presses produce bytes.
+            WindowEvent::KeyboardInput { event, is_synthetic: false, .. }
+                if event.state == ElementState::Pressed =>
+            {
                 gpu.on_key(event, self.mods, &self.config, &self.keymap, event_loop);
             }
             _ => {}
