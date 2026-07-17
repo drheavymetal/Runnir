@@ -1,0 +1,555 @@
+// Input handling for `Gpu`. Included into main.rs (crate root), not a module, so
+// it shares the imports there.
+
+impl Gpu {
+    fn on_wheel(&mut self, delta: MouseScrollDelta, config: &Config) {
+        // While an overlay owns input, the wheel scrolls it, not the terminal.
+        if let Some(ov) = self.overlay.as_mut() {
+            let lines = wheel_lines(delta, config.behaviour.wheel_lines, 1.0);
+            match ov {
+                Overlay::Docs(d) => d.scroll(-lines as isize),
+                _ => {}
+            }
+            self.window.request_redraw();
+            return;
+        }
+        let lines = wheel_lines(delta, config.behaviour.wheel_lines, self.renderer.cell_size().1);
+        if self.tab().focused().scroll(lines as isize) {
+            self.window.request_redraw();
+        }
+    }
+
+    fn on_cursor(&mut self, position: PhysicalPosition<f64>) {
+        self.cursor_px = position;
+        if self.overlay.is_some() {
+            return;
+        }
+        let area = self.active_area();
+        // Which pane is under the pointer, and the local point inside it.
+        if let Some((id, rect)) = self.pane_at(position, area) {
+            if self.tab().focused_ptr() == id && self.tab().focused().selecting {
+                if let Some(point) = self.point_in(id, rect, position) {
+                    if self.tab().focused().update_selection(point) {
+                        self.window.request_redraw();
+                    }
+                }
+            }
+        }
+    }
+
+    fn on_click(&mut self, state: ElementState, button: MouseButton) {
+        if self.overlay.is_some() {
+            return;
+        }
+        let area = self.active_area();
+        match (state, button) {
+            (ElementState::Pressed, MouseButton::Left) => {
+                if let Some((id, rect)) = self.pane_at(self.cursor_px, area) {
+                    self.tab().focus = id;
+                    if let Some(point) = self.point_in(id, rect, self.cursor_px) {
+                        self.tab().focused().begin_selection(point, SelMode::Char);
+                        self.window.request_redraw();
+                    }
+                }
+            }
+            (ElementState::Released, MouseButton::Left) => {
+                self.tab().focused().end_selection();
+                if self.tabs[self.active].focused_ref().selection.is_some() {
+                    self.copy_selection();
+                }
+            }
+            (ElementState::Pressed, MouseButton::Middle) => self.paste(),
+            _ => {}
+        }
+    }
+
+    fn on_key(
+        &mut self,
+        event: winit::event::KeyEvent,
+        mods: ModifiersState,
+        config: &Config,
+        keymap: &Keymap,
+        event_loop: &ActiveEventLoop,
+    ) {
+        // An overlay swallows all keys while open.
+        if self.overlay.is_some() {
+            self.overlay_key(&event, mods, config);
+            return;
+        }
+
+        // A bound chord runs its action and never reaches the child.
+        if let Some(action) = keymap.resolve(&event.logical_key, mods) {
+            self.run_action(action.clone(), config, event_loop);
+            return;
+        }
+
+        // Otherwise it is input for the focused pane's process.
+        let mode = keys::KeyMode { app_cursor: self.tab().focused().app_cursor() };
+        if let Some(bytes) = keys::encode(&event, mods, mode) {
+            if self.tab().focused().snap_to_bottom() {
+                self.window.request_redraw();
+            }
+            self.tab().focused().clear_selection();
+            if self.broadcast {
+                self.broadcast_bytes(&bytes);
+            } else {
+                self.tab().focused().write(&bytes);
+            }
+        }
+    }
+
+    fn run_action(&mut self, action: Action, config: &Config, event_loop: &ActiveEventLoop) {
+        let area = self.active_area();
+        let wake = wake_fn(self.window.clone());
+        match action {
+            Action::Quit => event_loop.exit(),
+
+            Action::NewTab => {
+                let id = self.new_pane_id();
+                if let Ok(tab) = Tab::new(area, self.renderer.cell_size(), config, id, &Spawn::default(), wake) {
+                    self.tabs.push(tab);
+                    self.active = self.tabs.len() - 1;
+                    self.reflow_all();
+                }
+            }
+            Action::CloseTab => {
+                if self.tabs.len() > 1 {
+                    self.tabs.remove(self.active);
+                    self.active = self.active.min(self.tabs.len() - 1);
+                    self.reflow_all();
+                } else {
+                    event_loop.exit();
+                }
+            }
+            Action::NextTab => self.active = (self.active + 1) % self.tabs.len(),
+            Action::PrevTab => {
+                self.active = (self.active + self.tabs.len() - 1) % self.tabs.len()
+            }
+            Action::GoToTab(n) => {
+                if n >= 1 && n <= self.tabs.len() {
+                    self.active = n - 1;
+                }
+            }
+            Action::RenameTab => {
+                self.overlay = Some(Overlay::Prompt(Prompt::new(
+                    PromptKind::RenameTab,
+                    "Rename tab",
+                    Vec::new(),
+                )));
+            }
+
+            Action::SplitHorizontal | Action::SplitVertical => {
+                let axis = action.split_axis().unwrap();
+                let id = self.new_pane_id();
+                let _ = self.tab().split_with_id(area, axis, config, id, wake);
+            }
+            Action::ClosePane => {
+                if !self.tab().close_focused(area) && self.tabs.len() > 1 {
+                    self.tabs.remove(self.active);
+                    self.active = self.active.min(self.tabs.len() - 1);
+                    self.reflow_all();
+                } else if self.tabs.len() == 1 && self.tab().tree.len() == 1 {
+                    event_loop.exit();
+                }
+            }
+            a if a.focus_dir().is_some() => {
+                self.tab().focus_dir(area, a.focus_dir().unwrap());
+            }
+            a if a.resize_dir().is_some() => {
+                self.tab().resize_focused(area, a.resize_dir().unwrap());
+            }
+            Action::FocusNext => self.tab().focus_next(),
+
+            Action::Copy => self.copy_selection(),
+            Action::Paste => self.paste(),
+            Action::CopyLastOutput => {
+                if let Some(text) = self.tab().focused().last_command_output() {
+                    self.set_clipboard(text);
+                }
+            }
+            Action::ScrollPageUp => {
+                let rows = self.tab().focused().grid.lock().unwrap().rows() as isize;
+                self.tab().focused().scroll(rows);
+            }
+            Action::ScrollPageDown => {
+                let rows = self.tab().focused().grid.lock().unwrap().rows() as isize;
+                self.tab().focused().scroll(-rows);
+            }
+            Action::ScrollToTop => {
+                self.tab().focused().scroll(isize::MAX / 2);
+            }
+            Action::ScrollToBottom => {
+                self.tab().focused().snap_to_bottom();
+            }
+            Action::ScrollUp => {
+                self.tab().focused().scroll(3);
+            }
+            Action::ScrollDown => {
+                self.tab().focused().scroll(-3);
+            }
+            Action::JumpPrevPrompt => self.jump_prompt(-1),
+            Action::JumpNextPrompt => self.jump_prompt(1),
+
+            Action::FontBigger => self.set_font_px(self.font_px + 1.0, config),
+            Action::FontSmaller => self.set_font_px(self.font_px - 1.0, config),
+            Action::FontReset => self.set_font_px(config.font.size, config),
+
+            Action::CommandPalette => {
+                self.overlay = Some(Overlay::Palette(Palette::new(&keyhints())));
+            }
+            Action::ShowDocs => {
+                self.overlay = Some(Overlay::Docs(overlay::Docs::new(docs::HELP)));
+            }
+            Action::ToggleAi => self.toggle_ai(config),
+            Action::AskAiAboutError => self.ask_ai_about_error(config),
+            Action::QuickConnect => self.open_quick_connect(),
+            Action::HintMode => self.open_hints(),
+            Action::LaunchClaude => self.launch_claude(config),
+            Action::ToggleBroadcast => self.broadcast = !self.broadcast,
+            Action::ClearSelectionOrScrollback => {
+                if !self.tab().focused().clear_selection() {
+                    self.tab().focused().snap_to_bottom();
+                }
+            }
+            // The focus/resize directional actions are dispatched by the guarded
+            // arms above; this arm is unreachable for them but keeps the match
+            // exhaustive.
+            _ => {}
+        }
+        self.window.request_redraw();
+    }
+
+    fn overlay_key(&mut self, event: &winit::event::KeyEvent, mods: ModifiersState, config: &Config) {
+        let key = &event.logical_key;
+        match self.overlay.as_mut().unwrap() {
+            Overlay::Palette(p) => match key {
+                Key::Named(NamedKey::Escape) => self.overlay = None,
+                Key::Named(NamedKey::ArrowUp) => p.up(),
+                Key::Named(NamedKey::ArrowDown) => p.down(),
+                Key::Named(NamedKey::Backspace) => p.backspace(),
+                Key::Named(NamedKey::Enter) => {
+                    let sel = p.selected();
+                    self.overlay = None;
+                    if let Some(action) = sel {
+                        self.run_palette_action(action, config);
+                    }
+                }
+                Key::Character(s) => {
+                    for c in s.chars() {
+                        p.input(c);
+                    }
+                }
+                _ => {}
+            },
+            Overlay::Docs(d) => match key {
+                Key::Named(NamedKey::Escape) | Key::Named(NamedKey::Enter) => self.overlay = None,
+                Key::Named(NamedKey::ArrowUp) => d.scroll(-1),
+                Key::Named(NamedKey::ArrowDown) => d.scroll(1),
+                Key::Named(NamedKey::PageUp) => d.scroll(-15),
+                Key::Named(NamedKey::PageDown) => d.scroll(15),
+                _ => {}
+            },
+            Overlay::Prompt(p) => match key {
+                Key::Named(NamedKey::Escape) => self.overlay = None,
+                Key::Named(NamedKey::ArrowUp) => p.up(),
+                Key::Named(NamedKey::ArrowDown) => p.down(),
+                Key::Named(NamedKey::Backspace) => p.backspace(),
+                Key::Named(NamedKey::Enter) => {
+                    let kind = p.kind;
+                    let value = p.value();
+                    self.overlay = None;
+                    self.confirm_prompt(kind, value, config);
+                }
+                Key::Character(s) => {
+                    for c in s.chars() {
+                        p.input_char(c);
+                    }
+                }
+                Key::Named(NamedKey::Space) => p.input_char(' '),
+                _ => {}
+            },
+            Overlay::Ai(panel) => match key {
+                Key::Named(NamedKey::Escape) => self.overlay = None,
+                Key::Named(NamedKey::Backspace) => panel.backspace(),
+                Key::Named(NamedKey::Enter) => {
+                    let q = panel.take_input();
+                    if !q.is_empty() {
+                        self.send_ai(q, config);
+                    }
+                }
+                Key::Named(NamedKey::Space) => panel.input_char(' '),
+                Key::Character(s) => {
+                    for c in s.chars() {
+                        panel.input_char(c);
+                    }
+                }
+                _ => {}
+            },
+            Overlay::Hints(h) => match key {
+                Key::Named(NamedKey::Escape) => self.overlay = None,
+                Key::Character(s) => {
+                    if let Some(c) = s.chars().next() {
+                        match h.input(c) {
+                            overlay::HintResult::More => {}
+                            overlay::HintResult::NoMatch => self.overlay = None,
+                            overlay::HintResult::Chosen(_, text, kind) => {
+                                self.overlay = None;
+                                self.act_on_hint(text, kind);
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            },
+        }
+        let _ = mods;
+        self.window.request_redraw();
+    }
+
+    fn run_palette_action(&mut self, action: Action, config: &Config) {
+        // The palette cannot quit the loop (no ActiveEventLoop here); those come
+        // through key chords. Everything else is safe to route.
+        if action == Action::Quit {
+            std::process::exit(0);
+        }
+        // Reuse run_action by faking an event loop is not possible; inline the ones
+        // the palette exposes that do not need the loop.
+        let area = self.active_area();
+        let wake = wake_fn(self.window.clone());
+        match action {
+            Action::NewTab => {
+                let id = self.new_pane_id();
+                if let Ok(tab) =
+                    Tab::new(area, self.renderer.cell_size(), config, id, &Spawn::default(), wake)
+                {
+                    self.tabs.push(tab);
+                    self.active = self.tabs.len() - 1;
+                    self.reflow_all();
+                }
+            }
+            Action::SplitHorizontal | Action::SplitVertical => {
+                let id = self.new_pane_id();
+                let _ = self.tab().split_with_id(area, action.split_axis().unwrap(), config, id, wake);
+            }
+            Action::CommandPalette => {
+                self.overlay = Some(Overlay::Palette(Palette::new(&keyhints())))
+            }
+            Action::ShowDocs => self.overlay = Some(Overlay::Docs(overlay::Docs::new(docs::HELP))),
+            Action::ToggleAi => self.toggle_ai(config),
+            Action::AskAiAboutError => self.ask_ai_about_error(config),
+            Action::QuickConnect => self.open_quick_connect(),
+            Action::HintMode => self.open_hints(),
+            Action::LaunchClaude => self.launch_claude(config),
+            Action::RenameTab => {
+                self.overlay = Some(Overlay::Prompt(Prompt::new(
+                    PromptKind::RenameTab,
+                    "Rename tab",
+                    Vec::new(),
+                )))
+            }
+            Action::Copy => self.copy_selection(),
+            Action::Paste => self.paste(),
+            Action::CopyLastOutput => {
+                if let Some(text) = self.tab().focused().last_command_output() {
+                    self.set_clipboard(text);
+                }
+            }
+            Action::CloseTab => {
+                if self.tabs.len() > 1 {
+                    self.tabs.remove(self.active);
+                    self.active = self.active.min(self.tabs.len() - 1);
+                    self.reflow_all();
+                }
+            }
+            Action::NextTab => self.active = (self.active + 1) % self.tabs.len(),
+            Action::PrevTab => {
+                self.active = (self.active + self.tabs.len() - 1) % self.tabs.len()
+            }
+            Action::ClosePane => {
+                self.tab().close_focused(area);
+            }
+            Action::ScrollToTop => {
+                self.tab().focused().scroll(isize::MAX / 2);
+            }
+            Action::ScrollToBottom => {
+                self.tab().focused().snap_to_bottom();
+            }
+            Action::JumpPrevPrompt => self.jump_prompt(-1),
+            Action::JumpNextPrompt => self.jump_prompt(1),
+            Action::FontBigger => self.set_font_px(self.font_px + 1.0, config),
+            Action::FontSmaller => self.set_font_px(self.font_px - 1.0, config),
+            Action::FontReset => self.set_font_px(config.font.size, config),
+            Action::ToggleBroadcast => self.broadcast = !self.broadcast,
+            _ => {}
+        }
+    }
+
+    fn confirm_prompt(&mut self, kind: PromptKind, value: String, config: &Config) {
+        match kind {
+            PromptKind::RenameTab => {
+                self.tab().title_override = Some(value).filter(|s| !s.is_empty());
+            }
+            PromptKind::QuickConnect => {
+                if !value.is_empty() {
+                    self.split_running(config, vec!["ssh".into(), value]);
+                }
+            }
+            PromptKind::AiQuestion => {
+                if !value.is_empty() {
+                    self.send_ai(value, config);
+                }
+            }
+        }
+    }
+
+    // ---- helpers used above --------------------------------------------------
+
+    fn reflow_all(&mut self) {
+        let area = self.active_area();
+        for tab in &mut self.tabs {
+            tab.reflow(area);
+        }
+        self.window.request_redraw();
+    }
+
+    fn pane_at(&self, pos: PhysicalPosition<f64>, area: Rect) -> Option<(u64, Rect)> {
+        let (px, py) = (pos.x as f32, pos.y as f32);
+        self.tabs[self.active]
+            .layout(area)
+            .into_iter()
+            .find(|(_, r)| px >= r.x && px < r.x + r.w && py >= r.y && py < r.y + r.h)
+    }
+
+    fn point_in(&self, id: u64, rect: Rect, pos: PhysicalPosition<f64>) -> Option<selection::Point> {
+        let (cw, ch) = self.renderer.cell_size();
+        let col = (((pos.x as f32 - rect.x) / cw).floor().max(0.0)) as usize;
+        let row = (((pos.y as f32 - rect.y) / ch).floor().max(0.0)) as usize;
+        let pane = self.tabs[self.active].panes.get(&id)?;
+        let grid = pane.grid.lock().unwrap();
+        let row = row.min(grid.rows().saturating_sub(1));
+        Some((grid.abs_row(row), col.min(grid.cols().saturating_sub(1))))
+    }
+
+    fn jump_prompt(&mut self, dir: isize) {
+        let pane = self.tab().focused();
+        let mut grid = pane.grid.lock().unwrap();
+        let offsets = grid.prompt_offsets();
+        if offsets.is_empty() {
+            return;
+        }
+        let current = grid.display_offset();
+        // Offsets are how far back each prompt sits; pick the next one in `dir`.
+        let target = if dir < 0 {
+            offsets.iter().copied().filter(|&o| o > current).min()
+        } else {
+            offsets.iter().copied().filter(|&o| o < current).max()
+        };
+        if let Some(t) = target {
+            let delta = t as isize - current as isize;
+            grid.scroll_display(delta);
+        }
+    }
+
+    fn broadcast_bytes(&mut self, bytes: &[u8]) {
+        for pane in self.tab().panes.values_mut() {
+            pane.write(bytes);
+        }
+    }
+
+    fn copy_selection(&mut self) {
+        if let Some(text) = self.tabs[self.active].focused_ref().selection_text() {
+            self.set_clipboard(text);
+        }
+    }
+
+    fn set_clipboard(&mut self, text: String) {
+        if let Some(cb) = self.clipboard.as_mut() {
+            let _ = cb.set_text(text);
+        }
+    }
+
+    fn paste(&mut self) {
+        let Some(text) = self.clipboard.as_mut().and_then(|cb| cb.get_text().ok()) else {
+            return;
+        };
+        let bracketed = self.tab().focused().bracketed_paste();
+        let pane = self.tab().focused();
+        if bracketed {
+            pane.write(b"\x1b[200~");
+            pane.write(text.as_bytes());
+            pane.write(b"\x1b[201~");
+        } else {
+            pane.write(text.as_bytes());
+        }
+    }
+
+    fn set_font_px(&mut self, px: f32, config: &Config) {
+        let px = px.clamp(6.0, 72.0);
+        if (px - self.font_px).abs() < 0.5 {
+            return;
+        }
+        if let Ok(mut font) = FontAtlas::new_with(&config.font.family, px) {
+            font.ligatures = config.font.ligatures;
+            self.renderer.replace_font(&self.device, font);
+            self.font_px = px;
+            self.reflow_all();
+        }
+    }
+
+    fn split_running(&mut self, config: &Config, command: Vec<String>) {
+        let area = self.active_area();
+        let id = self.new_pane_id();
+        let wake = wake_fn(self.window.clone());
+        let _ = self.tab().split_running_with_id(area, Axis::Horizontal, config, id, command, wake);
+        self.window.request_redraw();
+    }
+
+    fn open_quick_connect(&mut self) {
+        let hosts = ssh_hosts();
+        self.overlay = Some(Overlay::Prompt(Prompt::new(
+            PromptKind::QuickConnect,
+            "SSH connect to",
+            hosts,
+        )));
+    }
+
+    fn launch_claude(&mut self, config: &Config) {
+        let cmd = ai::claude_launch_command(config);
+        self.split_running(config, cmd);
+    }
+}
+
+fn wheel_lines(delta: MouseScrollDelta, wheel_lines: f32, cell_h: f32) -> f32 {
+    match delta {
+        MouseScrollDelta::LineDelta(_, y) => y * wheel_lines,
+        MouseScrollDelta::PixelDelta(p) => p.y as f32 / cell_h.max(1.0),
+    }
+}
+
+/// Key hints for the palette: action id -> the first chord bound to it.
+fn keyhints() -> std::collections::HashMap<String, String> {
+    crate::actions::default_hints()
+}
+
+/// SSH hosts from `~/.ssh/config`, for quick connect.
+fn ssh_hosts() -> Vec<String> {
+    let Some(home) = dirs::home_dir() else { return Vec::new() };
+    let Ok(text) = std::fs::read_to_string(home.join(".ssh/config")) else {
+        return Vec::new();
+    };
+    let mut hosts = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("Host ").or_else(|| line.strip_prefix("host ")) {
+            for h in rest.split_whitespace() {
+                // Skip wildcard patterns: they are not connectable names.
+                if !h.contains('*') && !h.contains('?') {
+                    hosts.push(h.to_string());
+                }
+            }
+        }
+    }
+    hosts.sort();
+    hosts.dedup();
+    hosts
+}

@@ -1,348 +1,47 @@
+mod actions;
+mod ai;
 mod boxdraw;
 mod config;
+mod docs;
 mod font;
 mod grid;
+mod hints;
 mod keys;
 mod layout;
+mod overlay;
+mod pane;
 mod pty;
 mod render;
 mod selection;
+mod tab;
 
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition};
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::keyboard::ModifiersState;
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
+use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowId};
 
+use crate::actions::{Action, Keymap};
+use crate::config::Config;
+use crate::grid::{Color, Grid, Pen};
 use crate::font::FontAtlas;
-use crate::grid::Grid;
-use crate::keys::KeyMode;
-use crate::pty::Pty;
-use crate::render::{Renderer, Viewport};
-use crate::selection::{Mode as SelMode, Selection};
+use crate::layout::{Axis, Direction, Rect};
+use crate::overlay::{Overlay, Palette, Prompt, PromptKind};
+use crate::pty::Spawn;
+use crate::render::{Overlay as OverlayDraw, PaneDraw, Renderer};
+use crate::selection::Mode as SelMode;
+use crate::tab::Tab;
 
-/// Matches the `scrollback_lines`/`copy_on_select` habits from the user's kitty
-/// config; real configuration lands in M6.
-const WHEEL_LINES: f32 = 3.0;
+/// Height of the tab bar, in cells. Shown only when more than one tab exists.
+const TABBAR_ROWS: f32 = 1.0;
 
-const FONT_PX: f32 = 16.0;
-
-struct Gpu {
-    window: Arc<Window>,
-    surface: wgpu::Surface<'static>,
-    device: wgpu::Device,
-    queue: wgpu::Queue,
-    config: wgpu::SurfaceConfiguration,
-    renderer: Renderer,
-    grid: Arc<Mutex<Grid>>,
-    pty: Pty,
-    selection: Option<Selection>,
-    selecting: bool,
-    cursor_px: PhysicalPosition<f64>,
-    clipboard: Option<arboard::Clipboard>,
-}
-
-impl Gpu {
-    fn new(window: Arc<Window>) -> Self {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
-        let surface = instance.create_surface(window.clone()).unwrap();
-
-        // LowPower picks the iGPU on hybrid laptops. Waking the dGPU to draw text
-        // costs battery and buys nothing.
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::LowPower,
-            compatible_surface: Some(&surface),
-            ..Default::default()
-        }))
-        .expect("no suitable GPU adapter");
-
-        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            label: Some("runnir"),
-            ..Default::default()
-        }))
-        .expect("failed to create device");
-
-        let size = window.inner_size();
-        let config = surface
-            .get_default_config(&adapter, size.width.max(1), size.height.max(1))
-            .expect("adapter does not support this surface");
-        surface.configure(&device, &config);
-
-        let info = adapter.get_info();
-        println!("runnir: {} ({:?})", info.name, info.backend);
-
-        let font = FontAtlas::new(FONT_PX).expect("font");
-        let renderer = Renderer::new(&device, config.format, font);
-
-        let (cols, rows) = renderer.cells_for(config.width as f32, config.height as f32);
-        let grid = Arc::new(Mutex::new(Grid::new(cols, rows)));
-
-        let waker = window.clone();
-        let pty = Pty::spawn(grid.clone(), None, move || waker.request_redraw())
-            .expect("failed to spawn pty");
-
-        Self {
-            window,
-            surface,
-            device,
-            queue,
-            config,
-            renderer,
-            grid,
-            pty,
-            selection: None,
-            selecting: false,
-            cursor_px: PhysicalPosition::new(0.0, 0.0),
-            clipboard: arboard::Clipboard::new().ok(),
-        }
-    }
-
-    /// Pixel position -> absolute grid point, clamped to the viewport.
-    fn point_at(&self, px: PhysicalPosition<f64>) -> selection::Point {
-        let grid = self.grid.lock().unwrap();
-        let col = (px.x as f32 / self.renderer.font.cell_w).floor().max(0.0) as usize;
-        let row = (px.y as f32 / self.renderer.font.cell_h).floor().max(0.0) as usize;
-        let row = row.min(grid.rows() - 1);
-        (grid.abs_row(row), col.min(grid.cols() - 1))
-    }
-
-    fn copy_selection(&mut self) {
-        let Some(sel) = self.selection else { return };
-        let text = {
-            let grid = self.grid.lock().unwrap();
-            if sel.is_empty(&grid) {
-                return;
-            }
-            sel.text(&grid)
-        };
-        if let Some(cb) = self.clipboard.as_mut() {
-            let _ = cb.set_text(text);
-        }
-    }
-
-    fn paste(&mut self) {
-        let Some(text) = self.clipboard.as_mut().and_then(|cb| cb.get_text().ok()) else {
-            return;
-        };
-        let bracketed = self.grid.lock().unwrap().bracketed_paste;
-        if bracketed {
-            // Without the brackets, a pasted newline runs the line immediately and
-            // an editor auto-indents every line of the paste.
-            self.pty.write(b"\x1b[200~");
-            self.pty.write(text.as_bytes());
-            self.pty.write(b"\x1b[201~");
-        } else {
-            self.pty.write(text.as_bytes());
-        }
-    }
-
-    fn clear_selection(&mut self) {
-        if self.selection.take().is_some() {
-            self.renderer.invalidate();
-            self.window.request_redraw();
-        }
-    }
-
-    fn resize(&mut self, width: u32, height: u32) {
-        self.config.width = width.max(1);
-        self.config.height = height.max(1);
-        self.surface.configure(&self.device, &self.config);
-
-        let (cols, rows) = self.renderer.cells_for(self.config.width as f32, self.config.height as f32);
-        self.grid.lock().unwrap().resize(cols, rows);
-        // The child only learns the new size from the PTY, not from the window.
-        self.pty.resize(cols as u16, rows as u16);
-    }
-
-    fn render(&mut self) {
-        use wgpu::CurrentSurfaceTexture as Cst;
-        let frame = match self.surface.get_current_texture() {
-            Cst::Success(frame) | Cst::Suboptimal(frame) => frame,
-            Cst::Outdated | Cst::Lost => {
-                self.surface.configure(&self.device, &self.config);
-                return;
-            }
-            Cst::Timeout | Cst::Occluded => return,
-            Cst::Validation => {
-                eprintln!("runnir: surface validation error");
-                return;
-            }
-        };
-
-        let view = frame.texture.create_view(&Default::default());
-        let mut encoder = self.device.create_command_encoder(&Default::default());
-        let screen = (self.config.width as f32, self.config.height as f32);
-
-        {
-            let mut grid = self.grid.lock().unwrap();
-            // The PTY thread sets `dirty` from another thread; this is where we
-            // notice and rebuild.
-            if grid.dirty {
-                grid.dirty = false;
-                self.renderer.invalidate();
-            }
-            self.window.set_title(if grid.title.is_empty() { "runnir" } else { &grid.title });
-            self.renderer.draw(
-                &self.device,
-                &self.queue,
-                &mut encoder,
-                &view,
-                &grid,
-                self.selection.as_ref(),
-                Viewport { x: 0.0, y: 0.0, w: screen.0, h: screen.1 },
-                screen,
-            );
-        }
-
-        self.queue.submit(Some(encoder.finish()));
-        self.window.pre_present_notify();
-        self.queue.present(frame);
-    }
-}
-
-#[derive(Default)]
-struct App {
-    gpu: Option<Gpu>,
-    mods: ModifiersState,
-}
-
-impl ApplicationHandler for App {
-    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.gpu.is_some() {
-            return;
-        }
-        let attrs = Window::default_attributes()
-            .with_title("runnir")
-            .with_inner_size(LogicalSize::new(960.0, 600.0));
-        let window = Arc::new(event_loop.create_window(attrs).unwrap());
-        self.gpu = Some(Gpu::new(window));
-    }
-
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
-        let Some(gpu) = self.gpu.as_mut() else {
-            return;
-        };
-        match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
-            WindowEvent::Resized(size) => gpu.resize(size.width, size.height),
-            WindowEvent::RedrawRequested => gpu.render(),
-            WindowEvent::ModifiersChanged(mods) => self.mods = mods.state(),
-
-            WindowEvent::MouseWheel { delta, .. } => {
-                let lines = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => y * WHEEL_LINES,
-                    MouseScrollDelta::PixelDelta(p) => {
-                        p.y as f32 / gpu.renderer.font.cell_h
-                    }
-                };
-                if gpu.grid.lock().unwrap().scroll_display(lines.round() as isize) {
-                    gpu.renderer.invalidate();
-                    gpu.window.request_redraw();
-                }
-            }
-
-            WindowEvent::CursorMoved { position, .. } => {
-                gpu.cursor_px = position;
-                if gpu.selecting {
-                    let point = gpu.point_at(position);
-                    if let Some(sel) = gpu.selection.as_mut() {
-                        sel.update(point);
-                        gpu.renderer.invalidate();
-                        gpu.window.request_redraw();
-                    }
-                }
-            }
-
-            WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => match state {
-                ElementState::Pressed => {
-                    let point = gpu.point_at(gpu.cursor_px);
-                    gpu.selection = Some(Selection::new(point, SelMode::Char));
-                    gpu.selecting = true;
-                    gpu.renderer.invalidate();
-                    gpu.window.request_redraw();
-                }
-                ElementState::Released => {
-                    gpu.selecting = false;
-                    // copy_on_select, as in the user's kitty config.
-                    gpu.copy_selection();
-                }
-            },
-
-            // Middle click pastes the primary selection on X11/Wayland. arboard
-            // gives us the clipboard, which is close enough until M6 config.
-            WindowEvent::MouseInput {
-                state: ElementState::Pressed,
-                button: MouseButton::Middle,
-                ..
-            } => gpu.paste(),
-
-            WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
-                use winit::keyboard::{Key, NamedKey};
-
-                let ctrl_shift = self.mods.control_key() && self.mods.shift_key();
-
-                // Shift+PageUp/Down scrolls the view instead of reaching the child.
-                if self.mods.shift_key() {
-                    let scroll = match event.logical_key {
-                        Key::Named(NamedKey::PageUp) => Some(gpu.grid.lock().unwrap().rows() as isize),
-                        Key::Named(NamedKey::PageDown) => {
-                            Some(-(gpu.grid.lock().unwrap().rows() as isize))
-                        }
-                        _ => None,
-                    };
-                    if let Some(delta) = scroll {
-                        if gpu.grid.lock().unwrap().scroll_display(delta) {
-                            gpu.renderer.invalidate();
-                            gpu.window.request_redraw();
-                        }
-                        return;
-                    }
-                }
-
-                if ctrl_shift {
-                    match event.logical_key.as_ref() {
-                        Key::Character("C") | Key::Character("c") => {
-                            gpu.copy_selection();
-                            return;
-                        }
-                        Key::Character("V") | Key::Character("v") => {
-                            gpu.paste();
-                            return;
-                        }
-                        _ => {}
-                    }
-                }
-
-                let mode = KeyMode { app_cursor: gpu.grid.lock().unwrap().app_cursor };
-                if let Some(bytes) = keys::encode(&event, self.mods, mode) {
-                    // Typing into a scrolled-back view and seeing nothing happen is
-                    // maddening; snap to the live output first.
-                    if gpu.grid.lock().unwrap().scroll_to_bottom() {
-                        gpu.renderer.invalidate();
-                    }
-                    gpu.clear_selection();
-                    gpu.pty.write(&bytes);
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
-/// Runs `cmd` on a real PTY and prints the resulting grid as text. Checks the
-/// parser without involving the GPU.
-fn dump(cmd: &str) {
-    let grid = Arc::new(Mutex::new(Grid::new(80, 24)));
-    let mut pty = Pty::spawn(grid.clone(), Some(cmd), || {}).expect("failed to spawn pty");
-    pty.wait();
-
-    let grid = grid.lock().unwrap();
-    println!("{}", grid.dump());
-    let (row, col) = grid.cursor();
-    eprintln!("--- cursor: row {row} col {col} | title: {:?}", grid.title);
+/// A message from a background worker back to the UI thread.
+pub enum UserEvent {
+    Ai(ai::Reply),
 }
 
 fn main() {
@@ -353,13 +52,344 @@ fn main() {
             let path = args.get(2).map(String::as_str).unwrap_or("/tmp/runnir.png");
             let cmd = args.get(3).map(String::as_str).unwrap_or("echo hola");
             let delay = args.get(4).and_then(|s| s.parse().ok());
-            return render::offscreen(path, cmd, FONT_PX, delay);
+            return render::offscreen(path, cmd, 16.0, delay);
+        }
+        Some("--write-config") => {
+            let path = Config::path();
+            match Config::write_default(&path) {
+                Ok(()) => println!("runnir: wrote {}", path.display()),
+                Err(e) => eprintln!("runnir: could not write config: {e}"),
+            }
+            return;
+        }
+        Some("--version" | "-v") => return println!("runnir {}", env!("CARGO_PKG_VERSION")),
+        Some("--help" | "-h") => return print_help(),
+        Some("--demo") => {
+            return demo_scene(args.get(2).map(String::as_str).unwrap_or("/tmp/runnir-demo.png"));
         }
         _ => {}
     }
 
-    let event_loop = EventLoop::new().unwrap();
-    // Wait, not Poll: redraw only on demand. An idle terminal must not burn a core.
+    let event_loop = EventLoop::<UserEvent>::with_user_event().build().unwrap();
+    // Wait, not Poll: an idle terminal must not burn a core.
     event_loop.set_control_flow(ControlFlow::Wait);
-    event_loop.run_app(&mut App::default()).unwrap();
+    let mut app = App::new(event_loop.create_proxy());
+    event_loop.run_app(&mut app).unwrap();
 }
+
+fn print_help() {
+    println!(
+        "runnir {} — a GPU terminal emulator\n\n\
+         USAGE:\n  \
+         runnir                     start the terminal\n  \
+         runnir --write-config      write a default config file\n  \
+         runnir --dump CMD          run CMD, print the resulting grid (debug)\n  \
+         runnir --render OUT CMD    render CMD's output to a PNG (debug)\n\n\
+         Press F1 inside runnir for the full key reference.",
+        env!("CARGO_PKG_VERSION")
+    );
+}
+
+fn dump(cmd: &str) {
+    let grid = Arc::new(Mutex::new(Grid::new(80, 24)));
+    let spawn = Spawn {
+        command: Some(vec![
+            std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into()),
+            "-c".into(),
+            cmd.into(),
+        ]),
+        cwd: None,
+    };
+    let mut pty = pty::Pty::spawn(grid.clone(), &spawn, || {}).expect("pty");
+    pty.wait();
+    let grid = grid.lock().unwrap();
+    println!("{}", grid.dump());
+}
+
+/// Builds a static multi-pane scene with an overlay and renders it, so the layout,
+/// tinting, focus dimming and overlay path can be verified without a live window.
+fn demo_scene(path: &str) {
+    use crate::render::Rect;
+    render::offscreen_scene(path, 1000, 600, 16.0, |r| {
+        let (cw, ch) = r.cell_size();
+        let cells = |rect: Rect| {
+            ((rect.w / cw).floor().max(1.0) as usize, (rect.h / ch).floor().max(1.0) as usize)
+        };
+        let bar_h = ch;
+        let full = Rect { x: 0.0, y: bar_h, w: 1000.0, h: 600.0 - bar_h };
+        // Left pane full-height; right column split into two.
+        let left = Rect { x: 0.0, y: full.y, w: 496.0, h: full.h };
+        let rt = Rect { x: 504.0, y: full.y, w: 496.0, h: (full.h - 8.0) / 2.0 };
+        let rb = Rect { x: 504.0, y: rt.y + rt.h + 8.0, w: 496.0, h: rt.h };
+
+        let pen = Pen { fg: Color::Rgb(0xd4, 0xd6, 0xd9), ..Pen::default() };
+        let accent = Pen { fg: Color::Rgb(0x0d, 0xbc, 0x79), ..Pen::default() };
+
+        let (lc, lr) = cells(left);
+        let mut g_left = Grid::new(lc, lr);
+        g_left.write_str(0, 0, "~/projects/runnir ❯ cargo build", accent);
+        g_left.write_str(1, 0, "   Compiling runnir v0.1.0", pen);
+        g_left.write_str(2, 0, "    Finished in 2.41s", pen);
+        g_left.write_str(3, 0, "~/projects/runnir ❯ █", accent);
+
+        let (rc, rr) = cells(rt);
+        let mut g_rt = Grid::new(rc, rr);
+        g_rt.write_str(0, 0, "drheavymetal@192.168.1.3 ❯ docker ps", pen);
+        g_rt.write_str(1, 0, "CONTAINER   IMAGE      STATUS", pen);
+        g_rt.write_str(2, 0, "a1b2c3d4    hermes     Up 3 days", pen);
+
+        let (rbc, rbr) = cells(rb);
+        let mut g_rb = Grid::new(rbc, rbr);
+        g_rb.write_str(0, 0, "❯ ssh cloudmax → building...", pen);
+        g_rb.write_str(1, 0, "  #1 [internal] load build definition", pen);
+
+        // Tab bar chrome.
+        let mut bar = Grid::new((1000.0 / cw) as usize, 1);
+        bar.fill(Pen { bg: Color::Rgb(0x15, 0x16, 0x1a), ..Pen::default() });
+        bar.write_str(0, 1, " 1 runnir ", Pen {
+            fg: Color::Rgb(0x0d, 0x0d, 0x0f),
+            bg: Color::Rgb(0x4c, 0x9f, 0xd4),
+            ..Pen::default()
+        });
+        bar.write_str(0, 12, " 2 servers ", Pen { fg: Color::Rgb(0x9a, 0x9d, 0xa4), bg: Color::Rgb(0x15, 0x16, 0x1a), ..Pen::default() });
+
+        let panes = vec![
+            (bar, Rect { x: 0.0, y: 0.0, w: 1000.0, h: bar_h }, None, true),
+            (g_left, left, None, true),
+            (g_rt, rt, Some((40, 60, 90)), false), // ssh-tinted, unfocused
+            (g_rb, rb, Some((30, 45, 70)), false),
+        ];
+
+        // A command palette overlay.
+        let cols = (1000.0 / cw) as usize;
+        let rows = (600.0 / ch) as usize;
+        let palette = Palette::new(&actions::default_hints());
+        let overlay = Overlay::Palette(palette);
+        let panels = overlay.render(cols, rows, &config::Theme::default());
+        let overlay_specs: Vec<(Grid, Rect)> = panels
+            .into_iter()
+            .map(|p| {
+                let rect =
+                    Rect { x: p.col as f32 * cw, y: p.row as f32 * ch, w: 0.0, h: 0.0 };
+                (p.grid, rect)
+            })
+            .collect();
+
+        (panes, Some(overlay_specs))
+    });
+}
+
+// ---- application -----------------------------------------------------------
+
+struct App {
+    proxy: EventLoopProxy<UserEvent>,
+    gpu: Option<Gpu>,
+    config: Config,
+    keymap: Keymap,
+    mods: ModifiersState,
+}
+
+impl App {
+    fn new(proxy: EventLoopProxy<UserEvent>) -> Self {
+        let config = Config::load();
+        let keymap = Keymap::new(&config.keys);
+        Self { proxy, gpu: None, config, keymap, mods: ModifiersState::empty() }
+    }
+}
+
+struct Gpu {
+    window: Arc<Window>,
+    surface: wgpu::Surface<'static>,
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    surface_config: wgpu::SurfaceConfiguration,
+    renderer: Renderer,
+    tabs: Vec<Tab>,
+    active: usize,
+    next_pane_seed: u64,
+    overlay: Option<Overlay>,
+    cursor_px: PhysicalPosition<f64>,
+    clipboard: Option<arboard::Clipboard>,
+    broadcast: bool,
+    font_px: f32,
+    ai: ai::Session,
+    last_context_refresh: Instant,
+    proxy: EventLoopProxy<UserEvent>,
+}
+
+fn wake_fn(window: Arc<Window>) -> impl Fn() + Send + Clone + 'static {
+    move || window.request_redraw()
+}
+
+impl App {
+    fn init_gpu(&mut self, event_loop: &ActiveEventLoop) -> Gpu {
+        let attrs = Window::default_attributes()
+            .with_title("runnir")
+            .with_decorations(self.config.window.decorations)
+            .with_inner_size(LogicalSize::new(self.config.window.width, self.config.window.height));
+        let window = Arc::new(event_loop.create_window(attrs).unwrap());
+
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let surface = instance.create_surface(window.clone()).unwrap();
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::LowPower,
+            compatible_surface: Some(&surface),
+            ..Default::default()
+        }))
+        .expect("no suitable GPU adapter");
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("runnir"),
+            ..Default::default()
+        }))
+        .expect("failed to create device");
+
+        let size = window.inner_size();
+        let surface_config = surface
+            .get_default_config(&adapter, size.width.max(1), size.height.max(1))
+            .expect("adapter does not support this surface");
+        surface.configure(&device, &surface_config);
+        println!("runnir: {} ({:?})", adapter.get_info().name, adapter.get_info().backend);
+
+        let font_px = self.config.font.size;
+        let mut font =
+            FontAtlas::new_with(&self.config.font.family, font_px).unwrap_or_else(|e| panic!("font: {e}"));
+        font.ligatures = self.config.font.ligatures;
+        let mut renderer = Renderer::new(&device, surface_config.format, font);
+        renderer.set_theme(self.config.theme.clone());
+
+        let cell = renderer.cell_size();
+        let area = content_area(&surface_config, cell, 1);
+        let wake = wake_fn(window.clone());
+        let tab = Tab::new(area, cell, &self.config, 1, &Spawn::default(), wake)
+            .expect("failed to spawn first pane");
+
+        Gpu {
+            window,
+            surface,
+            device,
+            queue,
+            surface_config,
+            renderer,
+            tabs: vec![tab],
+            active: 0,
+            next_pane_seed: 1000,
+            overlay: None,
+            cursor_px: PhysicalPosition::new(0.0, 0.0),
+            clipboard: arboard::Clipboard::new().ok(),
+            broadcast: false,
+            font_px,
+            ai: ai::Session::new(),
+            last_context_refresh: Instant::now(),
+            proxy: self.proxy.clone(),
+        }
+    }
+}
+
+fn content_area(cfg: &wgpu::SurfaceConfiguration, cell: (f32, f32), tab_count: usize) -> Rect {
+    let bar = if tab_count > 1 { TABBAR_ROWS * cell.1 } else { 0.0 };
+    Rect { x: 0.0, y: bar, w: cfg.width as f32, h: (cfg.height as f32 - bar).max(cell.1) }
+}
+
+impl ApplicationHandler<UserEvent> for App {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        if self.gpu.is_none() {
+            self.gpu = Some(self.init_gpu(event_loop));
+        }
+    }
+
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
+        let Some(gpu) = self.gpu.as_mut() else { return };
+        match event {
+            UserEvent::Ai(reply) => {
+                gpu.ai.receive(reply, gpu.overlay.as_mut());
+                gpu.window.request_redraw();
+            }
+        }
+    }
+
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        let Some(gpu) = self.gpu.as_mut() else { return };
+        match event {
+            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::Resized(size) => gpu.resize(size.width, size.height, &self.config),
+            WindowEvent::RedrawRequested => gpu.render(&self.config),
+            WindowEvent::ModifiersChanged(m) => self.mods = m.state(),
+            WindowEvent::MouseWheel { delta, .. } => gpu.on_wheel(delta, &self.config),
+            WindowEvent::CursorMoved { position, .. } => gpu.on_cursor(position),
+            WindowEvent::MouseInput { state, button, .. } => gpu.on_click(state, button),
+            WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
+                gpu.on_key(event, self.mods, &self.config, &self.keymap, event_loop);
+            }
+            _ => {}
+        }
+    }
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let Some(gpu) = self.gpu.as_mut() else { return };
+        if !gpu.reap(&self.config) {
+            event_loop.exit();
+            return;
+        }
+        gpu.periodic(&self.config);
+    }
+}
+
+impl Gpu {
+    fn active_area(&self) -> Rect {
+        content_area(&self.surface_config, self.renderer.cell_size(), self.tabs.len())
+    }
+
+    fn resize(&mut self, w: u32, h: u32, _config: &Config) {
+        self.surface_config.width = w.max(1);
+        self.surface_config.height = h.max(1);
+        self.surface.configure(&self.device, &self.surface_config);
+        let area = self.active_area();
+        for tab in &mut self.tabs {
+            tab.reflow(area);
+        }
+        self.window.request_redraw();
+    }
+
+    /// Refreshes context tints/titles periodically and re-arms cursor-blink waits.
+    fn periodic(&mut self, config: &Config) {
+        if self.last_context_refresh.elapsed() >= Duration::from_millis(500) {
+            self.last_context_refresh = Instant::now();
+            for tab in &mut self.tabs {
+                for pane in tab.panes.values_mut() {
+                    pane.refresh_context(config);
+                }
+            }
+            self.window.request_redraw();
+        }
+    }
+
+    /// Removes exited panes and empty tabs. Returns false when nothing is left.
+    fn reap(&mut self, _config: &Config) -> bool {
+        let area = self.active_area();
+        let mut i = 0;
+        while i < self.tabs.len() {
+            if !self.tabs[i].reap_dead(area) {
+                self.tabs.remove(i);
+                if self.active >= self.tabs.len() && self.active > 0 {
+                    self.active -= 1;
+                }
+            } else {
+                i += 1;
+            }
+        }
+        !self.tabs.is_empty()
+    }
+
+    fn tab(&mut self) -> &mut Tab {
+        &mut self.tabs[self.active]
+    }
+
+    fn new_pane_id(&mut self) -> u64 {
+        self.next_pane_seed += 1;
+        self.next_pane_seed
+    }
+}
+
+include!("app_input.rs");
+include!("app_ai.rs");
+include!("app_draw.rs");

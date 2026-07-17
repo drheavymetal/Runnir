@@ -85,8 +85,20 @@ pub struct Grid {
     /// Lines that have scrolled off the top, oldest first.
     scrollback: VecDeque<Vec<Cell>>,
     scrollback_limit: usize,
+    /// Total rows ever dropped off the front of scrollback. Lets absolute
+    /// coordinates stay stable as the ring buffer evicts: an absolute row is
+    /// `dropped + index_into(scrollback ++ screen)`.
+    dropped: usize,
     /// Rows scrolled back from the live bottom. 0 = following new output.
     display_offset: usize,
+    /// OSC 133 shell-integration marks, in absolute rows. Each is the row where a
+    /// command's output began. Powers "jump to prompt" and "copy last output".
+    prompt_marks: Vec<usize>,
+    /// Stable row where the command currently running started its output, set at
+    /// OSC 133;C and cleared at OSC 133;D.
+    command_start: Option<usize>,
+    /// Stable (start, end) rows of the last finished command's output.
+    last_output: Option<(usize, usize)>,
     /// Inclusive row bounds that scrolling is confined to (DECSTBM).
     scroll_top: usize,
     scroll_bot: usize,
@@ -113,7 +125,11 @@ impl Grid {
             parked: None,
             scrollback: VecDeque::new(),
             scrollback_limit: 3000,
+            dropped: 0,
             display_offset: 0,
+            prompt_marks: Vec::new(),
+            command_start: None,
+            last_output: None,
             scroll_top: 0,
             scroll_bot: rows - 1,
             app_cursor: false,
@@ -230,6 +246,82 @@ impl Grid {
         self.scroll_display(-(self.display_offset as isize))
     }
 
+    /// Paints every cell with `pen` and a space. Used to give an overlay grid a
+    /// solid background so it occludes the panes behind it.
+    pub fn fill(&mut self, pen: Pen) {
+        let blank = Cell { ch: ' ', pen };
+        self.cells.fill(blank);
+        self.pen = pen;
+        self.dirty = true;
+    }
+
+    /// Writes `text` starting at `(row, col)`, clipped to the row. For overlays,
+    /// which compose their own content rather than parsing a stream.
+    pub fn write_str(&mut self, row: usize, col: usize, text: &str, pen: Pen) {
+        if row >= self.rows {
+            return;
+        }
+        let mut c = col;
+        for ch in text.chars() {
+            if c >= self.cols {
+                break;
+            }
+            let w = UnicodeWidthChar::width(ch).unwrap_or(1).max(1);
+            self.cells[row * self.cols + c] = Cell { ch, pen };
+            if w == 2 && c + 1 < self.cols {
+                self.cells[row * self.cols + c + 1] = Cell { ch: SPACER, pen };
+            }
+            c += w;
+        }
+        self.dirty = true;
+    }
+
+    pub fn set_scrollback_limit(&mut self, limit: usize) {
+        self.scrollback_limit = limit.max(1);
+        while self.scrollback.len() > self.scrollback_limit {
+            self.scrollback.pop_front();
+            self.dropped += 1;
+        }
+    }
+
+    // ---- Stable coordinates & OSC 133 ---------------------------------------
+    //
+    // Absolute rows above (`abs_row`) index `scrollback ++ screen`, which shifts
+    // when the ring evicts. Shell-integration marks must outlive eviction, so they
+    // are stored as `dropped + local`, a monotonic line number that a given line
+    // keeps forever. `stable_to_local` maps one back, or `None` once evicted.
+
+    fn local_to_stable(&self, local: usize) -> usize {
+        self.dropped + local
+    }
+
+    fn stable_to_local(&self, stable: usize) -> Option<usize> {
+        stable.checked_sub(self.dropped).filter(|&l| l < self.total_rows())
+    }
+
+    /// Absolute row (local) where the cursor sits.
+    fn cursor_abs(&self) -> usize {
+        self.scrollback.len() + self.row
+    }
+
+    /// Scroll offsets, oldest first, that put each prompt at the top of the view.
+    /// Backs "jump to previous/next command".
+    pub fn prompt_offsets(&self) -> Vec<usize> {
+        self.prompt_marks
+            .iter()
+            .filter_map(|&s| self.stable_to_local(s))
+            .map(|local| self.scrollback.len().saturating_sub(local))
+            .collect()
+    }
+
+    /// Text of the most recently finished command's output, if OSC 133 marked it.
+    pub fn last_command_output(&self) -> Option<String> {
+        let (start, end) = self.last_output?;
+        let from = self.stable_to_local(start)?;
+        let to = self.stable_to_local(end).unwrap_or(self.total_rows().saturating_sub(1));
+        Some(self.text_range((from, 0), (to.max(from), self.cols.saturating_sub(1))))
+    }
+
     /// Text of the rows in `[from, to]` absolute range, trailing blanks trimmed.
     pub fn text_range(&self, from: (usize, usize), to: (usize, usize)) -> String {
         let (from, to) = if from <= to { (from, to) } else { (to, from) };
@@ -293,6 +385,7 @@ impl Grid {
             }
             while self.scrollback.len() > self.scrollback_limit {
                 self.scrollback.pop_front();
+                self.dropped += 1;
             }
             // Keep the viewport pinned to the same content while scrolled back,
             // instead of letting it drift as new lines arrive.
@@ -675,9 +768,41 @@ impl Perform for Grid {
     }
 
     fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
-        if let [b"0" | b"2", title, ..] = params {
-            self.title = String::from_utf8_lossy(title).into_owned();
-            self.dirty = true;
+        match params {
+            [b"0" | b"2", title, ..] => {
+                self.title = String::from_utf8_lossy(title).into_owned();
+                self.dirty = true;
+            }
+            // OSC 133: shell integration (FinalTerm/iTerm2). The shell brackets its
+            // prompt and each command's output, letting the terminal navigate and
+            // extract by command with no guessing.
+            [b"133", kind, ..] => self.shell_integration(kind),
+            _ => {}
+        }
+    }
+}
+
+impl Grid {
+    fn shell_integration(&mut self, kind: &[u8]) {
+        match kind.first() {
+            // A: a fresh prompt begins here.
+            Some(b'A') => {
+                let mark = self.local_to_stable(self.cursor_abs());
+                // Collapse duplicates: some shells emit A twice per prompt.
+                if self.prompt_marks.last() != Some(&mark) {
+                    self.prompt_marks.push(mark);
+                }
+            }
+            // C: the command's output starts here.
+            Some(b'C') => self.command_start = Some(self.local_to_stable(self.cursor_abs())),
+            // D: the command finished. Bank its output range for "copy last output".
+            Some(b'D') => {
+                if let Some(start) = self.command_start.take() {
+                    let end = self.local_to_stable(self.cursor_abs());
+                    self.last_output = Some((start, end.max(start)));
+                }
+            }
+            _ => {}
         }
     }
 }

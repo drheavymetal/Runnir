@@ -120,10 +120,16 @@ pub struct FontAtlas {
 
 impl FontAtlas {
     pub fn new(px: f32) -> anyhow::Result<Self> {
+        Self::new_with(DEFAULT_FAMILY, px)
+    }
+
+    /// Builds an atlas for a specific family. The `RUNNIR_FONT` env var still wins,
+    /// so a quick override does not need a config edit.
+    pub fn new_with(family: &str, px: f32) -> anyhow::Result<Self> {
         let mut db = fontdb::Database::new();
         db.load_system_fonts();
 
-        let family = std::env::var("RUNNIR_FONT").unwrap_or_else(|_| DEFAULT_FAMILY.into());
+        let family = std::env::var("RUNNIR_FONT").unwrap_or_else(|_| family.to_string());
         let faces = load_family(&db, &family)
             .or_else(|| load_family(&db, DEFAULT_FAMILY))
             .or_else(|| load_family(&db, "monospace"))
