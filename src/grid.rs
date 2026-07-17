@@ -527,16 +527,22 @@ impl Grid {
         let needle = needle.to_lowercase();
         let mut hits = Vec::new();
         for abs in 0..self.total_rows() {
-            let row: String = (0..self.cols)
-                .map(|c| self.abs_cell(abs, c))
-                .filter(|cell| !cell.is_spacer())
-                .map(|cell| cell.ch.to_ascii_lowercase())
-                .collect();
-            // Column mapping is approximate when spacers are present, but exact for
-            // the common ASCII case; good enough to place the highlight.
+            // Spacers are skipped, so the string index and the grid column diverge
+            // whenever wide chars precede the match; `col_map` records the grid
+            // column of each char so a hit lands on the right cell.
+            let mut row = String::new();
+            let mut col_map = Vec::new();
+            for c in 0..self.cols {
+                let cell = self.abs_cell(abs, c);
+                if cell.is_spacer() {
+                    continue;
+                }
+                row.push(cell.ch.to_ascii_lowercase());
+                col_map.push(c);
+            }
             let mut start = 0;
             while let Some(pos) = row[start..].find(&needle) {
-                let col = row[..start + pos].chars().count();
+                let col = col_map[row[..start + pos].chars().count()];
                 hits.push((abs, col));
                 // Advance past the whole matched substring. Stepping a single byte
                 // would land inside a multibyte char when `needle` begins with one
@@ -760,19 +766,30 @@ impl Grid {
     }
 
     fn erase_display(&mut self, mode: u16) {
-        // Mode 3 ("erase saved lines", xterm) additionally clears scrollback and
-        // the marks that point into it.
+        // Mode 3 ("erase saved lines", xterm) clears scrollback and the marks
+        // that point into it — and nothing else: the visible screen is 2J's
+        // job, and `clear` sends both when it wants both.
         if mode == 3 {
+            // Stable rows are `dropped + local`. Clearing scrollback shifts every
+            // local index down by its length, so account the cleared rows as
+            // dropped — otherwise every surviving mark (OSC 133, image anchors)
+            // would point `scrollback.len()` rows too low.
+            self.dropped += self.scrollback.len();
             self.scrollback.clear();
-            self.prompt_marks.clear();
+            let dropped = self.dropped;
+            // Marks and images anchored in the erased history are gone; those on
+            // the live screen keep their (still valid) stable rows.
+            self.prompt_marks.retain(|&m| m >= dropped);
+            self.images.retain(|im| im.anchor >= dropped);
             self.display_offset = 0;
+            return;
         }
         let blank = self.blank();
         let idx = self.index();
         let range = match mode {
             0 => idx..self.cells.len(),
             1 => 0..idx + 1,
-            2 | 3 => 0..self.cells.len(),
+            2 => 0..self.cells.len(),
             _ => return,
         };
         self.cells[range].fill(blank);
@@ -965,8 +982,17 @@ impl Perform for Grid {
         let mode = |i: usize| ps.get(i).copied().unwrap_or(0);
 
         match action {
-            'A' => self.row = self.row.saturating_sub(count(0)),
-            'B' => self.row = (self.row + count(0)).min(self.rows - 1),
+            // CUU/CUD stop at the scroll-region margin when the cursor starts on
+            // its side of it (DEC STD 070); only a cursor already outside the
+            // region may travel the rest of the screen.
+            'A' => {
+                let top = if self.row >= self.scroll_top { self.scroll_top } else { 0 };
+                self.row = self.row.saturating_sub(count(0)).max(top);
+            }
+            'B' => {
+                let bot = if self.row <= self.scroll_bot { self.scroll_bot } else { self.rows - 1 };
+                self.row = (self.row + count(0)).min(bot);
+            }
             'C' => self.col = (self.col + count(0)).min(self.cols - 1),
             'D' => self.col = self.col.saturating_sub(count(0)),
             'G' => self.col = (count(0) - 1).min(self.cols - 1),
@@ -1008,7 +1034,12 @@ impl Perform for Grid {
             }
             _ => return,
         }
-        self.wrap_pending = false;
+        // SGR only changes the pen; it must not cancel a deferred wrap, or a
+        // colour change after printing into the last column makes the next
+        // glyph overwrite that column instead of wrapping.
+        if action != 'm' {
+            self.wrap_pending = false;
+        }
         self.dirty = true;
     }
 
@@ -1043,10 +1074,14 @@ impl Perform for Grid {
                 let limit = self.scrollback_limit;
                 let scrollback = std::mem::take(&mut self.scrollback);
                 let dropped = self.dropped;
+                // The cell pixel size is renderer environment, not terminal
+                // state: losing it would mis-size images placed after a reset.
+                let cell_px = self.cell_px;
                 *self = Grid::new(self.cols, self.rows);
                 self.scrollback_limit = limit;
                 self.scrollback = scrollback;
                 self.dropped = dropped;
+                self.cell_px = cell_px;
             }
             _ => return,
         }
@@ -1321,6 +1356,9 @@ mod tests {
         assert!(g.scrollback.len() > 0);
         feed(&mut g, "\x1b[3J");
         assert_eq!(g.scrollback.len(), 0, "3J must erase saved lines");
+        // Regression: 3J also blanked the visible screen; xterm's "erase saved
+        // lines" touches history only — clearing the screen is 2J's job.
+        assert_eq!(g.dump(), "c\nd", "3J must leave the visible screen alone");
     }
 
     #[test]
@@ -1493,6 +1531,69 @@ mod tests {
         feed(&mut g, "\x1b[1;3HY");
         assert_eq!(g.cell(0, 2).ch, 'Y');
         assert_eq!(g.cell(0, 3).ch, ' ', "the orphaned spacer must be blanked");
+    }
+
+    #[test]
+    fn sgr_does_not_cancel_pending_wrap() {
+        // Regression: any CSI cleared the deferred-wrap flag, so a colour change
+        // right after filling the last column made the next glyph overwrite that
+        // column instead of wrapping.
+        let mut g = Grid::new(4, 3);
+        feed(&mut g, "abcd\x1b[31me");
+        assert_eq!(g.dump(), "abcd\ne", "the glyph after SGR must wrap");
+        assert_eq!(g.cell(1, 0).pen.fg, Color::Indexed(1));
+        assert_eq!(g.cursor(), (1, 1));
+    }
+
+    #[test]
+    fn cursor_up_down_stop_at_scroll_region_margins() {
+        // Regression: CUU/CUD ignored DECSTBM, letting the cursor drift out of
+        // the region and write over pinned rows.
+        let mut g = Grid::new(3, 5);
+        feed(&mut g, "\x1b[2;4r"); // region rows 2..4 (1-based)
+        feed(&mut g, "\x1b[3;1H\x1b[9A");
+        assert_eq!(g.cursor().0, 1, "CUU stops at the top margin");
+        feed(&mut g, "\x1b[9B");
+        assert_eq!(g.cursor().0, 3, "CUD stops at the bottom margin");
+        // A cursor outside the region is not confined by it.
+        feed(&mut g, "\x1b[5;1H\x1b[9B");
+        assert_eq!(g.cursor().0, 4, "below the region CUD reaches the last row");
+    }
+
+    #[test]
+    fn erase_saved_lines_keeps_stable_marks_valid() {
+        // Regression: 3J cleared scrollback without accounting the cleared rows
+        // as dropped, so every stable row (OSC 133 marks, image anchors) pointed
+        // scrollback.len() rows too low afterwards.
+        let mut g = Grid::new(10, 3);
+        feed(&mut g, "a\r\nb\r\nc\r\nd\r\n"); // pushes rows into scrollback
+        assert!(g.scrollback.len() > 0);
+        feed(&mut g, "\x1b]133;C\x07out\r\n");
+        feed(&mut g, "\x1b[3J"); // clear saved lines mid-command
+        feed(&mut g, "\x1b]133;D\x07");
+        let text = g.last_command_output().expect("output range must survive 3J");
+        assert!(text.contains("out"), "the marked output must still resolve: {text:?}");
+    }
+
+    #[test]
+    fn ris_preserves_cell_pixel_size() {
+        // Regression: ESC c rebuilt the grid and zeroed cell_px, so images placed
+        // after a reset fell back to a bogus 1-row footprint.
+        let mut g = Grid::new(10, 3);
+        g.set_cell_px(8.0, 16.0);
+        feed(&mut g, "\x1bc");
+        assert_eq!(g.cell_px, (8.0, 16.0), "cell_px is renderer state, not terminal state");
+    }
+
+    #[test]
+    fn search_reports_grid_columns_with_wide_chars() {
+        // Regression: the match column was counted over the spacer-filtered
+        // string, so wide chars before the match shifted the highlight left.
+        let mut g = Grid::new(20, 1);
+        feed(&mut g, "日本 abc");
+        // 日 spans cols 0-1, 本 cols 2-3, the space col 4, so 'a' sits at col 5.
+        assert_eq!(g.search("abc"), vec![(0, 5)]);
+        assert_eq!(g.search("本"), vec![(0, 2)]);
     }
 
     #[test]

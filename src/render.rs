@@ -267,21 +267,28 @@ impl Renderer {
         screen: (f32, f32),
     ) -> usize {
         let (cw, ch) = (self.font.cell_w, self.font.cell_h);
-        let mut quads: Vec<(u64, [f32; 2], [f32; 2])> = Vec::new(); // serial, origin_px, size_px
+        let mut quads: Vec<ImageQuad> = Vec::new();
         let mut seen = std::collections::HashSet::new();
         for pane in panes {
+            let pane_rect = [
+                pane.origin.0,
+                pane.origin.1,
+                pane.grid.cols() as f32 * cw,
+                pane.grid.rows() as f32 * ch,
+            ];
             for (img, row) in pane.grid.images() {
-                // Skip images entirely above the pane; a partial one still draws.
-                if (row + img.rows as isize) <= 0 {
-                    continue;
-                }
                 let x = pane.origin.0;
                 let y = pane.origin.1 + row as f32 * ch;
                 let w = img.cols as f32 * cw;
                 let h = img.rows as f32 * ch;
+                // Clip to the pane: a partially scrolled image draws its visible
+                // part only, instead of bleeding over neighbouring panes/chrome.
+                let Some(quad) = clip_image_quad(img.serial, [x, y], [w, h], pane_rect) else {
+                    continue;
+                };
                 self.images.upload(device, queue, &img);
                 seen.insert(img.serial);
-                quads.push((img.serial, [x, y], [w, h]));
+                quads.push(quad);
             }
         }
         self.images.retain(&seen);
@@ -884,6 +891,41 @@ enum Ligature {
     Tail,
 }
 
+/// An image quad ready to draw: pixel rect plus the texture sub-range that
+/// survived clipping to its pane.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ImageQuad {
+    serial: u64,
+    origin: [f32; 2],
+    size: [f32; 2],
+    uv_min: [f32; 2],
+    uv_max: [f32; 2],
+}
+
+/// Intersects an image's pixel rect with its pane's rect (`[x, y, w, h]`),
+/// scaling the uv range to the surviving part. `None` when nothing is visible —
+/// an image scrolled wholly above or below the pane must not draw at all, or it
+/// paints over whatever lives beyond the pane's edge.
+fn clip_image_quad(serial: u64, origin: [f32; 2], size: [f32; 2], pane: [f32; 4]) -> Option<ImageQuad> {
+    if size[0] <= 0.0 || size[1] <= 0.0 {
+        return None;
+    }
+    let x0 = origin[0].max(pane[0]);
+    let y0 = origin[1].max(pane[1]);
+    let x1 = (origin[0] + size[0]).min(pane[0] + pane[2]);
+    let y1 = (origin[1] + size[1]).min(pane[1] + pane[3]);
+    if x1 <= x0 || y1 <= y0 {
+        return None;
+    }
+    Some(ImageQuad {
+        serial,
+        origin: [x0, y0],
+        size: [x1 - x0, y1 - y0],
+        uv_min: [(x0 - origin[0]) / size[0], (y0 - origin[1]) / size[1]],
+        uv_max: [(x1 - origin[0]) / size[0], (y1 - origin[1]) / size[1]],
+    })
+}
+
 impl Renderer {
     /// Resolves a cell colour to linear RGBA, taking the 16 ANSI colours and the
     /// defaults from the active theme. `base_bg` is the pane's own background,
@@ -1034,23 +1076,25 @@ impl ImageLayer {
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        quads: &[(u64, [f32; 2], [f32; 2])],
+        quads: &[ImageQuad],
         screen: (f32, f32),
     ) -> usize {
         self.frame.clear();
         let mut verts: Vec<ImgVertex> = Vec::with_capacity(quads.len() * 4);
-        for (i, (serial, origin, size)) in quads.iter().enumerate() {
+        for (i, q) in quads.iter().enumerate() {
             let to_ndc = |px: f32, py: f32| {
                 [px / screen.0 * 2.0 - 1.0, 1.0 - py / screen.1 * 2.0]
             };
-            let (x0, y0) = (origin[0], origin[1]);
-            let (x1, y1) = (origin[0] + size[0], origin[1] + size[1]);
+            let (x0, y0) = (q.origin[0], q.origin[1]);
+            let (x1, y1) = (q.origin[0] + q.size[0], q.origin[1] + q.size[1]);
+            let (u0, v0) = (q.uv_min[0], q.uv_min[1]);
+            let (u1, v1) = (q.uv_max[0], q.uv_max[1]);
             // Triangle strip: TL, TR, BL, BR with matching uvs.
-            verts.push(ImgVertex { pos: to_ndc(x0, y0), uv: [0.0, 0.0] });
-            verts.push(ImgVertex { pos: to_ndc(x1, y0), uv: [1.0, 0.0] });
-            verts.push(ImgVertex { pos: to_ndc(x0, y1), uv: [0.0, 1.0] });
-            verts.push(ImgVertex { pos: to_ndc(x1, y1), uv: [1.0, 1.0] });
-            self.frame.push((*serial, i as u32 * 4));
+            verts.push(ImgVertex { pos: to_ndc(x0, y0), uv: [u0, v0] });
+            verts.push(ImgVertex { pos: to_ndc(x1, y0), uv: [u1, v0] });
+            verts.push(ImgVertex { pos: to_ndc(x0, y1), uv: [u0, v1] });
+            verts.push(ImgVertex { pos: to_ndc(x1, y1), uv: [u1, v1] });
+            self.frame.push((q.serial, i as u32 * 4));
         }
         if verts.len() > self.vcap {
             self.vertices = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -1161,5 +1205,38 @@ fn xterm256(i: u8, ansi: &[crate::config::Rgb]) -> crate::config::Rgb {
             crate::config::Rgb(v, v, v)
         }
         _ => crate::config::Rgb(0, 0, 0),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn image_quad_clips_to_the_pane_rect() {
+        let pane = [100.0, 50.0, 200.0, 100.0]; // x, y, w, h
+
+        // Fully inside: untouched, full uv range.
+        let q = clip_image_quad(1, [120.0, 60.0], [40.0, 20.0], pane).unwrap();
+        assert_eq!(q.origin, [120.0, 60.0]);
+        assert_eq!(q.size, [40.0, 20.0]);
+        assert_eq!((q.uv_min, q.uv_max), ([0.0, 0.0], [1.0, 1.0]));
+
+        // Scrolled half above the pane: only the lower half draws, upper uvs cut.
+        let q = clip_image_quad(2, [120.0, 30.0], [40.0, 40.0], pane).unwrap();
+        assert_eq!(q.origin[1], 50.0);
+        assert_eq!(q.size[1], 20.0);
+        assert_eq!(q.uv_min[1], 0.5);
+        assert_eq!(q.uv_max[1], 1.0);
+
+        // Hanging past the pane bottom: clipped there, not painted over what is
+        // below the pane.
+        let q = clip_image_quad(3, [120.0, 140.0], [40.0, 40.0], pane).unwrap();
+        assert_eq!(q.origin[1] + q.size[1], 150.0);
+        assert_eq!(q.uv_max[1], 0.25);
+
+        // Regression: an image wholly below (or above) the pane must not draw.
+        assert!(clip_image_quad(4, [120.0, 160.0], [40.0, 40.0], pane).is_none());
+        assert!(clip_image_quad(5, [120.0, 0.0], [40.0, 40.0], pane).is_none());
     }
 }

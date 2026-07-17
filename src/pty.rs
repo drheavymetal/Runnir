@@ -6,6 +6,22 @@ use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 
 use crate::grid::Grid;
 
+// Concurrency invariants (the lock hierarchy of a pane):
+//
+// - `grid` (Mutex<Grid>) is taken by the reader thread while parsing and by the
+//   main thread for input/render/session snapshots. It is the only lock either
+//   side holds while doing real work.
+// - Writing to the child NEVER takes a lock and NEVER blocks: bytes are queued to
+//   a dedicated writer thread through an mpsc channel. This matters twice over:
+//   1. A blocking `write_all` on the main thread (paste into a child that is not
+//      reading stdin) would freeze the whole UI until the child drained it.
+//   2. The reader thread answers graphics queries while holding `grid`. With a
+//      shared writer *mutex* (the old design) this deadlocked: main blocks in
+//      `write_all` holding the writer lock → reader blocks on the writer lock and
+//      stops draining the child's output → the child blocks writing output and so
+//      never reads its input → main's write never completes. A cycle with no
+//      timeout. A channel send cannot participate in any such cycle.
+
 /// How to start a pane's process.
 #[derive(Clone, Debug, Default)]
 pub struct Spawn {
@@ -17,10 +33,11 @@ pub struct Spawn {
 
 pub struct Pty {
     master: Box<dyn portable_pty::MasterPty + Send>,
-    /// Shared with the reader thread so it can answer graphics support queries
-    /// (kitty `a=q`) without racing the keyboard's writes.
-    writer: Arc<Mutex<Box<dyn Write + Send>>>,
-    _child: Box<dyn portable_pty::Child + Send + Sync>,
+    /// Queue to the dedicated writer thread. Cloned into the reader thread so it
+    /// can answer graphics support queries (kitty `a=q`) without taking any lock.
+    /// Sends never block, so no caller can wedge on a full PTY input buffer.
+    writer_tx: std::sync::mpsc::Sender<Vec<u8>>,
+    child: Box<dyn portable_pty::Child + Send + Sync>,
     reader: Option<std::thread::JoinHandle<()>>,
     /// Cleared by the reader thread when the child's output ends, i.e. it exited.
     alive: Arc<AtomicBool>,
@@ -68,11 +85,24 @@ impl Pty {
         drop(pair.slave);
 
         let mut reader = pair.master.try_clone_reader()?;
-        let writer = Arc::new(Mutex::new(pair.master.take_writer()?));
+        let mut writer = pair.master.take_writer()?;
+
+        // All writes to the child go through this thread. It exits when every
+        // sender is gone (the Pty dropped and the reader thread ended), which
+        // then drops the writer and closes the master's write side.
+        let (writer_tx, writer_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        std::thread::spawn(move || {
+            while let Ok(bytes) = writer_rx.recv() {
+                if writer.write_all(&bytes).is_err() {
+                    break; // Child gone; drop the rest.
+                }
+                let _ = writer.flush();
+            }
+        });
 
         let alive = Arc::new(AtomicBool::new(true));
         let thread_alive = alive.clone();
-        let thread_writer = writer.clone();
+        let thread_writer = writer_tx.clone();
         let thread = std::thread::spawn(move || {
             let mut parser = vte::Parser::new();
             let mut decoder = crate::graphics::Decoder::default();
@@ -116,10 +146,10 @@ impl Pty {
                                     crate::graphics::Event::Query(id) => {
                                         // Answer "OK" so icat & co. know inline
                                         // images work and proceed to send them.
-                                        if let Ok(mut w) = thread_writer.lock() {
-                                            let _ = w.write_all(&crate::graphics::respond(id));
-                                            let _ = w.flush();
-                                        }
+                                        // A channel send: safe under the grid
+                                        // lock, can never block or deadlock.
+                                        let _ = thread_writer
+                                            .send(crate::graphics::respond(id));
                                     }
                                     crate::graphics::Event::None => {}
                                 }
@@ -139,8 +169,8 @@ impl Pty {
 
         Ok(Self {
             master: pair.master,
-            writer,
-            _child: child,
+            writer_tx,
+            child,
             reader: Some(thread),
             alive,
         })
@@ -158,11 +188,11 @@ impl Pty {
         }
     }
 
+    /// Queues bytes for the child. Never blocks — the writer thread does the
+    /// actual (possibly blocking) write, so a child that stops reading its input
+    /// can never freeze the UI or the output-reader thread.
     pub fn write(&mut self, bytes: &[u8]) {
-        if let Ok(mut w) = self.writer.lock() {
-            let _ = w.write_all(bytes);
-            let _ = w.flush();
-        }
+        let _ = self.writer_tx.send(bytes.to_vec());
     }
 
     pub fn resize(&self, cols: u16, rows: u16) {
@@ -185,6 +215,18 @@ impl Pty {
     pub fn foreground(&self) -> Option<Foreground> {
         let pid = self.master.process_group_leader()?;
         foreground_of(pid)
+    }
+}
+
+impl Drop for Pty {
+    fn drop(&mut self) {
+        // Kill and reap the child. Nothing else ever waits on it, so without the
+        // `wait` every closed pane (and every shell that exited on its own) would
+        // leave a zombie in the process table for the life of the terminal. The
+        // kill makes the wait prompt when the pane is closed while the child is
+        // still running; on an already-exited child it is a no-op.
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 
@@ -279,5 +321,45 @@ mod tests {
     fn ssh_host_is_none_for_other_commands() {
         assert_eq!(fg(&["vim", "file"]).ssh_host(), None);
         assert_eq!(fg(&["ssh"]).ssh_host(), None, "no host given");
+    }
+
+    #[test]
+    fn write_never_blocks_even_when_the_child_ignores_stdin() {
+        // Regression: writes used to run synchronously under a shared mutex on
+        // the caller's thread. A paste larger than the kernel PTY input buffer
+        // into a child that does not read stdin blocked the UI thread — and,
+        // because the reader thread answers graphics queries through the same
+        // writer while holding the grid lock, could deadlock the whole process
+        // (main holds writer waiting on the child; reader waits on writer and
+        // stops draining; child blocks on output and never reads input).
+        let grid = Arc::new(Mutex::new(Grid::new(20, 5)));
+        let spawn = Spawn { command: Some(vec!["sleep".into(), "30".into()]), cwd: None };
+        let mut pty = Pty::spawn(grid, &spawn, || {}).expect("spawn");
+        let big = vec![b'x'; 1 << 20]; // far beyond any PTY input buffer
+        let start = std::time::Instant::now();
+        pty.write(&big);
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "write must queue asynchronously, never block on the child"
+        );
+        // Dropping the pty kills and reaps the sleeping child.
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_dropped_pty_reaps_its_child() {
+        // Regression: the child was never killed nor waited on, so every closed
+        // pane left a zombie in the process table for the life of the terminal.
+        let grid = Arc::new(Mutex::new(Grid::new(20, 5)));
+        let spawn = Spawn { command: Some(vec!["true".into()]), cwd: None };
+        let mut pty = Pty::spawn(grid, &spawn, || {}).expect("spawn");
+        let pid = pty.child.process_id().expect("child pid") as i32;
+        pty.wait(); // the child exits on its own; the reader sees EOF
+        drop(pty); // must reap
+        // If the pid still exists it must not be a zombie. (The pid could have
+        // been recycled by an unrelated live process; only state Z is the bug.)
+        if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            assert!(!stat.contains(") Z"), "child left as a zombie: {stat}");
+        }
     }
 }

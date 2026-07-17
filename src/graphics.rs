@@ -169,10 +169,18 @@ impl Decoder {
             return Event::Delete { all: id == 0, id };
         }
 
-        // Accumulate payload across chunks.
+        // Accumulate payload across chunks — bounded. A stream of endless `m=1`
+        // chunks (buggy or hostile) would otherwise grow this without limit and
+        // take the whole process down with it. Past the cap the transmission is
+        // abandoned; later chunks restart (and are bounded the same way).
+        const MAX_PENDING: usize = 128 * 1024 * 1024;
         match self.pending.as_mut() {
             Some(acc) => acc.payload.extend_from_slice(&cmd.payload),
             None => self.pending = Some(cmd.clone()),
+        }
+        if self.pending.as_ref().is_some_and(|p| p.payload.len() > MAX_PENDING) {
+            self.pending = None;
+            return Event::None;
         }
         if cmd.more() {
             return Event::None; // Wait for the final chunk.
@@ -357,6 +365,39 @@ mod tests {
             matches!(Decoder::default().feed(cmd), Event::None),
             "an impossible size must be rejected, not overflow"
         );
+    }
+
+    #[test]
+    fn endless_chunked_payload_is_bounded_not_oom() {
+        // Regression: `m=1` continuation chunks were accumulated without limit,
+        // so a buggy or hostile stream could grow the reader thread's memory
+        // until the whole process died.
+        let mut dec = Decoder::default();
+        let mut first = Command::default();
+        first.keys.insert('a', "T".into());
+        first.keys.insert('f', "32".into());
+        first.keys.insert('m', "1".into());
+        first.payload = vec![0u8; 1 << 20];
+        assert!(matches!(dec.feed(first), Event::None));
+        for _ in 0..130 {
+            let mut c = Command::default();
+            c.keys.insert('m', "1".into());
+            c.payload = vec![0u8; 1 << 20];
+            let _ = dec.feed(c);
+        }
+        // Past the cap the accumulator is dropped; whatever restarted after that
+        // must be small, not 130 MB.
+        let pending = dec.pending.as_ref().map_or(0, |p| p.payload.len());
+        assert!(pending < 8 * (1 << 20), "accumulator not bounded: {pending} bytes");
+        // And the decoder still works afterwards: a small complete image decodes.
+        let mut ok = Command::default();
+        ok.keys.insert('a', "T".into());
+        ok.keys.insert('f', "32".into());
+        ok.keys.insert('s', "1".into());
+        ok.keys.insert('v', "1".into());
+        ok.payload = vec![255, 0, 0, 255];
+        let mut dec2 = Decoder::default();
+        assert!(matches!(dec2.feed(ok), Event::Show(_)));
     }
 
     #[test]
