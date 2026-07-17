@@ -98,6 +98,16 @@ pub struct Overlay<'a> {
     pub panels: Vec<PaneDraw<'a>>,
 }
 
+/// A solid-colour rectangle in pixels: pane borders and dividers.
+#[derive(Clone, Copy)]
+pub struct SolidRect {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+    pub color: (u8, u8, u8),
+}
+
 impl Renderer {
     pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat, font: FontAtlas) -> Self {
         let size = FontAtlas::atlas_size();
@@ -303,6 +313,7 @@ impl Renderer {
         encoder: &mut wgpu::CommandEncoder,
         target: &wgpu::TextureView,
         panes: &[PaneDraw],
+        decorations: &[SolidRect],
         overlay: Option<&Overlay>,
         screen: (f32, f32),
     ) {
@@ -312,6 +323,10 @@ impl Renderer {
         let mut instances = Vec::new();
         for pane in panes {
             self.pane_instances(pane, &mut instances);
+        }
+        // Pane borders / dividers, over the panes.
+        for d in decorations {
+            instances.push(solid_rect(d));
         }
         if let Some(ov) = overlay {
             // A dimming quad over the whole surface, then the overlay panels on top.
@@ -709,7 +724,7 @@ pub fn offscreen_scene(
                 })
                 .collect(),
         });
-        renderer.render(&device, &queue, &mut encoder, &view, &panes, overlay.as_ref(), (width as f32, height as f32));
+        renderer.render(&device, &queue, &mut encoder, &view, &panes, &[], overlay.as_ref(), (width as f32, height as f32));
     }
     encoder.copy_texture_to_buffer(
         wgpu::TexelCopyTextureInfo {
@@ -818,6 +833,7 @@ pub fn offscreen(path: &str, cmd: &str, font_px: f32, delay_ms: Option<u64>) {
             &mut encoder,
             &view,
             &panes,
+            &[],
             None,
             (width as f32, height as f32),
         );
@@ -859,6 +875,7 @@ pub fn offscreen(path: &str, cmd: &str, font_px: f32, delay_ms: Option<u64>) {
 /// Sit above the `Flags` bits, which only reach 1<<6.
 const FLAG_COLOR: u32 = 1 << 8;
 const FLAG_FULLSCREEN: u32 = 1 << 9;
+const FLAG_SOLID: u32 = 1 << 10;
 
 /// Where a ligature sits on a row: the cell that draws it, or one it swallows.
 #[derive(Clone, Copy)]
@@ -1097,6 +1114,23 @@ fn blend(base: crate::config::Rgb, over: (u8, u8, u8), t: f32) -> crate::config:
 /// A full-surface quad at `alpha`, black, to dim panes behind an overlay. Glyphless
 /// (so only its background shows) and flagged fullscreen (so the vertex shader
 /// spans the whole surface rather than one cell).
+/// A solid-colour rectangle instance: pixel position in `pos_px`, pixel size in
+/// `glyph_size`, flagged `FLAG_SOLID` so the shader fills it flat.
+fn solid_rect(d: &SolidRect) -> Instance {
+    Instance {
+        pos_px: [d.x, d.y],
+        glyph_offset: [0.0, 0.0],
+        glyph_size: [d.w, d.h],
+        uv_min: [0.0, 0.0],
+        uv_max: [0.0, 0.0],
+        fg: srgb(d.color.0, d.color.1, d.color.2),
+        bg: srgb(d.color.0, d.color.1, d.color.2),
+        flags: FLAG_SOLID,
+        width: 1.0,
+        _pad: [0; 2],
+    }
+}
+
 fn backdrop(_screen: (f32, f32), alpha: f32) -> Instance {
     Instance {
         pos_px: [0.0, 0.0],

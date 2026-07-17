@@ -110,6 +110,24 @@ impl Gpu {
             panes.push(PaneDraw { grid, selection: None, origin: (*ox, *oy), tint: None, focused: true, cursor: None, search: Default::default() });
         }
 
+        // Status toast (e.g. "whispering…"), centred near the top, with a spinner
+        // so a pending AI request is unmistakably working.
+        let toast: Option<(Grid, f32, f32)> = self.status.as_ref().map(|msg| {
+            const SPIN: [char; 4] = ['⠋', '⠙', '⠹', '⠸'];
+            let frame = (self.start.elapsed().as_millis() / 120) as usize % SPIN.len();
+            let text = format!(" {} {} ", SPIN[frame], msg);
+            let w = text.chars().count();
+            let mut g = Grid::new(w, 1);
+            let bg = Color::Rgb(config.theme.accent.0, config.theme.accent.1, config.theme.accent.2);
+            g.fill(Pen { bg, ..Pen::default() });
+            g.write_str(0, 0, &text, Pen { fg: Color::Rgb(0x0d, 0x0d, 0x0f), bg, ..Pen::default() });
+            let x = (screen.0 - w as f32 * cell.0) / 2.0;
+            (g, x.max(0.0), cell.1)
+        });
+        if let Some((grid, ox, oy)) = &toast {
+            panes.push(PaneDraw { grid, selection: None, origin: (*ox, *oy), tint: None, focused: true, cursor: None, search: Default::default() });
+        }
+
         // The search bar draws as chrome (undimmed) so matches stay visible.
         let theme = self.renderer_theme();
         let search_bar: Option<(Grid, f32, f32)> = match &self.overlay {
@@ -145,12 +163,31 @@ impl Gpu {
                 .collect(),
         });
 
+        // Pane dividers: a thin border on each pane when there is more than one, so
+        // splits are visible. The focused pane gets the accent colour.
+        let mut decorations: Vec<crate::render::SolidRect> = Vec::new();
+        if rects.len() > 1 {
+            let a = config.theme.accent;
+            let accent = (a.0, a.1, a.2);
+            let dim = (0x33, 0x36, 0x3d);
+            for (id, r) in &rects {
+                let color = if *id == focus { accent } else { dim };
+                let t = 1.5;
+                // Four edges of the pane.
+                decorations.push(crate::render::SolidRect { x: r.x, y: r.y, w: r.w, h: t, color });
+                decorations.push(crate::render::SolidRect { x: r.x, y: r.y + r.h - t, w: r.w, h: t, color });
+                decorations.push(crate::render::SolidRect { x: r.x, y: r.y, w: t, h: r.h, color });
+                decorations.push(crate::render::SolidRect { x: r.x + r.w - t, y: r.y, w: t, h: r.h, color });
+            }
+        }
+
         self.renderer.render(
             &self.device,
             &self.queue,
             &mut encoder,
             &view,
             &panes,
+            &decorations,
             overlay.as_ref(),
             screen,
         );

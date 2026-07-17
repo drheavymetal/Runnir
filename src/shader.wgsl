@@ -10,6 +10,9 @@ const FLAG_UNDERLINE: u32 = 8u;
 const FLAG_STRIKE: u32 = 64u;
 const FLAG_COLOR: u32 = 256u;
 const FLAG_FULLSCREEN: u32 = 512u;
+// A solid rectangle at pixel position, sized by glyph_size (pixels): pane borders,
+// dividers. No glyph is sampled.
+const FLAG_SOLID: u32 = 1024u;
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
 @group(0) @binding(1) var atlas: texture_2d<f32>;
@@ -49,6 +52,9 @@ fn vs_main(@builtin(vertex_index) vi: u32, inst: Instance) -> VsOut {
     var span = u.cell * vec2<f32>(inst.width, 1.0);
     if (inst.flags & FLAG_FULLSCREEN) != 0u {
         span = u.screen;
+    } else if (inst.flags & FLAG_SOLID) != 0u {
+        // A solid rect carries its pixel size in glyph_size.
+        span = inst.glyph_size;
     }
     let px = inst.pos_px + corner * span;
 
@@ -77,6 +83,10 @@ fn in_band(y: f32, band: vec2<f32>) -> bool {
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+    // A solid rect (border/divider) is just its background, no glyph.
+    if (in.flags & FLAG_SOLID) != 0u {
+        return in.bg;
+    }
     var color = in.bg;
 
     let g = in.local - in.glyph_offset;

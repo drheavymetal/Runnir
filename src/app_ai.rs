@@ -76,11 +76,13 @@ impl Gpu {
             "Translate this request into a single shell command for a Linux system. \
              Output ONLY the command, no explanation, no markdown, no backticks.\n\n{description}"
         );
+        self.status = Some(format!("asking {provider} for a command…"));
         if let Err(e) =
             ai::ask(&mut self.ai, config, &provider, prompt, ai::Purpose::InsertCommand, self.proxy.clone())
         {
-            eprintln!("runnir: ai command failed: {e}");
+            self.status = Some(format!("ai command failed: {e}"));
         }
+        self.window.request_redraw();
     }
 
     /// Sends the current selection to the assistant to be explained.
@@ -115,11 +117,13 @@ impl Gpu {
     fn send_whisper(&mut self, request: String, config: &Config) {
         let provider = config.ai.default.clone();
         let prompt = crate::whisper::prompt(&request);
+        self.status = Some(format!("whispering to {provider}…"));
         if let Err(e) =
             ai::ask(&mut self.ai, config, &provider, prompt, ai::Purpose::Whisper, self.proxy.clone())
         {
-            eprintln!("runnir: whisper failed: {e}");
+            self.status = Some(format!("whisper failed: {e}"));
         }
+        self.window.request_redraw();
     }
 
     /// Executes a whisper plan: each step is a runnir action or a shell command.

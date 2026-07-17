@@ -237,6 +237,9 @@ struct Gpu {
     click_count: u32,
     /// Button held down, for drag reporting to mouse-mode apps.
     mouse_down: Option<mouse::Button>,
+    /// A transient status shown as a toast (e.g. "whispering…") while a background
+    /// request is in flight, so an AI action never looks like it did nothing.
+    status: Option<String>,
     proxy: EventLoopProxy<UserEvent>,
 }
 
@@ -347,6 +350,7 @@ impl App {
             last_click: (Instant::now(), (usize::MAX, usize::MAX)),
             click_count: 0,
             mouse_down: None,
+            status: None,
             proxy: self.proxy.clone(),
         }
     }
@@ -401,6 +405,8 @@ impl ApplicationHandler<UserEvent> for App {
         let Some(gpu) = self.gpu.as_mut() else { return };
         match event {
             UserEvent::Ai(reply) => {
+                // The request finished: clear the "thinking" toast.
+                gpu.status = None;
                 match gpu.ai.receive(reply, gpu.overlay.as_mut()) {
                     ai::Delivery::Insert(cmd) => gpu.insert_command(cmd),
                     ai::Delivery::Whisper(plan) => gpu.execute_whisper(plan, &self.config),
@@ -444,6 +450,15 @@ impl ApplicationHandler<UserEvent> for App {
             return;
         }
         gpu.periodic(&self.config);
+
+        // A pending AI request animates a spinner: wake often and repaint.
+        if gpu.status.is_some() {
+            gpu.window.request_redraw();
+            event_loop.set_control_flow(ControlFlow::WaitUntil(
+                Instant::now() + Duration::from_millis(120),
+            ));
+            return;
+        }
 
         // Drive cursor blink. A WaitUntil wake does not itself repaint, so redraw
         // only when the blink phase actually flips — that keeps an idle terminal
