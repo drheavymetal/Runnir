@@ -97,6 +97,9 @@ variable named in the config, never stored in the file.
 @ Ctrl+Shift+A     open / close the assistant panel
 @ Ctrl+Shift+G     send the last command, its output and its exit code to the model
 @ Ctrl+Shift+N     launch Claude Code in a new split
+@ Ctrl+Shift+M     describe a command in plain language; the model writes it and
+                   types it at the prompt for you to review and run (not run for you)
+@ Ctrl+Shift+Y     explain the current selection in the assistant panel
 
 # Broadcast input
 

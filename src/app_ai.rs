@@ -49,13 +49,58 @@ impl Gpu {
             panel.push(overlay::Who::You, question.clone());
             panel.busy = true;
         }
-        if let Err(e) = ai::ask(&mut self.ai, config, &provider, question, self.proxy.clone()) {
+        if let Err(e) =
+            ai::ask(&mut self.ai, config, &provider, question, ai::Purpose::Panel, self.proxy.clone())
+        {
             if let Some(Overlay::Ai(panel)) = self.overlay.as_mut() {
                 panel.busy = false;
                 panel.push(overlay::Who::System, format!("error: {e}"));
             }
         }
         self.window.request_redraw();
+    }
+
+    /// Opens a prompt that turns a natural-language description into a shell
+    /// command and types it at the prompt (not run — you review, then press Enter).
+    fn ai_command(&mut self) {
+        self.overlay = Some(Overlay::Prompt(Prompt::new(
+            PromptKind::AiCommand,
+            "Describe the command (natural language)",
+            Vec::new(),
+        )));
+    }
+
+    fn send_ai_command(&mut self, description: String, config: &Config) {
+        let provider = config.ai.default.clone();
+        let prompt = format!(
+            "Translate this request into a single shell command for a Linux system. \
+             Output ONLY the command, no explanation, no markdown, no backticks.\n\n{description}"
+        );
+        if let Err(e) =
+            ai::ask(&mut self.ai, config, &provider, prompt, ai::Purpose::InsertCommand, self.proxy.clone())
+        {
+            eprintln!("runnir: ai command failed: {e}");
+        }
+    }
+
+    /// Sends the current selection to the assistant to be explained.
+    fn ai_explain_selection(&mut self, config: &Config) {
+        let Some(text) = self.tab().focused().selection_text() else { return };
+        let provider = config.ai.default.clone();
+        if !matches!(self.overlay, Some(Overlay::Ai(_))) {
+            self.ai.provider = Some(provider.clone());
+            self.overlay = Some(Overlay::Ai(overlay::AiPanel::new(provider)));
+        }
+        self.send_ai(format!("Explain this concisely:\n\n{}", truncate(&text, 4000)), config);
+    }
+
+    /// Types an AI-produced command at the focused shell prompt without running it.
+    fn insert_command(&mut self, cmd: String) {
+        if !cmd.is_empty() {
+            self.tab().focused().snap_to_bottom();
+            self.tab().focused().write(cmd.as_bytes());
+            self.window.request_redraw();
+        }
     }
 
     fn open_hints(&mut self) {

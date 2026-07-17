@@ -56,6 +56,8 @@ pub enum Action {
     ShowDocs,
     ToggleAi,
     AskAiAboutError,
+    AiCommand,
+    AiExplain,
     QuickConnect,
     HintMode,
     // Launchers
@@ -109,6 +111,8 @@ impl Action {
             ShowDocs => "show_docs",
             ToggleAi => "toggle_ai",
             AskAiAboutError => "ask_ai_about_error",
+            AiCommand => "ai_command",
+            AiExplain => "ai_explain",
             QuickConnect => "quick_connect",
             HintMode => "hint_mode",
             LaunchClaude => "launch_claude",
@@ -160,6 +164,8 @@ impl Action {
             ShowDocs => "Show documentation",
             ToggleAi => "Toggle AI assistant",
             AskAiAboutError => "Ask AI: why did this fail?",
+            AiCommand => "AI: natural language to command",
+            AiExplain => "AI: explain the selection",
             QuickConnect => "SSH quick connect",
             HintMode => "Hint mode (open/copy on screen)",
             LaunchClaude => "Launch Claude Code",
@@ -214,6 +220,8 @@ impl Action {
             "show_docs" => ShowDocs,
             "toggle_ai" => ToggleAi,
             "ask_ai_about_error" => AskAiAboutError,
+            "ai_command" => AiCommand,
+            "ai_explain" => AiExplain,
             "quick_connect" => QuickConnect,
             "hint_mode" => HintMode,
             "launch_claude" => LaunchClaude,
@@ -281,6 +289,8 @@ impl Action {
             ShowDocs,
             ToggleAi,
             AskAiAboutError,
+            AiCommand,
+            AiExplain,
             QuickConnect,
             HintMode,
             LaunchClaude,
@@ -434,6 +444,8 @@ fn default_bindings() -> HashMap<Chord, Action> {
     bind(&mut m, "f1", ShowDocs);
     bind(&mut m, "ctrl+shift+a", ToggleAi);
     bind(&mut m, "ctrl+shift+g", AskAiAboutError);
+    bind(&mut m, "ctrl+shift+m", AiCommand);
+    bind(&mut m, "ctrl+shift+y", AiExplain);
     bind(&mut m, "ctrl+shift+s", QuickConnect);
     bind(&mut m, "ctrl+shift+space", HintMode);
     bind(&mut m, "ctrl+shift+n", LaunchClaude);
@@ -459,6 +471,8 @@ pub fn default_hints() -> HashMap<String, String> {
         ("show_docs", "F1"),
         ("toggle_ai", "Ctrl+Shift+A"),
         ("ask_ai_about_error", "Ctrl+Shift+G"),
+        ("ai_command", "Ctrl+Shift+M"),
+        ("ai_explain", "Ctrl+Shift+Y"),
         ("quick_connect", "Ctrl+Shift+S"),
         ("hint_mode", "Ctrl+Shift+Space"),
         ("launch_claude", "Ctrl+Shift+N"),

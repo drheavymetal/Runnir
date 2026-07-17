@@ -289,6 +289,8 @@ pub struct Prompt {
 pub enum PromptKind {
     RenameTab,
     QuickConnect,
+    /// Natural-language description to translate into a shell command.
+    AiCommand,
 }
 
 impl Prompt {

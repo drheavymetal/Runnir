@@ -291,6 +291,8 @@ impl Gpu {
             }
             Action::ToggleAi => self.toggle_ai(config),
             Action::AskAiAboutError => self.ask_ai_about_error(config),
+            Action::AiCommand => self.ai_command(),
+            Action::AiExplain => self.ai_explain_selection(config),
             Action::QuickConnect => self.open_quick_connect(),
             Action::HintMode => self.open_hints(),
             Action::LaunchClaude => self.launch_claude(config),
@@ -475,6 +477,9 @@ impl Gpu {
             Action::ShowDocs => self.overlay = Some(Overlay::Docs(overlay::Docs::new(docs::HELP))),
             Action::ToggleAi => self.toggle_ai(config),
             Action::AskAiAboutError => self.ask_ai_about_error(config),
+            Action::AiCommand => self.ai_command(),
+            Action::AiExplain => self.ai_explain_selection(config),
+            Action::SearchScrollback => self.overlay = Some(Overlay::Search(overlay::Search::new())),
             Action::QuickConnect => self.open_quick_connect(),
             Action::HintMode => self.open_hints(),
             Action::LaunchClaude => self.launch_claude(config),
@@ -516,7 +521,6 @@ impl Gpu {
             }
             Action::JumpPrevPrompt => self.jump_prompt(-1),
             Action::JumpNextPrompt => self.jump_prompt(1),
-            Action::SearchScrollback => self.overlay = Some(Overlay::Search(overlay::Search::new())),
             Action::FontBigger => self.set_font_px(self.font_px + 1.0, config),
             Action::FontSmaller => self.set_font_px(self.font_px - 1.0, config),
             Action::FontReset => self.set_font_px(config.font.size, config),
@@ -533,6 +537,11 @@ impl Gpu {
             PromptKind::QuickConnect => {
                 if !value.is_empty() {
                     self.split_running(config, vec!["ssh".into(), value]);
+                }
+            }
+            PromptKind::AiCommand => {
+                if !value.is_empty() {
+                    self.send_ai_command(value, config);
                 }
             }
         }

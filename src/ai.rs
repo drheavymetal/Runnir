@@ -21,6 +21,23 @@ pub struct Reply {
     pub result: Result<String, String>,
 }
 
+/// What to do with a completed answer.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Purpose {
+    /// Show it in the assistant panel.
+    Panel,
+    /// Type it at the shell prompt (a natural-language → command translation),
+    /// without pressing Enter — the user reviews then runs it.
+    InsertCommand,
+}
+
+/// What the UI thread should do with a delivered reply.
+pub enum Delivery {
+    Nothing,
+    ToPanel,
+    Insert(String),
+}
+
 /// Per-window AI state. The transcript lives in the overlay panel; this only
 /// tracks which request is current.
 pub struct Session {
@@ -28,32 +45,59 @@ pub struct Session {
     /// Id of the request whose answer we are still waiting for. A reply with a
     /// different id is stale (the user asked again) and is ignored.
     pending: Option<u64>,
+    pending_purpose: Purpose,
     pub provider: Option<String>,
 }
 
 impl Session {
     pub fn new() -> Self {
-        Self { next_id: AtomicU64::new(1), pending: None, provider: None }
+        Self { next_id: AtomicU64::new(1), pending: None, pending_purpose: Purpose::Panel, provider: None }
     }
 
     fn next(&self) -> u64 {
         self.next_id.fetch_add(1, Ordering::Relaxed)
     }
 
-    /// Delivers a reply to the panel, unless it is stale.
-    pub fn receive(&mut self, reply: Reply, overlay: Option<&mut crate::overlay::Overlay>) {
+    /// Handles a reply: routes a panel answer into the panel here, and returns what
+    /// the caller must still do (insert a command at the prompt). Stale replies are
+    /// dropped.
+    pub fn receive(&mut self, reply: Reply, overlay: Option<&mut crate::overlay::Overlay>) -> Delivery {
         if self.pending != Some(reply.id) {
-            return; // Superseded by a newer question.
+            return Delivery::Nothing; // Superseded by a newer question.
         }
         self.pending = None;
-        if let Some(crate::overlay::Overlay::Ai(panel)) = overlay {
-            panel.busy = false;
-            match reply.result {
-                Ok(text) => panel.push(crate::overlay::Who::Assistant, text),
-                Err(err) => panel.push(crate::overlay::Who::System, format!("error: {err}")),
+        match self.pending_purpose {
+            Purpose::InsertCommand => match reply.result {
+                Ok(text) => Delivery::Insert(clean_command(&text)),
+                Err(_) => Delivery::Nothing,
+            },
+            Purpose::Panel => {
+                if let Some(crate::overlay::Overlay::Ai(panel)) = overlay {
+                    panel.busy = false;
+                    match reply.result {
+                        Ok(text) => panel.push(crate::overlay::Who::Assistant, text),
+                        Err(err) => panel.push(crate::overlay::Who::System, format!("error: {err}")),
+                    }
+                }
+                Delivery::ToPanel
             }
         }
     }
+}
+
+/// Strips markdown fences and surrounding whitespace from a model's command reply,
+/// leaving a single line ready to type at the prompt. Models wrap commands in
+/// ```` ```sh ```` blocks even when told not to.
+fn clean_command(text: &str) -> String {
+    let mut s = text.trim();
+    if let Some(rest) = s.strip_prefix("```") {
+        // Drop the opening fence (and any language tag) and the closing one.
+        let rest = rest.splitn(2, '\n').nth(1).unwrap_or(rest);
+        s = rest.trim_end_matches("```").trim();
+    }
+    s = s.trim_start_matches('`').trim_end_matches('`');
+    // Keep only the first line: a command, not a paragraph.
+    s.lines().next().unwrap_or("").trim().to_string()
 }
 
 /// Fires a question at `provider` on a worker thread. The answer arrives later as
@@ -63,6 +107,7 @@ pub fn ask(
     config: &Config,
     provider_name: &str,
     prompt: String,
+    purpose: Purpose,
     proxy: winit::event_loop::EventLoopProxy<crate::UserEvent>,
 ) -> Result<(), String> {
     let provider = config
@@ -75,6 +120,7 @@ pub fn ask(
 
     let id = session.next();
     session.pending = Some(id);
+    session.pending_purpose = purpose;
 
     std::thread::spawn(move || {
         let result = match provider {
@@ -271,6 +317,16 @@ mod tests {
         cfg.ai.default = "openai".into();
         // "Launch Claude Code" must still be the CLI, never an API call.
         assert_eq!(claude_launch_command(&cfg), vec!["claude".to_string()]);
+    }
+
+    #[test]
+    fn clean_command_strips_markdown_and_keeps_one_line() {
+        assert_eq!(clean_command("ls -la"), "ls -la");
+        assert_eq!(clean_command("`ls -la`"), "ls -la");
+        assert_eq!(clean_command("```sh\nfind . -name '*.rs'\n```"), "find . -name '*.rs'");
+        assert_eq!(clean_command("```\ngit status\n```"), "git status");
+        // A model that adds a paragraph: keep only the command line.
+        assert_eq!(clean_command("rm -rf build\nThis deletes the build dir."), "rm -rf build");
     }
 
     #[test]
