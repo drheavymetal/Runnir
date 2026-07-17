@@ -890,6 +890,12 @@ impl Perform for Grid {
         if width == 0 {
             return;
         }
+        // A double-width glyph needs two columns. In a one-column grid it can never
+        // be placed: writing its trailing spacer would spill into the next row and,
+        // for the last cell, index one past the buffer end and panic. Drop it.
+        if width == 2 && self.cols < 2 {
+            return;
+        }
 
         if self.wrap_pending {
             self.col = 0;
@@ -1141,6 +1147,20 @@ mod tests {
         assert_eq!(g.dump(), "abcde\nfg");
         feed(&mut g, "\x1b[2J");
         assert_eq!(g.dump(), "");
+    }
+
+    #[test]
+    fn double_width_glyph_in_one_column_grid_does_not_panic() {
+        // A 1-column grid cannot hold a double-width glyph. Printing one must not
+        // spill a spacer into the next row nor index past the buffer end.
+        let mut g = Grid::new(1, 1);
+        feed(&mut g, "中"); // was: index-out-of-bounds panic at cells[idx + 1]
+        assert_eq!(g.cell(0, 0).ch, ' ', "the glyph is dropped, not half-written");
+
+        // Multi-row, single-column: the spacer must not leak into row 1 either.
+        let mut g = Grid::new(1, 3);
+        feed(&mut g, "中");
+        assert!(!g.cell(1, 0).is_spacer(), "no spacer bleeds into the next row");
     }
 
     #[test]
