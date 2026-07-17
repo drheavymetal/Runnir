@@ -92,6 +92,17 @@ pub fn split(input: &[u8]) -> (Vec<u8>, Vec<Command>, Vec<u8>) {
                 return (vt, cmds, input[i..].to_vec());
             }
         }
+        // The 3-byte introducer itself can straddle a read boundary. If the chunk
+        // ends inside it (a trailing `ESC` or `ESC _`), carry those bytes so the
+        // next chunk can complete the match. Otherwise they go to vte, which then
+        // reassembles the APC and silently discards the image.
+        if input[i] == 0x1b {
+            let next = input.get(i + 1);
+            let partial = next.is_none() || (next == Some(&b'_') && input.get(i + 2).is_none());
+            if partial {
+                return (vt, cmds, input[i..].to_vec());
+            }
+        }
         vt.push(input[i]);
         i += 1;
     }
@@ -190,7 +201,11 @@ fn decode(cmd: &Command) -> Option<Image> {
         32 => {
             let w = cmd.num('s', 0) as u32;
             let h = cmd.num('v', 0) as u32;
-            if w == 0 || h == 0 || cmd.payload.len() < (w * h * 4) as usize {
+            // Compute the byte count in u64: `s`/`v` are attacker-controlled and
+            // `w * h * 4` overflows u32 (panicking in debug) well before it exceeds
+            // any real payload.
+            let need = w as u64 * h as u64 * 4;
+            if w == 0 || h == 0 || (cmd.payload.len() as u64) < need {
                 return None;
             }
             (cmd.payload.clone(), w, h)
@@ -198,11 +213,12 @@ fn decode(cmd: &Command) -> Option<Image> {
         24 => {
             let w = cmd.num('s', 0) as u32;
             let h = cmd.num('v', 0) as u32;
-            if w == 0 || h == 0 || cmd.payload.len() < (w * h * 3) as usize {
+            let need = w as u64 * h as u64 * 3;
+            if w == 0 || h == 0 || (cmd.payload.len() as u64) < need {
                 return None;
             }
             // Expand RGB to RGBA.
-            let mut rgba = Vec::with_capacity((w * h * 4) as usize);
+            let mut rgba = Vec::with_capacity((w as usize) * (h as usize) * 4);
             for px in cmd.payload.chunks_exact(3) {
                 rgba.extend_from_slice(&[px[0], px[1], px[2], 255]);
             }
@@ -258,6 +274,31 @@ mod tests {
     }
 
     #[test]
+    fn an_introducer_split_across_reads_is_carried_not_lost() {
+        // The read boundary falls inside `ESC _ G`. Both the trailing `ESC` and
+        // `ESC _` cases must come back as remainder; feeding them to vte would let
+        // it swallow the reassembled APC and drop the image.
+        for cut in [1usize, 2] {
+            let mut full = b"hi".to_vec();
+            full.extend_from_slice(&apc("a=T,f=100", "Zm9v"));
+            let esc = full.iter().position(|&b| b == 0x1b).unwrap();
+            let (head, tail) = full.split_at(esc + cut);
+
+            let (vt1, cmds1, rem1) = split(head);
+            assert_eq!(vt1, b"hi");
+            assert!(cmds1.is_empty());
+            assert_eq!(rem1, &head[esc..], "the partial introducer is carried");
+
+            // Next chunk: prepend the carry, as the reader thread does.
+            let mut next = rem1;
+            next.extend_from_slice(tail);
+            let (_vt2, cmds2, rem2) = split(&next);
+            assert_eq!(cmds2.len(), 1, "the image parses once reassembled");
+            assert!(rem2.is_empty());
+        }
+    }
+
+    #[test]
     fn chunked_transmission_reassembles() {
         let mut dec = Decoder::default();
         // Two chunks of raw RGBA (m=1 then m=0), 1x1 red pixel needs 4 bytes.
@@ -300,6 +341,22 @@ mod tests {
         }
         // The response tools expect.
         assert_eq!(respond(7), b"\x1b_Gi=7;OK\x1b\\");
+    }
+
+    #[test]
+    fn oversized_raw_dimensions_are_rejected_without_overflow() {
+        // Regression: `w * h * 4` was computed in u32 and overflowed (panicking in
+        // debug) for attacker-supplied s/v before the payload-length check ran.
+        let mut cmd = Command::default();
+        cmd.keys.insert('a', "T".into());
+        cmd.keys.insert('f', "32".into());
+        cmd.keys.insert('s', "70000".into()); // 70000*70000*4 overflows u32
+        cmd.keys.insert('v', "70000".into());
+        cmd.payload = vec![0u8; 16];
+        assert!(
+            matches!(Decoder::default().feed(cmd), Event::None),
+            "an impossible size must be rejected, not overflow"
+        );
     }
 
     #[test]

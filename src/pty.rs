@@ -93,7 +93,17 @@ impl Pty {
                             c
                         };
                         let (vt, cmds, rem) = crate::graphics::split(&chunk);
-                        carry = rem;
+                        // Bound the carry: an unterminated APC (no ST) would grow it
+                        // without limit as a program streams bytes. Past the cap,
+                        // give up on the sequence and flush it to vte rather than
+                        // buffering forever.
+                        const MAX_CARRY: usize = 16 * 1024 * 1024;
+                        carry = if rem.len() > MAX_CARRY {
+                            parser.advance(&mut *grid.lock().unwrap(), &rem);
+                            Vec::new()
+                        } else {
+                            rem
+                        };
                         {
                             let mut g = grid.lock().unwrap();
                             parser.advance(&mut *g, &vt);

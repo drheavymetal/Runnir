@@ -538,7 +538,11 @@ impl Grid {
             while let Some(pos) = row[start..].find(&needle) {
                 let col = row[..start + pos].chars().count();
                 hits.push((abs, col));
-                start += pos + 1;
+                // Advance past the whole matched substring. Stepping a single byte
+                // would land inside a multibyte char when `needle` begins with one
+                // (e.g. searching "é" over "café"), and the next `row[start..]`
+                // slice would panic on the non-boundary index.
+                start += pos + needle.len();
             }
         }
         hits
@@ -1309,6 +1313,16 @@ mod tests {
         feed(&mut g, "\r\nERROR shouting");
         assert_eq!(g.search("error").len(), 3);
         assert!(g.search("nope").is_empty());
+    }
+
+    #[test]
+    fn search_with_multibyte_needle_does_not_panic() {
+        // Regression: advancing by a single byte after a multibyte match landed
+        // inside a UTF-8 char, so the next slice panicked ("not a char boundary").
+        let mut g = Grid::new(20, 2);
+        feed(&mut g, "café société");
+        assert_eq!(g.search("é").len(), 3, "all three accented chars found");
+        assert_eq!(g.search("café").len(), 1);
     }
 
     #[test]
