@@ -216,6 +216,8 @@ struct Gpu {
     ai: ai::Session,
     last_context_refresh: Instant,
     last_autosave: Instant,
+    /// Process-start instant, the time base for cursor blink.
+    start: Instant,
     /// Last left-click time and cell, and the run length, for double/triple click.
     last_click: (Instant, selection::Point),
     click_count: u32,
@@ -313,6 +315,7 @@ impl App {
             ai: ai::Session::new(),
             last_context_refresh: Instant::now(),
             last_autosave: Instant::now(),
+            start: Instant::now(),
             last_click: (Instant::now(), (0, 0)),
             click_count: 0,
             proxy: self.proxy.clone(),
@@ -403,6 +406,17 @@ impl ApplicationHandler<UserEvent> for App {
             return;
         }
         gpu.periodic(&self.config);
+
+        // While the cursor blinks, wake at the next toggle so it keeps flashing on
+        // an idle terminal. Otherwise wait indefinitely for the next event.
+        if self.config.cursor.blink && gpu.overlay.is_none() {
+            let interval = self.config.cursor.blink_interval.max(50);
+            event_loop.set_control_flow(ControlFlow::WaitUntil(
+                Instant::now() + Duration::from_millis(interval),
+            ));
+        } else {
+            event_loop.set_control_flow(ControlFlow::Wait);
+        }
     }
 }
 

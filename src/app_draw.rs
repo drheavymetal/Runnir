@@ -44,6 +44,11 @@ impl Gpu {
             })
             .collect();
 
+        // The cursor shows on the focused pane only, off during the blink's dark
+        // phase. An overlay owns input, so the terminal cursor is hidden then.
+        let cursor_on = self.cursor_on(config);
+        let shape = config.cursor.shape;
+
         let mut panes: Vec<PaneDraw> = guards
             .iter()
             .map(|(id, r, grid, tint, focused)| PaneDraw {
@@ -52,19 +57,20 @@ impl Gpu {
                 origin: (r.x, r.y),
                 tint: *tint,
                 focused: *focused,
+                cursor: (*focused && cursor_on && self.overlay.is_none()).then_some(shape),
             })
             .collect();
 
         // The tab bar and any status chrome are grids too, appended as panes.
         let chrome = self.build_chrome(config, screen);
         for (grid, ox, oy) in &chrome {
-            panes.push(PaneDraw { grid, selection: None, origin: (*ox, *oy), tint: None, focused: true });
+            panes.push(PaneDraw { grid, selection: None, origin: (*ox, *oy), tint: None, focused: true, cursor: None });
         }
 
         // Hint labels annotate the focused pane, drawn as a top chrome grid.
         let hint_grid = self.build_hints(area, cell, focus);
         if let Some((grid, ox, oy)) = &hint_grid {
-            panes.push(PaneDraw { grid, selection: None, origin: (*ox, *oy), tint: None, focused: true });
+            panes.push(PaneDraw { grid, selection: None, origin: (*ox, *oy), tint: None, focused: true, cursor: None });
         }
 
         // Overlay panels, on a dimmed backdrop.
@@ -79,6 +85,7 @@ impl Gpu {
                     origin: (*ox, *oy),
                     tint: None,
                     focused: true,
+                    cursor: None,
                 })
                 .collect(),
         });
@@ -193,6 +200,18 @@ impl Gpu {
 
     fn renderer_theme(&self) -> crate::config::Theme {
         crate::config::Theme::default()
+    }
+
+    /// Whether the cursor is in its visible phase. Steady when blink is off; else a
+    /// square wave over `blink_interval`. Time comes from the process start so it
+    /// needs no per-frame state.
+    fn cursor_on(&self, config: &Config) -> bool {
+        if !config.cursor.blink {
+            return true;
+        }
+        let ms = self.start.elapsed().as_millis() as u64;
+        let interval = config.cursor.blink_interval.max(50);
+        (ms / interval) % 2 == 0
     }
 
     /// Writes the current layout and scrollback to the session file. Called before

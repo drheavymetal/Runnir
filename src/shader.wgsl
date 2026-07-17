@@ -81,20 +81,26 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 
     let g = in.local - in.glyph_offset;
     let inside = all(g >= vec2<f32>(0.0)) && all(g < in.glyph_size);
+    // Output alpha is the greater of the background's own alpha and the glyph
+    // coverage. For a normal cell (bg alpha 1) this is always 1. For a cursor
+    // overlay (bg alpha 0) only the glyph's pixels become opaque, so a beam or
+    // underline bar draws over the character beneath without a solid box.
+    var out_a = in.bg.a;
+
     if inside && in.glyph_size.x > 0.0 {
         let uv = mix(in.uv_min, in.uv_max, g / in.glyph_size);
         let texel = textureSampleLevel(atlas, atlas_sampler, uv, 0.0);
         // Masks are stored white with coverage in alpha, so the cell's foreground
         // tints them; emoji bring their own colour and ignore it.
         let ink = select(in.fg.rgb, texel.rgb, (in.flags & FLAG_COLOR) != 0u);
-        color = vec4<f32>(mix(color.rgb, ink, texel.a), in.bg.a);
+        color = vec4<f32>(mix(color.rgb, ink, texel.a), max(out_a, texel.a));
     }
 
     // Decorations sit on top of the glyph, so a strikeout actually strikes it out.
     let underlined = (in.flags & FLAG_UNDERLINE) != 0u && in_band(in.local.y, u.underline);
     let struck = (in.flags & FLAG_STRIKE) != 0u && in_band(in.local.y, u.strike);
     if underlined || struck {
-        color = vec4<f32>(in.fg.rgb, in.bg.a);
+        color = vec4<f32>(in.fg.rgb, max(out_a, 1.0));
     }
 
     return color;

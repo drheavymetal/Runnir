@@ -54,6 +54,8 @@ pub struct PaneDraw<'a> {
     /// Background tint (ssh/root/docker), blended over the theme background.
     pub tint: Option<(u8, u8, u8)>,
     pub focused: bool,
+    /// Cursor style, or `None` to draw no cursor (unfocused, hidden, or blinked off).
+    pub cursor: Option<crate::config::CursorShape>,
 }
 
 /// An overlay: a dimmed backdrop plus one or more panels drawn on top.
@@ -433,7 +435,14 @@ impl Renderer {
                 if selection.is_some_and(|s| s.contains(grid, (abs, col))) {
                     bg = srgb(self.theme.selection.0, self.theme.selection.1, self.theme.selection.2);
                 }
-                if grid.cursor_visible && abs == cursor_abs && col == cur_col && pane.focused {
+                // A block cursor inverts the cell it sits on; beam/underline are
+                // drawn as a separate bar after the loop so the character stays
+                // legible under them.
+                if grid.cursor_visible
+                    && abs == cursor_abs
+                    && col == cur_col
+                    && matches!(pane.cursor, Some(crate::config::CursorShape::Block))
+                {
                     std::mem::swap(&mut fg, &mut bg);
                 }
 
@@ -469,6 +478,37 @@ impl Renderer {
                     width: span,
                     _pad: [0; 2],
                 });
+            }
+        }
+
+        // Beam / underline cursor: a thin bar over the character, drawn with the
+        // one-eighth block glyphs so it is exactly cell-aligned. Transparent bg
+        // (alpha 0) means only the bar's pixels are opaque.
+        use crate::config::CursorShape;
+        if grid.cursor_visible && pane.focused {
+            let bar = match pane.cursor {
+                Some(CursorShape::Beam) => Some('\u{258F}'),   // ▏ left one-eighth
+                Some(CursorShape::Underline) => Some('\u{2581}'), // ▁ lower one-eighth
+                _ => None,
+            };
+            if let Some(bar_ch) = bar {
+                let row = cursor_abs.saturating_sub(grid.total_rows() - grid.rows());
+                if row < grid.rows() {
+                    let g = self.font.glyph(bar_ch, Style::REGULAR);
+                    let cur = self.theme.cursor;
+                    out.push(Instance {
+                        pos_px: [ox + cur_col as f32 * cw, oy + row as f32 * ch],
+                        glyph_offset: g.offset,
+                        glyph_size: g.size,
+                        uv_min: g.uv_min,
+                        uv_max: g.uv_max,
+                        fg: srgb(cur.0, cur.1, cur.2),
+                        bg: [0.0, 0.0, 0.0, 0.0],
+                        flags: 0,
+                        width: 1.0,
+                        _pad: [0; 2],
+                    });
+                }
             }
         }
     }
@@ -557,6 +597,7 @@ pub fn offscreen_scene(
                 origin: (rect.x, rect.y),
                 tint: *tint,
                 focused: *focused,
+                cursor: focused.then_some(crate::config::CursorShape::Block),
             })
             .collect();
         let overlay = overlay_specs.as_ref().map(|panels| Overlay {
@@ -569,6 +610,7 @@ pub fn offscreen_scene(
                     origin: (r.x, r.y),
                     tint: None,
                     focused: true,
+                    cursor: None,
                 })
                 .collect(),
         });
@@ -672,6 +714,7 @@ pub fn offscreen(path: &str, cmd: &str, font_px: f32, delay_ms: Option<u64>) {
             origin: (0.0, 0.0),
             tint: None,
             focused: true,
+            cursor: Some(crate::config::CursorShape::Block),
         }];
         renderer.render(
             &device,
