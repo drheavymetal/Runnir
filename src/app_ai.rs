@@ -77,10 +77,13 @@ impl Gpu {
              Output ONLY the command, no explanation, no markdown, no backticks.\n\n{description}"
         );
         self.status = Some(format!("asking {provider} for a command…"));
+        self.status_expiry = None; // In-flight: the reply clears the toast.
         if let Err(e) =
             ai::ask(&mut self.ai, config, &provider, prompt, ai::Purpose::InsertCommand, self.proxy.clone())
         {
+            // No worker spawned, so no reply will ever clear this. Expire it.
             self.status = Some(format!("ai command failed: {e}"));
+            self.status_expiry = Some(Instant::now() + Duration::from_secs(5));
         }
         self.window.request_redraw();
     }
@@ -118,10 +121,13 @@ impl Gpu {
         let provider = config.ai.default.clone();
         let prompt = crate::whisper::prompt(&request);
         self.status = Some(format!("whispering to {provider}…"));
+        self.status_expiry = None; // In-flight: the reply clears the toast.
         if let Err(e) =
             ai::ask(&mut self.ai, config, &provider, prompt, ai::Purpose::Whisper, self.proxy.clone())
         {
+            // No worker spawned, so no reply will ever clear this. Expire it.
             self.status = Some(format!("whisper failed: {e}"));
+            self.status_expiry = Some(Instant::now() + Duration::from_secs(5));
         }
         self.window.request_redraw();
     }
@@ -173,7 +179,13 @@ impl Gpu {
                 }
                 "run" if !step.arg.is_empty() => {
                     // Typed, not executed: the user reviews then presses Enter.
-                    self.tab().focused().write(step.arg.as_bytes());
+                    // Keep only the first line so a model-emitted newline (trailing
+                    // or embedded) can never auto-run the command — that would break
+                    // the review-before-run contract this action rests on.
+                    let typed = step.arg.split(['\n', '\r']).next().unwrap_or("");
+                    if !typed.is_empty() {
+                        self.tab().focused().write(typed.as_bytes());
+                    }
                 }
                 "search" if !step.arg.is_empty() => {
                     let mut search = overlay::Search::new();

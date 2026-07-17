@@ -248,6 +248,10 @@ struct Gpu {
     /// A transient status shown as a toast (e.g. "whispering…") while a background
     /// request is in flight, so an AI action never looks like it did nothing.
     status: Option<String>,
+    /// When set, the toast is a terminal message (an error) that no reply will
+    /// ever clear, so it must expire on its own at this instant. Without it a
+    /// synchronous `ai::ask` failure would leave the spinner turning forever.
+    status_expiry: Option<Instant>,
     proxy: EventLoopProxy<UserEvent>,
 }
 
@@ -365,6 +369,7 @@ impl App {
             mouse_down: None,
             resizing: None,
             status: None,
+            status_expiry: None,
             proxy: self.proxy.clone(),
         }
     }
@@ -424,6 +429,7 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::Ai(reply) => {
                 // The request finished: clear the "thinking" toast.
                 gpu.status = None;
+                gpu.status_expiry = None;
                 match gpu.ai.receive(reply, gpu.overlay.as_mut()) {
                     ai::Delivery::Insert(cmd) => gpu.insert_command(cmd),
                     ai::Delivery::Whisper(plan) => gpu.execute_whisper(plan, &self.config),
@@ -475,13 +481,23 @@ impl ApplicationHandler<UserEvent> for App {
         }
         gpu.periodic(&self.config);
 
-        // A pending AI request animates a spinner: wake often and repaint.
+        // A pending AI request animates a spinner: wake often and repaint. An
+        // error toast has an expiry (no reply will clear it); once it passes,
+        // drop the toast and fall through to normal idling instead of spinning
+        // the spinner forever.
         if gpu.status.is_some() {
-            gpu.window.request_redraw();
-            event_loop.set_control_flow(ControlFlow::WaitUntil(
-                Instant::now() + Duration::from_millis(120),
-            ));
-            return;
+            let expired = gpu.status_expiry.is_some_and(|e| Instant::now() >= e);
+            if expired {
+                gpu.status = None;
+                gpu.status_expiry = None;
+                gpu.window.request_redraw();
+            } else {
+                gpu.window.request_redraw();
+                event_loop.set_control_flow(ControlFlow::WaitUntil(
+                    Instant::now() + Duration::from_millis(120),
+                ));
+                return;
+            }
         }
 
         // Drive cursor blink. A WaitUntil wake does not itself repaint, so redraw
