@@ -227,7 +227,6 @@ pub struct Prompt {
 pub enum PromptKind {
     RenameTab,
     QuickConnect,
-    AiQuestion,
 }
 
 impl Prompt {
@@ -413,7 +412,7 @@ impl Hints {
         match matches.as_slice() {
             [] => HintResult::NoMatch,
             [only] if only.label == self.typed => {
-                HintResult::Chosen(only.label.clone(), only.text.clone(), only.kind)
+                HintResult::Chosen(only.text.clone(), only.kind)
             }
             _ => HintResult::More,
         }
@@ -423,7 +422,7 @@ impl Hints {
 pub enum HintResult {
     More,
     NoMatch,
-    Chosen(String, String, HintKind),
+    Chosen(String, HintKind),
 }
 
 /// Two-letter labels from a home-row alphabet, enough for ~600 targets, assigned
@@ -552,7 +551,7 @@ mod tests {
             Hint { label: "s".into(), abs_row: 1, col: 0, text: "y".into(), kind: HintKind::Path },
         ];
         let mut h = Hints::new(hints);
-        assert!(matches!(h.input('a'), HintResult::Chosen(_, _, _)));
+        assert!(matches!(h.input('a'), HintResult::Chosen(_, _)));
     }
 
     #[test]

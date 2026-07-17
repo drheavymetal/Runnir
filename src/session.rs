@@ -55,6 +55,7 @@ impl Session {
         Self { version: VERSION, active, tabs: Vec::new() }
     }
 
+    #[cfg(test)]
     pub fn add_tab(&mut self, tree: Node, focus: PaneId, title: Option<String>) -> &mut TabState {
         self.tabs.push(TabState { tree, focus, title, panes: HashMap::new() });
         self.tabs.last_mut().unwrap()

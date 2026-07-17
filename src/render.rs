@@ -357,14 +357,14 @@ impl Renderer {
             // So a ligature is: a run of blank glyphs followed by a real one.
             let mut i = 0;
             while i < shaped.len() {
-                let blank = self.font.shaped_glyph(shaped[i].glyph_id, style).size[0] == 0.0;
+                let blank = self.font.shaped_glyph(shaped[i], style).size[0] == 0.0;
                 if !blank {
                     i += 1;
                     continue;
                 }
                 let mut j = i;
                 while j < shaped.len()
-                    && self.font.shaped_glyph(shaped[j].glyph_id, style).size[0] == 0.0
+                    && self.font.shaped_glyph(shaped[j], style).size[0] == 0.0
                 {
                     j += 1;
                 }
@@ -376,7 +376,7 @@ impl Renderer {
                     start + i,
                     // `anchor` is how many cells right of the head the glyph's own
                     // cell sits; its bearing is measured from there.
-                    Ligature::Head { glyph_id: shaped[j].glyph_id, len, anchor: j - i },
+                    Ligature::Head { glyph_id: shaped[j], len, anchor: j - i },
                 );
                 for k in 1..len {
                     out.insert(start + i + k, Ligature::Tail);

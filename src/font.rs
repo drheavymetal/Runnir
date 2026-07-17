@@ -80,15 +80,6 @@ impl Face {
     }
 }
 
-/// One glyph produced by shaping, and the cells it covers. A ligature is simply a
-/// span longer than one.
-#[derive(Clone, Copy, Debug)]
-pub struct Shaped {
-    pub glyph_id: u16,
-    pub start: usize,
-    pub len: usize,
-}
-
 pub struct FontAtlas {
     data: Vec<u8>,
     /// Indexed by `Style`: regular, bold, italic, bold-italic. Slot 0 always
@@ -190,13 +181,16 @@ impl FontAtlas {
         &self.data
     }
 
-    /// Shapes an **ASCII** run and returns each glyph with the cells it spans.
+    /// Shapes an **ASCII** run into glyph ids, one per source column.
     ///
     /// ASCII-only by design: every ligature in a coding face is an ASCII sequence
     /// (`!=`, `->`, `=>`), so restricting the shaper here means one byte is always
-    /// one cell and the byte offsets the shaper reports *are* cell offsets. Runs
-    /// with CJK or emoji keep the per-character path, where they belong.
-    pub fn shape(&mut self, text: &str, style: Style) -> Vec<Shaped> {
+    /// one cell and the returned glyphs line up one-to-one with columns. Runs with
+    /// CJK or emoji keep the per-character path, where they belong. A ligature
+    /// shows up as blank leading glyphs followed by the real one (see the caller);
+    /// the positional alignment is what makes that detectable, so no per-glyph
+    /// source span is needed.
+    pub fn shape(&mut self, text: &str, style: Style) -> Vec<u16> {
         let face = &self.faces[style.index().min(self.faces.len() - 1)];
         let Some(font) = face.font() else { return Vec::new() };
 
@@ -212,12 +206,8 @@ impl FontAtlas {
 
         let mut out = Vec::new();
         shaper.shape_with(|cluster| {
-            let start = cluster.source.start as usize;
-            let len = (cluster.source.end - cluster.source.start) as usize;
-            // A ligature is one glyph for several sources. Several glyphs for one
-            // source (marks) cannot happen in an ASCII run.
             if let Some(g) = cluster.glyphs.first() {
-                out.push(Shaped { glyph_id: g.id, start, len: len.max(1) });
+                out.push(g.id);
             }
         });
         out
@@ -518,20 +508,16 @@ mod tests {
                 f.charmap().map(ch)
             };
             let shaped = atlas.shape(&ch.to_string(), Style::REGULAR);
-            eprintln!(
-                "  {ch:?}: charmap={db_id} shaped={:?}",
-                shaped.iter().map(|s| s.glyph_id).collect::<Vec<_>>()
-            );
+            eprintln!("  {ch:?}: charmap={db_id} shaped={shaped:?}");
         }
         eprintln!("--");
         for seq in ["ab", "!=", "->", "=>", "===", "<=", "|>", "::", "//"] {
             let shaped = atlas.shape(seq, Style::REGULAR);
-            let ligated = shaped.iter().any(|s| s.len > 1);
-            eprintln!(
-                "{seq:5} -> {} glyph(s) {:?} ligated={ligated}",
-                shaped.len(),
-                shaped.iter().map(|s| (s.glyph_id, s.start, s.len)).collect::<Vec<_>>()
-            );
+            // A ligature shows as a blank leading glyph (size 0) followed by a real
+            // one; print the ids so a mismatch points at the font, not the parser.
+            let blanks: Vec<bool> =
+                shaped.iter().map(|&id| atlas.shaped_glyph(id, Style::REGULAR).size[0] == 0.0).collect();
+            eprintln!("{seq:5} -> {shaped:?} blank={blanks:?}");
         }
     }
 

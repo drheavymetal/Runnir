@@ -310,7 +310,7 @@ impl Gpu {
                         match h.input(c) {
                             overlay::HintResult::More => {}
                             overlay::HintResult::NoMatch => self.overlay = None,
-                            overlay::HintResult::Chosen(_, text, kind) => {
+                            overlay::HintResult::Chosen(text, kind) => {
                                 self.overlay = None;
                                 self.act_on_hint(text, kind);
                             }
@@ -412,11 +412,6 @@ impl Gpu {
             PromptKind::QuickConnect => {
                 if !value.is_empty() {
                     self.split_running(config, vec!["ssh".into(), value]);
-                }
-            }
-            PromptKind::AiQuestion => {
-                if !value.is_empty() {
-                    self.send_ai(value, config);
                 }
             }
         }
