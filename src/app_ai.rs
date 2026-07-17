@@ -133,7 +133,7 @@ impl Gpu {
         let plan = crate::whisper::parse(&plan_json);
         let area = self.active_area();
         for step in plan {
-            let wake = wake_fn(self.window.clone());
+            let wake = wake_fn(self.proxy.clone());
             match step.action.as_str() {
                 "new_tab" => {
                     let id = self.new_pane_id();

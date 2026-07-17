@@ -121,8 +121,10 @@ impl Gpu {
             let bg = Color::Rgb(config.theme.accent.0, config.theme.accent.1, config.theme.accent.2);
             g.fill(Pen { bg, ..Pen::default() });
             g.write_str(0, 0, &text, Pen { fg: Color::Rgb(0x0d, 0x0d, 0x0f), bg, ..Pen::default() });
-            let x = (screen.0 - w as f32 * cell.0) / 2.0;
-            (g, x.max(0.0), cell.1)
+            // Bottom-right, one row up from the very edge, clear of the prompt.
+            let x = screen.0 - w as f32 * cell.0 - cell.0;
+            let y = screen.1 - 2.0 * cell.1;
+            (g, x.max(0.0), y.max(0.0))
         });
         if let Some((grid, ox, oy)) = &toast {
             panes.push(PaneDraw { grid, selection: None, origin: (*ox, *oy), tint: None, focused: true, cursor: None, search: Default::default() });

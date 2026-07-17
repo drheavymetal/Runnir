@@ -47,6 +47,11 @@ const TABBAR_ROWS: f32 = 1.0;
 /// A message from a background worker back to the UI thread.
 pub enum UserEvent {
     Ai(ai::Reply),
+    /// A PTY produced output. On Wayland, `Window::request_redraw` from another
+    /// thread does not reliably interrupt `ControlFlow::Wait`; sending a user event
+    /// through the proxy does. Without this, echoed input and command output appear
+    /// only on the next keystroke or blink tick — the "typing feels laggy" bug.
+    Redraw,
 }
 
 fn main() {
@@ -257,8 +262,13 @@ fn notify(body: &str) {
         .spawn();
 }
 
-fn wake_fn(window: Arc<Window>) -> impl Fn() + Send + Clone + 'static {
-    move || window.request_redraw()
+/// A PTY wake closure. Sends a user event through the proxy — the reliable way to
+/// interrupt `ControlFlow::Wait` from another thread on Wayland — rather than
+/// calling `Window::request_redraw` directly, which can be missed there.
+fn wake_fn(proxy: EventLoopProxy<UserEvent>) -> impl Fn() + Send + Clone + 'static {
+    move || {
+        let _ = proxy.send_event(UserEvent::Redraw);
+    }
 }
 
 impl App {
@@ -317,11 +327,11 @@ impl App {
         let (tabs, active, next_seed) = match restored {
             Some(saved) => {
                 session::Session::clear();
-                restore_tabs(&saved, &surface_config, cell, &self.config, &window)
+                restore_tabs(&saved, &surface_config, cell, &self.config, self.proxy.clone())
             }
             None => {
                 let area = content_area(&surface_config, cell, 1);
-                let tab = Tab::new(area, cell, &self.config, 1, &Spawn::default(), wake_fn(window.clone()))
+                let tab = Tab::new(area, cell, &self.config, 1, &Spawn::default(), wake_fn(self.proxy.clone()))
                     .expect("failed to spawn first pane");
                 (vec![tab], 0, 1000)
             }
@@ -372,17 +382,19 @@ fn restore_tabs(
     cfg: &wgpu::SurfaceConfiguration,
     cell: (f32, f32),
     config: &Config,
-    window: &Arc<Window>,
+    proxy: EventLoopProxy<UserEvent>,
 ) -> (Vec<Tab>, usize, u64) {
     let area = content_area(cfg, cell, saved.tabs.len());
     let mut tabs = Vec::new();
     let mut max_id = 0u64;
     for state in &saved.tabs {
         max_id = max_id.max(state.panes.keys().copied().max().unwrap_or(0));
-        let win = window.clone();
+        let p = proxy.clone();
         let wake = move |_id| -> Box<dyn Fn() + Send + 'static> {
-            let w = win.clone();
-            Box::new(move || w.request_redraw())
+            let p = p.clone();
+            Box::new(move || {
+                let _ = p.send_event(UserEvent::Redraw);
+            })
         };
         match Tab::from_session(state, area, cell, config, wake) {
             Ok(tab) => tabs.push(tab),
@@ -390,7 +402,7 @@ fn restore_tabs(
         }
     }
     if tabs.is_empty() {
-        let tab = Tab::new(area, cell, config, 1, &Spawn::default(), wake_fn(window.clone()))
+        let tab = Tab::new(area, cell, config, 1, &Spawn::default(), wake_fn(proxy.clone()))
             .expect("failed to spawn fallback pane");
         return (vec![tab], 0, 1000);
     }
@@ -408,6 +420,7 @@ impl ApplicationHandler<UserEvent> for App {
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
         let Some(gpu) = self.gpu.as_mut() else { return };
         match event {
+            UserEvent::Redraw => gpu.window.request_redraw(),
             UserEvent::Ai(reply) => {
                 // The request finished: clear the "thinking" toast.
                 gpu.status = None;

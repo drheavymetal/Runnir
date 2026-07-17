@@ -89,9 +89,15 @@ fn named_key(key: NamedKey, mods: ModifiersState, mode: KeyMode) -> Option<Vec<u
     match key {
         NamedKey::Enter => b("\r"),
         NamedKey::Backspace => {
-            // DEL, not BS. Every Unix terminal has done this since the VT220, and
-            // erase=^? in termios depends on it.
-            if mods.control_key() { b("\x08") } else { b("\x7f") }
+            // Plain Backspace: DEL, not BS. Every Unix terminal has done this since
+            // the VT220, and erase=^? in termios depends on it. Ctrl+Backspace and
+            // Alt+Backspace both send ESC-DEL, which readline/fish/zsh treat as
+            // backward-kill-word — "delete the whole word".
+            if mods.control_key() || mods.alt_key() {
+                b("\x1b\x7f")
+            } else {
+                b("\x7f")
+            }
         }
         NamedKey::Tab => {
             if mods.shift_key() {

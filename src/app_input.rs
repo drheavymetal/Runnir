@@ -193,6 +193,17 @@ impl Gpu {
         // Otherwise it is input for the focused pane's process.
         let mode = keys::KeyMode { app_cursor: self.tab().focused().app_cursor() };
         if let Some(bytes) = keys::encode(&event, mods, mode) {
+            // Diagnostic: RUNNIR_KEYLOG=1 logs each keypress → bytes it sends, with
+            // the focused pane id and the winit repeat flag, to catch duplication.
+            if std::env::var("RUNNIR_KEYLOG").is_ok() {
+                eprintln!(
+                    "keylog pane={} repeat={} key={:?} -> {:?}",
+                    self.tab().focused_ptr(),
+                    event.repeat,
+                    event.logical_key,
+                    String::from_utf8_lossy(&bytes)
+                );
+            }
             if self.tab().focused().snap_to_bottom() {
                 self.window.request_redraw();
             }
@@ -207,7 +218,7 @@ impl Gpu {
 
     fn run_action(&mut self, action: Action, config: &Config, event_loop: &ActiveEventLoop) {
         let area = self.active_area();
-        let wake = wake_fn(self.window.clone());
+        let wake = wake_fn(self.proxy.clone());
         match action {
             Action::Quit => {
                 self.save_session(config);
@@ -483,7 +494,7 @@ impl Gpu {
         // Reuse run_action by faking an event loop is not possible; inline the ones
         // the palette exposes that do not need the loop.
         let area = self.active_area();
-        let wake = wake_fn(self.window.clone());
+        let wake = wake_fn(self.proxy.clone());
         match action {
             Action::NewTab => {
                 let id = self.new_pane_id();
@@ -620,10 +631,10 @@ impl Gpu {
     fn reopen_closed(&mut self, config: &Config) {
         let Some(state) = self.closed_tabs.pop() else { return };
         let area = self.active_area();
-        let window = self.window.clone();
+        let proxy = self.proxy.clone();
         let wake = move |_id| -> Box<dyn Fn() + Send + 'static> {
-            let w = window.clone();
-            Box::new(move || w.request_redraw())
+            let p = proxy.clone();
+            Box::new(move || { let _ = p.send_event(UserEvent::Redraw); })
         };
         match Tab::from_session(&state, area, self.renderer.cell_size(), config, wake) {
             Ok(tab) => {
@@ -761,7 +772,7 @@ impl Gpu {
     fn split_running(&mut self, config: &Config, command: Vec<String>) {
         let area = self.active_area();
         let id = self.new_pane_id();
-        let wake = wake_fn(self.window.clone());
+        let wake = wake_fn(self.proxy.clone());
         let _ = self.tab().split_running_with_id(area, Axis::Horizontal, config, id, command, wake);
         self.window.request_redraw();
     }
