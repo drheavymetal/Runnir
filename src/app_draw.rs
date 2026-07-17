@@ -26,7 +26,7 @@ impl Gpu {
         // Lock every pane's grid up front; the render borrows them read-only.
         let area = self.active_area();
         let cell = self.renderer.cell_size();
-        let rects = self.tabs[self.active].layout(area);
+        let rects = self.visible_rects(area);
         let focus = self.tabs[self.active].focus;
 
         // Clear dirty flags so the next output marks a fresh redraw.

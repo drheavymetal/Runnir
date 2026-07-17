@@ -65,6 +65,7 @@ pub enum Action {
     Whisper,
     // Misc
     ToggleBroadcast,
+    ToggleZoom,
     ClearSelectionOrScrollback,
     Quit,
 }
@@ -119,6 +120,7 @@ impl Action {
             LaunchClaude => "launch_claude",
             Whisper => "whisper",
             ToggleBroadcast => "toggle_broadcast",
+            ToggleZoom => "toggle_zoom",
             ClearSelectionOrScrollback => "clear",
             Quit => "quit",
         }
@@ -173,6 +175,7 @@ impl Action {
             LaunchClaude => "Launch Claude Code",
             Whisper => "Whisper (tell the terminal what to do)",
             ToggleBroadcast => "Toggle broadcast input",
+            ToggleZoom => "Zoom / unzoom focused pane",
             ClearSelectionOrScrollback => "Clear selection / scrollback",
             Quit => "Quit runnir",
         }
@@ -230,6 +233,7 @@ impl Action {
             "launch_claude" => LaunchClaude,
             "whisper" => Whisper,
             "toggle_broadcast" => ToggleBroadcast,
+            "toggle_zoom" => ToggleZoom,
             "clear" => ClearSelectionOrScrollback,
             "quit" => Quit,
             _ => return None,
@@ -300,6 +304,7 @@ impl Action {
             LaunchClaude,
             Whisper,
             ToggleBroadcast,
+            ToggleZoom,
             Quit,
         ]
     }
@@ -457,6 +462,7 @@ fn default_bindings() -> HashMap<Chord, Action> {
     bind(&mut m, "ctrl+shift+n", LaunchClaude);
     bind(&mut m, "ctrl+shift+enter", Whisper);
     bind(&mut m, "ctrl+shift+b", ToggleBroadcast);
+    bind(&mut m, "ctrl+shift+z", ToggleZoom);
     m
 }
 
@@ -485,6 +491,7 @@ pub fn default_hints() -> HashMap<String, String> {
         ("launch_claude", "Ctrl+Shift+N"),
         ("whisper", "Ctrl+Shift+Enter"),
         ("toggle_broadcast", "Ctrl+Shift+B"),
+        ("toggle_zoom", "Ctrl+Shift+Z"),
         ("jump_prev_prompt", "Ctrl+Shift+Up"),
         ("jump_next_prompt", "Ctrl+Shift+Down"),
         ("font_bigger", "Ctrl++"),

@@ -44,7 +44,7 @@ DIFFERENTIAL (aim ~15 total incl. above):
 - [ ] D7 Session summarizer (AI) — "what did I do here" from scrollback.
 - [ ] D8 Broadcast groups — broadcast to a named subset of panes.
 - [ ] D9 Smooth/momentum scroll.
-- [ ] D10 Pane zoom — temporarily maximize focused pane (toggle).
+- [x] D10 Pane zoom (Ctrl+Shift+Z) — visible_rects override + resize_one. commit 25.
 - [ ] D11 Open scrollback in $EDITOR / pipe pane to editor.
 - [ ] D12 Copy-mode with vim motions (keyboard scrollback nav + select).
 - [ ] D13 Tab reordering (drag / move-left/right).

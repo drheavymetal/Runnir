@@ -245,6 +245,8 @@ struct Gpu {
     mouse_down: Option<mouse::Button>,
     /// A divider being dragged with the mouse to resize panes.
     resizing: Option<crate::layout::DividerHit>,
+    /// When set, the focused pane of the active tab fills the whole area (zoom).
+    zoomed: Option<u64>,
     /// A transient status shown as a toast (e.g. "whispering…") while a background
     /// request is in flight, so an AI action never looks like it did nothing.
     status: Option<String>,
@@ -368,6 +370,7 @@ impl App {
             click_count: 0,
             mouse_down: None,
             resizing: None,
+            zoomed: None,
             status: None,
             status_expiry: None,
             proxy: self.proxy.clone(),
@@ -528,6 +531,17 @@ impl ApplicationHandler<UserEvent> for App {
 impl Gpu {
     fn active_area(&self) -> Rect {
         content_area(&self.surface_config, self.renderer.cell_size(), self.tabs.len())
+    }
+
+    /// Pane rectangles for the active tab, honouring zoom: a zoomed pane fills the
+    /// whole area alone. Used by rendering and mouse hit-testing so both agree.
+    fn visible_rects(&self, area: Rect) -> Vec<(u64, Rect)> {
+        match self.zoomed {
+            Some(id) if self.tabs[self.active].panes.contains_key(&id) => {
+                vec![(id, self.tabs[self.active].full_rect(area))]
+            }
+            _ => self.tabs[self.active].layout(area),
+        }
     }
 
     fn resize(&mut self, w: u32, h: u32, _config: &Config) {

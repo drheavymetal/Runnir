@@ -336,6 +336,7 @@ impl Gpu {
             Action::LaunchClaude => self.launch_claude(config),
             Action::Whisper => self.whisper(),
             Action::ToggleBroadcast => self.broadcast = !self.broadcast,
+            Action::ToggleZoom => self.toggle_zoom(),
             Action::ClearSelectionOrScrollback => {
                 if !self.tab().focused().clear_selection() {
                     self.tab().focused().snap_to_bottom();
@@ -565,8 +566,24 @@ impl Gpu {
             Action::FontSmaller => self.set_font_px(self.font_px - 1.0, config),
             Action::FontReset => self.set_font_px(config.font.size, config),
             Action::ToggleBroadcast => self.broadcast = !self.broadcast,
+            Action::ToggleZoom => self.toggle_zoom(),
             _ => {}
         }
+    }
+
+    /// Zooms the focused pane to fill the tab, or unzooms. Resizes its PTY so the
+    /// program sees the bigger size, and restores every pane on unzoom.
+    fn toggle_zoom(&mut self) {
+        let area = self.active_area();
+        if self.zoomed.take().is_some() {
+            self.tabs[self.active].reflow(area);
+        } else {
+            let focus = self.tab().focused_ptr();
+            self.zoomed = Some(focus);
+            let rect = self.tabs[self.active].full_rect(area);
+            self.tabs[self.active].resize_one(focus, rect);
+        }
+        self.window.request_redraw();
     }
 
     fn confirm_prompt(&mut self, kind: PromptKind, value: String, config: &Config) {
@@ -689,8 +706,7 @@ impl Gpu {
 
     fn pane_at(&self, pos: PhysicalPosition<f64>, area: Rect) -> Option<(u64, Rect)> {
         let (px, py) = (pos.x as f32, pos.y as f32);
-        self.tabs[self.active]
-            .layout(area)
+        self.visible_rects(area)
             .into_iter()
             .find(|(_, r)| px >= r.x && px < r.x + r.w && py >= r.y && py < r.y + r.h)
     }

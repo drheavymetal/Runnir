@@ -69,6 +69,19 @@ impl Tab {
         self.tree.layout(pad(area, self.padding), self.gap)
     }
 
+    /// The whole padded area, for a zoomed (maximized) pane.
+    pub fn full_rect(&self, area: Rect) -> Rect {
+        pad(area, self.padding)
+    }
+
+    /// Resizes one pane's grid/PTY to `rect` (used when zooming a single pane).
+    pub fn resize_one(&mut self, id: PaneId, rect: Rect) {
+        let (cols, rows) = cells_in(rect, self.cell);
+        if let Some(pane) = self.panes.get_mut(&id) {
+            pane.resize(cols, rows);
+        }
+    }
+
     /// Splits the focused pane along `axis`, giving the new pane focus. Inherits
     /// the focused pane's working directory so a split lands where you were.
     pub fn split_with_id(
