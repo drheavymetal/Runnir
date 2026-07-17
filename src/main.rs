@@ -1,7 +1,9 @@
 mod boxdraw;
+mod config;
 mod font;
 mod grid;
 mod keys;
+mod layout;
 mod pty;
 mod render;
 mod selection;
