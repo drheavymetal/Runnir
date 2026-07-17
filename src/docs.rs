@@ -96,6 +96,30 @@ variable named in the config, never stored in the file.
 @ Ctrl+Shift+B     toggle broadcast: what you type goes to every pane in the tab at
                    once. Useful for driving several servers together.
 
+# Reopen a closed tab
+
+@ Ctrl+Shift+U     bring back the last tab you closed, with its layout, working
+                   directories and scrollback — like a browser's reopen-closed-tab.
+
+# Sticky command
+
+While you scroll back, the prompt line of the command whose output you are reading
+is pinned at the top of the pane, so you never lose track of which command produced
+what you see. Automatic; needs OSC 133 shell integration.
+
+# Quake (dropdown) mode
+
+Launch with `runnir --quake` for a borderless window with the Wayland app-id
+`runnir-quake`, meant to drop down from the top on a global key. Wayland gives no
+application global hotkeys, so the toggle is the compositor's job. For Hyprland:
+
+  windowrulev2 = float, class:^(runnir-quake)$
+  windowrulev2 = size 100% 45%, class:^(runnir-quake)$
+  windowrulev2 = move 0 0, class:^(runnir-quake)$
+  windowrulev2 = workspace special:runnir, class:^(runnir-quake)$
+  bind = , F12, togglespecialworkspace, runnir
+  exec-once = runnir --quake
+
 # Font
 
 @ Ctrl++ / Ctrl+-  bigger / smaller (live, no restart)

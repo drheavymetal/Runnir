@@ -358,6 +358,33 @@ impl Grid {
             .collect()
     }
 
+    /// The prompt line to pin at the top while scrolled back: the most recent
+    /// prompt at or above the current top row, so you always see which command's
+    /// output you are reading. `None` when following live output, when there are no
+    /// marks, or when the pinned prompt would be the very top row already.
+    pub fn sticky_prompt(&self) -> Option<String> {
+        if self.display_offset == 0 {
+            return None;
+        }
+        let top = self.scrollback.len().saturating_sub(self.display_offset);
+        // Prompt marks are stable rows; convert to local and find the last one at
+        // or above the viewport top.
+        let mark = self
+            .prompt_marks
+            .iter()
+            .filter_map(|&s| self.stable_to_local(s))
+            .filter(|&local| local < top)
+            .max()?;
+        // `mark` is already an absolute (local) row index, which abs_cell takes.
+        let text: String = (0..self.cols)
+            .map(|c| self.abs_cell(mark, c))
+            .filter(|cell| !cell.is_spacer())
+            .map(|cell| cell.ch)
+            .collect();
+        let text = text.trim_end().to_string();
+        (!text.is_empty()).then_some(text)
+    }
+
     /// Number of commands finished so far (OSC 133;D count).
     pub fn command_seq(&self) -> u64 {
         self.command_seq
@@ -1108,6 +1135,23 @@ mod tests {
         assert!(g.scrollback.len() > 0);
         feed(&mut g, "\x1b[3J");
         assert_eq!(g.scrollback.len(), 0, "3J must erase saved lines");
+    }
+
+    #[test]
+    fn sticky_prompt_pins_the_command_being_read() {
+        let mut g = Grid::new(20, 3);
+        // A first command with a marked prompt, then lots of later output so the
+        // first prompt ends up well above the viewport when scrolled part-way back.
+        feed(&mut g, "\x1b]133;A\x1b\\$ first\r\n");
+        for i in 0..8 {
+            feed(&mut g, &format!("out{i}\r\n"));
+        }
+        // Following live output: nothing pinned.
+        assert!(g.sticky_prompt().is_none());
+        // Scroll back a little — the first prompt sits above the top row now.
+        g.scroll_display(3);
+        let sticky = g.sticky_prompt();
+        assert_eq!(sticky.as_deref(), Some("$ first"), "the command's prompt must pin");
     }
 
     #[test]

@@ -121,6 +121,8 @@ impl Gpu {
             }
             Action::CloseTab => {
                 if self.tabs.len() > 1 {
+                    // Remember it so ReopenClosed can bring it back.
+                    self.closed_tabs.push(self.tabs[self.active].to_session());
                     self.tabs.remove(self.active);
                     self.active = self.active.min(self.tabs.len() - 1);
                     self.reflow_all();
@@ -129,6 +131,7 @@ impl Gpu {
                     event_loop.exit();
                 }
             }
+            Action::ReopenClosed => self.reopen_closed(config),
             Action::NextTab => self.active = (self.active + 1) % self.tabs.len(),
             Action::PrevTab => {
                 self.active = (self.active + self.tabs.len() - 1) % self.tabs.len()
@@ -376,11 +379,13 @@ impl Gpu {
             }
             Action::CloseTab => {
                 if self.tabs.len() > 1 {
+                    self.closed_tabs.push(self.tabs[self.active].to_session());
                     self.tabs.remove(self.active);
                     self.active = self.active.min(self.tabs.len() - 1);
                     self.reflow_all();
                 }
             }
+            Action::ReopenClosed => self.reopen_closed(config),
             Action::NextTab => self.active = (self.active + 1) % self.tabs.len(),
             Action::PrevTab => {
                 self.active = (self.active + self.tabs.len() - 1) % self.tabs.len()
@@ -425,6 +430,26 @@ impl Gpu {
             tab.reflow(area);
         }
         self.window.request_redraw();
+    }
+
+    /// Restores the most recently closed tab, with its layout, working dirs and
+    /// scrollback — like a browser's reopen-closed-tab.
+    fn reopen_closed(&mut self, config: &Config) {
+        let Some(state) = self.closed_tabs.pop() else { return };
+        let area = self.active_area();
+        let window = self.window.clone();
+        let wake = move |_id| -> Box<dyn Fn() + Send + 'static> {
+            let w = window.clone();
+            Box::new(move || w.request_redraw())
+        };
+        match Tab::from_session(&state, area, self.renderer.cell_size(), config, wake) {
+            Ok(tab) => {
+                self.tabs.push(tab);
+                self.active = self.tabs.len() - 1;
+                self.reflow_all();
+            }
+            Err(e) => eprintln!("runnir: could not reopen tab: {e}"),
+        }
     }
 
     /// Selection mode from click cadence: 1 char, 2 word, 3+ line. Two clicks count

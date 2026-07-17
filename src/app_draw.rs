@@ -67,6 +67,25 @@ impl Gpu {
             panes.push(PaneDraw { grid, selection: None, origin: (*ox, *oy), tint: None, focused: true, cursor: None });
         }
 
+        // Sticky prompt: while scrolled back, pin the focused command's prompt line
+        // at the top of its pane so you always see what you're reading. Built into a
+        // local (not self) so it does not conflict with the guards' borrow. Read
+        // from the already-held guard to avoid re-locking (would deadlock).
+        let sticky_holder: Option<(Grid, f32, f32)> =
+            guards.iter().find(|(id, ..)| *id == focus).and_then(|(_, r, grid, ..)| {
+                grid.sticky_prompt().map(|text| {
+                    let cols = (r.w / cell.0).floor().max(1.0) as usize;
+                    let mut bar = Grid::new(cols, 1);
+                    let bg = Color::Rgb(0x2a, 0x2c, 0x33);
+                    bar.fill(Pen { bg, ..Pen::default() });
+                    bar.write_str(0, 0, &text, Pen { fg: Color::Rgb(0xd4, 0xd6, 0xd9), bg, ..Pen::default() });
+                    (bar, r.x, r.y)
+                })
+            });
+        if let Some((grid, ox, oy)) = &sticky_holder {
+            panes.push(PaneDraw { grid, selection: None, origin: (*ox, *oy), tint: None, focused: true, cursor: None });
+        }
+
         // Hint labels annotate the focused pane, drawn as a top chrome grid. The
         // focused grid is already locked in `guards`, so read its top row from
         // there — locking it again on this thread would deadlock (Mutex is not

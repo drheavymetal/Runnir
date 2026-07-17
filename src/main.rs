@@ -71,10 +71,11 @@ fn main() {
         _ => {}
     }
 
+    let quake = args.iter().any(|a| a == "--quake");
     let event_loop = EventLoop::<UserEvent>::with_user_event().build().unwrap();
     // Wait, not Poll: an idle terminal must not burn a core.
     event_loop.set_control_flow(ControlFlow::Wait);
-    let mut app = App::new(event_loop.create_proxy());
+    let mut app = App::new(event_loop.create_proxy(), quake);
     event_loop.run_app(&mut app).unwrap();
 }
 
@@ -188,13 +189,18 @@ struct App {
     config: Config,
     keymap: Keymap,
     mods: ModifiersState,
+    /// Quake ("dropdown") mode: a distinct app-id and no decorations so the
+    /// compositor can match and toggle it as a scratchpad. The toggle itself is
+    /// the compositor's job — Wayland gives no app global hotkeys — so `--quake`
+    /// pairs with a Hyprland binding (see the F1 docs).
+    quake: bool,
 }
 
 impl App {
-    fn new(proxy: EventLoopProxy<UserEvent>) -> Self {
+    fn new(proxy: EventLoopProxy<UserEvent>, quake: bool) -> Self {
         let config = Config::load();
         let keymap = Keymap::new(&config.keys);
-        Self { proxy, gpu: None, config, keymap, mods: ModifiersState::empty() }
+        Self { proxy, gpu: None, config, keymap, mods: ModifiersState::empty(), quake }
     }
 }
 
@@ -209,6 +215,9 @@ struct Gpu {
     active: usize,
     next_pane_seed: u64,
     overlay: Option<Overlay>,
+    /// Tabs closed this session, most recent last, so `ReopenClosed` can bring the
+    /// last one back with its layout and scrollback.
+    closed_tabs: Vec<session::TabState>,
     cursor_px: PhysicalPosition<f64>,
     clipboard: Option<arboard::Clipboard>,
     broadcast: bool,
@@ -243,10 +252,18 @@ fn wake_fn(window: Arc<Window>) -> impl Fn() + Send + Clone + 'static {
 
 impl App {
     fn init_gpu(&mut self, event_loop: &ActiveEventLoop) -> Gpu {
-        let attrs = Window::default_attributes()
+        let mut attrs = Window::default_attributes()
             .with_title("runnir")
-            .with_decorations(self.config.window.decorations)
+            .with_decorations(self.config.window.decorations && !self.quake)
             .with_inner_size(LogicalSize::new(self.config.window.width, self.config.window.height));
+        // Set a Wayland app-id so compositor rules can match runnir; a distinct one
+        // in quake mode so a dropdown rule targets only that instance.
+        #[cfg(target_os = "linux")]
+        {
+            use winit::platform::wayland::WindowAttributesExtWayland;
+            let app_id = if self.quake { "runnir-quake" } else { "runnir" };
+            attrs = attrs.with_name(app_id, app_id);
+        }
         let window = Arc::new(event_loop.create_window(attrs).unwrap());
 
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
@@ -310,6 +327,7 @@ impl App {
             active,
             next_pane_seed: next_seed,
             overlay: None,
+            closed_tabs: Vec::new(),
             cursor_px: PhysicalPosition::new(0.0, 0.0),
             clipboard: arboard::Clipboard::new().ok(),
             broadcast: false,

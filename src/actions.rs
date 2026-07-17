@@ -20,6 +20,7 @@ pub enum Action {
     PrevTab,
     GoToTab(usize),
     RenameTab,
+    ReopenClosed,
     // Panes / splits
     SplitHorizontal,
     SplitVertical,
@@ -75,6 +76,7 @@ impl Action {
             PrevTab => "prev_tab",
             GoToTab(_) => "go_to_tab",
             RenameTab => "rename_tab",
+            ReopenClosed => "reopen_closed",
             SplitHorizontal => "split_horizontal",
             SplitVertical => "split_vertical",
             ClosePane => "close_pane",
@@ -124,6 +126,7 @@ impl Action {
             PrevTab => "Previous tab",
             GoToTab(_) => "Go to tab N",
             RenameTab => "Rename tab",
+            ReopenClosed => "Reopen closed tab",
             SplitHorizontal => "Split pane left/right",
             SplitVertical => "Split pane up/down",
             ClosePane => "Close pane",
@@ -176,6 +179,7 @@ impl Action {
             "next_tab" => NextTab,
             "prev_tab" => PrevTab,
             "rename_tab" => RenameTab,
+            "reopen_closed" => ReopenClosed,
             "split_horizontal" => SplitHorizontal,
             "split_vertical" => SplitVertical,
             "close_pane" => ClosePane,
@@ -255,6 +259,7 @@ impl Action {
             NextTab,
             PrevTab,
             RenameTab,
+            ReopenClosed,
             SplitHorizontal,
             SplitVertical,
             ClosePane,
@@ -390,6 +395,7 @@ fn default_bindings() -> HashMap<Chord, Action> {
         bind(&mut m, &format!("super+{n}"), GoToTab(n));
     }
     bind(&mut m, "ctrl+shift+r", RenameTab);
+    bind(&mut m, "ctrl+shift+u", ReopenClosed);
 
     bind(&mut m, "ctrl+shift+d", SplitHorizontal);
     bind(&mut m, "ctrl+shift+e", SplitVertical);
@@ -455,6 +461,7 @@ pub fn default_hints() -> HashMap<String, String> {
         ("font_bigger", "Ctrl++"),
         ("font_smaller", "Ctrl+-"),
         ("rename_tab", "Ctrl+Shift+R"),
+        ("reopen_closed", "Ctrl+Shift+U"),
     ];
     pretty.iter().map(|(a, k)| (a.to_string(), k.to_string())).collect()
 }
