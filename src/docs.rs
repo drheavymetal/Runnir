@@ -110,9 +110,9 @@ The name fits: 'rún' is a whisper to the machine. Whisper drives runnir itself,
 not just the shell — one instruction can split panes, open ssh sessions, search,
 launch tools. Examples:
 
-  "split in four and ssh to 192.168.1.3, .7, .9 and .188"
-  "search the scrollback for 'panic'"
-  "make the font bigger and open the docs"
+  split in four and ssh to 192.168.1.3, .7, .9 and .188
+  search the scrollback for the word panic
+  make the font bigger and open the docs
 
 Runnir actions run immediately; a shell command it decides on is typed at the
 prompt for you to review and run, never executed for you.
