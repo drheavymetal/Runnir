@@ -62,6 +62,7 @@ pub enum Action {
     HintMode,
     // Launchers
     LaunchClaude,
+    Whisper,
     // Misc
     ToggleBroadcast,
     ClearSelectionOrScrollback,
@@ -116,6 +117,7 @@ impl Action {
             QuickConnect => "quick_connect",
             HintMode => "hint_mode",
             LaunchClaude => "launch_claude",
+            Whisper => "whisper",
             ToggleBroadcast => "toggle_broadcast",
             ClearSelectionOrScrollback => "clear",
             Quit => "quit",
@@ -169,6 +171,7 @@ impl Action {
             QuickConnect => "SSH quick connect",
             HintMode => "Hint mode (open/copy on screen)",
             LaunchClaude => "Launch Claude Code",
+            Whisper => "Whisper (tell the terminal what to do)",
             ToggleBroadcast => "Toggle broadcast input",
             ClearSelectionOrScrollback => "Clear selection / scrollback",
             Quit => "Quit runnir",
@@ -225,6 +228,7 @@ impl Action {
             "quick_connect" => QuickConnect,
             "hint_mode" => HintMode,
             "launch_claude" => LaunchClaude,
+            "whisper" => Whisper,
             "toggle_broadcast" => ToggleBroadcast,
             "clear" => ClearSelectionOrScrollback,
             "quit" => Quit,
@@ -294,6 +298,7 @@ impl Action {
             QuickConnect,
             HintMode,
             LaunchClaude,
+            Whisper,
             ToggleBroadcast,
             Quit,
         ]
@@ -449,6 +454,7 @@ fn default_bindings() -> HashMap<Chord, Action> {
     bind(&mut m, "ctrl+shift+s", QuickConnect);
     bind(&mut m, "ctrl+shift+space", HintMode);
     bind(&mut m, "ctrl+shift+n", LaunchClaude);
+    bind(&mut m, "ctrl+shift+enter", Whisper);
     bind(&mut m, "ctrl+shift+b", ToggleBroadcast);
     m
 }
@@ -476,6 +482,7 @@ pub fn default_hints() -> HashMap<String, String> {
         ("quick_connect", "Ctrl+Shift+S"),
         ("hint_mode", "Ctrl+Shift+Space"),
         ("launch_claude", "Ctrl+Shift+N"),
+        ("whisper", "Ctrl+Shift+Enter"),
         ("toggle_broadcast", "Ctrl+Shift+B"),
         ("jump_prev_prompt", "Ctrl+Shift+Up"),
         ("jump_next_prompt", "Ctrl+Shift+Down"),

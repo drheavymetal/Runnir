@@ -291,6 +291,8 @@ pub enum PromptKind {
     QuickConnect,
     /// Natural-language description to translate into a shell command.
     AiCommand,
+    /// A whisper: a natural-language instruction turned into terminal actions.
+    Whisper,
 }
 
 impl Prompt {

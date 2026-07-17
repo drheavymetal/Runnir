@@ -29,6 +29,8 @@ pub enum Purpose {
     /// Type it at the shell prompt (a natural-language → command translation),
     /// without pressing Enter — the user reviews then runs it.
     InsertCommand,
+    /// A "whisper": the answer is a JSON plan of terminal actions to execute.
+    Whisper,
 }
 
 /// What the UI thread should do with a delivered reply.
@@ -36,6 +38,8 @@ pub enum Delivery {
     Nothing,
     ToPanel,
     Insert(String),
+    /// A JSON action plan from a whisper, for the app to parse and run.
+    Whisper(String),
 }
 
 /// Per-window AI state. The transcript lives in the overlay panel; this only
@@ -69,6 +73,10 @@ impl Session {
         match self.pending_purpose {
             Purpose::InsertCommand => match reply.result {
                 Ok(text) => Delivery::Insert(clean_command(&text)),
+                Err(_) => Delivery::Nothing,
+            },
+            Purpose::Whisper => match reply.result {
+                Ok(text) => Delivery::Whisper(text),
                 Err(_) => Delivery::Nothing,
             },
             Purpose::Panel => {

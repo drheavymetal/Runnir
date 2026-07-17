@@ -103,6 +103,94 @@ impl Gpu {
         }
     }
 
+    /// Opens the whisper bar: tell the terminal what to do in plain language.
+    fn whisper(&mut self) {
+        self.overlay = Some(Overlay::Prompt(Prompt::new(
+            PromptKind::Whisper,
+            "Whisper — what should runnir do?",
+            Vec::new(),
+        )));
+    }
+
+    fn send_whisper(&mut self, request: String, config: &Config) {
+        let provider = config.ai.default.clone();
+        let prompt = crate::whisper::prompt(&request);
+        if let Err(e) =
+            ai::ask(&mut self.ai, config, &provider, prompt, ai::Purpose::Whisper, self.proxy.clone())
+        {
+            eprintln!("runnir: whisper failed: {e}");
+        }
+    }
+
+    /// Executes a whisper plan: each step is a runnir action or a shell command.
+    /// Actions run immediately; a `run` step is typed at the prompt (not executed)
+    /// so a model-written command is always reviewed before it runs.
+    fn execute_whisper(&mut self, plan_json: String, config: &Config) {
+        let plan = crate::whisper::parse(&plan_json);
+        let area = self.active_area();
+        for step in plan {
+            let wake = wake_fn(self.window.clone());
+            match step.action.as_str() {
+                "new_tab" => {
+                    let id = self.new_pane_id();
+                    if let Ok(tab) =
+                        Tab::new(area, self.renderer.cell_size(), config, id, &Spawn::default(), wake)
+                    {
+                        self.tabs.push(tab);
+                        self.active = self.tabs.len() - 1;
+                        self.reflow_all();
+                    }
+                }
+                "split_h" => {
+                    let id = self.new_pane_id();
+                    let _ = self.tab().split_with_id(area, Axis::Horizontal, config, id, wake);
+                }
+                "split_v" => {
+                    let id = self.new_pane_id();
+                    let _ = self.tab().split_with_id(area, Axis::Vertical, config, id, wake);
+                }
+                "close_pane" => {
+                    self.tab().close_focused(area);
+                }
+                "focus_left" => {
+                    self.tab().focus_dir(area, crate::layout::Direction::Left);
+                }
+                "focus_right" => {
+                    self.tab().focus_dir(area, crate::layout::Direction::Right);
+                }
+                "focus_up" => {
+                    self.tab().focus_dir(area, crate::layout::Direction::Up);
+                }
+                "focus_down" => {
+                    self.tab().focus_dir(area, crate::layout::Direction::Down);
+                }
+                "ssh" if !step.arg.is_empty() => {
+                    self.split_running(config, vec!["ssh".into(), step.arg]);
+                }
+                "run" if !step.arg.is_empty() => {
+                    // Typed, not executed: the user reviews then presses Enter.
+                    self.tab().focused().write(step.arg.as_bytes());
+                }
+                "search" if !step.arg.is_empty() => {
+                    let mut search = overlay::Search::new();
+                    for c in step.arg.chars() {
+                        search.input(c);
+                    }
+                    self.overlay = Some(Overlay::Search(search));
+                    self.recompute_search();
+                    self.scroll_to_current_match();
+                }
+                "font_bigger" => self.set_font_px(self.font_px + 1.0, config),
+                "font_smaller" => self.set_font_px(self.font_px - 1.0, config),
+                "broadcast" => self.broadcast = !self.broadcast,
+                "launch_claude" => self.launch_claude(config),
+                "docs" => self.overlay = Some(Overlay::Docs(overlay::Docs::new(docs::HELP))),
+                other => eprintln!("runnir: whisper: unknown action {other:?}"),
+            }
+        }
+        self.window.request_redraw();
+    }
+
     fn open_hints(&mut self) {
         let hints = {
             let pane = self.tab().focused();

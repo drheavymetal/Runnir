@@ -17,6 +17,7 @@ mod render;
 mod selection;
 mod session;
 mod tab;
+mod whisper;
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -402,6 +403,7 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::Ai(reply) => {
                 match gpu.ai.receive(reply, gpu.overlay.as_mut()) {
                     ai::Delivery::Insert(cmd) => gpu.insert_command(cmd),
+                    ai::Delivery::Whisper(plan) => gpu.execute_whisper(plan, &self.config),
                     ai::Delivery::ToPanel | ai::Delivery::Nothing => {}
                 }
                 gpu.window.request_redraw();

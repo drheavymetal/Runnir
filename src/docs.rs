@@ -101,6 +101,22 @@ variable named in the config, never stored in the file.
                    types it at the prompt for you to review and run (not run for you)
 @ Ctrl+Shift+Y     explain the current selection in the assistant panel
 
+# Whisper — talk to the terminal
+
+@ Ctrl+Shift+Enter  open the whisper bar and say what you want in plain language.
+                    A model turns it into terminal actions and runnir runs them.
+
+The name fits: 'rún' is a whisper to the machine. Whisper drives runnir itself,
+not just the shell — one instruction can split panes, open ssh sessions, search,
+launch tools. Examples:
+
+  "split in four and ssh to 192.168.1.3, .7, .9 and .188"
+  "search the scrollback for 'panic'"
+  "make the font bigger and open the docs"
+
+Runnir actions run immediately; a shell command it decides on is typed at the
+prompt for you to review and run, never executed for you.
+
 # Broadcast input
 
 @ Ctrl+Shift+B     toggle broadcast: what you type goes to every pane in the tab at

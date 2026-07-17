@@ -296,6 +296,7 @@ impl Gpu {
             Action::QuickConnect => self.open_quick_connect(),
             Action::HintMode => self.open_hints(),
             Action::LaunchClaude => self.launch_claude(config),
+            Action::Whisper => self.whisper(),
             Action::ToggleBroadcast => self.broadcast = !self.broadcast,
             Action::ClearSelectionOrScrollback => {
                 if !self.tab().focused().clear_selection() {
@@ -479,6 +480,7 @@ impl Gpu {
             Action::AskAiAboutError => self.ask_ai_about_error(config),
             Action::AiCommand => self.ai_command(),
             Action::AiExplain => self.ai_explain_selection(config),
+            Action::Whisper => self.whisper(),
             Action::SearchScrollback => self.overlay = Some(Overlay::Search(overlay::Search::new())),
             Action::QuickConnect => self.open_quick_connect(),
             Action::HintMode => self.open_hints(),
@@ -542,6 +544,11 @@ impl Gpu {
             PromptKind::AiCommand => {
                 if !value.is_empty() {
                     self.send_ai_command(value, config);
+                }
+            }
+            PromptKind::Whisper => {
+                if !value.is_empty() {
+                    self.send_whisper(value, config);
                 }
             }
         }
