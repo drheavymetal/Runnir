@@ -194,4 +194,20 @@ impl Gpu {
     fn renderer_theme(&self) -> crate::config::Theme {
         crate::config::Theme::default()
     }
+
+    /// Writes the current layout and scrollback to the session file. Called before
+    /// exit and on a slow autosave timer, so a crash still leaves a recent state.
+    pub fn save_session(&self, config: &Config) {
+        if !config.behaviour.restore_session {
+            return;
+        }
+        let mut sess = session::Session::new(self.active);
+        for tab in &self.tabs {
+            let state = tab.to_session();
+            sess.tabs.push(state);
+        }
+        if let Err(e) = sess.save() {
+            eprintln!("runnir: could not save session: {e}");
+        }
+    }
 }

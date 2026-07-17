@@ -99,6 +99,8 @@ pub struct Grid {
     command_start: Option<usize>,
     /// Stable (start, end) rows of the last finished command's output.
     last_output: Option<(usize, usize)>,
+    /// Count of commands finished (OSC 133;D), for completion notifications.
+    command_seq: u64,
     /// Inclusive row bounds that scrolling is confined to (DECSTBM).
     scroll_top: usize,
     scroll_bot: usize,
@@ -130,6 +132,7 @@ impl Grid {
             prompt_marks: Vec::new(),
             command_start: None,
             last_output: None,
+            command_seq: 0,
             scroll_top: 0,
             scroll_bot: rows - 1,
             app_cursor: false,
@@ -276,6 +279,42 @@ impl Grid {
         self.dirty = true;
     }
 
+    /// Scrollback as plain text lines, oldest first, for session persistence.
+    /// Trailing blank lines are dropped so a mostly-empty screen does not save a
+    /// wall of nothing.
+    pub fn scrollback_text(&self) -> Vec<String> {
+        let mut lines: Vec<String> = self
+            .scrollback
+            .iter()
+            .map(|row| {
+                let s: String =
+                    row.iter().filter(|c| !c.is_spacer()).map(|c| c.ch).collect();
+                s.trim_end().to_string()
+            })
+            .collect();
+        while lines.last().is_some_and(|l| l.is_empty()) {
+            lines.pop();
+        }
+        lines
+    }
+
+    /// Restores saved history as inert scrollback above the live screen. Colour is
+    /// not persisted — restored history is plain text, which is what a session is
+    /// for (reading what happened), not re-running it.
+    pub fn preload_scrollback(&mut self, lines: &[String]) {
+        for line in lines {
+            let mut row = vec![Cell::default(); self.cols];
+            for (i, ch) in line.chars().take(self.cols).enumerate() {
+                row[i] = Cell { ch, pen: Pen::default() };
+            }
+            self.scrollback.push_back(row);
+        }
+        while self.scrollback.len() > self.scrollback_limit {
+            self.scrollback.pop_front();
+            self.dropped += 1;
+        }
+    }
+
     pub fn set_scrollback_limit(&mut self, limit: usize) {
         self.scrollback_limit = limit.max(1);
         while self.scrollback.len() > self.scrollback_limit {
@@ -312,6 +351,16 @@ impl Grid {
             .filter_map(|&s| self.stable_to_local(s))
             .map(|local| self.scrollback.len().saturating_sub(local))
             .collect()
+    }
+
+    /// Number of commands finished so far (OSC 133;D count).
+    pub fn command_seq(&self) -> u64 {
+        self.command_seq
+    }
+
+    /// Whether a command's output is currently being produced (between C and D).
+    pub fn command_running(&self) -> bool {
+        self.command_start.is_some()
     }
 
     /// Text of the most recently finished command's output, if OSC 133 marked it.
@@ -801,6 +850,7 @@ impl Grid {
                     let end = self.local_to_stable(self.cursor_abs());
                     self.last_output = Some((start, end.max(start)));
                 }
+                self.command_seq += 1;
             }
             _ => {}
         }

@@ -13,6 +13,7 @@ mod pane;
 mod pty;
 mod render;
 mod selection;
+mod session;
 mod tab;
 
 use std::sync::{Arc, Mutex};
@@ -214,7 +215,22 @@ struct Gpu {
     font_px: f32,
     ai: ai::Session,
     last_context_refresh: Instant,
+    last_autosave: Instant,
+    /// Last left-click time and cell, and the run length, for double/triple click.
+    last_click: (Instant, selection::Point),
+    click_count: u32,
     proxy: EventLoopProxy<UserEvent>,
+}
+
+/// Fires a desktop notification. Silent on failure — there is nowhere useful to
+/// report that the notifier itself is missing.
+fn notify(body: &str) {
+    let _ = std::process::Command::new("notify-send")
+        .arg("runnir")
+        .arg(body)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
 }
 
 fn wake_fn(window: Arc<Window>) -> impl Fn() + Send + Clone + 'static {
@@ -258,10 +274,26 @@ impl App {
         renderer.set_theme(self.config.theme.clone());
 
         let cell = renderer.cell_size();
-        let area = content_area(&surface_config, cell, 1);
-        let wake = wake_fn(window.clone());
-        let tab = Tab::new(area, cell, &self.config, 1, &Spawn::default(), wake)
-            .expect("failed to spawn first pane");
+
+        // Restore the previous session if enabled and present; otherwise one tab.
+        let restored = self
+            .config
+            .behaviour
+            .restore_session
+            .then(session::Session::load)
+            .flatten();
+        let (tabs, active, next_seed) = match restored {
+            Some(saved) => {
+                session::Session::clear();
+                restore_tabs(&saved, &surface_config, cell, &self.config, &window)
+            }
+            None => {
+                let area = content_area(&surface_config, cell, 1);
+                let tab = Tab::new(area, cell, &self.config, 1, &Spawn::default(), wake_fn(window.clone()))
+                    .expect("failed to spawn first pane");
+                (vec![tab], 0, 1000)
+            }
+        };
 
         Gpu {
             window,
@@ -270,9 +302,9 @@ impl App {
             queue,
             surface_config,
             renderer,
-            tabs: vec![tab],
-            active: 0,
-            next_pane_seed: 1000,
+            tabs,
+            active,
+            next_pane_seed: next_seed,
             overlay: None,
             cursor_px: PhysicalPosition::new(0.0, 0.0),
             clipboard: arboard::Clipboard::new().ok(),
@@ -280,6 +312,9 @@ impl App {
             font_px,
             ai: ai::Session::new(),
             last_context_refresh: Instant::now(),
+            last_autosave: Instant::now(),
+            last_click: (Instant::now(), (0, 0)),
+            click_count: 0,
             proxy: self.proxy.clone(),
         }
     }
@@ -288,6 +323,39 @@ impl App {
 fn content_area(cfg: &wgpu::SurfaceConfiguration, cell: (f32, f32), tab_count: usize) -> Rect {
     let bar = if tab_count > 1 { TABBAR_ROWS * cell.1 } else { 0.0 };
     Rect { x: 0.0, y: bar, w: cfg.width as f32, h: (cfg.height as f32 - bar).max(cell.1) }
+}
+
+/// Rebuilds tabs from a saved session. Returns the tabs, the active index, and the
+/// next free pane id (above every restored one, so new panes never collide).
+fn restore_tabs(
+    saved: &session::Session,
+    cfg: &wgpu::SurfaceConfiguration,
+    cell: (f32, f32),
+    config: &Config,
+    window: &Arc<Window>,
+) -> (Vec<Tab>, usize, u64) {
+    let area = content_area(cfg, cell, saved.tabs.len());
+    let mut tabs = Vec::new();
+    let mut max_id = 0u64;
+    for state in &saved.tabs {
+        max_id = max_id.max(state.panes.keys().copied().max().unwrap_or(0));
+        let win = window.clone();
+        let wake = move |_id| -> Box<dyn Fn() + Send + 'static> {
+            let w = win.clone();
+            Box::new(move || w.request_redraw())
+        };
+        match Tab::from_session(state, area, cell, config, wake) {
+            Ok(tab) => tabs.push(tab),
+            Err(e) => eprintln!("runnir: could not restore a tab: {e}"),
+        }
+    }
+    if tabs.is_empty() {
+        let tab = Tab::new(area, cell, config, 1, &Spawn::default(), wake_fn(window.clone()))
+            .expect("failed to spawn fallback pane");
+        return (vec![tab], 0, 1000);
+    }
+    let active = saved.active.min(tabs.len() - 1);
+    (tabs, active, max_id.max(1000) + 1)
 }
 
 impl ApplicationHandler<UserEvent> for App {
@@ -310,7 +378,10 @@ impl ApplicationHandler<UserEvent> for App {
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         let Some(gpu) = self.gpu.as_mut() else { return };
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                gpu.save_session(&self.config);
+                event_loop.exit();
+            }
             WindowEvent::Resized(size) => gpu.resize(size.width, size.height, &self.config),
             WindowEvent::RedrawRequested => gpu.render(&self.config),
             WindowEvent::ModifiersChanged(m) => self.mods = m.state(),
@@ -327,6 +398,7 @@ impl ApplicationHandler<UserEvent> for App {
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         let Some(gpu) = self.gpu.as_mut() else { return };
         if !gpu.reap(&self.config) {
+            gpu.save_session(&self.config);
             event_loop.exit();
             return;
         }
@@ -350,14 +422,27 @@ impl Gpu {
         self.window.request_redraw();
     }
 
-    /// Refreshes context tints/titles periodically and re-arms cursor-blink waits.
+    /// Refreshes context tints/titles periodically, autosaves the session, and
+    /// checks for long-running commands that finished while unfocused.
     fn periodic(&mut self, config: &Config) {
         if self.last_context_refresh.elapsed() >= Duration::from_millis(500) {
             self.last_context_refresh = Instant::now();
+            let focused = self.window.has_focus();
             for tab in &mut self.tabs {
                 for pane in tab.panes.values_mut() {
                     pane.refresh_context(config);
+                    // A command that ran longer than the threshold and finished
+                    // while the window is unfocused earns a desktop notification.
+                    if config.behaviour.notify_after_secs > 0 && !focused {
+                        if let Some(msg) = pane.take_completion(config.behaviour.notify_after_secs) {
+                            notify(&msg);
+                        }
+                    }
                 }
+            }
+            if self.last_autosave.elapsed() >= Duration::from_secs(30) {
+                self.last_autosave = Instant::now();
+                self.save_session(config);
             }
             self.window.request_redraw();
         }

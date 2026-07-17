@@ -119,6 +119,9 @@ pub struct Behaviour {
     /// Zero disables.
     pub notify_after_secs: u64,
     pub confirm_close: bool,
+    /// Reopen the previous session (tabs, layout, working dirs, scrollback text)
+    /// on start. The processes do not survive — only the layout and history do.
+    pub restore_session: bool,
 }
 
 impl Default for Behaviour {
@@ -129,6 +132,7 @@ impl Default for Behaviour {
             context_tint: true,
             notify_after_secs: 20,
             confirm_close: true,
+            restore_session: true,
         }
     }
 }

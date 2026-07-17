@@ -47,7 +47,11 @@ impl Gpu {
                 if let Some((id, rect)) = self.pane_at(self.cursor_px, area) {
                     self.tab().focus = id;
                     if let Some(point) = self.point_in(id, rect, self.cursor_px) {
-                        self.tab().focused().begin_selection(point, SelMode::Char);
+                        // Double-click selects a word, triple a line — the count is
+                        // tracked by clicks landing on the same cell in quick
+                        // succession.
+                        let mode = self.click_mode(point);
+                        self.tab().focused().begin_selection(point, mode);
                         self.window.request_redraw();
                     }
                 }
@@ -102,7 +106,10 @@ impl Gpu {
         let area = self.active_area();
         let wake = wake_fn(self.window.clone());
         match action {
-            Action::Quit => event_loop.exit(),
+            Action::Quit => {
+                self.save_session(config);
+                event_loop.exit();
+            }
 
             Action::NewTab => {
                 let id = self.new_pane_id();
@@ -118,6 +125,7 @@ impl Gpu {
                     self.active = self.active.min(self.tabs.len() - 1);
                     self.reflow_all();
                 } else {
+                    self.save_session(config);
                     event_loop.exit();
                 }
             }
@@ -149,6 +157,7 @@ impl Gpu {
                     self.active = self.active.min(self.tabs.len() - 1);
                     self.reflow_all();
                 } else if self.tabs.len() == 1 && self.tab().tree.len() == 1 {
+                    self.save_session(config);
                     event_loop.exit();
                 }
             }
@@ -410,6 +419,25 @@ impl Gpu {
             tab.reflow(area);
         }
         self.window.request_redraw();
+    }
+
+    /// Selection mode from click cadence: 1 char, 2 word, 3+ line. Two clicks count
+    /// as a double only when they land on the same cell within the double-click
+    /// window; otherwise the counter resets.
+    fn click_mode(&mut self, point: selection::Point) -> SelMode {
+        let now = Instant::now();
+        let quick = now.duration_since(self.last_click.0) < Duration::from_millis(400);
+        if quick && self.last_click.1 == point {
+            self.click_count += 1;
+        } else {
+            self.click_count = 1;
+        }
+        self.last_click = (now, point);
+        match self.click_count {
+            2 => SelMode::Word,
+            n if n >= 3 => SelMode::Line,
+            _ => SelMode::Char,
+        }
     }
 
     fn pane_at(&self, pos: PhysicalPosition<f64>, area: Rect) -> Option<(u64, Rect)> {

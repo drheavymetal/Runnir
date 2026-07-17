@@ -32,6 +32,10 @@ pub struct Pane {
     pub title: String,
     /// Set by the user; overrides the automatic title.
     pub title_override: Option<String>,
+    /// When the currently-running command started, and its name, for completion
+    /// notifications. Tracked via OSC 133 marks when available, else the foreground.
+    running_since: Option<(std::time::Instant, String)>,
+    last_command_seq: u64,
 }
 
 impl Pane {
@@ -54,7 +58,37 @@ impl Pane {
             context: Context::Local,
             title: "shell".into(),
             title_override: None,
+            running_since: None,
+            last_command_seq: 0,
         })
+    }
+
+    /// Returns a message if a command that ran at least `threshold` seconds just
+    /// finished. Uses the OSC 133 command counter so it fires once per command, and
+    /// only for commands long enough to be worth interrupting for.
+    pub fn take_completion(&mut self, threshold: u64) -> Option<String> {
+        let (seq, running) = {
+            let g = self.grid.lock().unwrap();
+            (g.command_seq(), g.command_running())
+        };
+        // A new command started running: remember when and what.
+        if running && self.running_since.is_none() {
+            self.running_since = Some((std::time::Instant::now(), self.title.clone()));
+        }
+        // The command counter advanced past what we last saw: one finished.
+        if seq > self.last_command_seq {
+            self.last_command_seq = seq;
+            if let Some((started, name)) = self.running_since.take() {
+                let secs = started.elapsed().as_secs();
+                if secs >= threshold {
+                    return Some(format!("{name} finished after {secs}s"));
+                }
+            }
+        }
+        if !running {
+            self.running_since = None;
+        }
+        None
     }
 
     pub fn alive(&self) -> bool {
@@ -63,6 +97,17 @@ impl Pane {
 
     pub fn pty_pid(&self) -> Option<i32> {
         self.pty.pid()
+    }
+
+    /// The child's current working directory, for session persistence and for a
+    /// split to inherit.
+    pub fn cwd(&self) -> Option<std::path::PathBuf> {
+        let pid = self.pty.pid()?;
+        std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
+    }
+
+    pub fn scrollback_text(&self) -> Vec<String> {
+        self.grid.lock().unwrap().scrollback_text()
     }
 
     pub fn write(&mut self, bytes: &[u8]) {

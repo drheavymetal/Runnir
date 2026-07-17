@@ -213,6 +213,75 @@ impl Tab {
         self.title_override.clone().unwrap_or_else(|| self.focused_ref().title.clone())
     }
 
+    /// Captures this tab's layout and scrollback for the session file.
+    pub fn to_session(&self) -> crate::session::TabState {
+        let mut panes = std::collections::HashMap::new();
+        for (id, pane) in &self.panes {
+            panes.insert(
+                *id,
+                crate::session::PaneState {
+                    cwd: pane.cwd(),
+                    title: pane.title_override.clone(),
+                    scrollback: pane.scrollback_text(),
+                },
+            );
+        }
+        crate::session::TabState {
+            tree: self.tree.clone(),
+            focus: self.focus,
+            title: self.title_override.clone(),
+            panes,
+        }
+    }
+
+    /// Rebuilds a tab from a saved state: relaunches a shell per pane in its saved
+    /// cwd and loads the saved scrollback above it. Panes named in the tree but
+    /// missing from `panes` fall back to a default shell.
+    pub fn from_session(
+        state: &crate::session::TabState,
+        area: Rect,
+        cell: (f32, f32),
+        config: &Config,
+        mut wake: impl FnMut(PaneId) -> Box<dyn Fn() + Send + 'static>,
+    ) -> anyhow::Result<Self> {
+        let padding = config.window.padding;
+        let gap = padding.max(6.0);
+        let rects = state.tree.layout(pad(area, padding), gap);
+
+        let mut panes = HashMap::new();
+        for (id, rect) in &rects {
+            let (cols, rows) = cells_in(*rect, cell);
+            let saved = state.panes.get(id);
+            let spawn = Spawn {
+                command: None,
+                cwd: saved.and_then(|s| s.cwd.clone()),
+            };
+            let mut pane = Pane::new(cols, rows, config.scrollback.lines, &spawn, wake(*id))?;
+            if let Some(s) = saved {
+                pane.title_override = s.title.clone();
+                pane.grid.lock().unwrap().preload_scrollback(&s.scrollback);
+            }
+            panes.insert(*id, pane);
+        }
+
+        // The saved focus may name a pane that failed to spawn; fall back.
+        let focus = if panes.contains_key(&state.focus) {
+            state.focus
+        } else {
+            *panes.keys().next().expect("a tab always has at least one pane")
+        };
+
+        Ok(Self {
+            tree: state.tree.clone(),
+            panes,
+            focus,
+            title_override: state.title.clone(),
+            cell,
+            gap,
+            padding,
+        })
+    }
+
     fn focused_cwd(&self) -> Option<std::path::PathBuf> {
         // Read the child's cwd straight from /proc, so a split opens where the
         // focused shell actually is, not where the window was launched.
