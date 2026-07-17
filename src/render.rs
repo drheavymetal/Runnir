@@ -42,7 +42,30 @@ pub struct Renderer {
     instances: wgpu::Buffer,
     capacity: usize,
     theme: crate::config::Theme,
+    images: ImageLayer,
     pub font: FontAtlas,
+}
+
+/// A vertex of an image quad: clip-space position and texture uv.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct ImgVertex {
+    pos: [f32; 2],
+    uv: [f32; 2],
+}
+
+/// Draws inline images as textured quads, on their own pipeline. Textures are
+/// cached by the grid's monotonic image serial, so an image is uploaded once.
+struct ImageLayer {
+    pipeline: wgpu::RenderPipeline,
+    sampler: wgpu::Sampler,
+    layout: wgpu::BindGroupLayout,
+    /// serial -> (texture, bind group). Kept across frames.
+    cache: HashMap<u64, (wgpu::Texture, wgpu::BindGroup)>,
+    vertices: wgpu::Buffer,
+    vcap: usize,
+    /// This frame's draw order: (serial, first vertex index).
+    frame: Vec<(u64, u32)>,
 }
 
 /// One pane (or overlay panel) to draw: its grid, where it sits, and how.
@@ -198,9 +221,12 @@ impl Renderer {
             mapped_at_creation: false,
         });
 
+        let images = ImageLayer::new(device, format);
+
         Self {
             pipeline,
             bind_group,
+            images,
             uniforms,
             atlas_tex,
             instances,
@@ -208,6 +234,37 @@ impl Renderer {
             theme: crate::config::Theme::default(),
             font,
         }
+    }
+
+    /// The inline images to draw this frame, from every pane, as (grid image,
+    /// pixel rect). Uploads new textures and returns quads ready for the pass.
+    fn prepare_images(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        panes: &[PaneDraw],
+        screen: (f32, f32),
+    ) -> usize {
+        let (cw, ch) = (self.font.cell_w, self.font.cell_h);
+        let mut quads: Vec<(u64, [f32; 2], [f32; 2])> = Vec::new(); // serial, origin_px, size_px
+        let mut seen = std::collections::HashSet::new();
+        for pane in panes {
+            for (img, row) in pane.grid.images() {
+                // Skip images entirely above the pane; a partial one still draws.
+                if (row + img.rows as isize) <= 0 {
+                    continue;
+                }
+                let x = pane.origin.0;
+                let y = pane.origin.1 + row as f32 * ch;
+                let w = img.cols as f32 * cw;
+                let h = img.rows as f32 * ch;
+                self.images.upload(device, queue, &img);
+                seen.insert(img.serial);
+                quads.push((img.serial, [x, y], [w, h]));
+            }
+        }
+        self.images.retain(&seen);
+        self.images.build_vertices(device, queue, &quads, screen)
     }
 
     pub fn set_theme(&mut self, theme: crate::config::Theme) {
@@ -277,6 +334,10 @@ impl Renderer {
             queue.write_buffer(&self.instances, 0, bytemuck::cast_slice(&instances));
         }
 
+        // Upload/refresh image textures and build their quads before the pass;
+        // resources cannot be created while a pass is recording.
+        self.prepare_images(device, queue, panes, screen);
+
         let clear = self.theme.background;
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("terminal"),
@@ -298,6 +359,10 @@ impl Renderer {
         pass.set_bind_group(0, &self.bind_group, &[]);
         pass.set_vertex_buffer(0, self.instances.slice(..));
         pass.draw(0..4, 0..count as u32);
+
+        // Inline images on top of the (blank) cells reserved for them. Prepared
+        // before the pass; recorded here on their own pipeline.
+        self.images.record(&mut pass);
     }
 
     /// Finds the ligatures on one row, keyed by the column each one starts at.
@@ -788,6 +853,186 @@ impl Renderer {
             Color::Indexed(i) => xterm256(i, &t.ansi),
         };
         srgb(rgb.0, rgb.1, rgb.2)
+    }
+}
+
+impl ImageLayer {
+    fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("image shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("image_shader.wgsl").into()),
+        });
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("image bind layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("image pipeline layout"),
+            bind_group_layouts: &[Some(&layout)],
+            immediate_size: 0,
+        });
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("image pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                buffers: &[Some(wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<ImgVertex>() as u64,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2],
+                })],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleStrip,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: Default::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("image sampler"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        let vertices = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("image vertices"),
+            size: 0,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        Self { pipeline, sampler, layout, cache: HashMap::new(), vertices, vcap: 0, frame: Vec::new() }
+    }
+
+    /// Uploads an image's texture on first sight; a no-op once cached.
+    fn upload(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, img: &crate::grid::GridImage) {
+        if self.cache.contains_key(&img.serial) {
+            return;
+        }
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("inline image"),
+            size: wgpu::Extent3d { width: img.width, height: img.height, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            // Non-srgb: image data is passed through untouched (the sampler feeds
+            // the fragment which returns it directly).
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &img.rgba,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(img.width * 4),
+                rows_per_image: Some(img.height),
+            },
+            wgpu::Extent3d { width: img.width, height: img.height, depth_or_array_layers: 1 },
+        );
+        let view = texture.create_view(&Default::default());
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("image bind group"),
+            layout: &self.layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+            ],
+        });
+        self.cache.insert(img.serial, (texture, bind_group));
+    }
+
+    /// Drops cached textures for images no longer present.
+    fn retain(&mut self, seen: &std::collections::HashSet<u64>) {
+        self.cache.retain(|serial, _| seen.contains(serial));
+    }
+
+    /// Writes the frame's image quads (4 clip-space vertices each) and remembers the
+    /// draw order. Returns the image count.
+    fn build_vertices(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        quads: &[(u64, [f32; 2], [f32; 2])],
+        screen: (f32, f32),
+    ) -> usize {
+        self.frame.clear();
+        let mut verts: Vec<ImgVertex> = Vec::with_capacity(quads.len() * 4);
+        for (i, (serial, origin, size)) in quads.iter().enumerate() {
+            let to_ndc = |px: f32, py: f32| {
+                [px / screen.0 * 2.0 - 1.0, 1.0 - py / screen.1 * 2.0]
+            };
+            let (x0, y0) = (origin[0], origin[1]);
+            let (x1, y1) = (origin[0] + size[0], origin[1] + size[1]);
+            // Triangle strip: TL, TR, BL, BR with matching uvs.
+            verts.push(ImgVertex { pos: to_ndc(x0, y0), uv: [0.0, 0.0] });
+            verts.push(ImgVertex { pos: to_ndc(x1, y0), uv: [1.0, 0.0] });
+            verts.push(ImgVertex { pos: to_ndc(x0, y1), uv: [0.0, 1.0] });
+            verts.push(ImgVertex { pos: to_ndc(x1, y1), uv: [1.0, 1.0] });
+            self.frame.push((*serial, i as u32 * 4));
+        }
+        if verts.len() > self.vcap {
+            self.vertices = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("image vertices"),
+                contents: bytemuck::cast_slice(&verts),
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            });
+            self.vcap = verts.len();
+        } else if !verts.is_empty() {
+            queue.write_buffer(&self.vertices, 0, bytemuck::cast_slice(&verts));
+        }
+        quads.len()
+    }
+
+    fn record(&self, pass: &mut wgpu::RenderPass) {
+        if self.frame.is_empty() {
+            return;
+        }
+        pass.set_pipeline(&self.pipeline);
+        pass.set_vertex_buffer(0, self.vertices.slice(..));
+        for (serial, base) in &self.frame {
+            if let Some((_, bind_group)) = self.cache.get(serial) {
+                pass.set_bind_group(0, bind_group, &[]);
+                pass.draw(*base..*base + 4, 0..1);
+            }
+        }
     }
 }
 

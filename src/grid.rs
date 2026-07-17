@@ -110,6 +110,29 @@ pub struct Grid {
     autowrap: bool,
     pub title: String,
     pub dirty: bool,
+    /// Inline images (kitty graphics protocol), anchored to a stable row so they
+    /// scroll with the content that placed them.
+    images: Vec<GridImage>,
+    image_serial: u64,
+    /// Cell size in pixels, needed to size an image's cell footprint. Zero until
+    /// set, in which case images fall back to their control-supplied rows.
+    cell_px: (f32, f32),
+}
+
+/// An inline image placed in the grid.
+#[derive(Clone)]
+pub struct GridImage {
+    /// Monotonic id for GPU-texture caching in the renderer.
+    pub serial: u64,
+    /// Protocol image id, for targeted deletion (0 = none).
+    pub id: u32,
+    pub rgba: std::sync::Arc<Vec<u8>>,
+    pub width: u32,
+    pub height: u32,
+    /// Stable row (dropped + local) of the image's top-left cell.
+    pub anchor: usize,
+    pub cols: usize,
+    pub rows: usize,
 }
 
 impl Grid {
@@ -141,7 +164,80 @@ impl Grid {
             autowrap: true,
             title: String::new(),
             dirty: true,
+            images: Vec::new(),
+            image_serial: 0,
+            cell_px: (0.0, 0.0),
         }
+    }
+
+    pub fn set_cell_px(&mut self, w: f32, h: f32) {
+        self.cell_px = (w, h);
+    }
+
+    /// Places a decoded image at the cursor, reserving its rows so following text
+    /// flows below it. The anchor is a stable row, so the image scrolls with the
+    /// content and evicts with it.
+    pub fn place_image(&mut self, img: crate::graphics::Image) {
+        let (cw, ch) = self.cell_px;
+        let rows = if img.rows > 0 {
+            img.rows as usize
+        } else if ch > 0.0 {
+            (img.height as f32 / ch).ceil() as usize
+        } else {
+            1
+        };
+        let cols = if img.cols > 0 {
+            img.cols as usize
+        } else if cw > 0.0 {
+            (img.width as f32 / cw).ceil() as usize
+        } else {
+            1
+        };
+
+        self.image_serial += 1;
+        self.images.push(GridImage {
+            serial: self.image_serial,
+            id: img.id,
+            rgba: std::sync::Arc::new(img.rgba),
+            width: img.width,
+            height: img.height,
+            anchor: self.local_to_stable(self.cursor_abs()),
+            cols: cols.max(1),
+            rows: rows.max(1),
+        });
+        // Reserve the rows: move the cursor down past the image so text does not
+        // overwrite it. Column returns to the left, as after a newline.
+        self.col = 0;
+        for _ in 0..rows.max(1) {
+            self.linefeed();
+        }
+        self.dirty = true;
+    }
+
+    /// Deletes images: `all` clears every one, else only the given protocol id.
+    pub fn clear_images(&mut self, all: bool, id: u32) {
+        if all {
+            self.images.clear();
+        } else {
+            self.images.retain(|im| im.id != id);
+        }
+        self.dirty = true;
+    }
+
+    /// Live images with their current viewport row (`None` if scrolled out of
+    /// view). Drops images evicted from scrollback along the way.
+    pub fn images(&self) -> Vec<(GridImage, isize)> {
+        self.images
+            .iter()
+            .filter_map(|im| {
+                let local = self.stable_to_local(im.anchor)?;
+                // Viewport row: local rows are scrollback ++ screen; the top of the
+                // view is scrollback.len() - display_offset.
+                let top = self.scrollback.len() - self.display_offset;
+                let row = local as isize - top as isize;
+                Some((im.clone(), row))
+            })
+            .collect()
     }
 
     pub fn cols(&self) -> usize {
@@ -475,9 +571,16 @@ impl Grid {
                 let start = row * self.cols;
                 self.scrollback.push_back(self.cells[start..start + self.cols].to_vec());
             }
+            let before = self.dropped;
             while self.scrollback.len() > self.scrollback_limit {
                 self.scrollback.pop_front();
                 self.dropped += 1;
+            }
+            // Drop images whose anchor scrolled out of the ring, so the list cannot
+            // grow without bound.
+            if self.dropped != before && !self.images.is_empty() {
+                let dropped = self.dropped;
+                self.images.retain(|im| im.anchor >= dropped);
             }
             // Keep the viewport pinned to the same content while scrolled back,
             // instead of letting it drift as new lines arrive.

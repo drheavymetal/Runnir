@@ -120,6 +120,17 @@ application global hotkeys, so the toggle is the compositor's job. For Hyprland:
   bind = , F12, togglespecialworkspace, runnir
   exec-once = runnir --quake
 
+# Inline images (kitty graphics protocol)
+
+runnir understands the kitty graphics protocol, so tools that speak it draw real
+images in the grid — image previews, plots, icons.
+
+  kitten icat photo.png
+  # matplotlib, timg, chafa --format kitty, etc.
+
+Images scroll with the text that placed them and evict with the scrollback. A
+support query is answered so tools auto-detect it.
+
 # Font
 
 @ Ctrl++ / Ctrl+-  bigger / smaller (live, no restart)

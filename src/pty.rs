@@ -17,7 +17,9 @@ pub struct Spawn {
 
 pub struct Pty {
     master: Box<dyn portable_pty::MasterPty + Send>,
-    writer: Box<dyn Write + Send>,
+    /// Shared with the reader thread so it can answer graphics support queries
+    /// (kitty `a=q`) without racing the keyboard's writes.
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
     _child: Box<dyn portable_pty::Child + Send + Sync>,
     reader: Option<std::thread::JoinHandle<()>>,
     /// Cleared by the reader thread when the child's output ends, i.e. it exited.
@@ -66,20 +68,53 @@ impl Pty {
         drop(pair.slave);
 
         let mut reader = pair.master.try_clone_reader()?;
-        let writer = pair.master.take_writer()?;
+        let writer = Arc::new(Mutex::new(pair.master.take_writer()?));
 
         let alive = Arc::new(AtomicBool::new(true));
         let thread_alive = alive.clone();
+        let thread_writer = writer.clone();
         let thread = std::thread::spawn(move || {
             let mut parser = vte::Parser::new();
+            let mut decoder = crate::graphics::Decoder::default();
+            // Bytes of an image APC split across reads, prepended to the next chunk.
+            let mut carry: Vec<u8> = Vec::new();
             let mut buf = [0u8; 65536];
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) => break, // EOF: the child closed its end.
                     Ok(n) => {
-                        // Parse the whole chunk under one lock. Locking per byte
-                        // would serialise the reader against the renderer.
-                        parser.advance(&mut *grid.lock().unwrap(), &buf[..n]);
+                        // vte discards APC, so pull kitty graphics out of the stream
+                        // first and feed only the VT bytes to the parser.
+                        let chunk = if carry.is_empty() {
+                            buf[..n].to_vec()
+                        } else {
+                            let mut c = std::mem::take(&mut carry);
+                            c.extend_from_slice(&buf[..n]);
+                            c
+                        };
+                        let (vt, cmds, rem) = crate::graphics::split(&chunk);
+                        carry = rem;
+                        {
+                            let mut g = grid.lock().unwrap();
+                            parser.advance(&mut *g, &vt);
+                            for cmd in cmds {
+                                match decoder.feed(cmd) {
+                                    crate::graphics::Event::Show(img) => g.place_image(img),
+                                    crate::graphics::Event::Delete { all, id } => {
+                                        g.clear_images(all, id)
+                                    }
+                                    crate::graphics::Event::Query(id) => {
+                                        // Answer "OK" so icat & co. know inline
+                                        // images work and proceed to send them.
+                                        if let Ok(mut w) = thread_writer.lock() {
+                                            let _ = w.write_all(&crate::graphics::respond(id));
+                                            let _ = w.flush();
+                                        }
+                                    }
+                                    crate::graphics::Event::None => {}
+                                }
+                            }
+                        }
                         on_output();
                     }
                     // A signal can interrupt the read; that is not the child
@@ -114,8 +149,10 @@ impl Pty {
     }
 
     pub fn write(&mut self, bytes: &[u8]) {
-        let _ = self.writer.write_all(bytes);
-        let _ = self.writer.flush();
+        if let Ok(mut w) = self.writer.lock() {
+            let _ = w.write_all(bytes);
+            let _ = w.flush();
+        }
     }
 
     pub fn resize(&self, cols: u16, rows: u16) {

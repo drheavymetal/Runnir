@@ -4,6 +4,7 @@ mod boxdraw;
 mod config;
 mod docs;
 mod font;
+mod graphics;
 mod grid;
 mod hints;
 mod keys;

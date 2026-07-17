@@ -2485,6 +2485,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arboard",
+ "base64",
  "bitflags 2.13.1",
  "bytemuck",
  "dirs",

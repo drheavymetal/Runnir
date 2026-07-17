@@ -37,7 +37,7 @@ impl Tab {
         let padding = config.window.padding;
         let inner = pad(area, padding);
         let (cols, rows) = cells_in(inner, cell);
-        let pane = Pane::new(cols, rows, config.scrollback.lines, spawn, wake)?;
+        let pane = Pane::new(cols, rows, config.scrollback.lines, cell, spawn, wake)?;
 
         let mut panes = HashMap::new();
         panes.insert(first_id, pane);
@@ -113,7 +113,7 @@ impl Tab {
             .unwrap_or(inner);
         let (cols, rows) = cells_in(rect, self.cell);
 
-        let pane = Pane::new(cols, rows, config.scrollback.lines, &spawn, wake)?;
+        let pane = Pane::new(cols, rows, config.scrollback.lines, self.cell, &spawn, wake)?;
         self.tree = tree;
         self.panes.insert(id, pane);
         self.focus = id;
@@ -259,11 +259,11 @@ impl Tab {
             // A single pane that cannot spawn (e.g. its saved cwd is gone) must not
             // discard the whole tab and everyone else's restored history. Retry in
             // the home directory; only give up on the pane if that fails too.
-            let mut pane = match Pane::new(cols, rows, config.scrollback.lines, &spawn, wake(*id)) {
+            let mut pane = match Pane::new(cols, rows, config.scrollback.lines, cell, &spawn, wake(*id)) {
                 Ok(p) => p,
                 Err(_) => {
                     let fallback = Spawn { command: None, cwd: dirs::home_dir() };
-                    Pane::new(cols, rows, config.scrollback.lines, &fallback, wake(*id))?
+                    Pane::new(cols, rows, config.scrollback.lines, cell, &fallback, wake(*id))?
                 }
             };
             if let Some(s) = saved {

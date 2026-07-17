@@ -43,11 +43,13 @@ impl Pane {
         cols: usize,
         rows: usize,
         scrollback: usize,
+        cell_px: (f32, f32),
         spawn: &Spawn,
         wake: impl Fn() + Send + 'static,
     ) -> anyhow::Result<Self> {
         let mut grid = Grid::new(cols, rows);
         grid.set_scrollback_limit(scrollback);
+        grid.set_cell_px(cell_px.0, cell_px.1);
         let grid = Arc::new(Mutex::new(grid));
         let pty = Pty::spawn(grid.clone(), spawn, wake)?;
         Ok(Self {
