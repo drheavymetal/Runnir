@@ -46,6 +46,7 @@ pub enum Action {
     JumpPrevPrompt,
     JumpNextPrompt,
     CopyLastOutput,
+    SearchScrollback,
     // Font
     FontBigger,
     FontSmaller,
@@ -100,6 +101,7 @@ impl Action {
             JumpPrevPrompt => "jump_prev_prompt",
             JumpNextPrompt => "jump_next_prompt",
             CopyLastOutput => "copy_last_output",
+            SearchScrollback => "search",
             FontBigger => "font_bigger",
             FontSmaller => "font_smaller",
             FontReset => "font_reset",
@@ -150,6 +152,7 @@ impl Action {
             JumpPrevPrompt => "Jump to previous command",
             JumpNextPrompt => "Jump to next command",
             CopyLastOutput => "Copy last command output",
+            SearchScrollback => "Search scrollback",
             FontBigger => "Increase font size",
             FontSmaller => "Decrease font size",
             FontReset => "Reset font size",
@@ -203,6 +206,7 @@ impl Action {
             "jump_prev_prompt" => JumpPrevPrompt,
             "jump_next_prompt" => JumpNextPrompt,
             "copy_last_output" => CopyLastOutput,
+            "search" => SearchScrollback,
             "font_bigger" => FontBigger,
             "font_smaller" => FontSmaller,
             "font_reset" => FontReset,
@@ -266,6 +270,7 @@ impl Action {
             Copy,
             Paste,
             CopyLastOutput,
+            SearchScrollback,
             ScrollToTop,
             ScrollToBottom,
             JumpPrevPrompt,
@@ -412,6 +417,7 @@ fn default_bindings() -> HashMap<Chord, Action> {
     bind(&mut m, "ctrl+shift+c", Copy);
     bind(&mut m, "ctrl+shift+v", Paste);
     bind(&mut m, "ctrl+shift+o", CopyLastOutput);
+    bind(&mut m, "ctrl+shift+f", SearchScrollback);
     bind(&mut m, "shift+pageup", ScrollPageUp);
     bind(&mut m, "shift+pagedown", ScrollPageDown);
     bind(&mut m, "ctrl+shift+home", ScrollToTop);
@@ -429,7 +435,7 @@ fn default_bindings() -> HashMap<Chord, Action> {
     bind(&mut m, "ctrl+shift+a", ToggleAi);
     bind(&mut m, "ctrl+shift+g", AskAiAboutError);
     bind(&mut m, "ctrl+shift+s", QuickConnect);
-    bind(&mut m, "ctrl+shift+f", HintMode);
+    bind(&mut m, "ctrl+shift+space", HintMode);
     bind(&mut m, "ctrl+shift+n", LaunchClaude);
     bind(&mut m, "ctrl+shift+b", ToggleBroadcast);
     m
@@ -448,12 +454,13 @@ pub fn default_hints() -> HashMap<String, String> {
         ("copy", "Ctrl+Shift+C"),
         ("paste", "Ctrl+Shift+V"),
         ("copy_last_output", "Ctrl+Shift+O"),
+        ("search", "Ctrl+Shift+F"),
         ("command_palette", "Ctrl+Shift+P"),
         ("show_docs", "F1"),
         ("toggle_ai", "Ctrl+Shift+A"),
         ("ask_ai_about_error", "Ctrl+Shift+G"),
         ("quick_connect", "Ctrl+Shift+S"),
-        ("hint_mode", "Ctrl+Shift+F"),
+        ("hint_mode", "Ctrl+Shift+Space"),
         ("launch_claude", "Ctrl+Shift+N"),
         ("toggle_broadcast", "Ctrl+Shift+B"),
         ("jump_prev_prompt", "Ctrl+Shift+Up"),

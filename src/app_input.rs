@@ -2,30 +2,38 @@
 // it shares the imports there.
 
 impl Gpu {
-    fn on_wheel(&mut self, delta: MouseScrollDelta, config: &Config) {
+    fn on_wheel(&mut self, delta: MouseScrollDelta, config: &Config, mods: ModifiersState) {
         // While an overlay owns input, the wheel scrolls it, not the terminal.
         if let Some(ov) = self.overlay.as_mut() {
             let lines = wheel_lines(delta, config.behaviour.wheel_lines, 1.0);
-            match ov {
-                Overlay::Docs(d) => d.scroll(-lines as isize),
-                _ => {}
+            if let Overlay::Docs(d) = ov {
+                d.scroll(-lines as isize);
             }
             self.window.request_redraw();
             return;
         }
+        // A mouse-mode app (unless Shift is held) gets the wheel as button events.
         let lines = wheel_lines(delta, config.behaviour.wheel_lines, self.renderer.cell_size().1);
+        if !mods.shift_key() && self.forward_wheel(lines) {
+            return;
+        }
         if self.tab().focused().scroll(lines as isize) {
             self.window.request_redraw();
         }
     }
 
-    fn on_cursor(&mut self, position: PhysicalPosition<f64>) {
+    fn on_cursor(&mut self, position: PhysicalPosition<f64>, mods: ModifiersState) {
         self.cursor_px = position;
         if self.overlay.is_some() {
             return;
         }
+        // Report drag motion to a mouse-mode app while a button is held.
+        if !mods.shift_key() && self.mouse_down.is_some() {
+            if self.forward_mouse(mouse::Kind::Move, self.mouse_down.unwrap(), position) {
+                return;
+            }
+        }
         let area = self.active_area();
-        // Which pane is under the pointer, and the local point inside it.
         if let Some((id, rect)) = self.pane_at(position, area) {
             if self.tab().focused_ptr() == id && self.tab().focused().selecting {
                 if let Some(point) = self.point_in(id, rect, position) {
@@ -37,19 +45,46 @@ impl Gpu {
         }
     }
 
-    fn on_click(&mut self, state: ElementState, button: MouseButton) {
+    fn on_click(&mut self, state: ElementState, button: MouseButton, mods: ModifiersState) {
         if self.overlay.is_some() {
             return;
         }
-        let area = self.active_area();
+        // Focus the pane under the pointer on any press first.
+        if state == ElementState::Pressed {
+            let area = self.active_area();
+            if let Some((id, _)) = self.pane_at(self.cursor_px, area) {
+                self.tab().focus = id;
+            }
+        }
+
+        // A mouse-mode app (unless Shift held) receives the click instead of the
+        // terminal acting on it.
+        let btn = match button {
+            MouseButton::Left => Some(mouse::Button::Left),
+            MouseButton::Middle => Some(mouse::Button::Middle),
+            MouseButton::Right => Some(mouse::Button::Right),
+            _ => None,
+        };
+        if !mods.shift_key() {
+            if let Some(btn) = btn {
+                let kind = if state == ElementState::Pressed {
+                    mouse::Kind::Press
+                } else {
+                    mouse::Kind::Release
+                };
+                if self.forward_mouse(kind, btn, self.cursor_px) {
+                    self.mouse_down = (state == ElementState::Pressed).then_some(btn);
+                    return;
+                }
+            }
+        }
+
         match (state, button) {
             (ElementState::Pressed, MouseButton::Left) => {
+                let area = self.active_area();
                 if let Some((id, rect)) = self.pane_at(self.cursor_px, area) {
-                    self.tab().focus = id;
                     if let Some(point) = self.point_in(id, rect, self.cursor_px) {
-                        // Double-click selects a word, triple a line — the count is
-                        // tracked by clicks landing on the same cell in quick
-                        // succession.
+                        // Double-click selects a word, triple a line.
                         let mode = self.click_mode(point);
                         self.tab().focused().begin_selection(point, mode);
                         self.window.request_redraw();
@@ -65,6 +100,47 @@ impl Gpu {
             (ElementState::Pressed, MouseButton::Middle) => self.paste(),
             _ => {}
         }
+    }
+
+    /// Forwards a mouse event to the focused pane's process if it is in mouse mode.
+    /// Returns whether it was consumed.
+    fn forward_mouse(
+        &mut self,
+        kind: mouse::Kind,
+        button: mouse::Button,
+        pos: PhysicalPosition<f64>,
+    ) -> bool {
+        let area = self.active_area();
+        let Some((id, rect)) = self.pane_at(pos, area) else { return false };
+        if id != self.tab().focused_ptr() {
+            return false;
+        }
+        let (mode, sgr) = {
+            let g = self.tab().focused().grid.lock().unwrap();
+            (g.mouse_mode, g.mouse_sgr)
+        };
+        let (cw, ch) = self.renderer.cell_size();
+        let col = (((pos.x as f32 - rect.x) / cw).floor().max(0.0)) as usize;
+        let row = (((pos.y as f32 - rect.y) / ch).floor().max(0.0)) as usize;
+        if let Some(bytes) = mouse::encode(mode, sgr, button, kind, col, row) {
+            self.tab().focused().write(&bytes);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn forward_wheel(&mut self, lines: f32) -> bool {
+        let button = if lines > 0.0 { mouse::Button::WheelUp } else { mouse::Button::WheelDown };
+        // One report per line of scroll, so a fast wheel moves several rows.
+        let n = lines.abs().round().max(1.0) as usize;
+        let mut consumed = false;
+        for _ in 0..n {
+            if self.forward_mouse(mouse::Kind::Press, button, self.cursor_px) {
+                consumed = true;
+            }
+        }
+        consumed
     }
 
     fn on_key(
@@ -201,6 +277,7 @@ impl Gpu {
             }
             Action::JumpPrevPrompt => self.jump_prompt(-1),
             Action::JumpNextPrompt => self.jump_prompt(1),
+            Action::SearchScrollback => self.overlay = Some(Overlay::Search(overlay::Search::new())),
 
             Action::FontBigger => self.set_font_px(self.font_px + 1.0, config),
             Action::FontSmaller => self.set_font_px(self.font_px - 1.0, config),
@@ -306,6 +383,44 @@ impl Gpu {
                 }
                 _ => {}
             },
+            Overlay::Search(s) => {
+                let mut changed = false;
+                match key {
+                    Key::Named(NamedKey::Escape) => {
+                        self.overlay = None;
+                        self.tab().focused().snap_to_bottom();
+                    }
+                    Key::Named(NamedKey::Enter) | Key::Named(NamedKey::ArrowDown) => {
+                        s.next();
+                        changed = true;
+                    }
+                    Key::Named(NamedKey::ArrowUp) => {
+                        s.prev();
+                        changed = true;
+                    }
+                    Key::Named(NamedKey::Backspace) => {
+                        s.backspace();
+                        self.recompute_search();
+                        changed = true;
+                    }
+                    Key::Named(NamedKey::Space) => {
+                        s.input(' ');
+                        self.recompute_search();
+                        changed = true;
+                    }
+                    Key::Character(txt) => {
+                        for c in txt.chars() {
+                            s.input(c);
+                        }
+                        self.recompute_search();
+                        changed = true;
+                    }
+                    _ => {}
+                }
+                if changed {
+                    self.scroll_to_current_match();
+                }
+            }
             Overlay::Hints(h) => match key {
                 Key::Named(NamedKey::Escape) => self.overlay = None,
                 Key::Character(s) => {
@@ -401,6 +516,7 @@ impl Gpu {
             }
             Action::JumpPrevPrompt => self.jump_prompt(-1),
             Action::JumpNextPrompt => self.jump_prompt(1),
+            Action::SearchScrollback => self.overlay = Some(Overlay::Search(overlay::Search::new())),
             Action::FontBigger => self.set_font_px(self.font_px + 1.0, config),
             Action::FontSmaller => self.set_font_px(self.font_px - 1.0, config),
             Action::FontReset => self.set_font_px(config.font.size, config),
@@ -428,6 +544,30 @@ impl Gpu {
         let area = self.active_area();
         for tab in &mut self.tabs {
             tab.reflow(area);
+        }
+        self.window.request_redraw();
+    }
+
+    /// Reruns the search against the focused pane and updates the match list.
+    fn recompute_search(&mut self) {
+        let query = match &self.overlay {
+            Some(Overlay::Search(s)) => s.query.clone(),
+            _ => return,
+        };
+        let matches = self.tab().focused().grid.lock().unwrap().search(&query);
+        if let Some(Overlay::Search(s)) = self.overlay.as_mut() {
+            s.set_matches(matches);
+        }
+    }
+
+    /// Scrolls the focused pane so the current search match is visible.
+    fn scroll_to_current_match(&mut self) {
+        let target = match &self.overlay {
+            Some(Overlay::Search(s)) => s.current_match(),
+            _ => None,
+        };
+        if let Some((abs, _)) = target {
+            self.tab().focused().grid.lock().unwrap().scroll_to_abs(abs);
         }
         self.window.request_redraw();
     }

@@ -79,6 +79,17 @@ pub struct PaneDraw<'a> {
     pub focused: bool,
     /// Cursor style, or `None` to draw no cursor (unfocused, hidden, or blinked off).
     pub cursor: Option<crate::config::CursorShape>,
+    /// Search matches to highlight: absolute `(row, col)` starts, the match length,
+    /// and which one is current. Empty when not searching.
+    pub search: SearchHighlight<'a>,
+}
+
+/// Search highlight data for a pane. Cheap to pass empty.
+#[derive(Clone, Copy, Default)]
+pub struct SearchHighlight<'a> {
+    pub matches: &'a [(usize, usize)],
+    pub len: usize,
+    pub current: Option<(usize, usize)>,
 }
 
 /// An overlay: a dimmed backdrop plus one or more panels drawn on top.
@@ -500,6 +511,19 @@ impl Renderer {
                 if selection.is_some_and(|s| s.contains(grid, (abs, col))) {
                     bg = srgb(self.theme.selection.0, self.theme.selection.1, self.theme.selection.2);
                 }
+                // Search-match highlight: amber for a match, brighter for the
+                // current one so it stands out among the rest.
+                if pane.search.len > 0 {
+                    let in_match = |start: (usize, usize)| {
+                        abs == start.0 && col >= start.1 && col < start.1 + pane.search.len
+                    };
+                    if pane.search.current.is_some_and(in_match) {
+                        bg = srgb(0xf5, 0xa0, 0x23);
+                        fg = srgb(0x0d, 0x0d, 0x0f);
+                    } else if pane.search.matches.iter().any(|&m| in_match(m)) {
+                        bg = srgb(0x6a, 0x54, 0x1a);
+                    }
+                }
                 // A block cursor inverts the cell it sits on; beam/underline are
                 // drawn as a separate bar after the loop so the character stays
                 // legible under them.
@@ -667,6 +691,7 @@ pub fn offscreen_scene(
                 tint: *tint,
                 focused: *focused,
                 cursor: focused.then_some(crate::config::CursorShape::Block),
+                search: Default::default(),
             })
             .collect();
         let overlay = overlay_specs.as_ref().map(|panels| Overlay {
@@ -680,6 +705,7 @@ pub fn offscreen_scene(
                     tint: None,
                     focused: true,
                     cursor: None,
+                    search: Default::default(),
                 })
                 .collect(),
         });
@@ -784,6 +810,7 @@ pub fn offscreen(path: &str, cmd: &str, font_px: f32, delay_ms: Option<u64>) {
             tint: None,
             focused: true,
             cursor: Some(crate::config::CursorShape::Block),
+            search: Default::default(),
         }];
         renderer.render(
             &device,

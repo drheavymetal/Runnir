@@ -16,6 +16,7 @@ pub enum Overlay {
     Prompt(Prompt),
     Ai(AiPanel),
     Hints(Hints),
+    Search(Search),
 }
 
 impl Overlay {
@@ -28,7 +29,68 @@ impl Overlay {
             Overlay::Prompt(p) => p.render(cols, rows, theme),
             Overlay::Ai(a) => a.render(cols, rows, theme),
             Overlay::Hints(_) => Vec::new(), // Hints annotate panes, drawn elsewhere.
+            Overlay::Search(s) => s.render(cols, rows, theme),
         }
+    }
+}
+
+/// Incremental scrollback search. The matches themselves are highlighted in the
+/// pane by the renderer; this overlay is the little query bar at the bottom.
+pub struct Search {
+    pub query: String,
+    /// Absolute `(row, col)` of each match, in order.
+    pub matches: Vec<(usize, usize)>,
+    pub current: usize,
+}
+
+impl Search {
+    pub fn new() -> Self {
+        Self { query: String::new(), matches: Vec::new(), current: 0 }
+    }
+
+    pub fn input(&mut self, c: char) {
+        self.query.push(c);
+    }
+
+    pub fn backspace(&mut self) {
+        self.query.pop();
+    }
+
+    pub fn set_matches(&mut self, matches: Vec<(usize, usize)>) {
+        self.matches = matches;
+        self.current = 0;
+    }
+
+    pub fn next(&mut self) {
+        if !self.matches.is_empty() {
+            self.current = (self.current + 1) % self.matches.len();
+        }
+    }
+
+    pub fn prev(&mut self) {
+        if !self.matches.is_empty() {
+            self.current = (self.current + self.matches.len() - 1) % self.matches.len();
+        }
+    }
+
+    pub fn current_match(&self) -> Option<(usize, usize)> {
+        self.matches.get(self.current).copied()
+    }
+
+    pub fn render(&self, cols: usize, rows: usize, theme: &Theme) -> Vec<Panel> {
+        let w = cols.min(60).max(20);
+        let mut g = panel_grid(w, 1, theme);
+        let count = if self.matches.is_empty() {
+            if self.query.is_empty() { String::new() } else { " no matches".into() }
+        } else {
+            format!(" {}/{}", self.current + 1, self.matches.len())
+        };
+        let line = format!("/{}", self.query);
+        write(&mut g, 0, 1, &line, normal());
+        write(&mut g, 0, 1 + line.chars().count(), " ", selected());
+        write(&mut g, 0, w.saturating_sub(count.chars().count() + 1), &count, dim());
+        // Anchored to the bottom row, vim-style.
+        vec![Panel { grid: g, col: 0, row: rows.saturating_sub(1) }]
     }
 }
 

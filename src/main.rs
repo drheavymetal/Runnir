@@ -9,6 +9,7 @@ mod grid;
 mod hints;
 mod keys;
 mod layout;
+mod mouse;
 mod overlay;
 mod pane;
 mod pty;
@@ -233,6 +234,8 @@ struct Gpu {
     /// Last left-click time and cell, and the run length, for double/triple click.
     last_click: (Instant, selection::Point),
     click_count: u32,
+    /// Button held down, for drag reporting to mouse-mode apps.
+    mouse_down: Option<mouse::Button>,
     proxy: EventLoopProxy<UserEvent>,
 }
 
@@ -342,6 +345,7 @@ impl App {
             // mistaken for the second half of a double.
             last_click: (Instant::now(), (usize::MAX, usize::MAX)),
             click_count: 0,
+            mouse_down: None,
             proxy: self.proxy.clone(),
         }
     }
@@ -412,9 +416,11 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::Resized(size) => gpu.resize(size.width, size.height, &self.config),
             WindowEvent::RedrawRequested => gpu.render(&self.config),
             WindowEvent::ModifiersChanged(m) => self.mods = m.state(),
-            WindowEvent::MouseWheel { delta, .. } => gpu.on_wheel(delta, &self.config),
-            WindowEvent::CursorMoved { position, .. } => gpu.on_cursor(position),
-            WindowEvent::MouseInput { state, button, .. } => gpu.on_click(state, button),
+            WindowEvent::MouseWheel { delta, .. } => gpu.on_wheel(delta, &self.config, self.mods),
+            WindowEvent::CursorMoved { position, .. } => gpu.on_cursor(position, self.mods),
+            WindowEvent::MouseInput { state, button, .. } => {
+                gpu.on_click(state, button, self.mods)
+            }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 gpu.on_key(event, self.mods, &self.config, &self.keymap, event_loop);
             }

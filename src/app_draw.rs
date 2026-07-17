@@ -49,6 +49,16 @@ impl Gpu {
         let cursor_on = self.cursor_on(config);
         let shape = config.cursor.shape;
 
+        // Search-match highlight for the focused pane, when a search is open.
+        let search = match &self.overlay {
+            Some(Overlay::Search(s)) => crate::render::SearchHighlight {
+                matches: &s.matches,
+                len: s.query.chars().count(),
+                current: s.current_match(),
+            },
+            _ => Default::default(),
+        };
+
         let mut panes: Vec<PaneDraw> = guards
             .iter()
             .map(|(id, r, grid, tint, focused)| PaneDraw {
@@ -58,13 +68,14 @@ impl Gpu {
                 tint: *tint,
                 focused: *focused,
                 cursor: (*focused && cursor_on && self.overlay.is_none()).then_some(shape),
+                search: if *focused { search } else { Default::default() },
             })
             .collect();
 
         // The tab bar and any status chrome are grids too, appended as panes.
         let chrome = self.build_chrome(config, screen);
         for (grid, ox, oy) in &chrome {
-            panes.push(PaneDraw { grid, selection: None, origin: (*ox, *oy), tint: None, focused: true, cursor: None });
+            panes.push(PaneDraw { grid, selection: None, origin: (*ox, *oy), tint: None, focused: true, cursor: None, search: Default::default() });
         }
 
         // Sticky prompt: while scrolled back, pin the focused command's prompt line
@@ -83,7 +94,7 @@ impl Gpu {
                 })
             });
         if let Some((grid, ox, oy)) = &sticky_holder {
-            panes.push(PaneDraw { grid, selection: None, origin: (*ox, *oy), tint: None, focused: true, cursor: None });
+            panes.push(PaneDraw { grid, selection: None, origin: (*ox, *oy), tint: None, focused: true, cursor: None, search: Default::default() });
         }
 
         // Hint labels annotate the focused pane, drawn as a top chrome grid. The
@@ -96,7 +107,24 @@ impl Gpu {
             .map(|(_, _, grid, ..)| grid.abs_row(0));
         let hint_grid = focus_top.and_then(|top| self.build_hints(area, cell, focus, top));
         if let Some((grid, ox, oy)) = &hint_grid {
-            panes.push(PaneDraw { grid, selection: None, origin: (*ox, *oy), tint: None, focused: true, cursor: None });
+            panes.push(PaneDraw { grid, selection: None, origin: (*ox, *oy), tint: None, focused: true, cursor: None, search: Default::default() });
+        }
+
+        // The search bar draws as chrome (undimmed) so matches stay visible.
+        let theme = self.renderer_theme();
+        let search_bar: Option<(Grid, f32, f32)> = match &self.overlay {
+            Some(Overlay::Search(s)) => {
+                let cols = (screen.0 / cell.0).floor().max(1.0) as usize;
+                let rows = (screen.1 / cell.1).floor().max(1.0) as usize;
+                s.render(cols, rows, &theme)
+                    .into_iter()
+                    .next()
+                    .map(|p| (p.grid, p.col as f32 * cell.0, p.row as f32 * cell.1))
+            }
+            _ => None,
+        };
+        if let Some((grid, ox, oy)) = &search_bar {
+            panes.push(PaneDraw { grid, selection: None, origin: (*ox, *oy), tint: None, focused: true, cursor: None, search: Default::default() });
         }
 
         // Overlay panels, on a dimmed backdrop.
@@ -112,6 +140,7 @@ impl Gpu {
                     tint: None,
                     focused: true,
                     cursor: None,
+                    search: Default::default(),
                 })
                 .collect(),
         });
@@ -223,8 +252,10 @@ impl Gpu {
 
     fn build_overlay(&self, screen: (f32, f32), cell: (f32, f32)) -> Option<Vec<(Grid, f32, f32)>> {
         let overlay = self.overlay.as_ref()?;
-        if matches!(overlay, Overlay::Hints(_)) {
-            return None; // Hints are drawn as chrome, not a modal.
+        // Hints and search draw as chrome (no dimmed backdrop) so the pane stays
+        // fully visible behind them.
+        if matches!(overlay, Overlay::Hints(_) | Overlay::Search(_)) {
+            return None;
         }
         let (cw, ch) = cell;
         let cols = (screen.0 / cw).floor().max(1.0) as usize;

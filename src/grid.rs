@@ -66,6 +66,19 @@ struct Saved {
     pen: Pen,
 }
 
+/// What mouse events the running program wants forwarded.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum MouseMode {
+    #[default]
+    Off,
+    /// Press and release only (DECSET 1000).
+    Click,
+    /// Press, release, and motion while a button is held (1002).
+    Drag,
+    /// All motion (1003).
+    Motion,
+}
+
 pub struct Grid {
     cols: usize,
     rows: usize,
@@ -107,6 +120,9 @@ pub struct Grid {
     pub app_cursor: bool,
     pub bracketed_paste: bool,
     pub cursor_visible: bool,
+    /// Mouse tracking the app requested, and whether it wants SGR-encoded reports.
+    pub mouse_mode: MouseMode,
+    pub mouse_sgr: bool,
     autowrap: bool,
     pub title: String,
     pub dirty: bool,
@@ -161,6 +177,8 @@ impl Grid {
             app_cursor: false,
             bracketed_paste: false,
             cursor_visible: true,
+            mouse_mode: MouseMode::Off,
+            mouse_sgr: false,
             autowrap: true,
             title: String::new(),
             dirty: true,
@@ -499,6 +517,41 @@ impl Grid {
         Some(self.text_range((from, 0), (to.max(from), self.cols.saturating_sub(1))))
     }
 
+    /// Finds every occurrence of `needle` (case-insensitive) across scrollback and
+    /// screen, returning each match's absolute `(row, col)` start. Matches within a
+    /// single row only — a query does not span a line wrap.
+    pub fn search(&self, needle: &str) -> Vec<(usize, usize)> {
+        if needle.is_empty() {
+            return Vec::new();
+        }
+        let needle = needle.to_lowercase();
+        let mut hits = Vec::new();
+        for abs in 0..self.total_rows() {
+            let row: String = (0..self.cols)
+                .map(|c| self.abs_cell(abs, c))
+                .filter(|cell| !cell.is_spacer())
+                .map(|cell| cell.ch.to_ascii_lowercase())
+                .collect();
+            // Column mapping is approximate when spacers are present, but exact for
+            // the common ASCII case; good enough to place the highlight.
+            let mut start = 0;
+            while let Some(pos) = row[start..].find(&needle) {
+                let col = row[..start + pos].chars().count();
+                hits.push((abs, col));
+                start += pos + 1;
+            }
+        }
+        hits
+    }
+
+    /// Scrolls so the given absolute row sits in the middle of the view.
+    pub fn scroll_to_abs(&mut self, abs: usize) {
+        let target_top = abs.saturating_sub(self.rows / 2);
+        let offset = self.scrollback.len().saturating_sub(target_top);
+        self.display_offset = offset.min(self.scrollback.len());
+        self.dirty = true;
+    }
+
     /// Text of the rows in `[from, to]` absolute range, trailing blanks trimmed.
     pub fn text_range(&self, from: (usize, usize), to: (usize, usize)) -> String {
         let (from, to) = if from <= to { (from, to) } else { (to, from) };
@@ -692,6 +745,12 @@ impl Grid {
                     self.leave_alt_screen();
                 }
             }
+            // Mouse tracking modes. 1000 = click, 1002 = button-drag, 1003 = any
+            // motion; 1006 = SGR (extended) coordinate encoding.
+            1000 => self.mouse_mode = if on { MouseMode::Click } else { MouseMode::Off },
+            1002 => self.mouse_mode = if on { MouseMode::Drag } else { MouseMode::Off },
+            1003 => self.mouse_mode = if on { MouseMode::Motion } else { MouseMode::Off },
+            1006 => self.mouse_sgr = on,
             _ => {}
         }
     }
@@ -1238,6 +1297,18 @@ mod tests {
         assert!(g.scrollback.len() > 0);
         feed(&mut g, "\x1b[3J");
         assert_eq!(g.scrollback.len(), 0, "3J must erase saved lines");
+    }
+
+    #[test]
+    fn search_finds_matches_across_scrollback_and_screen() {
+        let mut g = Grid::new(20, 2);
+        feed(&mut g, "error here\r\nall fine\r\nanother error now");
+        let hits = g.search("error");
+        assert_eq!(hits.len(), 2, "both 'error' occurrences, in scrollback and screen");
+        // Case-insensitive.
+        feed(&mut g, "\r\nERROR shouting");
+        assert_eq!(g.search("error").len(), 3);
+        assert!(g.search("nope").is_empty());
     }
 
     #[test]

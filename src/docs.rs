@@ -40,6 +40,13 @@ whatever order you built the splits in.
 @ Ctrl+Shift+C / V          copy / paste
 @ middle click              paste
 @ Ctrl+Shift+Home/End       jump to top / live output
+@ Ctrl+Shift+F              search the scrollback; Enter/Up next/prev, Esc closes
+
+# Mouse in full-screen apps
+
+Clicks, drags and the wheel are forwarded to programs that ask for the mouse
+(vim, tmux, htop, less), so clicking a pane in tmux or a process in htop works.
+Hold Shift to override and select text instead, even inside such an app.
 
 Any key you type snaps the view back to the live output, so you never type into a
 scrolled-back screen and wonder why nothing happens.
