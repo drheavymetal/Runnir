@@ -126,6 +126,10 @@ pub struct Grid {
     autowrap: bool,
     pub title: String,
     pub dirty: bool,
+    /// Replies the terminal owes the program (Device Attributes, cursor position).
+    /// The PTY reader thread drains these and writes them back to the child. Without
+    /// answering DA1, fish waits 10s per query and then disables features.
+    responses: Vec<Vec<u8>>,
     /// Inline images (kitty graphics protocol), anchored to a stable row so they
     /// scroll with the content that placed them.
     images: Vec<GridImage>,
@@ -182,6 +186,7 @@ impl Grid {
             autowrap: true,
             title: String::new(),
             dirty: true,
+            responses: Vec::new(),
             images: Vec::new(),
             image_serial: 0,
             cell_px: (0.0, 0.0),
@@ -190,6 +195,12 @@ impl Grid {
 
     pub fn set_cell_px(&mut self, w: f32, h: f32) {
         self.cell_px = (w, h);
+    }
+
+    /// Drains the replies owed to the child (Device Attributes, cursor position),
+    /// which the PTY reader writes back. Called after each parse.
+    pub fn take_responses(&mut self) -> Vec<Vec<u8>> {
+        std::mem::take(&mut self.responses)
     }
 
     /// Places a decoded image at the cursor, reserving its rows so following text
@@ -972,6 +983,14 @@ impl Perform for Grid {
             }
             return;
         }
+        // Secondary Device Attributes: CSI > c. Report a VT220-class terminal,
+        // version 0. Programs use this alongside DA1 for capability detection.
+        if intermediates == b">" {
+            if action == 'c' {
+                self.responses.push(b"\x1b[>1;0;0c".to_vec());
+            }
+            return;
+        }
         if !intermediates.is_empty() {
             return;
         }
@@ -1032,6 +1051,21 @@ impl Perform for Grid {
                     self.col = 0;
                 }
             }
+            // Primary Device Attributes (CSI c / CSI 0 c): claim a VT220 with ANSI
+            // colour. Answering is what stops fish waiting 10s and disabling
+            // features. `\x1b[?62;22c` = service class 62 (VT220), 22 = colour.
+            'c' => self.responses.push(b"\x1b[?62;22c".to_vec()),
+            // Device Status Report. 5 = "are you ok" -> \x1b[0n; 6 = cursor
+            // position -> CSI row ; col R (1-based).
+            'n' => match mode(0) {
+                5 => self.responses.push(b"\x1b[0n".to_vec()),
+                6 => {
+                    let r = self.row + 1;
+                    let c = self.col + 1;
+                    self.responses.push(format!("\x1b[{r};{c}R").into_bytes());
+                }
+                _ => {}
+            },
             _ => return,
         }
         // SGR only changes the pen; it must not cancel a deferred wrap, or a
@@ -1233,6 +1267,21 @@ mod tests {
 
         feed(&mut g, "\x1b[48;5;99mI");
         assert_eq!(g.cell(0, 2).pen.bg, Color::Indexed(99));
+    }
+
+    #[test]
+    fn answers_device_attributes_and_cursor_position() {
+        // Regression: without a DA1 reply, fish waits 10s and disables features.
+        let mut g = Grid::new(20, 5);
+        feed(&mut g, "\x1b[c");
+        assert_eq!(g.take_responses(), vec![b"\x1b[?62;22c".to_vec()]);
+        feed(&mut g, "\x1b[>c");
+        assert_eq!(g.take_responses(), vec![b"\x1b[>1;0;0c".to_vec()]);
+        // DSR cursor position, 1-based.
+        feed(&mut g, "\x1b[3;5H\x1b[6n");
+        assert_eq!(g.take_responses(), vec![b"\x1b[3;5R".to_vec()]);
+        // Responses are drained: a second take is empty.
+        assert!(g.take_responses().is_empty());
     }
 
     #[test]

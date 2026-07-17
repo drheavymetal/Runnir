@@ -134,7 +134,7 @@ impl Pty {
                         } else {
                             rem
                         };
-                        {
+                        let replies = {
                             let mut g = grid.lock().unwrap();
                             parser.advance(&mut *g, &vt);
                             for cmd in cmds {
@@ -154,6 +154,11 @@ impl Pty {
                                     crate::graphics::Event::None => {}
                                 }
                             }
+                            // Terminal query replies (DA1/DA2/DSR) the parser queued.
+                            g.take_responses()
+                        };
+                        for reply in replies {
+                            let _ = thread_writer.send(reply);
                         }
                         on_output();
                     }
