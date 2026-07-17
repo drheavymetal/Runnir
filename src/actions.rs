@@ -408,6 +408,7 @@ fn default_bindings() -> HashMap<Chord, Action> {
     // bare ctrl, which belongs to the program in the pane.
     bind(&mut m, "ctrl+shift+t", NewTab);
     bind(&mut m, "ctrl+shift+w", CloseTab);
+    bind(&mut m, "ctrl+tab", NextTab);
     bind(&mut m, "ctrl+shift+tab", PrevTab);
     bind(&mut m, "ctrl+pageup", PrevTab);
     bind(&mut m, "ctrl+pagedown", NextTab);

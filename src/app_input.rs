@@ -24,6 +24,13 @@ impl Gpu {
 
     fn on_cursor(&mut self, position: PhysicalPosition<f64>, mods: ModifiersState) {
         self.cursor_px = position;
+        // Dragging a divider resizes, regardless of overlay state.
+        if let Some(hit) = self.resizing.clone() {
+            let area = self.active_area();
+            self.tabs[self.active].drag_divider(area, &hit, position.x as f32, position.y as f32);
+            self.window.request_redraw();
+            return;
+        }
         if self.overlay.is_some() {
             return;
         }
@@ -46,9 +53,29 @@ impl Gpu {
     }
 
     fn on_click(&mut self, state: ElementState, button: MouseButton, mods: ModifiersState) {
+        // Left release always ends a divider drag, even over an overlay.
+        if state == ElementState::Released && button == MouseButton::Left {
+            self.resizing = None;
+        }
         if self.overlay.is_some() {
             return;
         }
+
+        // A left press on the tab bar switches tab; on a divider starts a resize.
+        if state == ElementState::Pressed && button == MouseButton::Left {
+            if let Some(i) = self.tab_bar_hit(self.cursor_px) {
+                self.active = i;
+                self.window.request_redraw();
+                return;
+            }
+            let area = self.active_area();
+            let (x, y) = (self.cursor_px.x as f32, self.cursor_px.y as f32);
+            if let Some(hit) = self.tabs[self.active].divider_at(area, x, y) {
+                self.resizing = Some(hit);
+                return;
+            }
+        }
+
         // Focus the pane under the pointer on any press first.
         if state == ElementState::Pressed {
             let area = self.active_area();
@@ -627,6 +654,28 @@ impl Gpu {
         }
     }
 
+    /// Which tab, if any, was clicked in the tab bar. Mirrors the label layout in
+    /// `build_chrome` so the hit-test matches what is drawn.
+    fn tab_bar_hit(&self, pos: PhysicalPosition<f64>) -> Option<usize> {
+        if self.tabs.len() <= 1 {
+            return None; // No bar shown with a single tab.
+        }
+        let (cw, ch) = self.renderer.cell_size();
+        if (pos.y as f32) >= ch {
+            return None; // Below the one-row bar.
+        }
+        let click_col = (pos.x as f32 / cw).floor() as usize;
+        let mut x = 1;
+        for (i, tab) in self.tabs.iter().enumerate() {
+            let label_len = format!(" {} {} ", i + 1, tab.title()).chars().count();
+            if click_col >= x && click_col < x + label_len {
+                return Some(i);
+            }
+            x += label_len + 1;
+        }
+        None
+    }
+
     fn pane_at(&self, pos: PhysicalPosition<f64>, area: Rect) -> Option<(u64, Rect)> {
         let (px, py) = (pos.x as f32, pos.y as f32);
         self.tabs[self.active]
@@ -678,13 +727,11 @@ impl Gpu {
     }
 
     fn set_clipboard(&mut self, text: String) {
-        if let Some(cb) = self.clipboard.as_mut() {
-            let _ = cb.set_text(text);
-        }
+        self.clipboard.set(&text);
     }
 
     fn paste(&mut self) {
-        let Some(text) = self.clipboard.as_mut().and_then(|cb| cb.get_text().ok()) else {
+        let Some(text) = self.clipboard.get() else {
             return;
         };
         let bracketed = self.tab().focused().bracketed_paste();

@@ -1,6 +1,7 @@
 mod actions;
 mod ai;
 mod boxdraw;
+mod clipboard;
 mod config;
 mod docs;
 mod font;
@@ -222,7 +223,7 @@ struct Gpu {
     /// last one back with its layout and scrollback.
     closed_tabs: Vec<session::TabState>,
     cursor_px: PhysicalPosition<f64>,
-    clipboard: Option<arboard::Clipboard>,
+    clipboard: clipboard::Clipboard,
     broadcast: bool,
     font_px: f32,
     ai: ai::Session,
@@ -237,6 +238,8 @@ struct Gpu {
     click_count: u32,
     /// Button held down, for drag reporting to mouse-mode apps.
     mouse_down: Option<mouse::Button>,
+    /// A divider being dragged with the mouse to resize panes.
+    resizing: Option<crate::layout::DividerHit>,
     /// A transient status shown as a toast (e.g. "whispering…") while a background
     /// request is in flight, so an AI action never looks like it did nothing.
     status: Option<String>,
@@ -337,7 +340,7 @@ impl App {
             overlay: None,
             closed_tabs: Vec::new(),
             cursor_px: PhysicalPosition::new(0.0, 0.0),
-            clipboard: arboard::Clipboard::new().ok(),
+            clipboard: clipboard::Clipboard::new(),
             broadcast: false,
             font_px,
             ai: ai::Session::new(),
@@ -350,6 +353,7 @@ impl App {
             last_click: (Instant::now(), (usize::MAX, usize::MAX)),
             click_count: 0,
             mouse_down: None,
+            resizing: None,
             status: None,
             proxy: self.proxy.clone(),
         }

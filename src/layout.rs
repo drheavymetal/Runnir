@@ -198,6 +198,81 @@ impl Node {
     }
 }
 
+/// A divider found under a point: the path to its split node (which child to
+/// descend into at each level), the split's axis, and the split's area — enough to
+/// turn a later cursor position into a new ratio.
+#[derive(Clone)]
+pub struct DividerHit {
+    pub path: Vec<bool>,
+    pub axis: Axis,
+    pub area: Rect,
+}
+
+impl Node {
+    /// The divider under pixel `(x, y)` within `tol` pixels, if any. Used to start a
+    /// mouse resize by grabbing the line between two panes.
+    pub fn divider_at(&self, area: Rect, gap: f32, x: f32, y: f32, tol: f32) -> Option<DividerHit> {
+        let mut path = Vec::new();
+        self.divider_inner(area, gap, x, y, tol, &mut path)
+    }
+
+    fn divider_inner(
+        &self,
+        area: Rect,
+        gap: f32,
+        x: f32,
+        y: f32,
+        tol: f32,
+        path: &mut Vec<bool>,
+    ) -> Option<DividerHit> {
+        let Node::Split { axis, ratio, first, second } = self else {
+            return None;
+        };
+        let (a, b) = split_rect(area, *axis, *ratio, gap);
+        // Is the point on this split's own divider (the gap between a and b)?
+        let on_divider = match axis {
+            Axis::Horizontal => {
+                let line = a.x + a.w + gap / 2.0;
+                (x - line).abs() <= tol + gap / 2.0 && y >= area.y && y <= area.y + area.h
+            }
+            Axis::Vertical => {
+                let line = a.y + a.h + gap / 2.0;
+                (y - line).abs() <= tol + gap / 2.0 && x >= area.x && x <= area.x + area.w
+            }
+        };
+        if on_divider {
+            return Some(DividerHit { path: path.clone(), axis: *axis, area });
+        }
+        // Otherwise descend into whichever child contains the point.
+        path.push(false);
+        if let Some(hit) = first.divider_inner(a, gap, x, y, tol, path) {
+            return Some(hit);
+        }
+        path.pop();
+        path.push(true);
+        let hit = second.divider_inner(b, gap, x, y, tol, path);
+        path.pop();
+        hit
+    }
+
+    /// Sets the ratio of the split at `path` directly, clamped. For mouse resize,
+    /// where the new ratio comes from the cursor position, not a delta.
+    pub fn set_ratio(&mut self, path: &[bool], value: f32) {
+        let mut node = self;
+        for &go_second in path {
+            match node {
+                Node::Split { first, second, .. } => {
+                    node = if go_second { second } else { first };
+                }
+                Node::Leaf(_) => return,
+            }
+        }
+        if let Node::Split { ratio, .. } = node {
+            *ratio = value.clamp(0.05, 0.95);
+        }
+    }
+}
+
 fn split_rect(area: Rect, axis: Axis, ratio: f32, gap: f32) -> (Rect, Rect) {
     match axis {
         Axis::Horizontal => {

@@ -170,6 +170,24 @@ impl Tab {
         self.reflow(area);
     }
 
+    /// The divider under a pixel point, for starting a mouse resize.
+    pub fn divider_at(&self, area: Rect, x: f32, y: f32) -> Option<crate::layout::DividerHit> {
+        // A grab tolerance a little wider than the visible line, so it is easy to hit.
+        self.tree.divider_at(pad(area, self.padding), self.gap, x, y, 5.0)
+    }
+
+    /// Drags the divider identified by `hit` to the cursor, updating the split
+    /// ratio and reflowing so both children's PTYs learn their new size.
+    pub fn drag_divider(&mut self, area: Rect, hit: &crate::layout::DividerHit, x: f32, y: f32) {
+        let a = hit.area;
+        let ratio = match hit.axis {
+            Axis::Horizontal => (x - a.x) / a.w,
+            Axis::Vertical => (y - a.y) / a.h,
+        };
+        self.tree.set_ratio(&hit.path, ratio);
+        self.reflow(area);
+    }
+
     /// Reapplies the layout to every pane after the tree or the window changed, so
     /// each child PTY learns its true size.
     pub fn reflow(&mut self, area: Rect) {
