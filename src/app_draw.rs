@@ -187,6 +187,28 @@ impl Gpu {
             }
         }
 
+        // Command status gutter (D6): a short vertical bar at the left edge of each
+        // command's prompt row — green for exit 0, red for a failure, dim grey while
+        // it is unknown/running — so the pass/fail history is glanceable.
+        for (id, r, grid, ..) in &guards {
+            let _ = id;
+            let (_, ch) = cell;
+            for (row, exit) in grid.command_markers() {
+                let color = match exit {
+                    Some(0) => (0x3f, 0xb9, 0x50),
+                    Some(_) => (0xe0, 0x4f, 0x4f),
+                    None => (0x55, 0x58, 0x5f),
+                };
+                decorations.push(crate::render::SolidRect {
+                    x: r.x,
+                    y: r.y + row as f32 * ch + 1.0,
+                    w: 2.0,
+                    h: (ch - 2.0).max(1.0),
+                    color,
+                });
+            }
+        }
+
         // Hover underline (D14): a thin accent line under the URL/path the pointer is
         // on, drawn as a decoration so it needs no per-cell plumbing.
         if let Some(h) = &self.hover_url {

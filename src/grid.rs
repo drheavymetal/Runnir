@@ -119,6 +119,9 @@ pub struct Grid {
     command_input: Option<(usize, usize)>,
     /// OSC 8 hyperlink URIs. A cell's `pen.link` is index+1 into this (0 = none).
     links: Vec<String>,
+    /// Exit code of finished commands, keyed by the stable row of the prompt that
+    /// launched each (OSC 133;D;code). Drives the pass/fail status gutter.
+    cmd_exits: Vec<(usize, i32)>,
     /// Stable (start, end) rows of the last finished command's output.
     last_output: Option<(usize, usize)>,
     /// Count of commands finished (OSC 133;D), for completion notifications.
@@ -188,6 +191,7 @@ impl Grid {
             command_start: None,
             command_input: None,
             links: Vec::new(),
+            cmd_exits: Vec::new(),
             last_output: None,
             command_seq: 0,
             scroll_top: 0,
@@ -1218,8 +1222,15 @@ impl Perform for Grid {
             }
             // OSC 133: shell integration (FinalTerm/iTerm2). The shell brackets its
             // prompt and each command's output, letting the terminal navigate and
-            // extract by command with no guessing.
-            [b"133", kind, ..] => self.shell_integration(kind),
+            // extract by command with no guessing. `D` may carry an exit code
+            // (`133;D;1`) which drives the pass/fail status gutter.
+            [b"133", kind, extra @ ..] => {
+                let exit = extra
+                    .first()
+                    .and_then(|c| std::str::from_utf8(c).ok())
+                    .and_then(|s| s.trim().parse::<i32>().ok());
+                self.shell_integration(kind, exit);
+            }
             // OSC 8: hyperlink. `8 ; params ; URI` opens a link that following cells
             // belong to; `8 ; ; ` (empty URI) closes it. vte split the OSC on ';',
             // so a URI containing ';' arrives as extra parts — rejoin them.
@@ -1277,7 +1288,7 @@ impl Grid {
         Some((start, end - start + 1, uri))
     }
 
-    fn shell_integration(&mut self, kind: &[u8]) {
+    fn shell_integration(&mut self, kind: &[u8], exit: Option<i32>) {
         match kind.first() {
             // A: a fresh prompt begins here.
             Some(b'A') => {
@@ -1296,16 +1307,44 @@ impl Grid {
                 self.command_start = Some(self.local_to_stable(self.cursor_abs()));
                 self.command_input = None;
             }
-            // D: the command finished. Bank its output range for "copy last output".
+            // D: the command finished. Bank its output range for "copy last output",
+            // and record the exit code against the prompt that started it so the
+            // status gutter can mark it pass (green) or fail (red).
             Some(b'D') => {
                 if let Some(start) = self.command_start.take() {
                     let end = self.local_to_stable(self.cursor_abs());
                     self.last_output = Some((start, end.max(start)));
                 }
+                if let (Some(code), Some(&prompt)) = (exit, self.prompt_marks.last()) {
+                    self.cmd_exits.push((prompt, code));
+                    // Bound the record: it only needs to cover on-screen prompts, and
+                    // eviction prunes old prompt marks anyway.
+                    if self.cmd_exits.len() > 512 {
+                        self.cmd_exits.drain(0..256);
+                    }
+                }
                 self.command_seq += 1;
             }
             _ => {}
         }
+    }
+
+    /// Visible prompt rows with the exit code of the command each launched, as
+    /// `(screen_row, Option<exit>)`: `Some(0)` ok, `Some(n)` failed, `None` unknown
+    /// or still running. `screen_row` is in `0..rows`. Drives the status gutter (D6).
+    pub fn command_markers(&self) -> Vec<(usize, Option<i32>)> {
+        let top = self.scrollback.len().saturating_sub(self.display_offset);
+        let mut out = Vec::new();
+        for &stable in &self.prompt_marks {
+            if let Some(local) = self.stable_to_local(stable) {
+                if local >= top && local < top + self.rows {
+                    let exit =
+                        self.cmd_exits.iter().rev().find(|(p, _)| *p == stable).map(|(_, e)| *e);
+                    out.push((local - top, exit));
+                }
+            }
+        }
+        out
     }
 }
 
@@ -1805,6 +1844,20 @@ mod tests {
         // Prompt start (A), the prompt itself, prompt end / input begins (B), command.
         feed(&mut g, "\x1b]133;A\x07pedro$ \x1b]133;B\x07rm -rf /");
         assert_eq!(g.current_command_text(), "rm -rf /");
+    }
+
+    #[test]
+    fn status_gutter_records_exit_codes_per_prompt() {
+        let mut g = Grid::new(20, 4);
+        // Prompt A on row 0, command runs, finishes with exit 0.
+        feed(&mut g, "\x1b]133;A\x07$ true\r\n\x1b]133;C\x07\x1b]133;D;0\x07");
+        let m = g.command_markers();
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].1, Some(0), "first command succeeded");
+        // A second prompt further down, command fails with exit 1.
+        feed(&mut g, "\x1b]133;A\x07$ false\r\n\x1b]133;C\x07\x1b]133;D;1\x07");
+        let m = g.command_markers();
+        assert!(m.iter().any(|&(_, e)| e == Some(1)), "second command failed: {m:?}");
     }
 
     #[test]

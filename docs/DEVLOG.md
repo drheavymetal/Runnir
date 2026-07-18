@@ -48,7 +48,7 @@ wrapped across multiple rows + Home + Enter can scan short of the wrapped tail;
 RPROMPT tokens on the input row are in scan range. Pre-existing/deferred: dead
 copy_on_select/confirm_close config, ctrl+plus/minus chord unreachable, RIS wipes
 prompt_marks, broadcast-group last-member widening.
-NEXT: deferred W2 folding / D6 gutter / D12 copy-mode / D15 trail (D1 done, commit 44).
+NEXT: deferred W2 folding / D12 copy-mode / D15 trail (D1 commit 44, D6 commit 45).
 
 ## Current task: add 15–20 differential features, 4–5 "wow". Document each here.
 
@@ -92,7 +92,9 @@ DIFFERENTIAL (aim ~15 total incl. above):
       request_user_attention(Critical) when unfocused. commit 26.
 - [x] D5 Primary selection — clipboard set_primary/get_primary (wl-copy/paste --primary);
       copy_selection seeds PRIMARY; middle-click → paste_primary. commit 36.
-- [ ] D6 Command status gutter — exit code + duration next to each prompt (OSC 133 D + timing).
+- [x] D6 Command status gutter — grid.cmd_exits (OSC 133;D;code → prompt stable row);
+      command_markers() visible prompt rows+exit; app_draw draws a green/red/grey left
+      bar per prompt row (SolidRect). commit 45.
 - [x] D7 Session summarizer (AI) — SummarizeSession (Ctrl+Shift+I) → scrollback_text
       → AI panel with a concise-summary prompt (tail-truncated 8k). commit 30.
 - [x] D8 Broadcast groups — Pane.in_group + ToggleBroadcastGroup (palette); broadcast_bytes

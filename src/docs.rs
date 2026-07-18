@@ -67,6 +67,9 @@ input and output begin. That powers:
 @ Ctrl+Shift+O         copy the output of the last command
 @ Ctrl+Shift+G         ask the AI why the last command failed
 
+Each command's prompt row also gets a status bar at the left edge: green when it
+exited 0, red when it failed, dim while it runs — a glanceable pass/fail history.
+
 For fish, add to config.fish:
   function runnir_prompt --on-event fish_prompt
     printf '\\e]133;A\\e\\\\'
