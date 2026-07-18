@@ -1615,6 +1615,172 @@ impl Gpu {
         let cmd = ai::claude_launch_command(config);
         self.split_running(config, cmd);
     }
+
+    // ------------------------------------------------------------------
+    // Remote control (control.rs). Runs on the UI thread via
+    // `UserEvent::Control`, so it may touch tabs/panes/renderer freely.
+    // ------------------------------------------------------------------
+
+    /// Executes one remote-control request against the live terminal and returns the
+    /// response the socket thread will serialise back to the client.
+    fn handle_control(
+        &mut self,
+        req: crate::control::ControlRequest,
+        config: &Config,
+    ) -> crate::control::ControlResponse {
+        use crate::control::{ControlRequest, ControlResponse, LaunchTarget};
+        use serde_json::json;
+
+        match req {
+            ControlRequest::Ls => {
+                let active = self.active;
+                let tabs: Vec<_> = self
+                    .tabs
+                    .iter()
+                    .enumerate()
+                    .map(|(i, tab)| {
+                        let focus = tab.focused_ptr();
+                        let mut panes: Vec<_> = tab
+                            .panes
+                            .iter()
+                            .map(|(id, p)| {
+                                json!({
+                                    "id": id,
+                                    "title": p.title,
+                                    "cwd": p.cwd().map(|c| c.display().to_string()),
+                                    "focused": *id == focus,
+                                })
+                            })
+                            .collect();
+                        // HashMap iteration order is unspecified; sort by id so the
+                        // listing is stable across calls.
+                        panes.sort_by_key(|p| p["id"].as_u64().unwrap_or(0));
+                        json!({
+                            "index": i,
+                            "title": tab.title(),
+                            "active": i == active,
+                            "panes": panes,
+                        })
+                    })
+                    .collect();
+                ControlResponse::ok(json!({ "active": active, "tabs": tabs }))
+            }
+
+            ControlRequest::GetText { target } => match self.control_pane(target) {
+                Some(pane) => {
+                    let text = pane.scrollback_text().join("\n");
+                    ControlResponse::ok(json!({ "text": text }))
+                }
+                None => ControlResponse::error("no such pane"),
+            },
+
+            ControlRequest::SendText { text, target } => match self.control_pane(target) {
+                Some(pane) => {
+                    pane.write(text.as_bytes());
+                    pane.snap_to_bottom();
+                    self.window.request_redraw();
+                    ControlResponse::ok_empty()
+                }
+                None => ControlResponse::error("no such pane"),
+            },
+
+            ControlRequest::Launch { target, cmd } => {
+                let argv = cmd.as_deref().map(argv_of).unwrap_or_default();
+                match target {
+                    LaunchTarget::Tab => self.control_new_tab(config, argv),
+                    LaunchTarget::Split => {
+                        self.split_running(config, argv);
+                        let id = self.tab().focused_ptr();
+                        ControlResponse::ok(json!({ "pane": id }))
+                    }
+                }
+            }
+
+            ControlRequest::NewTab { cmd } => {
+                let argv = cmd.as_deref().map(argv_of).unwrap_or_default();
+                self.control_new_tab(config, argv)
+            }
+
+            ControlRequest::FocusTab { index } => {
+                if index < self.tabs.len() {
+                    self.active = index;
+                    self.window.request_redraw();
+                    ControlResponse::ok_empty()
+                } else {
+                    ControlResponse::error(format!("no tab {index} (have {})", self.tabs.len()))
+                }
+            }
+
+            ControlRequest::CloseTab { index } => {
+                let idx = index.unwrap_or(self.active);
+                if idx >= self.tabs.len() {
+                    return ControlResponse::error(format!("no tab {idx} (have {})", self.tabs.len()));
+                }
+                if self.tabs.len() <= 1 {
+                    return ControlResponse::error("cannot close the last tab");
+                }
+                // Remember it so ReopenClosed can bring it back, matching the keybind.
+                self.closed_tabs.push(self.tabs[idx].to_session());
+                self.tabs.remove(idx);
+                self.active = self.active.min(self.tabs.len() - 1);
+                self.reflow_all();
+                self.window.request_redraw();
+                ControlResponse::ok_empty()
+            }
+
+            ControlRequest::SetColors { opacity, foreground, background, accent, cursor } => {
+                let mut cfg = config.clone();
+                if let Some(o) = opacity {
+                    cfg.window.opacity = o.clamp(0.0, 1.0);
+                }
+                let colors = [
+                    (foreground, &mut cfg.theme.foreground),
+                    (background, &mut cfg.theme.background),
+                    (accent, &mut cfg.theme.accent),
+                    (cursor, &mut cfg.theme.cursor),
+                ];
+                for (hex, slot) in colors {
+                    if let Some(hex) = hex {
+                        match serde_json::from_value::<crate::config::Rgb>(serde_json::Value::String(hex.clone())) {
+                            Ok(rgb) => *slot = rgb,
+                            Err(_) => return ControlResponse::error(format!("bad colour: {hex:?}")),
+                        }
+                    }
+                }
+                self.apply_config(&cfg);
+                ControlResponse::ok_empty()
+            }
+        }
+    }
+
+    /// Resolves a control target to a pane: an explicit id (searched across every
+    /// tab) or, when `None`, the focused pane of the active tab.
+    fn control_pane(&mut self, target: Option<u64>) -> Option<&mut crate::pane::Pane> {
+        match target {
+            Some(id) => self.tabs.iter_mut().find_map(|t| t.panes.get_mut(&id)),
+            None => Some(self.tabs[self.active].focused()),
+        }
+    }
+
+    /// Opens a new tab (optionally running `command`) and focuses it, for the remote
+    /// `launch --type tab` / `new-tab` commands. Returns the new pane id on success.
+    fn control_new_tab(&mut self, config: &Config, command: Vec<String>) -> crate::control::ControlResponse {
+        use crate::control::ControlResponse;
+        let area = self.active_area();
+        let id = self.new_pane_id();
+        let spawn = Spawn { command: (!command.is_empty()).then_some(command), cwd: None };
+        let wake = wake_fn(self.proxy.clone());
+        match Tab::new(area, self.renderer.cell_size(), config, id, &spawn, wake) {
+            Ok(tab) => {
+                self.tabs.push(tab);
+                self.active = self.tabs.len() - 1;
+                self.reflow_all();
+                self.window.request_redraw();
+                ControlResponse::ok(serde_json::json!({ "tab": self.active, "pane": id }))
+            }
+            Err(e) => ControlResponse::error(format!("could not spawn: {e}")),
+        }
+    }
 }
 
 fn wheel_lines(delta: MouseScrollDelta, wheel_lines: f32, cell_h: f32) -> f32 {
