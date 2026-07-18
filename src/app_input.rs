@@ -478,6 +478,8 @@ impl Gpu {
             Action::OpenSnippets => self.open_snippet_picker(config),
             Action::CopyMode => self.enter_copy_mode(),
             Action::FoldOutput => self.tab().focused().toggle_fold_all(),
+            Action::ToggleImageWatch => self.toggle_image_watch(config),
+            Action::SetImageWatchDir => self.set_image_watch_dir(),
             Action::QuickConnect => self.open_quick_connect(),
             Action::HintMode => self.open_hints(),
             Action::LaunchClaude => self.launch_claude(config),
@@ -817,6 +819,8 @@ impl Gpu {
             Action::OpenSnippets => self.open_snippet_picker(config),
             Action::CopyMode => self.enter_copy_mode(),
             Action::FoldOutput => self.tab().focused().toggle_fold_all(),
+            Action::ToggleImageWatch => self.toggle_image_watch(config),
+            Action::SetImageWatchDir => self.set_image_watch_dir(),
             Action::Whisper => self.whisper(),
             Action::SearchScrollback => self.overlay = Some(Overlay::Search(overlay::Search::new())),
             Action::QuickConnect => self.open_quick_connect(),
@@ -1212,6 +1216,17 @@ impl Gpu {
             PromptKind::PipeScrollback => {
                 if !value.trim().is_empty() {
                     self.pipe_through(value, true, config);
+                }
+            }
+            PromptKind::ImageWatchDir => {
+                if value.trim().is_empty() {
+                    self.image_watch = None;
+                    self.toast("image auto-preview off", 2);
+                } else {
+                    let dir = crate::watch::expand_tilde(value.trim());
+                    let shown = dir.display().to_string();
+                    self.arm_image_watch(dir, config);
+                    self.toast(&format!("watching {shown} for images"), 3);
                 }
             }
         }
@@ -1846,6 +1861,142 @@ impl Gpu {
     fn launch_claude(&mut self, config: &Config) {
         let cmd = ai::claude_launch_command(config);
         self.split_running(config, cmd);
+    }
+
+    // ------------------------------------------------------------------
+    // Image auto-preview watch: poll a directory and preview new drops.
+    // ------------------------------------------------------------------
+
+    /// Arms the watch on a directory: snapshots what is there now (so only new files
+    /// fire) and remembers the extension filter and preview width from the config.
+    fn arm_image_watch(&mut self, dir: std::path::PathBuf, config: &Config) {
+        let exts = config.watch.extensions.clone();
+        let listing = crate::watch::list_dir(&dir, &exts);
+        let state = crate::watch::WatchState::armed(&listing);
+        self.image_watch = Some(ImageWatch {
+            dir,
+            state,
+            exts,
+            max_width: config.watch.max_width.clamp(1, 1000),
+            last_poll: Instant::now(),
+        });
+    }
+
+    /// Toggles the watch on the focused pane's working directory: off if already
+    /// watching, otherwise armed on that cwd. Shows a toast either way.
+    fn toggle_image_watch(&mut self, config: &Config) {
+        if self.image_watch.is_some() {
+            self.image_watch = None;
+            self.toast("image auto-preview off", 2);
+            return;
+        }
+        match self.tab().focused_ref().cwd() {
+            Some(dir) => {
+                let shown = dir.display().to_string();
+                self.arm_image_watch(dir, config);
+                self.toast(&format!("watching {shown} for images"), 3);
+            }
+            None => self.toast("no working directory to watch", 3),
+        }
+    }
+
+    /// Opens a prompt to set (or clear, with an empty line) the watched directory at
+    /// runtime, pre-filled with the current one.
+    fn set_image_watch_dir(&mut self) {
+        let current = self
+            .image_watch
+            .as_ref()
+            .map(|w| w.dir.display().to_string())
+            .unwrap_or_default();
+        let mut prompt = Prompt::new(
+            PromptKind::ImageWatchDir,
+            "Watch directory for images (empty clears)",
+            Vec::new(),
+        );
+        for c in current.chars() {
+            prompt.input_char(c);
+        }
+        self.overlay = Some(Overlay::Prompt(prompt));
+        self.window.request_redraw();
+    }
+
+    /// Polls the watched directory (throttled to the poll interval) and previews the
+    /// newest file that has become stable since the last poll. A no-op unless a watch
+    /// is armed; never blocks. Skipped while the focused pane is on the alternate
+    /// screen (vim/htop), so a full-screen app is never disrupted mid-use — the new
+    /// files stay unseen and are picked up once the app exits.
+    fn poll_image_watch(&mut self, _config: &Config) {
+        let Some(w) = self.image_watch.as_ref() else { return };
+        if w.last_poll.elapsed() < Duration::from_millis(WATCH_POLL_MS) {
+            return;
+        }
+        if self.tab().focused_ref().grid.lock().unwrap().alt_screen() {
+            return;
+        }
+        // Re-borrow mutably now the throttle and alt-screen guards have passed.
+        let Some(w) = self.image_watch.as_mut() else { return };
+        w.last_poll = Instant::now();
+        let listing = crate::watch::list_dir(&w.dir, &w.exts);
+        let ready = w.state.step(&listing);
+        let max_width = w.max_width;
+        // Only the newest of a batch is previewed (step returns oldest-first); the
+        // rest are already marked seen, so they neither re-fire nor pile up.
+        if let Some(path) = ready.into_iter().next_back() {
+            self.preview_image(&path, max_width);
+        }
+    }
+
+    /// Decodes an image file and places it inline in the focused pane through the
+    /// existing kitty-graphics placement path (`Grid::place_image`), scaled down so
+    /// it is at most `max_width` cells wide and never exceeds the GPU's max texture
+    /// size (the 8192px guard the background path also honours). Reuses the image
+    /// drawing code entirely — this only builds the decoded RGBA to hand it.
+    fn preview_image(&mut self, path: &std::path::Path, max_width: usize) {
+        let img = match image::open(path) {
+            Ok(img) => img,
+            Err(e) => {
+                self.toast(&format!("preview failed: {e}"), 3);
+                return;
+            }
+        };
+        let (cw, _ch) = self.renderer.cell_size();
+        // Target pixel width from the cell budget, capped by the texture limit so a
+        // huge render can never become an invalid (panicking) texture.
+        let cap = self.device.limits().max_texture_dimension_2d.max(1);
+        let target_w = ((max_width as f32 * cw).round() as u32).clamp(1, cap);
+        // Downscale only when the source is wider than the budget (or the cap); never
+        // upscale a small image. thumbnail preserves aspect and clamps both axes.
+        let img = if img.width() > target_w || img.height() > cap {
+            img.thumbnail(target_w, cap)
+        } else {
+            img
+        };
+        let rgba = img.to_rgba8();
+        let (width, height) = rgba.dimensions();
+        // cols/rows = 0 lets place_image derive the cell footprint from the pixel
+        // size and the grid's cell size, so aspect is preserved.
+        let decoded = crate::graphics::Image {
+            id: 0,
+            rgba: rgba.into_raw(),
+            width,
+            height,
+            cols: 0,
+            rows: 0,
+        };
+        {
+            let pane = self.tab().focused();
+            pane.snap_to_bottom();
+            pane.grid.lock().unwrap().place_image(decoded);
+        }
+        self.window.request_redraw();
+    }
+
+    /// Shows a transient toast for `secs` seconds. A small wrapper so the several
+    /// image-watch messages read cleanly.
+    fn toast(&mut self, msg: &str, secs: u64) {
+        self.status = Some(msg.to_string());
+        self.status_expiry = Some(Instant::now() + Duration::from_secs(secs));
+        self.window.request_redraw();
     }
 
     // ------------------------------------------------------------------

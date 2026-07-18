@@ -47,6 +47,18 @@ ai::clean_command now also strips a leading `$` prompt marker. Tests: clean_comm
 +prompt-marker cases, grid fix_last_command_captures_command_and_exit (capture+guard
 data). cargo build + test 222 green, 0 warnings. app_ai.rs::fix_last_command.
 
+## 2026-07-19 — image auto-preview watch (branch worktree-agent-a752120c0a0af7272)
+New `[watch]` config block (enabled/directory/extensions/max_width, all defaulted,
+serde round-trips TOML+JSON) + src/watch.rs: pure `WatchState`/`step` debounce state
+machine (snapshot on arm so old files never fire; a new file waits one stable tick;
+newest of a batch previewed). Polled from Gpu::poll_image_watch on the periodic tick
+(WATCH_POLL_MS=700, self-sustaining WaitUntil added in about_to_wait next to blink;
+skipped on alt-screen). preview_image decodes + downscales to max_width cells (capped
+at max_texture_dimension_2d, the 8192 guard) then reuses Grid::place_image (no new
+image drawing). Two palette actions: ToggleImageWatch (arms on focused pane cwd) and
+SetImageWatchDir (PromptKind::ImageWatchDir, empty clears). 8 new tests. Caveat:
+previews are injected at the live cursor, best viewed at an idle prompt.
+
 ## Status (2026-07-18)
 
 Done: M0–M7 + 4 feature blocks + kitty graphics + mouse-to-TUIs + scrollback search

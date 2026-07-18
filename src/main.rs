@@ -25,6 +25,7 @@ mod settings;
 mod shell_integration;
 mod tab;
 mod themes;
+mod watch;
 mod whisper;
 
 use std::sync::{Arc, Mutex};
@@ -309,6 +310,8 @@ struct Gpu {
     hover_url: Option<HoverUrl>,
     /// Keyboard copy-mode state, or `None` when off (D12).
     copy_mode: Option<CopyMode>,
+    /// The armed image auto-preview watch, or `None` when not watching.
+    image_watch: Option<ImageWatch>,
     /// An in-flight eased scroll: (pane id, current offset, target offset) in
     /// scrollback lines. Drives smooth glide on scroll-to-top/bottom and jumps.
     scroll_glide: Option<(u64, f32, f32)>,
@@ -467,7 +470,7 @@ impl App {
             }
         };
 
-        Gpu {
+        let mut gpu = Gpu {
             window,
             surface,
             device,
@@ -485,6 +488,7 @@ impl App {
             scroll_accum: 0.0,
             hover_url: None,
             copy_mode: None,
+            image_watch: None,
             scroll_glide: None,
             pending_config: None,
             cursor_trail: Vec::new(),
@@ -516,7 +520,16 @@ impl App {
             status: None,
             status_expiry: None,
             proxy: self.proxy.clone(),
+        };
+        // Arm the image auto-preview watch at startup when the config asks for it and
+        // names a directory. A snapshot of the directory is taken now, so files
+        // already there never flood the pane — only new drops fire.
+        if self.config.watch.enabled {
+            if let Some(dir) = self.config.watch.directory.as_deref() {
+                gpu.arm_image_watch(watch::expand_tilde(dir), &self.config);
+            }
         }
+        gpu
     }
 }
 
@@ -539,6 +552,23 @@ struct CopyMode {
     /// same line as new output arrives.
     dropped: usize,
 }
+
+/// An armed image auto-preview watch (the `[watch]` feature): the directory being
+/// polled, the debounce state machine, the extension filter and preview width taken
+/// from config at arm time, and when it was last polled (to throttle to the poll
+/// interval regardless of how often the loop wakes).
+struct ImageWatch {
+    dir: std::path::PathBuf,
+    state: watch::WatchState,
+    exts: Vec<String>,
+    max_width: usize,
+    last_poll: Instant,
+}
+
+/// How often the watched directory is polled, in milliseconds. Slow enough to cost
+/// nothing (one `read_dir` per interval), fast enough that a finished render shows
+/// promptly; also the debounce granularity (a new file waits one interval).
+const WATCH_POLL_MS: u64 = 700;
 
 /// A URL/path under the pointer: which pane, where on screen (absolute row and
 /// start column), how long, and the target itself for a Ctrl-click to act on.
@@ -775,6 +805,12 @@ impl ApplicationHandler<UserEvent> for App {
             return;
         }
 
+        // An armed image watch needs a periodic wake to poll its directory, even on a
+        // fully idle terminal (no output, no blink). This is that wake — the same
+        // self-sustaining WaitUntil pattern the blink uses.
+        let watch_wake = gpu.image_watch.is_some()
+            .then(|| Instant::now() + Duration::from_millis(WATCH_POLL_MS));
+
         // Drive cursor blink. A WaitUntil wake does not itself repaint, so redraw
         // only when the blink phase actually flips — that keeps an idle terminal
         // repainting at exactly the blink rate, not on every timer tick, and never
@@ -791,9 +827,14 @@ impl ApplicationHandler<UserEvent> for App {
             let next = (phase + 1) * interval;
             let since = gpu.start.elapsed().as_millis() as u64;
             let wait = next.saturating_sub(since).max(1);
-            event_loop.set_control_flow(ControlFlow::WaitUntil(
-                Instant::now() + Duration::from_millis(wait),
-            ));
+            let mut deadline = Instant::now() + Duration::from_millis(wait);
+            // Whichever comes first, blink or watch poll, is the one to wake on.
+            if let Some(w) = watch_wake {
+                deadline = deadline.min(w);
+            }
+            event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
+        } else if let Some(w) = watch_wake {
+            event_loop.set_control_flow(ControlFlow::WaitUntil(w));
         } else {
             event_loop.set_control_flow(ControlFlow::Wait);
         }
@@ -878,6 +919,10 @@ impl Gpu {
         // render early-returns when the surface is hidden. Cheap: one u64 compare
         // per pane.
         self.check_bells();
+
+        // Poll the image auto-preview watch (no-op unless armed). Runs on the periodic
+        // wake driven from about_to_wait; never blocks (one read_dir at most).
+        self.poll_image_watch(config);
 
         // Drain OSC 52 clipboard writes and OSC 9/99/777 notifications from every
         // pane on every wake (a PTY produced output → we were woken), so a program's

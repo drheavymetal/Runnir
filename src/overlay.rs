@@ -679,6 +679,8 @@ pub enum PromptKind {
     PipeLastOutput,
     /// A shell command to pipe the whole scrollback through, in a new split.
     PipeScrollback,
+    /// A directory to auto-preview new images from (empty clears the watch).
+    ImageWatchDir,
 }
 
 impl Prompt {

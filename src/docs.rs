@@ -267,6 +267,37 @@ images in the grid — image previews, plots, icons.
 Images scroll with the text that placed them and evict with the scrollback. A
 support query is answered so tools auto-detect it.
 
+# Auto-preview of generated images
+
+Point runnir at a directory your image pipeline writes to (SDXL, ComfyUI, Wan and
+the like) and every new file it drops is previewed inline in the focused pane,
+scaled down to fit. It reuses the same image path as the kitty graphics protocol,
+so the preview looks exactly like an icat one.
+
+From the palette:
+
+@ Auto-preview images: toggle on this pane's dir   arms the watch on the focused
+                   pane's working directory, or turns it off if already on
+@ Auto-preview images: set / clear watched dir     type a directory to watch; an
+                   empty line clears the watch
+
+Only files created or modified after you arm the watch fire, so the existing
+contents of the folder never flood the pane. A file still being written is held
+back until its size settles, so you never see a half-rendered image. When several
+land at once only the newest is shown. A preview is skipped while a full-screen app
+(vim, htop) has the focused pane, and picked up once you leave it.
+
+It can also start on its own. In the config:
+
+  [watch]
+  enabled = true
+  directory = ~/comfyui/output
+  extensions = [ png, jpg, webp ]
+  max_width = 40
+
+An empty extensions list previews any file. max_width is the widest a preview is
+drawn, in cells; a bigger image is scaled down to it, a smaller one left alone.
+
 # Font
 
 @ Ctrl++ / Ctrl+-  bigger / smaller (live, no restart)
