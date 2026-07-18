@@ -78,6 +78,11 @@ impl Gpu {
         if self.overlay.is_some() {
             return;
         }
+        // A mouse press leaves copy-mode (keyboard mode) before it can redirect focus
+        // onto another pane, which would otherwise strand its selection.
+        if state == ElementState::Pressed && self.copy_mode.is_some() {
+            self.exit_copy_mode(false);
+        }
 
         // A left press on the tab bar switches tab; on a divider starts a resize.
         if state == ElementState::Pressed && button == MouseButton::Left {
@@ -213,7 +218,7 @@ impl Gpu {
 
         // Copy-mode owns the keyboard: vim motions drive a virtual cursor/selection.
         if self.copy_mode.is_some() {
-            self.copy_mode_key(&event);
+            self.copy_mode_key(&event, mods);
             return;
         }
 
@@ -670,62 +675,96 @@ impl Gpu {
     /// cursor; hjkl/arrows move it, v anchors a selection, y/Enter yanks, Esc/q exit.
     fn enter_copy_mode(&mut self) {
         let pane_id = self.tab().focused_ptr();
-        let start = {
+        let (start, dropped) = {
             let g = self.tab().focused().grid.lock().unwrap();
-            let row = g.total_rows() - g.rows() + g.cursor().0;
-            (row, g.cursor().1)
+            // Start where the user is looking: the live cursor when following output,
+            // else the top of the scrolled-back view, so it is never off-screen.
+            let start = if g.display_offset() > 0 {
+                (g.abs_row(0), 0)
+            } else {
+                (g.total_rows() - g.rows() + g.cursor().0, g.cursor().1)
+            };
+            (start, g.dropped())
         };
         self.tab().focused().clear_selection();
-        self.copy_mode = Some(CopyMode { pane: pane_id, cur: start, anchor: None });
+        self.copy_mode = Some(CopyMode { pane: pane_id, cur: start, anchor: None, dropped });
         self.sync_copy_selection();
         self.status = Some("copy-mode — hjkl move, v select, y yank, Esc exit".into());
         self.status_expiry = Some(Instant::now() + Duration::from_secs(3));
         self.window.request_redraw();
     }
 
-    /// Mirrors the copy-mode cursor/anchor onto the focused pane's selection so the
-    /// existing highlight rendering shows both the cursor cell and any selection.
+    /// The pane copy-mode is bound to, wherever it lives, so a focus/tab change can't
+    /// redirect copy-mode onto a different pane.
+    fn copy_pane_mut(&mut self) -> Option<&mut crate::pane::Pane> {
+        let id = self.copy_mode.as_ref()?.pane;
+        self.tabs.iter_mut().find_map(|t| t.panes.get_mut(&id))
+    }
+
+    /// Mirrors the copy-mode cursor/anchor onto its pane's selection so the existing
+    /// highlight rendering shows both the cursor cell and any selection.
     fn sync_copy_selection(&mut self) {
         let Some(cm) = self.copy_mode.as_ref() else { return };
         let (anchor, cur) = (cm.anchor.unwrap_or(cm.cur), cm.cur);
-        let pane = self.tab().focused();
-        pane.begin_selection(anchor, crate::selection::Mode::Char);
-        pane.update_selection(cur);
+        if let Some(pane) = self.copy_pane_mut() {
+            pane.begin_selection(anchor, crate::selection::Mode::Char);
+            pane.update_selection(cur);
+        }
     }
 
-    /// Ends copy-mode, optionally copying the selection first.
+    /// Ends copy-mode, optionally copying the selection first. Operates on the bound
+    /// pane, not the focused one.
     fn exit_copy_mode(&mut self, yank: bool) {
-        if yank {
-            if let Some(cm) = self.copy_mode.as_ref() {
-                if cm.anchor.is_some() {
-                    if let Some(text) = self.tab().focused().selection_text() {
-                        self.clipboard.set_primary(&text);
-                        self.set_clipboard(text);
-                    }
-                }
-            }
+        let anchored = self.copy_mode.as_ref().is_some_and(|cm| cm.anchor.is_some());
+        let text = if yank && anchored {
+            self.copy_pane_mut().and_then(|p| p.selection_text())
+        } else {
+            None
+        };
+        if let Some(pane) = self.copy_pane_mut() {
+            pane.clear_selection();
+        }
+        if let Some(text) = text {
+            self.clipboard.set_primary(&text);
+            self.set_clipboard(text);
         }
         self.copy_mode = None;
-        self.tab().focused().clear_selection();
         self.status = None;
         self.window.request_redraw();
     }
 
-    fn copy_mode_key(&mut self, event: &winit::event::KeyEvent) {
+    fn copy_mode_key(&mut self, event: &winit::event::KeyEvent, mods: ModifiersState) {
         use winit::keyboard::{Key, NamedKey};
-        let Some(cm) = self.copy_mode.as_ref() else { return };
-        // The pane vanished (reaped): leave the mode.
-        if !self.tabs[self.active].panes.contains_key(&cm.pane) {
-            self.copy_mode = None;
+        // A modified chord (Ctrl+C, Ctrl+Q, …) leaves copy-mode rather than being
+        // mis-read as a motion key, and hands control back to the shell/bindings.
+        if mods.control_key() || mods.alt_key() || mods.super_key() {
+            self.exit_copy_mode(false);
             return;
         }
-        let (rows, cols, total, top) = {
-            let g = self.tab().focused().grid.lock().unwrap();
-            (g.rows(), g.cols(), g.total_rows(), g.abs_row(0))
+        let Some(cm) = self.copy_mode.as_ref() else { return };
+        let pane_id = cm.pane;
+        // The bound pane must be in the active tab; otherwise (a tab switch) leave.
+        if !self.tabs[self.active].panes.contains_key(&pane_id) {
+            self.exit_copy_mode(false);
+            return;
+        }
+        let (rows, cols, total, top, dropped) = {
+            let g = self.tabs[self.active].panes[&pane_id].grid.lock().unwrap();
+            (g.rows(), g.cols(), g.total_rows(), g.abs_row(0), g.dropped())
         };
         let last_col = cols.saturating_sub(1);
         let last_row = total.saturating_sub(1);
         let mut cm = self.copy_mode.take().unwrap();
+        // Rebase for any eviction since the last key: the abs index space shifts down
+        // one per dropped row, so subtract the delta to stay on the same content.
+        let shift = dropped.saturating_sub(cm.dropped);
+        if shift > 0 {
+            cm.cur.0 = cm.cur.0.saturating_sub(shift);
+            if let Some(a) = cm.anchor.as_mut() {
+                a.0 = a.0.saturating_sub(shift);
+            }
+        }
+        cm.dropped = dropped;
         let (mut yank, mut exit) = (false, false);
 
         match &event.logical_key {
@@ -758,21 +797,20 @@ impl Gpu {
             _ => {}
         }
 
+        self.copy_mode = Some(cm);
         if exit {
-            self.copy_mode = None;
-            self.tab().focused().clear_selection();
-            self.status = None;
-            self.window.request_redraw();
+            self.exit_copy_mode(false);
             return;
         }
-        // Keep the cursor on screen: scroll the viewport when it leaves the top or
-        // bottom of the current view.
-        if cm.cur.0 < top {
-            self.tab().focused().scroll((top - cm.cur.0) as isize);
-        } else if cm.cur.0 > top + rows.saturating_sub(1) {
-            self.tab().focused().scroll(-((cm.cur.0 - (top + rows - 1)) as isize));
+        // Keep the cursor on screen: scroll the bound pane when it leaves the view.
+        let cur0 = self.copy_mode.as_ref().unwrap().cur.0;
+        if let Some(pane) = self.copy_pane_mut() {
+            if cur0 < top {
+                pane.scroll((top - cur0) as isize);
+            } else if cur0 > top + rows.saturating_sub(1) {
+                pane.scroll(-((cur0 - (top + rows - 1)) as isize));
+            }
         }
-        self.copy_mode = Some(cm);
         self.sync_copy_selection();
         if yank {
             self.exit_copy_mode(true);

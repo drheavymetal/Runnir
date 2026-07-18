@@ -214,14 +214,28 @@ impl Gpu {
         // drawn as opaque decorations (colour pre-blended by remaining life).
         if config.cursor.trail {
             let (cw, ch) = cell;
-            if let Some((_, r, grid, ..)) = guards.iter().find(|(id, ..)| *id == focus) {
-                let (crow, ccol) = grid.cursor();
-                let rect = (r.x + ccol as f32 * cw, r.y + crow as f32 * ch, cw, ch);
-                if self.last_cursor_rect.is_some_and(|p| p != rect) {
-                    let p = self.last_cursor_rect.unwrap();
-                    self.cursor_trail.push((p.0, p.1, p.2, p.3, std::time::Instant::now()));
+            // Only sample while following live output: a scrolled-back cursor is drawn
+            // elsewhere (or not at all), so a ghost there would land on unrelated rows.
+            let sampled = guards
+                .iter()
+                .find(|(id, ..)| *id == focus)
+                .filter(|(_, _, grid, ..)| grid.display_offset() == 0)
+                .map(|(_, r, grid, ..)| {
+                    let (crow, ccol) = grid.cursor();
+                    (r.x + ccol as f32 * cw, r.y + crow as f32 * ch, cw, ch)
+                });
+            match sampled {
+                Some(rect) => {
+                    // Push a ghost only for a move of the SAME pane's cursor, not for
+                    // a focus/tab/resize jump.
+                    if let Some((pid, px, py, pw, ph)) = self.last_cursor_rect {
+                        if pid == focus && (px, py, pw, ph) != rect {
+                            self.cursor_trail.push((px, py, pw, ph, std::time::Instant::now()));
+                        }
+                    }
+                    self.last_cursor_rect = Some((focus, rect.0, rect.1, rect.2, rect.3));
                 }
-                self.last_cursor_rect = Some(rect);
+                None => self.last_cursor_rect = None,
             }
             let now = std::time::Instant::now();
             const LIFE_MS: f32 = 180.0;

@@ -48,8 +48,18 @@ wrapped across multiple rows + Home + Enter can scan short of the wrapped tail;
 RPROMPT tokens on the input row are in scan range. Pre-existing/deferred: dead
 copy_on_select/confirm_close config, ctrl+plus/minus chord unreachable, RIS wipes
 prompt_marks, broadcast-group last-member widening.
-NEXT: only W2 folding left (rewrites row/coord mapping — needs a dedicated session).
 D1 c44, D6 c45, D12 c46, D15 c47. 15 of 16 planned features done (all but W2).
+Fable 5 bug-hunt on the 4 new features → 11 findings fixed (commit 48):
+- D6 gutter: skip on alt-screen (was overdrawing vim); prune prompt_marks/cmd_exits
+  on eviction (unbounded growth + lost status).
+- D1 OSC 8: preserve links table across RIS (stale ids aliased new URIs); table-full
+  degrades to untagged not aliased.
+- D12 copy-mode: bind ops to cm.pane not focused() (mouse focus → wrong-pane yank);
+  exit on any click; rebase cur/anchor by dropped-delta on eviction; start visible
+  when scrolled back; Ctrl/Alt/Super exits instead of mis-reading as motion.
+- D15 trail: prune in about_to_wait (was 60Hz spin-loop forever when occluded); skip
+  sampling while scrolled back; key last_cursor_rect to pane (no ghost on focus jump).
+NEXT: only W2 folding left (rewrites row/coord mapping — needs a dedicated session).
 
 ## Current task: add 15–20 differential features, 4–5 "wow". Document each here.
 

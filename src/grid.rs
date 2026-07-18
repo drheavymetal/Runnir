@@ -498,6 +498,12 @@ impl Grid {
         self.parked.is_some()
     }
 
+    /// Rows evicted off the front of scrollback so far. Copy-mode uses the delta to
+    /// keep its cursor on the same line as the ring evicts.
+    pub fn dropped(&self) -> usize {
+        self.dropped
+    }
+
     /// The text currently on the command line: from the OSC 133;B command-input mark
     /// (end of prompt) when the shell emits one, else the last prompt-start mark,
     /// else the cursor's own row — down to the cursor. Used by the command guardian
@@ -724,11 +730,15 @@ impl Grid {
                 self.scrollback.pop_front();
                 self.dropped += 1;
             }
-            // Drop images whose anchor scrolled out of the ring, so the list cannot
-            // grow without bound.
-            if self.dropped != before && !self.images.is_empty() {
+            // Drop anything anchored to a row that scrolled out of the ring, so these
+            // lists cannot grow without bound: images, prompt marks and their exit
+            // codes. (Otherwise a long session grows them forever and old commands'
+            // status is lost by the count-based cap while still scrollable.)
+            if self.dropped != before {
                 let dropped = self.dropped;
                 self.images.retain(|im| im.anchor >= dropped);
+                self.prompt_marks.retain(|&m| m >= dropped);
+                self.cmd_exits.retain(|&(p, _)| p >= dropped);
             }
             // Keep the viewport pinned to the same content while scrolled back,
             // instead of letting it drift as new lines arrive.
@@ -1199,6 +1209,9 @@ impl Perform for Grid {
                 let bells = self.bell_count;
                 let cmd_seq = self.command_seq;
                 let title = std::mem::take(&mut self.title);
+                // Cells kept in scrollback still reference link ids; carry the table
+                // so those ids resolve to their real URIs, not aliases of new links.
+                let links = std::mem::take(&mut self.links);
                 *self = Grid::new(self.cols, self.rows);
                 self.scrollback_limit = limit;
                 self.scrollback = scrollback;
@@ -1207,6 +1220,7 @@ impl Perform for Grid {
                 self.bell_count = bells;
                 self.command_seq = cmd_seq;
                 self.title = title;
+                self.links = links;
             }
             _ => return,
         }
@@ -1261,8 +1275,9 @@ impl Grid {
             return;
         }
         if self.links.len() >= u16::MAX as usize - 1 {
-            // Table full: reuse the last slot rather than overflow the id space.
-            self.pen.link = self.links.len() as u16;
+            // Table full: leave the run untagged rather than alias it to an unrelated
+            // URI. The text-based URL hint still catches plain http links.
+            self.pen.link = 0;
             return;
         }
         self.links.push(uri.to_string());
@@ -1333,6 +1348,11 @@ impl Grid {
     /// `(screen_row, Option<exit>)`: `Some(0)` ok, `Some(n)` failed, `None` unknown
     /// or still running. `screen_row` is in `0..rows`. Drives the status gutter (D6).
     pub fn command_markers(&self) -> Vec<(usize, Option<i32>)> {
+        // A full-screen app owns the screen; the shell's prompt rows underneath are
+        // not visible, so no status bars belong there.
+        if self.parked.is_some() {
+            return Vec::new();
+        }
         let top = self.scrollback.len().saturating_sub(self.display_offset);
         let mut out = Vec::new();
         for &stable in &self.prompt_marks {

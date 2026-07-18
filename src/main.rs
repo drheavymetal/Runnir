@@ -290,8 +290,9 @@ struct Gpu {
     /// Cursor trail ghosts (D15): each is a cell rect and the instant it was left
     /// behind; drawn fading toward the background, pruned once faded.
     cursor_trail: Vec<(f32, f32, f32, f32, Instant)>,
-    /// The focused cursor's cell rect last frame, to detect a jump for the trail.
-    last_cursor_rect: Option<(f32, f32, f32, f32)>,
+    /// The focused pane id and its cursor cell rect last frame, to detect a jump for
+    /// the trail — keyed to the pane so a focus/tab change is not read as a move.
+    last_cursor_rect: Option<(u64, f32, f32, f32, f32)>,
     font_px: f32,
     /// The (family, size, ligatures) the config last asked for, so hot-reload can
     /// tell an actual font change from an unrelated edit — and so a color-only reload
@@ -490,6 +491,10 @@ struct CopyMode {
     cur: crate::selection::Point,
     /// Selection anchor once `v` is pressed; `None` means just navigating.
     anchor: Option<crate::selection::Point>,
+    /// The grid's `dropped` count when last synced, so eviction (which shifts the
+    /// scrollback++screen index space) can be rebased out and the cursor stays on the
+    /// same line as new output arrives.
+    dropped: usize,
 }
 
 /// A URL/path under the pointer: which pane, where on screen (absolute row and
@@ -645,7 +650,10 @@ impl ApplicationHandler<UserEvent> for App {
             gpu.window.request_redraw();
         }
 
-        // Animate the cursor trail (D15) to completion, same as the bell flash.
+        // Animate the cursor trail (D15) to completion, same as the bell flash. Prune
+        // HERE, not only in render(): render early-returns when the window is
+        // occluded, so without this the loop would spin at 60Hz forever while hidden.
+        gpu.cursor_trail.retain(|g| g.4.elapsed().as_millis() <= 180);
         if !gpu.cursor_trail.is_empty() {
             gpu.window.request_redraw();
             event_loop
