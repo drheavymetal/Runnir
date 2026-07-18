@@ -109,10 +109,17 @@ fn dd_to_device(norm: &str) -> bool {
 }
 
 fn git_force_push(norm: &str) -> bool {
-    norm.starts_with("git ")
-        && norm.contains("push")
-        && (norm.contains("--force") || norm.contains("-f") || norm.contains("+"))
-        && !norm.contains("--force-with-lease")
+    if !norm.starts_with("git ") || !norm.split_whitespace().any(|t| t == "push") {
+        return false;
+    }
+    if norm.contains("--force-with-lease") {
+        return false;
+    }
+    // Match --force / -f as whole tokens (not a substring of --follow-tags or a
+    // branch like feature-fix), and a leading-'+' refspec (git push origin +main).
+    norm.split_whitespace().any(|t| {
+        t == "--force" || t == "-f" || (t.starts_with('+') && t.len() > 1 && !t.contains("://"))
+    })
 }
 
 fn fork_bomb(cmd: &str) -> bool {
@@ -152,8 +159,13 @@ mod tests {
     fn flags_sql_and_git_hazards() {
         assert!(danger("psql -c 'DROP TABLE users'").is_some());
         assert!(danger("git push --force origin main").is_some());
+        assert!(danger("git push -f origin main").is_some());
+        assert!(danger("git push origin +main").is_some());
         assert!(danger("git push origin main").is_none());
         assert!(danger("git push --force-with-lease").is_none());
+        // Whole-token match: these must NOT false-positive.
+        assert!(danger("git push --follow-tags").is_none());
+        assert!(danger("git push -u origin feature-fix").is_none());
     }
 
     #[test]

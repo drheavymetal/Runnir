@@ -19,12 +19,13 @@ impl Gpu {
         let mut encoder = self.device.create_command_encoder(&Default::default());
         let screen = (self.surface_config.width as f32, self.surface_config.height as f32);
 
-        // A bell flashes the whole window briefly.
-        self.check_bells();
-
         // Window title tracks the focused pane.
         let title = self.tabs[self.active].title();
         self.window.set_title(if title.is_empty() { "runnir" } else { &title });
+
+        // Drop a zoom that no longer holds (its pane closed or lost focus) so input
+        // never lands on a pane the zoom hides.
+        self.sync_zoom();
 
         // Lock every pane's grid up front; the render borrows them read-only.
         let area = self.active_area();

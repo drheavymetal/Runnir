@@ -713,12 +713,19 @@ impl Gpu {
         for tab in &mut self.tabs {
             tab.reflow(area);
         }
+        self.reapply_zoom();
         self.window.request_redraw();
     }
 
     /// Refreshes context tints/titles periodically, autosaves the session, and
     /// checks for long-running commands that finished while unfocused.
     fn periodic(&mut self, config: &Config) {
+        // Bells are checked here (not only in render) so an occluded or minimized
+        // window — the case where the urgency hint matters most — still raises it;
+        // render early-returns when the surface is hidden. Cheap: one u64 compare
+        // per pane.
+        self.check_bells();
+
         if self.last_context_refresh.elapsed() >= Duration::from_millis(500) {
             self.last_context_refresh = Instant::now();
             let focused = self.window.has_focus();

@@ -494,13 +494,16 @@ impl Grid {
     /// so the prompt's own text is not mistaken for the command about to run.
     pub fn current_command_text(&self) -> String {
         let cur = self.cursor_abs();
-        let (_, col_c) = self.cursor();
-        let end_col = col_c.min(self.cols.saturating_sub(1));
+        // Scan to the END of the cursor row, not the cursor column: pressing Enter
+        // with the cursor moved back (Home, or an edit mid-line) must still see the
+        // whole typed command, or the guardian is trivially bypassed. text_range
+        // trims trailing blanks per row, so the full width is safe.
+        let last_col = self.cols.saturating_sub(1);
         // Prefer the B mark (prompt end): scan from exactly where input begins.
         if let Some((stable, col)) = self.command_input {
             if let Some(row) = self.stable_to_local(stable).filter(|&r| r <= cur) {
-                let start_col = if row == cur { col.min(end_col) } else { col };
-                return self.text_range((row, start_col), (cur, end_col));
+                let start_col = if row == cur { col.min(last_col) } else { col };
+                return self.text_range((row, start_col), (cur, last_col));
             }
         }
         let start_row = self
@@ -509,7 +512,7 @@ impl Grid {
             .and_then(|&s| self.stable_to_local(s))
             .filter(|&r| r <= cur)
             .unwrap_or(cur);
-        self.text_range((start_row, 0), (cur, end_col))
+        self.text_range((start_row, 0), (cur, last_col))
     }
 
     /// The stable index one past the last row that actually holds output — the
@@ -1760,6 +1763,15 @@ mod tests {
         feed(&mut g, "\x1bc");
         assert_eq!(g.bell_count, 3, "bell_count reset by RIS");
         assert_eq!(g.command_seq(), seq, "command_seq reset by RIS");
+    }
+
+    #[test]
+    fn command_text_seen_even_with_cursor_moved_back() {
+        let mut g = Grid::new(40, 3);
+        // Type a command, then send CR to move the cursor to column 0 (as Home / ^A
+        // would). The whole line must still be scanned, not just up to the cursor.
+        feed(&mut g, "\x1b]133;A\x07$ \x1b]133;B\x07rm -rf /\r");
+        assert_eq!(g.current_command_text(), "rm -rf /");
     }
 
     #[test]

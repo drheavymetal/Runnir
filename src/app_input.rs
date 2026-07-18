@@ -224,7 +224,6 @@ impl Gpu {
             && matches!(event.logical_key, Key::Named(NamedKey::Enter))
             && event.state.is_pressed()
             && mods.is_empty()
-            && !self.broadcast
         {
             let line = {
                 let g = self.tab().focused().grid.lock().unwrap();
@@ -672,6 +671,34 @@ impl Gpu {
         self.window.request_redraw();
     }
 
+    /// Drops a zoom that can no longer hold: the zoomed pane was closed, lost focus
+    /// (a focus move, a split, a tab switch), so it is not the one on screen. Without
+    /// this, focus/input would land on a pane the zoom keeps hidden. Called each
+    /// frame before laying out.
+    fn sync_zoom(&mut self) {
+        if let Some(id) = self.zoomed {
+            let tab = &self.tabs[self.active];
+            if !tab.panes.contains_key(&id) || tab.focus != id {
+                self.zoomed = None;
+                let area = self.active_area();
+                self.tabs[self.active].reflow(area);
+            }
+        }
+    }
+
+    /// Re-stretches the zoomed pane to fill the tab after a reflow (window resize,
+    /// font change), so its grid/PTY match what is drawn instead of the small layout
+    /// rect reflow gave it.
+    fn reapply_zoom(&mut self) {
+        if let Some(id) = self.zoomed {
+            if self.tabs[self.active].panes.contains_key(&id) {
+                let area = self.active_area();
+                let rect = self.tabs[self.active].full_rect(area);
+                self.tabs[self.active].resize_one(id, rect);
+            }
+        }
+    }
+
     fn confirm_prompt(&mut self, kind: PromptKind, value: String, config: &Config) {
         match kind {
             PromptKind::RenameTab => {
@@ -694,8 +721,14 @@ impl Gpu {
             }
             PromptKind::GuardedCommand => {
                 // Confirmed: submit the command that was held back. The line is
-                // already typed in the shell, so this is just the Enter we withheld.
-                self.tab().focused().write(b"\r");
+                // already typed in the shell, so this is just the Enter we withheld —
+                // broadcast it to the group if broadcast is on, exactly as the
+                // original keystroke would have gone.
+                if self.broadcast {
+                    self.broadcast_bytes(b"\r");
+                } else {
+                    self.tab().focused().write(b"\r");
+                }
             }
             PromptKind::HistoryInsert => {
                 // Type the chosen history line at the prompt; the user runs it.
@@ -726,6 +759,7 @@ impl Gpu {
         for tab in &mut self.tabs {
             tab.reflow(area);
         }
+        self.reapply_zoom();
         self.window.request_redraw();
     }
 
@@ -856,6 +890,9 @@ impl Gpu {
     /// Acts on the hovered URL/path if the pointer is over one: opens a URL in the
     /// browser, copies a path or hash. Returns whether it consumed the click.
     fn open_hover(&mut self) -> bool {
+        // Recompute against the pointer's current position first: a keyboard tab
+        // switch or a scroll can leave a stale target under the old coordinates.
+        self.update_hover(self.cursor_px);
         let Some(h) = self.hover_url.clone() else { return false };
         crate::hints::act(&h.text, h.kind, &mut self.clipboard);
         true
