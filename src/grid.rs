@@ -65,9 +65,14 @@ pub struct Pen {
     pub flags: Flags,
     /// Underline shape. `Flags::UNDERLINE` is kept in sync (set iff this is not
     /// `None`) so code that only asks "is it underlined?" still works.
+    /// `serde(default)`: sessions saved before this field existed must still
+    /// load (see the on-disk-format note on `Color`).
+    #[serde(default)]
     pub underline: UnderlineStyle,
     /// Colour of the underline decoration. `Color::Default` means "follow the
     /// foreground" (SGR 59); anything else is an explicit colour set by SGR 58.
+    /// `serde(default)` for the same on-disk compatibility reason as `underline`.
+    #[serde(default)]
     pub underline_color: Color,
     /// OSC 8 hyperlink id: 0 = none, else index+1 into the grid's `links` table.
     /// Kept as an id (not the URI) so a cell stays `Copy` and cheap.
@@ -1199,10 +1204,10 @@ impl Grid {
                 21 => self.set_underline(UnderlineStyle::Double),
                 22 => self.pen.flags.remove(Flags::BOLD | Flags::DIM),
                 23 => self.pen.flags.remove(Flags::ITALIC),
-                24 => {
-                    self.set_underline(UnderlineStyle::None);
-                    self.pen.underline_color = Color::Default;
-                }
+                // 24 removes the underline only, exactly like `4:0`. The colour
+                // set by 58 is its own attribute (kitty's colored-underline
+                // protocol): it persists until SGR 59 or a full SGR 0 reset.
+                24 => self.set_underline(UnderlineStyle::None),
                 27 => self.pen.flags.remove(Flags::REVERSE),
                 28 => self.pen.flags.remove(Flags::HIDDEN),
                 29 => self.pen.flags.remove(Flags::STRIKE),
@@ -2013,10 +2018,49 @@ mod tests {
         feed(&mut g, "\x1b[59mC");
         assert_eq!(g.cell(0, 2).pen.underline_color, Color::Default);
 
-        // `SGR 24` clears both the style and any custom colour.
+        // `SGR 24` clears the style only; the colour is its own attribute.
         feed(&mut g, "\x1b[4;58;5;9m\x1b[24mD");
         assert_eq!(g.cell(0, 3).pen.underline, UnderlineStyle::None);
+        assert_eq!(g.cell(0, 3).pen.underline_color, Color::Indexed(9));
+    }
+
+    #[test]
+    fn sgr_24_keeps_underline_color_for_later_underlines() {
+        // Kitty's colored-underline protocol: 24 (and 4:0) remove the line but
+        // not the colour set by 58 — only 59 or SGR 0 reset that. A client that
+        // sets the colour once and toggles the underline per span must keep it.
+        let mut g = Grid::new(10, 1);
+        feed(&mut g, "\x1b[4;58:5:9mA\x1b[24mB\x1b[4mC\x1b[59mD");
+        assert_eq!(g.cell(0, 0).pen.underline, UnderlineStyle::Single);
+        assert_eq!(g.cell(0, 0).pen.underline_color, Color::Indexed(9));
+        // Underline off, colour retained (invisible but pending).
+        assert_eq!(g.cell(0, 1).pen.underline, UnderlineStyle::None);
+        assert_eq!(g.cell(0, 1).pen.underline_color, Color::Indexed(9));
+        // Re-underlining picks the colour back up.
+        assert_eq!(g.cell(0, 2).pen.underline, UnderlineStyle::Single);
+        assert_eq!(g.cell(0, 2).pen.underline_color, Color::Indexed(9));
+        // 59 is the real colour reset.
         assert_eq!(g.cell(0, 3).pen.underline_color, Color::Default);
+
+        // And a full SGR 0 reset drops both the style and the colour.
+        feed(&mut g, "\x1b[4:3;58:5:9m\x1b[0mE");
+        assert_eq!(g.cell(0, 4).pen.underline, UnderlineStyle::None);
+        assert_eq!(g.cell(0, 4).pen.underline_color, Color::Default);
+    }
+
+    #[test]
+    fn pen_deserializes_from_pre_underline_sessions() {
+        // Sessions persist cells as JSON (see session.rs). A session saved
+        // before the styled-underline fields existed carries no `underline` /
+        // `underline_color` keys; loading it must fall back to the defaults, or
+        // every saved session is dropped as unreadable on upgrade.
+        let mut v = serde_json::to_value(Pen::default()).unwrap();
+        let obj = v.as_object_mut().unwrap();
+        obj.remove("underline");
+        obj.remove("underline_color");
+        let pen: Pen = serde_json::from_value(v).expect("old-format Pen must load");
+        assert_eq!(pen.underline, UnderlineStyle::None);
+        assert_eq!(pen.underline_color, Color::Default);
     }
 
     #[test]
