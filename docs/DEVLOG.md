@@ -10,11 +10,11 @@ them even inside double quotes and silently drops the word. Use plain quotes.
 Relaunch live: `pkill -x runnir; setsid ./target/release/runnir >/tmp/runnir-live.log 2>&1 </dev/null & disown`.
 Verify headless: `runnir --dump '<cmd>'`, `runnir --render out.png '<cmd>' [ms]`, `runnir --demo out.png`.
 
-## >>> PENDING INTEGRATION (2026-07-19) — parity batch in worktrees, MERGE THESE <<<
-7 code features built by parallel agents in isolated worktrees under
-`.claude/worktrees/`. Integrate each branch into main (cherry-pick/merge), resolve
-conflicts (hot files: app_input.rs, grid.rs, actions.rs), `cargo build`+`test` after
-each, THEN Fable bug-hunt all. Branches + commits + files touched:
+## >>> INTEGRATED (2026-07-19) — parity batch ALL MERGED to main <<<
+All 7 branches merged into main, commit f442b3d (amended: worktrees untracked +
+.gitignore). `cargo test` → 221 passed, 0 warnings. tab.rs conflict resolved
+(Pane::new rollback + shell_integration param); Spawn.env added to app_input.rs
+new-pane path. Fable bug-hunt on the integrated batch: IN PROGRESS. History below:
 1. Styled underlines (undercurl/dotted/dashed/double + SGR 58 color): branch
    `worktree-agent-a4570a098001fe55e` commit a67c644 — grid.rs, render.rs, shader.wgsl. Pen gained underline+underline_color; Instance +2 attrs.
 2. Rectangular selection (Alt/Ctrl+drag, Mode::Block): branch
