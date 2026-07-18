@@ -1362,12 +1362,12 @@ impl Gpu {
     /// tab. Non-destructive — existing tabs are left in place.
     fn restore_project_session_cmd(&mut self, config: &Config) {
         let Some(key) = self.current_project_key() else {
-            self.toast("cannot read the working directory");
+            self.toast("cannot read the working directory", 3);
             return;
         };
         let store = project_session::ProjectSessions::load();
         let Some(entry) = store.get(&key) else {
-            self.toast(&format!("no saved session for {}", abbreviate_home(&key)));
+            self.toast(&format!("no saved session for {}", abbreviate_home(&key)), 3);
             return;
         };
         let area = self.active_area();
@@ -1393,20 +1393,14 @@ impl Gpu {
         }
         if self.tabs.len() > first_new {
             self.active = first_new;
-            self.toast(&format!("session restored for {}", abbreviate_home(&key)));
+            self.toast(&format!("session restored for {}", abbreviate_home(&key)), 3);
         } else {
-            self.toast("session had no tabs to restore");
+            self.toast("session had no tabs to restore", 3);
         }
         self.reflow_all();
     }
 
     /// Shows a short-lived status message and requests a redraw.
-    fn toast(&mut self, msg: &str) {
-        self.status = Some(msg.to_string());
-        self.status_expiry = Some(Instant::now() + Duration::from_secs(3));
-        self.window.request_redraw();
-    }
-
     /// Selection mode from click cadence: 1 char, 2 word, 3+ line. Two clicks count
     /// as a double only when they land on the same cell within the double-click
     /// window; otherwise the counter resets.
