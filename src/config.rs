@@ -23,6 +23,9 @@ pub struct Config {
     pub ai: Ai,
     /// Auto-preview of images dropped into a watched directory.
     pub watch: Watch,
+    /// Now-playing media overlay (album art, transport, waveform).
+    #[serde(default)]
+    pub media: Media,
     /// Extra keybindings, merged over the built-in ones. `"ctrl+shift+t" = "new_tab"`.
     pub keys: HashMap<String, String>,
     /// Named workspace layouts. Each opens a fresh tab split into one pane per
@@ -73,6 +76,7 @@ impl Default for Config {
             clipboard: ClipboardCfg::default(),
             ai: Ai::default(),
             watch: Watch::default(),
+            media: Media::default(),
             keys: HashMap::new(),
             layouts: Vec::new(),
             snippets: Vec::new(),
@@ -296,6 +300,34 @@ impl Default for Watch {
             extensions: vec!["png".into(), "jpg".into(), "jpeg".into(), "webp".into()],
             max_width: 40,
         }
+    }
+}
+
+// ---- Media (now playing) --------------------------------------------------
+
+/// The now-playing overlay: album art, transport controls and a live waveform.
+/// Metadata and control shell out to `playerctl` (Linux) or `nowplaying-cli` /
+/// AppleScript (macOS); the waveform shells out to `cava` (Linux). All are optional
+/// at runtime — a missing tool simply degrades gracefully.
+///
+/// A missing `[media]` block is fine: every field defaults.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Media {
+    /// Draw a live audio waveform in the overlay, driven by `cava`. On by default; it
+    /// automatically shows nothing when cava is not installed, so it is safe to leave
+    /// enabled everywhere.
+    pub waveform: bool,
+    /// How many waveform bars cava computes and the overlay draws.
+    pub bars: usize,
+    /// Width of the album-art thumbnail in the overlay, in terminal cells (the height
+    /// is derived to keep the cover roughly square).
+    pub art_cells: usize,
+}
+
+impl Default for Media {
+    fn default() -> Self {
+        Self { waveform: true, bars: 24, art_cells: 18 }
     }
 }
 
@@ -569,6 +601,10 @@ impl Config {
         self.scrollback.lines = self.scrollback.lines.min(1_000_000);
         // A zero-width preview draws nothing; an absurd one would fill the pane.
         self.watch.max_width = self.watch.max_width.clamp(1, 1000);
+        // Keep the media overlay's bar count and art size sane (cava rejects extremes,
+        // and a huge art box would overflow the panel).
+        self.media.bars = self.media.bars.clamp(1, 512);
+        self.media.art_cells = self.media.art_cells.clamp(4, 40);
         if self.cursor.blink_interval < 50 {
             self.cursor.blink_interval = 50;
         }
@@ -648,6 +684,45 @@ mod tests {
         let none: Config = toml::from_str("[font]\nsize = 15.0\n").unwrap();
         assert!(!none.watch.enabled, "absent block defaults to disabled");
         assert_eq!(none.watch.max_width, 40);
+    }
+
+    #[test]
+    fn media_block_round_trips_and_defaults() {
+        // The now-playing settings survive both formats, and a missing block defaults.
+        let mut cfg = Config::default();
+        assert!(cfg.media.waveform, "waveform is on by default");
+        assert_eq!(cfg.media.bars, 24);
+        assert_eq!(cfg.media.art_cells, 18);
+
+        cfg.media.waveform = false;
+        cfg.media.bars = 32;
+        cfg.media.art_cells = 24;
+        let toml_text = toml::to_string_pretty(&cfg).unwrap();
+        let from_toml: Config = toml::from_str(&toml_text).expect("media must re-parse from toml");
+        assert!(!from_toml.media.waveform);
+        assert_eq!(from_toml.media.bars, 32);
+        let json_text = serde_json::to_string(&cfg).unwrap();
+        let from_json: Config = serde_json::from_str(&json_text).expect("media must re-parse from json");
+        assert_eq!(from_json.media.art_cells, 24);
+
+        let none: Config = toml::from_str("[font]\nsize = 15.0\n").unwrap();
+        assert!(none.media.waveform, "absent block defaults to waveform on");
+        assert_eq!(none.media.bars, 24);
+    }
+
+    #[test]
+    fn media_values_are_clamped() {
+        let mut cfg = Config::default();
+        cfg.media.bars = 0;
+        cfg.media.art_cells = 0;
+        cfg.validate();
+        assert_eq!(cfg.media.bars, 1);
+        assert_eq!(cfg.media.art_cells, 4);
+        cfg.media.bars = 100_000;
+        cfg.media.art_cells = 100_000;
+        cfg.validate();
+        assert_eq!(cfg.media.bars, 512);
+        assert_eq!(cfg.media.art_cells, 40);
     }
 
     #[test]

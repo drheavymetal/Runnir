@@ -8,6 +8,7 @@
 use crate::actions::Action;
 use crate::config::{SnippetDef, Theme};
 use crate::grid::{Cell, Color, Flags, Grid, Pen};
+use crate::media::{HalfCell, NowPlaying};
 
 /// Which overlay, if any, is capturing input. Only one is active at a time.
 pub enum Overlay {
@@ -21,6 +22,7 @@ pub enum Overlay {
     Theme(ThemePicker),
     Snippets(SnippetPicker),
     ClipHistory(ClipHistoryPicker),
+    Media(MediaOverlay),
 }
 
 impl Overlay {
@@ -38,6 +40,7 @@ impl Overlay {
             Overlay::Theme(t) => t.render(cols, rows, theme),
             Overlay::Snippets(s) => s.render(cols, rows, theme),
             Overlay::ClipHistory(p) => p.render(cols, rows, theme),
+            Overlay::Media(m) => m.render(cols, rows, theme),
         }
     }
 }
@@ -710,6 +713,135 @@ fn clip_preview(entry: &str) -> String {
         out.push_str(" \u{00b6}"); // pilcrow: this entry spans more than one line
     }
     out
+}
+
+// ---- now playing (media) ---------------------------------------------------
+
+/// The now-playing overlay: album art on the left (rendered as half-block cells),
+/// track metadata and playback status on the right, an optional live waveform below,
+/// and a one-line hint of the in-overlay control keys. It holds a snapshot captured
+/// when it opened; the host refreshes the snapshot (and the waveform) while it is open
+/// by calling [`MediaOverlay::set_now_playing`] / [`MediaOverlay::set_wave`].
+pub struct MediaOverlay {
+    np: NowPlaying,
+    /// Cover art as half-block cells (`rows` x `cols`); empty when there is no art.
+    art: Vec<Vec<HalfCell>>,
+    /// The latest waveform frame (one amplitude byte per bar); empty until one lands.
+    bars: Vec<u8>,
+    /// Whether a waveform is expected (config on and cava available), so the layout
+    /// reserves a row for it even before the first frame arrives.
+    wave_on: bool,
+}
+
+impl MediaOverlay {
+    pub fn new(np: NowPlaying, art: Vec<Vec<HalfCell>>, wave_on: bool) -> Self {
+        Self { np, art, bars: Vec::new(), wave_on }
+    }
+
+    /// Replaces the metadata snapshot (and its decoded art) on a refresh.
+    pub fn set_now_playing(&mut self, np: NowPlaying, art: Vec<Vec<HalfCell>>) {
+        self.np = np;
+        self.art = art;
+    }
+
+    /// Replaces only the metadata, keeping the already-decoded art — used on a refresh
+    /// where the cover-art path has not changed, so the file is not re-decoded.
+    pub fn set_meta(&mut self, np: NowPlaying) {
+        self.np = np;
+    }
+
+    /// The current cover-art path, so a refresh can tell whether to re-decode.
+    pub fn art_path(&self) -> Option<&std::path::Path> {
+        self.np.art.as_deref()
+    }
+
+    /// Stores the newest waveform frame for the next repaint.
+    pub fn set_wave(&mut self, bars: Vec<u8>) {
+        self.bars = bars;
+    }
+
+    fn render(&self, cols: usize, rows: usize, theme: &Theme) -> Vec<Panel> {
+        let art_rows = self.art.len();
+        let art_cols = self.art.first().map(|r| r.len()).unwrap_or(0);
+        let meta_x = if art_cols > 0 { art_cols + 4 } else { 2 };
+        let meta_w = 46usize;
+        let w = (meta_x + meta_w).clamp(34, cols.saturating_sub(2).max(34));
+        // Body height: the art, or the four metadata lines, whichever is taller.
+        let body = art_rows.max(4);
+        let wave_h = if self.wave_on { 1 } else { 0 };
+        // header(1) + gap(1) + body + wave + gap(1) + hint(1)
+        let h = (4 + body + wave_h).min(rows.saturating_sub(2).max(8));
+        let mut g = panel_grid(w, h, theme);
+
+        write(&mut g, 0, 2, "Now playing", accent());
+
+        // Album art (half-blocks) on the left: one '▀' per cell, upper half in the top
+        // pixel's colour, the cell background in the bottom pixel's.
+        for (r, line) in self.art.iter().enumerate() {
+            let row = 2 + r;
+            if row >= h.saturating_sub(1) {
+                break;
+            }
+            for (c, cell) in line.iter().enumerate() {
+                let pen = Pen {
+                    fg: Color::Rgb(cell.top.0, cell.top.1, cell.top.2),
+                    bg: Color::Rgb(cell.bottom.0, cell.bottom.1, cell.bottom.2),
+                    ..Pen::default()
+                };
+                write(&mut g, row, 2 + c, "\u{2580}", pen);
+            }
+        }
+
+        // Metadata on the right, clipped to the panel.
+        let room = w.saturating_sub(meta_x + 1);
+        let clip = |s: &str| -> String { s.chars().take(room).collect() };
+        let title = if self.np.title.is_empty() {
+            "(unknown title)".to_string()
+        } else {
+            self.np.title.clone()
+        };
+        write(&mut g, 2, meta_x, &clip(&title), normal());
+        if !self.np.artist.is_empty() {
+            write(&mut g, 3, meta_x, &clip(&self.np.artist), accent());
+        }
+        if !self.np.album.is_empty() {
+            write(&mut g, 4, meta_x, &clip(&self.np.album), dim());
+        }
+        let status = match self.np.status {
+            crate::media::Status::Playing => "\u{25b6} playing",
+            crate::media::Status::Paused => "\u{23f8} paused",
+            crate::media::Status::Stopped => "\u{25a0} stopped",
+        };
+        write(&mut g, 5, meta_x, status, dim());
+
+        // Waveform row, just below the body. A green bar per amplitude byte; before the
+        // first frame (or on silence) it is a flat baseline.
+        if wave_h > 0 {
+            let wy = (2 + body).min(h.saturating_sub(2));
+            let frame = if self.bars.is_empty() {
+                vec![0u8; art_cols.max(24).min(w.saturating_sub(3))]
+            } else {
+                self.bars.clone()
+            };
+            let wave_pen = Pen { fg: Color::Rgb(0x3f, 0xb9, 0x50), bg: bg(), ..Pen::default() };
+            for (i, b) in frame.iter().enumerate() {
+                let col = 2 + i;
+                if col >= w.saturating_sub(1) {
+                    break;
+                }
+                write(&mut g, wy, col, &crate::media::bar_block(*b).to_string(), wave_pen);
+            }
+        }
+
+        // Control hint on the bottom row.
+        let hint = "space play/pause   n/p next/prev   +/- volume   Esc close";
+        let hint: String = hint.chars().take(w.saturating_sub(4)).collect();
+        write(&mut g, h.saturating_sub(1), 2, &hint, dim());
+
+        let col = (cols.saturating_sub(w)) / 2;
+        let row = (rows.saturating_sub(h)) / 3;
+        vec![Panel { grid: g, col, row }]
+    }
 }
 
 // ---- docs ------------------------------------------------------------------

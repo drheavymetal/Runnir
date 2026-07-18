@@ -264,6 +264,21 @@ impl Gpu {
             return;
         }
 
+        // The XF86 media transport keys drive the media backend directly, wherever the
+        // focus is (no overlay needed). Volume media keys are left to the system.
+        if let Key::Named(n) = &event.logical_key {
+            let media = match n {
+                NamedKey::MediaPlayPause => Some(Action::MediaPlayPause),
+                NamedKey::MediaTrackNext => Some(Action::MediaNext),
+                NamedKey::MediaTrackPrevious => Some(Action::MediaPrev),
+                _ => None,
+            };
+            if let Some(a) = media {
+                self.run_action(a, config, event_loop);
+                return;
+            }
+        }
+
         // A bound chord runs its action and never reaches the child.
         if let Some(action) = keymap.resolve(&event.logical_key, mods) {
             self.run_action(action.clone(), config, event_loop);
@@ -483,6 +498,27 @@ impl Gpu {
             Action::SetImageWatchDir => self.set_image_watch_dir(),
             Action::SaveProjectSession => self.save_project_session_cmd(),
             Action::RestoreProjectSession => self.restore_project_session_cmd(config),
+            Action::NowPlaying => self.open_now_playing(),
+            Action::MediaPlayPause => {
+                crate::media::play_pause();
+                self.toast("play / pause", 1);
+            }
+            Action::MediaNext => {
+                crate::media::next();
+                self.toast("next track", 1);
+            }
+            Action::MediaPrev => {
+                crate::media::prev();
+                self.toast("previous track", 1);
+            }
+            Action::MediaVolumeUp => {
+                crate::media::volume(true);
+                self.toast("volume +", 1);
+            }
+            Action::MediaVolumeDown => {
+                crate::media::volume(false);
+                self.toast("volume -", 1);
+            }
             Action::QuickConnect => self.open_quick_connect(),
             Action::HintMode => self.open_hints(),
             Action::LaunchClaude => self.launch_claude(config),
@@ -655,6 +691,38 @@ impl Gpu {
                         p.input(c);
                     }
                 }
+                _ => {}
+            },
+            // The now-playing overlay drives the media backend directly: space toggles
+            // play/pause, n/p change track, +/- change volume; each control is followed
+            // by a quick metadata refresh so the shown status/track catches up.
+            Overlay::Media(_) => match key {
+                Key::Named(NamedKey::Escape) => {
+                    self.overlay = None;
+                    // Stop the waveform worker (and kill cava) as the overlay closes.
+                    let _ = self.media_wave.take();
+                }
+                Key::Named(NamedKey::Space) => {
+                    crate::media::play_pause();
+                    self.spawn_media_fetch();
+                }
+                Key::Character(s) => match s.chars().next() {
+                    Some('n') => {
+                        crate::media::next();
+                        self.spawn_media_fetch();
+                    }
+                    Some('p') => {
+                        crate::media::prev();
+                        self.spawn_media_fetch();
+                    }
+                    Some('+' | '=') => crate::media::volume(true),
+                    Some('-' | '_') => crate::media::volume(false),
+                    Some('q') => {
+                        self.overlay = None;
+                        let _ = self.media_wave.take();
+                    }
+                    _ => {}
+                },
                 _ => {}
             },
             Overlay::Prompt(p) => match key {
@@ -848,6 +916,27 @@ impl Gpu {
             Action::SetImageWatchDir => self.set_image_watch_dir(),
             Action::SaveProjectSession => self.save_project_session_cmd(),
             Action::RestoreProjectSession => self.restore_project_session_cmd(config),
+            Action::NowPlaying => self.open_now_playing(),
+            Action::MediaPlayPause => {
+                crate::media::play_pause();
+                self.toast("play / pause", 1);
+            }
+            Action::MediaNext => {
+                crate::media::next();
+                self.toast("next track", 1);
+            }
+            Action::MediaPrev => {
+                crate::media::prev();
+                self.toast("previous track", 1);
+            }
+            Action::MediaVolumeUp => {
+                crate::media::volume(true);
+                self.toast("volume +", 1);
+            }
+            Action::MediaVolumeDown => {
+                crate::media::volume(false);
+                self.toast("volume -", 1);
+            }
             Action::Whisper => self.whisper(),
             Action::SearchScrollback => self.overlay = Some(Overlay::Search(overlay::Search::new())),
             Action::QuickConnect => self.open_quick_connect(),
@@ -2122,6 +2211,102 @@ impl Gpu {
         self.status = Some(msg.to_string());
         self.status_expiry = Some(Instant::now() + Duration::from_secs(secs));
         self.window.request_redraw();
+    }
+
+    // ------------------------------------------------------------------
+    // Now-playing media (media.rs). Metadata + waveform are fetched on worker
+    // threads and delivered via UserEvent::Media, so the playerctl / cava
+    // subprocess never blocks the UI thread.
+    // ------------------------------------------------------------------
+
+    /// Opens the now-playing overlay. The metadata fetch is asynchronous: this only
+    /// kicks off the worker; the overlay opens (or a "no player" toast shows) once the
+    /// result arrives in [`Gpu::on_media_msg`].
+    fn open_now_playing(&mut self) {
+        self.spawn_media_fetch();
+        self.media_last_refresh = Some(Instant::now());
+        self.toast("loading now playing\u{2026}", 1);
+    }
+
+    /// Spawns a worker that fetches now-playing metadata and delivers it back through
+    /// the event-loop proxy. Non-blocking; safe to call on a timer.
+    fn spawn_media_fetch(&self) {
+        let proxy = self.proxy.clone();
+        std::thread::spawn(move || {
+            let np = crate::media::fetch();
+            let _ = proxy.send_event(UserEvent::Media(crate::media::MediaMsg::NowPlaying(np)));
+        });
+    }
+
+    /// Handles a media worker message: a metadata result (open/refresh the overlay, or
+    /// toast when nothing is playing) or a waveform frame (fed to the open overlay).
+    fn on_media_msg(&mut self, msg: crate::media::MediaMsg, config: &Config) {
+        match msg {
+            crate::media::MediaMsg::NowPlaying(Some(np)) => {
+                // Reuse already-decoded art when the cover path is unchanged (a plain
+                // refresh), so an open overlay does not re-decode the same file on every
+                // timer tick. Only decode when opening fresh or the cover actually changed.
+                let same_art = matches!(
+                    self.overlay.as_ref(),
+                    Some(Overlay::Media(m)) if m.art_path() == np.art.as_deref()
+                );
+                let art = if same_art { None } else { Some(self.decode_media_art(&np, config)) };
+                match self.overlay.as_mut() {
+                    // Already open: refresh in place, keep the waveform worker running.
+                    Some(Overlay::Media(m)) => match art {
+                        Some(a) => m.set_now_playing(np, a),
+                        None => m.set_meta(np),
+                    },
+                    _ => {
+                        // Fresh open: build the overlay and start the waveform worker.
+                        let wave_on = config.media.waveform;
+                        let overlay =
+                            crate::overlay::MediaOverlay::new(np, art.unwrap_or_default(), wave_on);
+                        self.overlay = Some(Overlay::Media(overlay));
+                        self.media_wave = if wave_on {
+                            crate::media::start_waveform(config.media.bars, self.proxy.clone())
+                        } else {
+                            None
+                        };
+                    }
+                }
+                self.window.request_redraw();
+            }
+            crate::media::MediaMsg::NowPlaying(None) => {
+                // A refresh returning nothing while open leaves the last snapshot up; an
+                // initial open with no player just toasts.
+                if !matches!(self.overlay, Some(Overlay::Media(_))) {
+                    self.toast("no media player active", 3);
+                }
+            }
+            crate::media::MediaMsg::Waveform(bars) => {
+                if let Some(Overlay::Media(m)) = self.overlay.as_mut() {
+                    m.set_wave(bars);
+                    self.window.request_redraw();
+                }
+                // A frame that arrives after the overlay closed is simply dropped.
+            }
+        }
+    }
+
+    /// Decodes an album-art file into half-block cells sized for the overlay, or an
+    /// empty grid when there is no local art or it cannot be read. Downscales to a
+    /// small thumbnail first so the sampling stays cheap.
+    fn decode_media_art(
+        &self,
+        np: &crate::media::NowPlaying,
+        config: &Config,
+    ) -> Vec<Vec<crate::media::HalfCell>> {
+        let Some(path) = np.art.as_ref() else { return Vec::new() };
+        let cols = config.media.art_cells.clamp(4, 40);
+        let rows = (cols / 2).max(2);
+        let img = match image::open(path) {
+            Ok(i) => i.thumbnail(256, 256),
+            Err(_) => return Vec::new(),
+        };
+        let rgba = img.to_rgba8();
+        let (w, h) = rgba.dimensions();
+        crate::media::halfblock_art(&rgba, w, h, cols, rows)
     }
 
     // ------------------------------------------------------------------
