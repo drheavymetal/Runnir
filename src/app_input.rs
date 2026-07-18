@@ -680,8 +680,11 @@ impl Gpu {
             let tab = &self.tabs[self.active];
             if !tab.panes.contains_key(&id) || tab.focus != id {
                 self.zoomed = None;
-                let area = self.active_area();
-                self.tabs[self.active].reflow(area);
+                // Reflow ALL tabs, not just the active one: when the zoom is dropped
+                // by switching away, the zoomed pane lives in the PREVIOUS tab, whose
+                // grid/PTY are still stretched to full-rect and would overdraw its
+                // siblings until the next global reflow.
+                self.reflow_all();
             }
         }
     }

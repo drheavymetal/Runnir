@@ -39,7 +39,16 @@ Fable 5 bug-hunt round 1 (4 parallel agents) → 25 findings, fixed in commit 40
   unescape, zsh unmetafy. Hover: real grid columns + display width (wide chars).
 - Scrollback dump: $XDG_RUNTIME_DIR + 0600 + O_NOFOLLOW (was predictable /tmp).
 - Picker: Down clamped to rendered window. 155 tests.
-NEXT: Fable 5 round 2 on the fixes; deferred features W2/D1/D6/D12/D15.
+Fable 5 rounds 2-4 (convergence): r2 5 bugs (commit 41), r3 6 bugs incl. guardian
+cursor-bypass + zoom desync (commit 42), r4 2 bugs (commit 43): zoom tab-switch
+reflow-wrong-tab regression → sync_zoom now reflow_all; RPROMPT "+2" false-positive
+in git force-push → +refspec must carry a letter. r4 verified fixes 3/4/5 clean.
+Documented limitations (conservative guardian, not a security boundary): a command
+wrapped across multiple rows + Home + Enter can scan short of the wrapped tail;
+RPROMPT tokens on the input row are in scan range. Pre-existing/deferred: dead
+copy_on_select/confirm_close config, ctrl+plus/minus chord unreachable, RIS wipes
+prompt_marks, broadcast-group last-member widening.
+NEXT: deferred features W2 folding / D1 OSC 8 / D6 gutter / D12 copy-mode / D15 trail.
 
 ## Current task: add 15–20 differential features, 4–5 "wow". Document each here.
 

@@ -117,8 +117,12 @@ fn git_force_push(norm: &str) -> bool {
     }
     // Match --force / -f as whole tokens (not a substring of --follow-tags or a
     // branch like feature-fix), and a leading-'+' refspec (git push origin +main).
+    // The refspec must carry a letter, so a numeric RPROMPT token like "+2" that the
+    // full-row scan may pick up is not mistaken for a force-push refspec.
     norm.split_whitespace().any(|t| {
-        t == "--force" || t == "-f" || (t.starts_with('+') && t.len() > 1 && !t.contains("://"))
+        t == "--force"
+            || t == "-f"
+            || (t.starts_with('+') && t[1..].chars().any(|c| c.is_alphabetic()))
     })
 }
 
@@ -166,6 +170,8 @@ mod tests {
         // Whole-token match: these must NOT false-positive.
         assert!(danger("git push --follow-tags").is_none());
         assert!(danger("git push -u origin feature-fix").is_none());
+        // A numeric RPROMPT token the full-row scan may append is not a +refspec.
+        assert!(danger("git push origin main +2").is_none());
     }
 
     #[test]
