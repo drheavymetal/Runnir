@@ -22,9 +22,11 @@ Fable 5 agents until no bugs. Fable 5 IS available now (Pedro has credits).
 ### Planned features (mark [x] when shipped, with commit)
 
 WOW (aim 4–5):
-- [ ] W1 AI command guardian — intercept dangerous commands (rm -rf /, dd of=, mkfs,
-      DROP TABLE, git push -f, :(){...}) before Enter; confirm/explain. Reads current
-      input line from OSC 133 command region or prompt→cursor.
+- [x] W1 command guardian — src/guardian.rs danger() scans the line (rm -rf root/home,
+      dd of=/dev, mkfs, DROP/TRUNCATE, git push -f, fork bomb, chmod 777 /). on_key
+      intercepts bare Enter → Grid::current_command_text (last prompt mark→cursor) →
+      PromptKind::GuardedCommand confirm; Enter runs, Esc edits. behaviour.command_guardian
+      (default true). 6 unit tests. commit 28. (Rule-based, not the LLM — instant, offline.)
 - [ ] W2 Semantic command folding — collapse a command's output block (OSC 133 marks);
       fold/unfold current, fold-all. Big cargo build → one line.
 - [ ] W3 Named layouts / workspaces — config `[[layout]]` defines panes+commands;

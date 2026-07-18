@@ -122,6 +122,10 @@ pub struct Behaviour {
     /// Reopen the previous session (tabs, layout, working dirs, scrollback text)
     /// on start. The processes do not survive — only the layout and history do.
     pub restore_session: bool,
+    /// Guard dangerous commands: when the command line about to run matches a known
+    /// destructive pattern (rm -rf /, dd of=, mkfs, DROP TABLE, git push -f, fork
+    /// bomb, …), pressing Enter opens a confirmation instead of running it blindly.
+    pub command_guardian: bool,
 }
 
 impl Default for Behaviour {
@@ -133,6 +137,7 @@ impl Default for Behaviour {
             notify_after_secs: 20,
             confirm_close: true,
             restore_session: true,
+            command_guardian: true,
         }
     }
 }

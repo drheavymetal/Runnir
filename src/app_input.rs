@@ -190,6 +190,28 @@ impl Gpu {
             return;
         }
 
+        // Command guardian: a plain Enter about to submit a destructive command
+        // opens a confirmation first. Only bare Enter (no modifiers) with the view
+        // at the live prompt is guarded, so history editing and TUIs are untouched.
+        if config.behaviour.command_guardian
+            && matches!(event.logical_key, Key::Named(NamedKey::Enter))
+            && event.state.is_pressed()
+            && mods.is_empty()
+            && !self.broadcast
+        {
+            let line = self.tab().focused().grid.lock().unwrap().current_command_text();
+            if let Some(reason) = crate::guardian::danger(&line) {
+                let label = format!("Run this? {reason}");
+                self.overlay = Some(Overlay::Prompt(Prompt::new(
+                    PromptKind::GuardedCommand,
+                    &label,
+                    vec![line.trim().to_string()],
+                )));
+                self.window.request_redraw();
+                return;
+            }
+        }
+
         // Otherwise it is input for the focused pane's process.
         let mode = keys::KeyMode { app_cursor: self.tab().focused().app_cursor() };
         if let Some(bytes) = keys::encode(&event, mods, mode) {
@@ -605,6 +627,11 @@ impl Gpu {
                 if !value.is_empty() {
                     self.send_whisper(value, config);
                 }
+            }
+            PromptKind::GuardedCommand => {
+                // Confirmed: submit the command that was held back. The line is
+                // already typed in the shell, so this is just the Enter we withheld.
+                self.tab().focused().write(b"\r");
             }
         }
     }

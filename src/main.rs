@@ -7,6 +7,7 @@ mod docs;
 mod font;
 mod graphics;
 mod grid;
+mod guardian;
 mod hints;
 mod keys;
 mod layout;

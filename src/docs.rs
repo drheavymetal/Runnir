@@ -122,6 +122,16 @@ launch tools. Examples:
 Runnir actions run immediately; a shell command it decides on is typed at the
 prompt for you to review and run, never executed for you.
 
+# Command guardian
+
+When you press Enter on a command that matches a known destructive pattern, runnir
+pauses and asks you to confirm instead of running it blindly. Enter confirms and
+runs it; Escape returns to the line so you can fix or cancel it. It catches things
+like recursive force-removes of a root or home path, dd onto a raw device, mkfs,
+SQL DROP/TRUNCATE, git force-push and the classic fork bomb. Only a bare Enter at
+the live prompt is guarded, so editing history and full-screen apps are untouched.
+Turn it off with behaviour.command_guardian = false.
+
 # Broadcast input
 
 @ Ctrl+Shift+B     toggle broadcast: what you type goes to every pane in the tab at

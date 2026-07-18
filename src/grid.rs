@@ -477,6 +477,22 @@ impl Grid {
         self.scrollback.len() + self.row
     }
 
+    /// The text currently on the command line: from the most recent prompt mark
+    /// down to the cursor, or — with no OSC 133 marks — the cursor's own row. Used
+    /// by the command guardian to scan what is about to run when Enter is pressed.
+    pub fn current_command_text(&self) -> String {
+        let cur = self.cursor_abs();
+        let (col_r, col_c) = self.cursor();
+        let _ = col_r;
+        let start_row = self
+            .prompt_marks
+            .last()
+            .and_then(|&s| self.stable_to_local(s))
+            .filter(|&r| r <= cur)
+            .unwrap_or(cur);
+        self.text_range((start_row, 0), (cur, col_c.min(self.cols.saturating_sub(1))))
+    }
+
     /// Scroll offsets, oldest first, that put each prompt at the top of the view.
     /// Backs "jump to previous/next command".
     pub fn prompt_offsets(&self) -> Vec<usize> {

@@ -293,6 +293,8 @@ pub enum PromptKind {
     AiCommand,
     /// A whisper: a natural-language instruction turned into terminal actions.
     Whisper,
+    /// A destructive command held at Enter by the guardian: confirm to run it.
+    GuardedCommand,
 }
 
 impl Prompt {
