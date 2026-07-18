@@ -94,6 +94,9 @@ docker blue. It launches the real ssh, so your ~/.ssh/config, jump hosts and
                    open or copy it. This removes most of the reasons to reach for
                    the mouse.
 
+Hovering the pointer over a URL or path also underlines it; Ctrl+click opens a URL
+in the browser or copies a path/hash, without entering hint mode.
+
 # AI assistant
 
 runnir talks to an assistant without leaving the terminal. Claude runs through the

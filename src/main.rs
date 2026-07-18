@@ -274,6 +274,8 @@ struct Gpu {
     /// Fractional scroll carry-over, so slow touchpad swipes (sub-line pixel deltas)
     /// accumulate into smooth motion instead of being truncated to zero (D9).
     scroll_accum: f32,
+    /// The URL/path currently under the pointer, underlined and Ctrl-clickable (D14).
+    hover_url: Option<HoverUrl>,
     font_px: f32,
     ai: ai::Session,
     last_context_refresh: Instant,
@@ -415,6 +417,7 @@ impl App {
             clipboard: clipboard::Clipboard::new(),
             broadcast: false,
             scroll_accum: 0.0,
+            hover_url: None,
             font_px,
             ai: ai::Session::new(),
             last_context_refresh: Instant::now(),
@@ -440,6 +443,18 @@ impl App {
 /// by hot-reload to notice edits.
 fn config_mtime() -> Option<std::time::SystemTime> {
     std::fs::metadata(Config::path()).and_then(|m| m.modified()).ok()
+}
+
+/// A URL/path under the pointer: which pane, where on screen (absolute row and
+/// start column), how long, and the target itself for a Ctrl-click to act on.
+#[derive(Clone, PartialEq)]
+struct HoverUrl {
+    pane: u64,
+    abs_row: usize,
+    col: usize,
+    len: usize,
+    text: String,
+    kind: overlay::HintKind,
 }
 
 fn content_area(cfg: &wgpu::SurfaceConfiguration, cell: (f32, f32), tab_count: usize) -> Rect {

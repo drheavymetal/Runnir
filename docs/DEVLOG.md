@@ -66,7 +66,8 @@ DIFFERENTIAL (aim ~15 total incl. above):
 - [ ] D12 Copy-mode with vim motions (keyboard scrollback nav + select).
 - [x] D13 Tab reordering — MoveTabLeft/Right (Ctrl+Shift+Left/Right), Vec::swap +
       keep focus, wrap-around. commit 29.
-- [ ] D14 URL/path auto-underline on hover (not just hint mode).
+- [x] D14 URL/path hover underline — Gpu.hover_url via hints::find on mouse move;
+      underline drawn as SolidRect decoration; Ctrl+click → hints::act. commit 39.
 - [ ] D15 Config: cursor trail / animations toggle (optional flair).
 
 ## Architecture cheatsheet (for fast edits)

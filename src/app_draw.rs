@@ -186,6 +186,28 @@ impl Gpu {
             }
         }
 
+        // Hover underline (D14): a thin accent line under the URL/path the pointer is
+        // on, drawn as a decoration so it needs no per-cell plumbing.
+        if let Some(h) = &self.hover_url {
+            if let Some((_, r, grid, ..)) = guards.iter().find(|(id, ..)| *id == h.pane) {
+                let top = grid.abs_row(0);
+                if h.abs_row >= top {
+                    let local = h.abs_row - top;
+                    if local < grid.rows() {
+                        let (cw, ch) = cell;
+                        let a = config.theme.accent;
+                        decorations.push(crate::render::SolidRect {
+                            x: r.x + h.col as f32 * cw,
+                            y: r.y + (local as f32 + 1.0) * ch - 2.0,
+                            w: h.len as f32 * cw,
+                            h: 1.5,
+                            color: (a.0, a.1, a.2),
+                        });
+                    }
+                }
+            }
+        }
+
         let flash = self.bell_alpha();
         self.renderer.render(
             &self.device,

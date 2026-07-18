@@ -41,6 +41,10 @@ impl Gpu {
         if self.overlay.is_some() {
             return;
         }
+        // Underline a URL/path under the pointer (D14); repaint when it changes.
+        if self.update_hover(position) {
+            self.window.request_redraw();
+        }
         // Report drag motion to a mouse-mode app while a button is held.
         if !mods.shift_key() && self.mouse_down.is_some() {
             if self.forward_mouse(mouse::Kind::Move, self.mouse_down.unwrap(), position) {
@@ -81,6 +85,15 @@ impl Gpu {
                 self.resizing = Some(hit);
                 return;
             }
+        }
+
+        // Ctrl+left on a hovered URL/path opens/copies it instead of selecting.
+        if state == ElementState::Pressed
+            && button == MouseButton::Left
+            && mods.control_key()
+            && self.open_hover()
+        {
+            return;
         }
 
         // Focus the pane under the pointer on any press first.
@@ -791,6 +804,44 @@ impl Gpu {
         self.visible_rects(area)
             .into_iter()
             .find(|(_, r)| px >= r.x && px < r.x + r.w && py >= r.y && py < r.y + r.h)
+    }
+
+    /// Recomputes which URL/path sits under the pointer (D14). Returns whether the
+    /// hovered target changed, so the caller only repaints when the underline moves.
+    fn update_hover(&mut self, pos: PhysicalPosition<f64>) -> bool {
+        let prev = self.hover_url.clone();
+        self.hover_url = None;
+        if self.overlay.is_none() {
+            let area = self.active_area();
+            if let Some((id, rect)) = self.pane_at(pos, area) {
+                if let Some((abs_row, col)) = self.point_in(id, rect, pos) {
+                    let grid = self.tabs[self.active].panes[&id].grid.lock().unwrap();
+                    for h in crate::hints::find(&grid) {
+                        let len = h.text.chars().count();
+                        if h.abs_row == abs_row && col >= h.col && col < h.col + len {
+                            self.hover_url = Some(HoverUrl {
+                                pane: id,
+                                abs_row,
+                                col: h.col,
+                                len,
+                                text: h.text,
+                                kind: h.kind,
+                            });
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        self.hover_url != prev
+    }
+
+    /// Acts on the hovered URL/path if the pointer is over one: opens a URL in the
+    /// browser, copies a path or hash. Returns whether it consumed the click.
+    fn open_hover(&mut self) -> bool {
+        let Some(h) = self.hover_url.clone() else { return false };
+        crate::hints::act(&h.text, h.kind, &mut self.clipboard);
+        true
     }
 
     fn point_in(&self, id: u64, rect: Rect, pos: PhysicalPosition<f64>) -> Option<selection::Point> {
