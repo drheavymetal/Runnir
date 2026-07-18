@@ -632,7 +632,7 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::MouseWheel { delta, .. } => gpu.on_wheel(delta, &self.config, self.mods),
             WindowEvent::CursorMoved { position, .. } => gpu.on_cursor(position, self.mods),
             WindowEvent::MouseInput { state, button, .. } => {
-                gpu.on_click(state, button, self.mods)
+                gpu.on_click(state, button, self.mods, &self.config)
             }
             // `is_synthetic` presses are emitted by winit for every key already held
             // when the window *gains focus* — they exist only to sync key state, not

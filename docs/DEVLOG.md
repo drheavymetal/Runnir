@@ -89,7 +89,13 @@ uptime<60s: Instant-60s → Option<Instant>) + HIGH (build_chrome drew its own l
 not tab_label → wrong clicks/badge) + unicode width + date-storm + glide input
 swallowed. commit 61. Verify → all correct, 4 lows; fixed glide-cancel gaps
 (search Esc / clear), tab-click under reserved tags, context-tag width. commit 62.
-CONVERGED. NEXT: background image + minimap (2 heaviest).
+CONVERGED.
+Background image (commit 63): bg_shader.wgsl fullscreen tri, premultiplied, drawn
+first; Background struct (own pipeline+texture+uniform, cover-crop scale); needs
+opacity<1 to show; load_background at startup + hot-reload. Minimap (commit 64):
+window.minimap, decorations strip on focused pane right edge (row_fill per sampled
+line + viewport highlight), minimap_jump click-to-scroll. NEXT: Fable rounds on
+background + minimap.
 
 ## Current task: add 15–20 differential features, 4–5 "wow". Document each here.
 

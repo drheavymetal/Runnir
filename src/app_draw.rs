@@ -290,9 +290,54 @@ impl Gpu {
             });
         }
 
+        // Minimap: a slim overview of the whole scrollback on the focused pane's
+        // right edge — one dim bar per sampled line (width = how full the line is),
+        // with the current viewport window highlighted. Click it to jump.
+        if config.window.minimap {
+            if let Some((_, r, grid, ..)) = guards.iter().find(|(id, ..)| *id == focus) {
+                let total = grid.total_rows();
+                let strip_w = 46.0f32;
+                let x0 = r.x + r.w - strip_w;
+                let rows_px = (r.h as usize).max(1);
+                // One screen pixel-row per map entry, sampling the scrollback.
+                let steps = rows_px.min(total.max(1));
+                let a = config.theme.accent;
+                for s in 0..steps {
+                    let abs = s * total / steps.max(1);
+                    let fill = grid.row_fill(abs);
+                    if fill <= 0.0 {
+                        continue;
+                    }
+                    let y = r.y + (s as f32 / steps as f32) * r.h;
+                    decorations.push(crate::render::SolidRect {
+                        x: x0,
+                        y,
+                        w: (strip_w * fill).max(1.0),
+                        h: (r.h / steps as f32).max(1.0),
+                        color: (0x4a, 0x4d, 0x55),
+                    });
+                }
+                // Highlight the visible window.
+                let top = grid.total_rows() - grid.rows() - grid.display_offset();
+                let vy = r.y + (top as f32 / total.max(1) as f32) * r.h;
+                let vh = (grid.rows() as f32 / total.max(1) as f32 * r.h).max(3.0);
+                decorations.push(crate::render::SolidRect {
+                    x: x0 - 1.0,
+                    y: vy,
+                    w: 1.5,
+                    h: vh,
+                    color: (a.0, a.1, a.2),
+                });
+            }
+        }
+
         // Scroll position indicator: a thin thumb on the right edge of any pane that
         // is scrolled back, sized and placed by the viewport's position in history.
-        for (_, r, grid, ..) in &guards {
+        for (id, r, grid, ..) in &guards {
+            // The focused pane's position is already shown by the minimap when on.
+            if config.window.minimap && *id == focus {
+                continue;
+            }
             let off = grid.display_offset();
             if off == 0 {
                 continue;

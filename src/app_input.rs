@@ -72,13 +72,19 @@ impl Gpu {
         }
     }
 
-    fn on_click(&mut self, state: ElementState, button: MouseButton, mods: ModifiersState) {
+    fn on_click(&mut self, state: ElementState, button: MouseButton, mods: ModifiersState, config: &Config) {
         // Left release always ends a divider drag, even over an overlay.
         if state == ElementState::Released && button == MouseButton::Left {
             self.resizing = None;
         }
         if self.overlay.is_some() {
             return;
+        }
+        // A left press in the focused pane's minimap strip jumps to that position.
+        if state == ElementState::Pressed && button == MouseButton::Left && config.window.minimap {
+            if self.minimap_jump(self.cursor_px) {
+                return;
+            }
         }
         // A mouse press leaves copy-mode (keyboard mode) before it can redirect focus
         // onto another pane, which would otherwise strand its selection.
@@ -848,6 +854,36 @@ impl Gpu {
 
     /// Scrolls the focused pane to an absolute scrollback offset, gliding there with
     /// easing when `smooth`, else jumping. `target` is clamped by the grid.
+    /// If `pos` is inside the focused pane's minimap strip (right edge), scrolls the
+    /// pane to the corresponding scrollback position and returns true.
+    fn minimap_jump(&mut self, pos: PhysicalPosition<f64>) -> bool {
+        let area = self.active_area();
+        let focus = self.tab().focused_ptr();
+        let Some((_, r)) = self.tabs[self.active].layout(area).into_iter().find(|(id, _)| *id == focus)
+        else {
+            return false;
+        };
+        let strip_w = 46.0;
+        let (x, y) = (pos.x as f32, pos.y as f32);
+        if x < r.x + r.w - strip_w || x > r.x + r.w || y < r.y || y > r.y + r.h {
+            return false;
+        }
+        let frac = ((y - r.y) / r.h).clamp(0.0, 1.0);
+        let pane = self.tab().focused();
+        let (total, rows, sb) = {
+            let g = pane.grid.lock().unwrap();
+            (g.total_rows(), g.rows(), g.total_rows() - g.rows())
+        };
+        // frac 0 = oldest line, 1 = newest; put that line at the viewport top.
+        let target_top = (frac * total as f32) as usize;
+        let offset = sb.saturating_sub(target_top);
+        let cur = pane.grid.lock().unwrap().display_offset();
+        pane.scroll(offset as isize - cur as isize);
+        let _ = rows;
+        self.window.request_redraw();
+        true
+    }
+
     fn glide_focused_to(&mut self, target: f32, smooth: bool) {
         let id = self.tab().focused_ptr();
         let cur = self.tab().focused().grid.lock().unwrap().display_offset() as f32;

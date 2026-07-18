@@ -89,6 +89,9 @@ pub struct WindowCfg {
     /// How much to dim the background image (0 = black, 1 = full brightness).
     #[serde(default = "default_bg_dim")]
     pub background_dim: f32,
+    /// Show a scrollback minimap on the right edge of the focused pane.
+    #[serde(default)]
+    pub minimap: bool,
 }
 
 fn default_bg_dim() -> f32 {
@@ -106,6 +109,7 @@ impl Default for WindowCfg {
             status_bar: true,
             background: None,
             background_dim: default_bg_dim(),
+            minimap: false,
         }
     }
 }

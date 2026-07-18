@@ -257,6 +257,7 @@ file is safe to keep in a dotfiles repo.
 @ window.status_bar  true shows a bottom bar (cwd, git branch, clock); costs a row
 @ window.background  path to an image drawn behind the terminal (needs opacity < 1)
 @ window.background_dim  0..1 how bright the background image is (default 0.35)
+@ window.minimap   true shows a scrollback minimap on the focused pane; click to jump
 @ cursor.trail     true draws a brief fading trail behind the cursor (flair, off)
 @ behaviour.smooth_scroll  true glides on scroll jumps instead of teleporting
 

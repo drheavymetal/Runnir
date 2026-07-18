@@ -530,6 +530,23 @@ impl Grid {
         self.dropped
     }
 
+    /// Fraction (0..1) of the absolute (local) row `abs` that holds non-blank cells,
+    /// for the minimap. Cheap: one pass over the row.
+    pub fn row_fill(&self, abs: usize) -> f32 {
+        if self.cols == 0 {
+            return 0.0;
+        }
+        let last = (0..self.cols)
+            .rev()
+            .find(|&c| {
+                let cell = self.abs_cell(abs, c);
+                !cell.is_spacer() && cell.ch != ' '
+            })
+            .map(|c| c + 1)
+            .unwrap_or(0);
+        last as f32 / self.cols as f32
+    }
+
     /// Exit code of the most recently finished command, if OSC 133;D carried one.
     /// Drives the tab fail badge.
     pub fn last_exit(&self) -> Option<i32> {
