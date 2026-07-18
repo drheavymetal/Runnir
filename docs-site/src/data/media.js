@@ -1,24 +1,27 @@
-// Capturas REALES renderizadas headless con `runnir --render` / `--demo` en este
-// repo. Clave = titulo exacto de la feature. Valor = { src, cap }.
+// Capturas REALES renderizadas headless con `runnir --render` / `--demo`.
+// Clave = key estable de la feature (ver features.js). Valor = { src, cap:{es,en} }.
+// Real screenshots rendered headless with runnir --render / --demo.
+// Key = the feature's stable key (see features.js). Value = { src, cap:{es,en} }.
 export const MEDIA = {
-  'Pestanas': { src: './img/scene.png', cap: 'Captura real (runnir --demo): dos pestanas, varios paneles y la paleta de comandos abierta.' },
-  'Splits (paneles)': { src: './img/scene.png', cap: 'Captura real (runnir --demo): una pestana dividida en paneles independientes.' },
-  'Teclado primero': { src: './img/scene.png', cap: 'Captura real (runnir --demo): la paleta de comandos con cada accion y su atajo.' },
-  'Panel de asistente IA': { src: './img/scene.png', cap: 'Captura real (runnir --demo): escena multi-panel; el asistente vive en un panel mas.' },
-  'Temas': { src: './img/colors.png', cap: 'Captura real (runnir --render): las 16 colores ANSI y una rampa truecolor.' },
-  'Ligaturas': { src: './img/ligatures.png', cap: 'Captura real (runnir --render): ligaturas de fuente de codigo (->, =>, !=, >=, <=, ==).' },
-  'Caracteres de dibujo de cajas': { src: './img/boxdraw.png', cap: 'Captura real (runnir --render): recuadros de linea simple y doble mas bloques de sombreado, dibujados al tamano de celda.' },
-  'Subrayado normal': { src: './img/underlines.png', cap: 'Captura real (runnir --render): subrayado clasico (SGR 4). Los estilos ondulado/punteado/color son la parte En desarrollo.' },
+  tabs: { src: './img/scene.png', cap: { es: 'Captura real (runnir --demo): dos pestañas, varios paneles y la paleta de comandos abierta.', en: 'Real screenshot (runnir --demo): two tabs, several panes and the command palette open.' } },
+  splits: { src: './img/scene.png', cap: { es: 'Captura real (runnir --demo): una pestaña dividida en paneles independientes.', en: 'Real screenshot (runnir --demo): a tab split into independent panes.' } },
+  'keyboard-first': { src: './img/scene.png', cap: { es: 'Captura real (runnir --demo): la paleta de comandos con cada acción y su atajo.', en: 'Real screenshot (runnir --demo): the command palette with each action and its keybind.' } },
+  'ai-panel': { src: './img/scene.png', cap: { es: 'Captura real (runnir --demo): escena multi-panel; el asistente vive en un panel más.', en: 'Real screenshot (runnir --demo): a multi-pane scene; the assistant lives in one more pane.' } },
+  themes: { src: './img/colors.png', cap: { es: 'Captura real (runnir --render): las 16 colores ANSI y una rampa truecolor.', en: 'Real screenshot (runnir --render): the 16 ANSI colors and a truecolor ramp.' } },
+  ligatures: { src: './img/ligatures.png', cap: { es: 'Captura real (runnir --render): ligaturas de fuente de código (->, =>, !=, >=, <=, ==).', en: 'Real screenshot (runnir --render): code-font ligatures (->, =>, !=, >=, <=, ==).' } },
+  boxdraw: { src: './img/boxdraw.png', cap: { es: 'Captura real (runnir --render): recuadros de línea simple y doble más bloques de sombreado, al tamaño de celda.', en: 'Real screenshot (runnir --render): single- and double-line boxes plus shading blocks, at cell size.' } },
+  underline: { src: './img/underlines.png', cap: { es: 'Captura real (runnir --render): subrayado clásico (SGR 4). Los estilos ondulado/punteado/color son la parte en desarrollo.', en: 'Real screenshot (runnir --render): classic underline (SGR 4). The curly/dotted/colored styles are the in-development part.' } },
 }
 
-// Demos ANIMADOS en CSS para funciones dinamicas que una captura estatica no
-// transmite (parpadeo, estela, deslizamiento, subrayado al pasar el raton).
-// Clave = titulo exacto. Valor = kind que interpreta <TerminalDemo>.
+// Demos ANIMADOS en CSS para funciones dinámicas que una captura estática no
+// transmite. Clave = key de la feature. Valor = kind que interpreta <TerminalDemo>.
+// Animated CSS demos for dynamic features a static shot can't convey.
+// Key = the feature's key. Value = the kind <TerminalDemo> renders.
 export const DEMOS = {
-  'Estela del cursor': 'trail',
-  'Campana visual y sonora': 'bell',
-  'Scroll suave': 'smooth',
-  'Resaltado de URL/ruta al pasar por encima': 'hover',
-  'Gutter de estado por comando': 'gutter',
-  'Minimapa del historial': 'minimap',
+  'cursor-trail': 'trail',
+  bell: 'bell',
+  'smooth-scroll': 'smooth',
+  'hover-highlight': 'hover',
+  'status-gutter': 'gutter',
+  minimap: 'minimap',
 }

@@ -1,31 +1,28 @@
 import Kbd from './Kbd.jsx'
 import TerminalDemo from './TerminalDemo.jsx'
 import { MEDIA, DEMOS } from '../data/media.js'
-
-function slug(s) {
-  return s.toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '')
-    .replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '')
-}
+import { useLang, UI } from '../i18n.jsx'
 
 export default function FeatureCard({ f }) {
-  const media = MEDIA[f.title]
-  const demo = DEMOS[f.title]
+  const { t } = useLang()
+  const media = MEDIA[f.key]
+  const demo = DEMOS[f.key]
   const hasTech = f.keys || f.palette || (f.config && f.config.length) || (f.escape && f.escape.length) || f.example
   return (
-    <article className="card" id={slug(f.title)}>
+    <article className="card" id={f.key}>
       <div className="card-head">
-        <h3>{f.title}</h3>
+        <h3>{t(f.title)}</h3>
         <span className={`badge ${f.status === 'dev' ? 'dev' : 'shipped'}`}>
-          {f.status === 'dev' ? 'En desarrollo' : 'Disponible'}
+          {f.status === 'dev' ? t(UI.badgeDev) : t(UI.badgeShipped)}
         </span>
       </div>
 
-      <p className="natural">{f.natural}</p>
+      <p className="natural">{t(f.natural)}</p>
 
       {media && (
         <figure className="shot">
-          <img src={media.src} alt={f.title} loading="lazy" />
-          <figcaption>{media.cap}</figcaption>
+          <img src={media.src} alt={t(f.title)} loading="lazy" />
+          <figcaption>{t(media.cap)}</figcaption>
         </figure>
       )}
 
@@ -35,15 +32,15 @@ export default function FeatureCard({ f }) {
         <div className="tech">
           {f.keys && (
             <div className="tech-row">
-              <div className="tech-label">Atajo</div>
+              <div className="tech-label">{t(UI.techShortcut)}</div>
               <div className="tech-val">
-                {f.keys.map((k, i) => <Kbd key={i} text={k} />)}
+                {f.keys.map((k, i) => <Kbd key={i} text={t(k)} />)}
               </div>
             </div>
           )}
           {f.palette && (
             <div className="tech-row">
-              <div className="tech-label">Paleta</div>
+              <div className="tech-label">{t(UI.techPalette)}</div>
               <div className="tech-val">
                 {f.palette.split(' / ').map((p, i) => <span className="pcmd" key={i}>{p}</span>)}
               </div>
@@ -51,13 +48,13 @@ export default function FeatureCard({ f }) {
           )}
           {f.config && f.config.length > 0 && (
             <div className="tech-row">
-              <div className="tech-label">Config</div>
+              <div className="tech-label">{t(UI.techConfig)}</div>
               <div className="tech-val">
                 {f.config.map((c, i) => (
                   <span className="line" key={i}>
                     <span className="cfg-key">{c.k}</span>
                     {c.v && <> = <span className="cfg-def">{c.v}</span></>}
-                    <span className="cfg-desc"> — {c.d}</span>
+                    <span className="cfg-desc"> — {t(c.d)}</span>
                   </span>
                 ))}
               </div>
@@ -65,7 +62,7 @@ export default function FeatureCard({ f }) {
           )}
           {f.escape && f.escape.length > 0 && (
             <div className="tech-row">
-              <div className="tech-label">Escape</div>
+              <div className="tech-label">{t(UI.techEscape)}</div>
               <div className="tech-val">
                 {f.escape.map((e, i) => <code className="esc" key={i}>{e}</code>)}
               </div>
@@ -73,7 +70,7 @@ export default function FeatureCard({ f }) {
           )}
           {f.example && (
             <div className="tech-row">
-              <div className="tech-label">Ejemplo</div>
+              <div className="tech-label">{t(UI.techExample)}</div>
               <div className="tech-val">
                 <pre className="example">{f.example}</pre>
               </div>
@@ -82,9 +79,7 @@ export default function FeatureCard({ f }) {
         </div>
       )}
 
-      {f.note && <p className="note"><b>Nota:</b> {f.note}</p>}
+      {f.note && <p className="note"><b>{t(UI.noteLabel)}:</b> {t(f.note)}</p>}
     </article>
   )
 }
-
-export { slug }

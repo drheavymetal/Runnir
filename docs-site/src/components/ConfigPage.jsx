@@ -1,25 +1,21 @@
 import { Fragment } from 'react'
 import { CONFIG_GROUPS } from '../data/config.js'
+import { useLang, UI } from '../i18n.jsx'
 
 export default function ConfigPage({ query }) {
+  const { t } = useLang()
   const q = query.trim().toLowerCase()
   const groups = CONFIG_GROUPS.map((g) => ({
     ...g,
     rows: g.rows.filter(
-      (r) => !q || r.k.toLowerCase().includes(q) || r.d.toLowerCase().includes(q) || String(r.v).toLowerCase().includes(q) || g.group.toLowerCase().includes(q)
+      (r) => !q || r.k.toLowerCase().includes(q) || t(r.d).toLowerCase().includes(q) || String(r.v).toLowerCase().includes(q) || g.group.toLowerCase().includes(q)
     ),
   })).filter((g) => g.rows.length)
 
   return (
     <div className="wrap">
-      <h1 className="page-title">Referencia de configuracion</h1>
-      <p className="page-lede">
-        Cada opcion, su valor por defecto y una linea de descripcion, sacadas de{' '}
-        <code>src/config.rs</code>. El archivo vive en{' '}
-        <code>~/.config/runnir/runnir.toml</code> (o <code>runnir.json</code>, que tiene
-        prioridad). Todo tiene un valor por defecto: un archivo parcial o ausente es normal.
-        Genera uno comentado con <code>runnir --write-config</code>.
-      </p>
+      <h1 className="page-title">{t(UI.cfgTitle)}</h1>
+      <p className="page-lede">{t(UI.cfgLede)}</p>
 
       <pre className="example" style={{ marginBottom: '24px' }}>{`# ~/.config/runnir/runnir.toml  (minimo, todo lo demas usa su valor por defecto)
 [font]
@@ -36,15 +32,15 @@ commands = [ "ssh 192.168.1.3", "ssh 192.168.1.7", "htop" ]
 [keys]
 "alt+enter" = "toggle_zoom"`}</pre>
 
-      {groups.length === 0 && <p className="empty">Sin resultados para “{query}”.</p>}
+      {groups.length === 0 && <p className="empty">{t(UI.emptyPrefix)} “{query}”.</p>}
 
       <div className="tbl-wrap">
         <table>
           <thead>
             <tr>
-              <th style={{ width: '26%' }}>Clave</th>
-              <th style={{ width: '24%' }}>Por defecto</th>
-              <th>Descripcion</th>
+              <th style={{ width: '26%' }}>{t(UI.cfgColKey)}</th>
+              <th style={{ width: '24%' }}>{t(UI.cfgColDefault)}</th>
+              <th>{t(UI.cfgColDesc)}</th>
             </tr>
           </thead>
           <tbody>
@@ -57,7 +53,7 @@ commands = [ "ssh 192.168.1.3", "ssh 192.168.1.7", "htop" ]
                   <tr key={g.group + i}>
                     <td className="k">{r.k}</td>
                     <td className="d">{r.v}</td>
-                    <td className="desc">{r.d}</td>
+                    <td className="desc">{t(r.d)}</td>
                   </tr>
                 ))}
               </Fragment>

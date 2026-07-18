@@ -61,7 +61,24 @@ code, kbd, pre, .mono { font-family: var(--mono); }
 .wrap { max-width: 900px; margin: 0 auto; }
 
 /* ---------------------------------------------------------------- brand */
-.brand { display: flex; align-items: center; gap: 10px; margin-bottom: 4px; cursor: pointer; }
+.brand-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 4px; }
+.brand { display: flex; align-items: center; gap: 10px; cursor: pointer; }
+
+.lang-toggle { display: inline-flex; gap: 2px; background: var(--bg-raise); border: 1px solid var(--border); border-radius: 7px; padding: 2px; }
+.lang-btn {
+  background: transparent;
+  border: 0;
+  color: var(--fg-dim);
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: .5px;
+  padding: 3px 8px;
+  border-radius: 5px;
+  cursor: pointer;
+}
+.lang-btn:hover { color: var(--fg); }
+.lang-btn.active { background: rgba(13,188,121,.14); color: var(--green-bright); }
 .brand-mark {
   width: 30px;
   height: 30px;
