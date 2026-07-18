@@ -995,20 +995,33 @@ impl Grid {
             _ => return,
         };
         self.cells[range].fill(blank);
-        // Erasing the screen in place (2J and friends) invalidates any fold/output
-        // anchored on the live screen: stable coords only track content under
-        // bottom-line scroll, so fresh output written there would otherwise render
-        // collapsed under a stale summary. Drop those; scrollback folds are fine.
-        self.invalidate_screen_folds();
+        // Erasing the screen in place invalidates any fold/output anchored on the
+        // erased rows: stable coords only track content under bottom-line scroll, so
+        // fresh output there would otherwise render collapsed under a stale summary.
+        // Only the erased rows are affected, so a prompt redraw's clr_eos (ED0) does
+        // not pop every fold on the screen.
+        let screen_top = self.dropped + self.scrollback.len();
+        let (lo, hi) = match mode {
+            0 => (screen_top + self.row, screen_top + self.rows.saturating_sub(1)),
+            1 => (screen_top, screen_top + self.row),
+            _ => (screen_top, screen_top + self.rows.saturating_sub(1)),
+        };
+        self.invalidate_folds_in(lo, hi);
     }
 
-    /// Drops folds and output regions that touch the live screen (stable row on or
-    /// after the first screen row). Called when the screen is edited in place, where
-    /// stable coordinates no longer track the content.
-    fn invalidate_screen_folds(&mut self) {
-        let screen_top = self.dropped + self.scrollback.len();
-        self.folds.retain(|&(_, e)| e < screen_top);
-        self.outputs.retain(|&(_, e)| e < screen_top);
+    /// Drops folds, banked output regions and the last-output range that intersect
+    /// the stable row range `[lo, hi]`. A no-op on the alternate screen, whose erases
+    /// touch the parked alt buffer, not the primary rows the folds anchor to.
+    fn invalidate_folds_in(&mut self, lo: usize, hi: usize) {
+        if self.parked.is_some() {
+            return;
+        }
+        let hit = |s: usize, e: usize| !(e < lo || s > hi);
+        self.folds.retain(|&(s, e)| !hit(s, e));
+        self.outputs.retain(|&(s, e)| !hit(s, e));
+        if self.last_output.is_some_and(|(s, e)| hit(s, e)) {
+            self.last_output = None;
+        }
     }
 
     fn erase_line(&mut self, mode: u16) {

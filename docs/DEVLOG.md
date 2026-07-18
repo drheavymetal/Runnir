@@ -70,7 +70,10 @@ row when col==0); folds applied on alt-screen (has_folds gated on !parked); gutt
 images/hover/hints used raw local-top → added grid.screen_row_of() fold-aware
 mapping; clear/2J left stale live-screen folds → invalidate_screen_folds; resize
 shrink duplicated summary → jump to total on evicted fold end. + label clamp,
-fold-click clears selection. ALL 16 FEATURES DONE + BUG-HUNTED. CONVERGED.
+fold-click clears selection. W2 verify → fix 4 regressed (moderate, commit 52): invalidate ran on alt-screen 2J
+wiping primary folds → gated on !parked; now range-based (only erased rows, not all
+screen, so prompt-redraw clr_eos doesn't pop folds); also invalidates last_output.
+Fixes 1/2/3/5/6 verified correct. ALL 16 FEATURES DONE + BUG-HUNTED. CONVERGED.
 
 ## Current task: add 15–20 differential features, 4–5 "wow". Document each here.
 
