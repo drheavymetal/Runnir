@@ -178,6 +178,12 @@ pub struct Grid {
     /// Exit code of finished commands, keyed by the stable row of the prompt that
     /// launched each (OSC 133;D;code). Drives the pass/fail status gutter.
     cmd_exits: Vec<(usize, i32)>,
+    /// Exit code carried by the most recent OSC 133;D, `None` when that D had no
+    /// code. Kept apart from `cmd_exits` (which only records Ds that carry one):
+    /// after a code-less D the latest command's exit is *unknown*, and reporting
+    /// the previous command's code would make "fix last command" fire on a
+    /// command that did not fail.
+    last_exit_code: Option<i32>,
     /// Output regions of finished commands as stable (start, end) inclusive rows
     /// (OSC 133 C→D). Backs "fold all output" (W2).
     outputs: Vec<(usize, usize)>,
@@ -276,6 +282,7 @@ impl Grid {
             progress: None,
             cwd: None,
             cmd_exits: Vec::new(),
+            last_exit_code: None,
             outputs: Vec::new(),
             folds: Vec::new(),
             last_output: None,
@@ -635,9 +642,9 @@ impl Grid {
     }
 
     /// Exit code of the most recently finished command, if OSC 133;D carried one.
-    /// Drives the tab fail badge.
+    /// Drives the tab fail badge and the "fix last command" guard.
     pub fn last_exit(&self) -> Option<i32> {
-        self.cmd_exits.last().map(|&(_, e)| e)
+        self.last_exit_code
     }
 
     /// Reported progress `(state, percent)` from OSC 9;4, or `None`. state 1 normal,
@@ -1864,6 +1871,9 @@ impl Grid {
                         self.outputs.drain(0..256);
                     }
                 }
+                // The freshest command's exit, code-less Ds included: `None` then
+                // means "finished, exit unknown", never the previous command's code.
+                self.last_exit_code = exit;
                 if let (Some(code), Some(&prompt)) = (exit, self.prompt_marks.last()) {
                     self.cmd_exits.push((prompt, code));
                     // Bound the record: it only needs to cover on-screen prompts, and
@@ -2691,6 +2701,20 @@ mod tests {
         feed(&mut g, "\x1b]133;A\x07$ \x1b]133;B\x07true\r\n\x1b]133;C\x07\x1b]133;D;0\x07");
         assert_eq!(g.last_exit(), Some(0), "success must not trigger a fix");
         assert_eq!(g.last_command_line().as_deref(), Some("true"));
+    }
+
+    #[test]
+    fn code_less_d_does_not_report_the_previous_commands_exit() {
+        // Regression: OSC 133;D may legally carry no exit code (e.g. an aborted
+        // command). last_exit() answered with the PREVIOUS command's code, so a
+        // failure followed by a code-less D made "fix last command" fire on a
+        // command that never reported a failure.
+        let mut g = Grid::new(40, 6);
+        feed(&mut g, "\x1b]133;A\x07$ \x1b]133;B\x07mkdr foo\r\n\x1b]133;C\x07\x1b]133;D;127\x07");
+        assert_eq!(g.last_exit(), Some(127));
+        // The next command finishes with a bare D — its exit is unknown.
+        feed(&mut g, "\x1b]133;A\x07$ \x1b]133;B\x07true\r\n\x1b]133;C\x07\x1b]133;D\x07");
+        assert_eq!(g.last_exit(), None, "a code-less D means unknown, not the stale 127");
     }
 
     #[test]

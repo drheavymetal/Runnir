@@ -2298,20 +2298,22 @@ fn wheel_lines(delta: MouseScrollDelta, wheel_lines: f32, cell_h: f32) -> f32 {
     }
 }
 
-/// Writes `data` to `path` with 0600 permissions, truncating an existing file we
-/// own. `O_NOFOLLOW` refuses to follow a symlink planted at the path, so a shared
-/// temp dir cannot be used to clobber another file through us.
+/// Writes `data` to `path` with 0600 permissions, replacing an existing file we
+/// own. The file is recreated, never opened in place: `mode(0o600)` only applies
+/// at creation, so writing into a pre-existing file would keep its old mode and
+/// owner — a stale loose file, or one another user planted in the shared /tmp
+/// fallback, would hold the text world-readable. Unlinking our own stale file
+/// always succeeds; a hostile one in a sticky temp dir cannot be unlinked, and
+/// then `create_new` (O_EXCL, which also refuses a planted symlink) fails closed
+/// instead of leaking through it.
 fn write_private(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
+    let _ = std::fs::remove_file(path);
     let mut f = std::fs::OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .mode(0o600)
-        // libc's constant, so the flag is correct on both Linux and macOS (the raw
-        // value differs between them).
-        .custom_flags(libc::O_NOFOLLOW)
         .open(path)?;
     f.write_all(data)
 }
@@ -2369,4 +2371,28 @@ fn ssh_hosts() -> Vec<String> {
     hosts.sort();
     hosts.dedup();
     hosts
+}
+
+#[cfg(test)]
+mod write_private_tests {
+    use super::write_private;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn recreates_with_0600_over_a_looser_preexisting_file() {
+        let path = std::env::temp_dir()
+            .join(format!("runnir-write-private-test-{}", std::process::id()));
+        // A pre-existing loose file at the path (a stale capture, or a file
+        // another user planted in a shared /tmp): the captured text must not
+        // land in it with those permissions.
+        std::fs::write(&path, b"old").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+
+        write_private(&path, b"secret").unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "the capture must be private, not the old file's mode");
+        assert_eq!(std::fs::read(&path).unwrap(), b"secret");
+        let _ = std::fs::remove_file(&path);
+    }
 }
