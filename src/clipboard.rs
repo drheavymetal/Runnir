@@ -77,6 +77,61 @@ impl Clipboard {
     }
 }
 
+/// A bounded, in-memory ring of recently copied text, newest first.
+///
+/// Every copy runnir makes — selection copy, Ctrl+Shift+C, copy-mode yank, an
+/// OSC 52 clipboard write from a program, copy-last-output, a hint copy — is pushed
+/// here, so the clipboard-history picker can offer them for re-paste. A re-copy of
+/// an entry already present moves it to the top instead of duplicating it, and the
+/// oldest entry drops once capacity is exceeded.
+///
+/// Deliberately never persisted to disk: the clipboard routinely carries secrets
+/// (passwords, tokens, private paths), so the history lives only for the session.
+pub struct ClipHistory {
+    entries: std::collections::VecDeque<String>,
+    capacity: usize,
+    enabled: bool,
+}
+
+impl ClipHistory {
+    pub fn new(capacity: usize, enabled: bool) -> Self {
+        Self { entries: std::collections::VecDeque::new(), capacity: capacity.max(1), enabled }
+    }
+
+    /// Records a copied entry at the front (dedup-to-top): a value already present is
+    /// moved to the front rather than added again; the ring then drops its oldest
+    /// entry while it exceeds capacity. Empty or whitespace-only text is ignored, and
+    /// the whole call is a no-op when the history is disabled.
+    pub fn push(&mut self, text: &str) {
+        if !self.enabled || text.trim().is_empty() {
+            return;
+        }
+        if let Some(pos) = self.entries.iter().position(|e| e == text) {
+            self.entries.remove(pos);
+        }
+        self.entries.push_front(text.to_string());
+        while self.entries.len() > self.capacity {
+            self.entries.pop_back();
+        }
+    }
+
+    /// The recorded entries, newest first.
+    pub fn entries(&self) -> &std::collections::VecDeque<String> {
+        &self.entries
+    }
+
+    /// Adopts capacity/enabled from a (re)loaded config, trimming the ring if the
+    /// capacity shrank. Existing entries are kept even when disabling — only further
+    /// recording stops.
+    pub fn configure(&mut self, capacity: usize, enabled: bool) {
+        self.capacity = capacity.max(1);
+        self.enabled = enabled;
+        while self.entries.len() > self.capacity {
+            self.entries.pop_back();
+        }
+    }
+}
+
 fn has(cmd: &str) -> bool {
     Command::new(cmd)
         .arg("--version")
@@ -129,5 +184,68 @@ fn wl_paste(primary: bool) -> Option<String> {
         Some(String::from_utf8_lossy(&out.stdout).into_owned())
     } else {
         None // Empty clipboard makes wl-paste exit non-zero.
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ClipHistory;
+
+    fn snapshot(h: &ClipHistory) -> Vec<String> {
+        h.entries().iter().cloned().collect()
+    }
+
+    #[test]
+    fn newest_first_and_skips_blank() {
+        let mut h = ClipHistory::new(50, true);
+        h.push("one");
+        h.push("two");
+        h.push("   "); // whitespace-only is ignored
+        h.push("");
+        assert_eq!(snapshot(&h), vec!["two".to_string(), "one".to_string()]);
+    }
+
+    #[test]
+    fn evicts_oldest_past_capacity() {
+        let mut h = ClipHistory::new(3, true);
+        for s in ["a", "b", "c", "d", "e"] {
+            h.push(s);
+        }
+        // Only the three newest survive, newest first.
+        assert_eq!(snapshot(&h), vec!["e".to_string(), "d".to_string(), "c".to_string()]);
+    }
+
+    #[test]
+    fn recopy_moves_to_top_without_duplicating() {
+        let mut h = ClipHistory::new(50, true);
+        h.push("a");
+        h.push("b");
+        h.push("c");
+        h.push("a"); // re-copy an existing entry
+        assert_eq!(
+            snapshot(&h),
+            vec!["a".to_string(), "c".to_string(), "b".to_string()],
+            "re-copy must move to the top, not duplicate"
+        );
+        assert_eq!(h.entries().len(), 3);
+    }
+
+    #[test]
+    fn disabled_records_nothing() {
+        let mut h = ClipHistory::new(50, false);
+        h.push("secret");
+        assert!(h.entries().is_empty());
+    }
+
+    #[test]
+    fn configure_shrinks_and_toggles() {
+        let mut h = ClipHistory::new(50, true);
+        for s in ["a", "b", "c", "d"] {
+            h.push(s);
+        }
+        h.configure(2, false); // shrink capacity and disable
+        assert_eq!(snapshot(&h), vec!["d".to_string(), "c".to_string()]);
+        h.push("e"); // disabled → ignored
+        assert_eq!(snapshot(&h), vec!["d".to_string(), "c".to_string()]);
     }
 }

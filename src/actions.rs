@@ -40,6 +40,7 @@ pub enum Action {
     // Clipboard & scrollback
     Copy,
     Paste,
+    ClipboardHistory,
     ScrollUp,
     ScrollDown,
     ScrollPageUp,
@@ -118,6 +119,7 @@ impl Action {
             CycleLayout => "cycle_layout",
             Copy => "copy",
             Paste => "paste",
+            ClipboardHistory => "clipboard_history",
             ScrollUp => "scroll_up",
             ScrollDown => "scroll_down",
             ScrollPageUp => "scroll_page_up",
@@ -192,6 +194,7 @@ impl Action {
             CycleLayout => "Cycle layout (splits/stack/tall/fat/grid)",
             Copy => "Copy selection",
             Paste => "Paste",
+            ClipboardHistory => "Clipboard history",
             ScrollUp => "Scroll up",
             ScrollDown => "Scroll down",
             ScrollPageUp => "Scroll page up",
@@ -269,6 +272,7 @@ impl Action {
             "cycle_layout" => CycleLayout,
             "copy" => Copy,
             "paste" => Paste,
+            "clipboard_history" => ClipboardHistory,
             "scroll_up" => ScrollUp,
             "scroll_down" => ScrollDown,
             "scroll_page_up" => ScrollPageUp,
@@ -364,6 +368,7 @@ impl Action {
             CycleLayout,
             Copy,
             Paste,
+            ClipboardHistory,
             CopyLastOutput,
             PipeLastOutput,
             PipeScrollback,
@@ -534,6 +539,9 @@ fn default_bindings() -> HashMap<Chord, Action> {
 
     bind(&mut m, "ctrl+shift+c", Copy);
     bind(&mut m, "ctrl+shift+v", Paste);
+    // Super+V mirrors the familiar clipboard-history chord; every ctrl+shift+letter
+    // is already taken, so this lives on the super layer alongside tab/resize chords.
+    bind(&mut m, "super+v", ClipboardHistory);
     bind(&mut m, "ctrl+shift+o", CopyLastOutput);
     bind(&mut m, "ctrl+shift+f", SearchScrollback);
     bind(&mut m, "ctrl+shift+q", OpenScrollbackInEditor);
@@ -583,6 +591,7 @@ pub fn default_hints() -> HashMap<String, String> {
         ("close_pane", "Ctrl+Shift+X"),
         ("copy", "Ctrl+Shift+C"),
         ("paste", "Ctrl+Shift+V"),
+        ("clipboard_history", "Super+V"),
         ("copy_last_output", "Ctrl+Shift+O"),
         ("search", "Ctrl+Shift+F"),
         ("open_scrollback_in_editor", "Ctrl+Shift+Q"),

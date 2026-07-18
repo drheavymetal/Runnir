@@ -18,6 +18,8 @@ pub struct Config {
     pub scrollback: Scrollback,
     pub theme: Theme,
     pub behaviour: Behaviour,
+    #[serde(default)]
+    pub clipboard: ClipboardCfg,
     pub ai: Ai,
     /// Auto-preview of images dropped into a watched directory.
     pub watch: Watch,
@@ -68,6 +70,7 @@ impl Default for Config {
             scrollback: Scrollback::default(),
             theme: Theme::default(),
             behaviour: Behaviour::default(),
+            clipboard: ClipboardCfg::default(),
             ai: Ai::default(),
             watch: Watch::default(),
             keys: HashMap::new(),
@@ -174,6 +177,24 @@ pub struct Scrollback {
 impl Default for Scrollback {
     fn default() -> Self {
         Self { lines: 10_000 }
+    }
+}
+
+/// Clipboard history: an in-memory ring of recent copies you can re-paste from the
+/// picker (palette: Clipboard history, or Super+V). Never written to disk.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ClipboardCfg {
+    /// How many recent copies the history keeps (newest first); the oldest drops
+    /// once this is exceeded.
+    pub capacity: usize,
+    /// Whether copies are recorded into the history at all.
+    pub enabled: bool,
+}
+
+impl Default for ClipboardCfg {
+    fn default() -> Self {
+        Self { capacity: 50, enabled: true }
     }
 }
 
@@ -631,6 +652,31 @@ mod tests {
         let cfg: Config = toml::from_str("").unwrap();
         assert_eq!(cfg.font.size, 16.0);
         assert_eq!(cfg.ai.default, "claude");
+        // Clipboard-history defaults: on, capacity 50.
+        assert!(cfg.clipboard.enabled);
+        assert_eq!(cfg.clipboard.capacity, 50);
+    }
+
+    #[test]
+    fn clipboard_cfg_round_trips_json_and_toml() {
+        let mut cfg = Config::default();
+        cfg.clipboard.capacity = 7;
+        cfg.clipboard.enabled = false;
+
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: Config = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.clipboard.capacity, 7);
+        assert!(!back.clipboard.enabled);
+
+        let toml_text = toml::to_string_pretty(&cfg).unwrap();
+        let back: Config = toml::from_str(&toml_text).unwrap();
+        assert_eq!(back.clipboard.capacity, 7);
+        assert!(!back.clipboard.enabled);
+
+        // An absent block falls back to defaults, like every other section.
+        let partial: Config = toml::from_str("[font]\nsize = 18.0\n").unwrap();
+        assert_eq!(partial.clipboard.capacity, 50);
+        assert!(partial.clipboard.enabled);
     }
 
     #[test]

@@ -337,7 +337,9 @@ impl Gpu {
     }
 
     fn act_on_hint(&mut self, text: String, kind: overlay::HintKind) {
-        hints::act(&text, kind, &mut self.clipboard);
+        if let Some(copied) = hints::act(&text, kind) {
+            self.set_clipboard(copied);
+        }
     }
 }
 
