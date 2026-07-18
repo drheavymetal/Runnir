@@ -31,7 +31,12 @@ struct Instance {
     bg: [f32; 4],
     flags: u32,
     width: f32,
-    _pad: [u32; 2],
+    /// Underline shape code (see `UnderlineStyle::code`): 0 none, 1 single,
+    /// 2 double, 3 curly, 4 dotted, 5 dashed.
+    underline_style: u32,
+    /// Underline colour, premultiply-ready linear rgba. Alpha 0 is the sentinel
+    /// for "use the foreground colour"; the shader falls back to `fg` then.
+    underline_color: [f32; 4],
 }
 
 pub struct Renderer {
@@ -233,7 +238,7 @@ impl Renderer {
                     attributes: &wgpu::vertex_attr_array![
                         0 => Float32x2, 1 => Float32x2, 2 => Float32x2,
                         3 => Float32x2, 4 => Float32x2, 5 => Float32x4, 6 => Float32x4,
-                        7 => Uint32, 8 => Float32
+                        7 => Uint32, 8 => Float32, 9 => Uint32, 10 => Float32x4
                     ],
                 })],
                 compilation_options: Default::default(),
@@ -587,7 +592,8 @@ impl Renderer {
                 bg,
                 flags: if glyph.color { FLAG_COLOR } else { 0 },
                 width: 1.0,
-                _pad: [0; 2],
+                underline_style: 0,
+                underline_color: [0.0; 4],
             });
         }
     }
@@ -709,6 +715,23 @@ impl Renderer {
                     ),
                 };
 
+                // Styled underline: the shape drives the shader's decoration path,
+                // the colour follows the foreground unless SGR 58 set one. An
+                // explicit colour carries alpha 1; the sentinel [0;4] (alpha 0)
+                // tells the shader to reuse `fg`.
+                let underline_color = match cell.pen.underline_color {
+                    Color::Default => [0.0; 4],
+                    other => {
+                        let mut c = self.resolve(other, base_bg, true);
+                        if dim < 1.0 {
+                            for ch in &mut c[..3] {
+                                *ch *= dim;
+                            }
+                        }
+                        c
+                    }
+                };
+
                 out.push(Instance {
                     pos_px: [ox + col as f32 * cw, y],
                     glyph_offset: glyph.offset,
@@ -719,7 +742,8 @@ impl Renderer {
                     bg,
                     flags: cell.pen.flags.bits() as u32 | if glyph.color { FLAG_COLOR } else { 0 },
                     width: span,
-                    _pad: [0; 2],
+                    underline_style: cell.pen.underline.code(),
+                    underline_color,
                 });
             }
         }
@@ -750,7 +774,8 @@ impl Renderer {
                         bg: [0.0, 0.0, 0.0, 0.0],
                         flags: 0,
                         width: 1.0,
-                        _pad: [0; 2],
+                        underline_style: 0,
+                        underline_color: [0.0; 4],
                     });
                 }
             }
@@ -1458,7 +1483,8 @@ fn solid_rect(d: &SolidRect) -> Instance {
         bg: srgb(d.color.0, d.color.1, d.color.2),
         flags: FLAG_SOLID,
         width: 1.0,
-        _pad: [0; 2],
+        underline_style: 0,
+        underline_color: [0.0; 4],
     }
 }
 
@@ -1473,7 +1499,8 @@ fn backdrop(_screen: (f32, f32), alpha: f32) -> Instance {
         bg: [0.0, 0.0, 0.0, alpha],
         flags: FLAG_FULLSCREEN,
         width: 1.0,
-        _pad: [0; 2],
+        underline_style: 0,
+        underline_color: [0.0; 4],
     }
 }
 
