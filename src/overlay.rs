@@ -18,6 +18,7 @@ pub enum Overlay {
     Hints(Hints),
     Search(Search),
     Config(ConfigPanel),
+    Theme(ThemePicker),
 }
 
 impl Overlay {
@@ -32,6 +33,7 @@ impl Overlay {
             Overlay::Hints(_) => Vec::new(), // Hints annotate panes, drawn elsewhere.
             Overlay::Search(s) => s.render(cols, rows, theme),
             Overlay::Config(c) => c.render(cols, rows, theme),
+            Overlay::Theme(t) => t.render(cols, rows, theme),
         }
     }
 }
@@ -368,6 +370,127 @@ impl Palette {
                 let hp = if sel { selected() } else { dim() };
                 let x = w.saturating_sub(hint.chars().count() + 2);
                 write(&mut g, row, x, hint, hp);
+            }
+        }
+
+        let col = (cols.saturating_sub(w)) / 2;
+        let row = (rows.saturating_sub(h)) / 3;
+        vec![Panel { grid: g, col, row }]
+    }
+}
+
+// ---- theme picker ----------------------------------------------------------
+
+/// A fuzzy-filterable list of the bundled colour themes. Modelled on [`Palette`]:
+/// arrows move, typing filters. What sets it apart is *live preview* — the host
+/// applies the highlighted theme to the renderer as the selection moves, so the
+/// terminal behind the picker updates immediately. The theme active when it opened
+/// is stashed in `original` so cancelling can restore it untouched.
+pub struct ThemePicker {
+    query: String,
+    all: Vec<(&'static str, Theme)>,
+    filtered: Vec<usize>,
+    cursor: usize,
+    original: Theme,
+}
+
+impl ThemePicker {
+    pub fn new(original: Theme) -> Self {
+        let all = crate::themes::builtins();
+        let filtered = (0..all.len()).collect();
+        Self { query: String::new(), all, filtered, cursor: 0, original }
+    }
+
+    pub fn input(&mut self, c: char) {
+        self.query.push(c);
+        self.refilter();
+    }
+
+    pub fn backspace(&mut self) {
+        self.query.pop();
+        self.refilter();
+    }
+
+    pub fn up(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    pub fn down(&mut self) {
+        if self.cursor + 1 < self.filtered.len() {
+            self.cursor += 1;
+        }
+    }
+
+    /// The theme under the cursor — what the host previews live and keeps on Enter.
+    pub fn selected_theme(&self) -> Option<Theme> {
+        self.filtered.get(self.cursor).map(|&i| self.all[i].1.clone())
+    }
+
+    /// Name of the highlighted theme, for a status toast on confirm.
+    pub fn selected_name(&self) -> Option<&'static str> {
+        self.filtered.get(self.cursor).map(|&i| self.all[i].0)
+    }
+
+    /// The theme that was in effect when the picker opened; restored on cancel.
+    pub fn original(&self) -> Theme {
+        self.original.clone()
+    }
+
+    fn refilter(&mut self) {
+        let q = self.query.to_lowercase();
+        self.filtered = (0..self.all.len())
+            .filter(|&i| fuzzy(&self.all[i].0.to_lowercase(), &q))
+            .collect();
+        self.cursor = 0;
+    }
+
+    fn render(&self, cols: usize, rows: usize, theme: &Theme) -> Vec<Panel> {
+        let w = (cols * 6 / 10).clamp(34, 74).min(cols.saturating_sub(2));
+        let visible = 12.min(self.filtered.len()).max(1);
+        let h = visible + 3;
+        let mut g = panel_grid(w, h, theme);
+
+        write(&mut g, 0, 2, "Theme picker", accent());
+        let prompt = format!("> {}", self.query);
+        write(&mut g, 1, 2, &prompt, normal());
+        write(&mut g, 1, 2 + prompt.chars().count(), " ", selected());
+
+        // A swatch strip previews each theme's palette inline: background, the six
+        // vivid ANSI colours, then foreground — enough to judge a theme at a glance
+        // without moving the selection onto it.
+        const SWATCH: usize = 8;
+        let scroll = self.cursor.saturating_sub(visible - 1);
+        for (line, &idx) in self.filtered.iter().skip(scroll).take(visible).enumerate() {
+            let sel = scroll + line == self.cursor;
+            let (name, t) = &self.all[idx];
+            let row = 3 + line;
+            let pen = if sel { selected() } else { normal() };
+            if sel {
+                write(&mut g, row, 0, &" ".repeat(w), selected());
+            }
+            write(&mut g, row, 2, name, pen);
+            // Draw the swatch flush-right, one cell per colour.
+            if w > SWATCH + 4 {
+                let cols_of = |t: &Theme| -> [(u8, u8, u8); SWATCH] {
+                    let a = &t.ansi;
+                    let g = |i: usize| a.get(i).map(|c| (c.0, c.1, c.2)).unwrap_or((0, 0, 0));
+                    [
+                        (t.background.0, t.background.1, t.background.2),
+                        g(1),
+                        g(2),
+                        g(3),
+                        g(4),
+                        g(5),
+                        g(6),
+                        (t.foreground.0, t.foreground.1, t.foreground.2),
+                    ]
+                };
+                let strip = cols_of(t);
+                let base = w.saturating_sub(SWATCH + 1);
+                for (i, (r, gg, b)) in strip.iter().enumerate() {
+                    let cell = Pen { bg: Color::Rgb(*r, *gg, *b), ..Pen::default() };
+                    write(&mut g, row, base + i, " ", cell);
+                }
             }
         }
 
@@ -791,6 +914,41 @@ mod tests {
         assert!(lines.iter().all(|l| l.chars().count() <= 9), "{lines:?}");
         let long = wrap("supercalifragilistic", 5);
         assert!(long.iter().all(|l| l.chars().count() <= 5));
+    }
+
+    #[test]
+    fn theme_picker_filters_and_navigates() {
+        let mut p = ThemePicker::new(Theme::default());
+        let before = p.filtered.len();
+        assert!(before >= 20, "the picker should list every builtin");
+        // Typing narrows the list to matching names.
+        for c in "nord".chars() {
+            p.input(c);
+        }
+        assert!(p.filtered.len() < before);
+        assert!(p.selected_name().unwrap().to_lowercase().contains("nord"));
+        // Backspacing widens it again, and refiltering resets the cursor to the top.
+        for _ in 0..4 {
+            p.backspace();
+        }
+        assert_eq!(p.filtered.len(), before);
+        assert_eq!(p.cursor, 0);
+    }
+
+    #[test]
+    fn theme_picker_selection_moves_clamps_and_previews() {
+        let original = Theme::default();
+        let mut p = ThemePicker::new(original.clone());
+        p.up(); // already at the top: must not underflow
+        assert_eq!(p.cursor, 0);
+        let first = p.selected_theme().unwrap();
+        p.down();
+        assert_eq!(p.cursor, 1);
+        let second = p.selected_theme().unwrap();
+        assert_ne!(first.background, second.background, "moving must preview a new theme");
+        // The theme active on open is preserved verbatim for a cancel to restore.
+        assert_eq!(p.original().background, original.background);
+        assert_eq!(p.original().ansi.len(), 16);
     }
 
     #[test]
