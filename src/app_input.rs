@@ -21,6 +21,8 @@ impl Gpu {
         if lines == 0.0 {
             return;
         }
+        // The user took over scrolling: cancel any in-flight glide animation.
+        self.scroll_glide = None;
         if !mods.shift_key() && self.forward_wheel(lines) {
             self.scroll_accum = 0.0;
             return;
@@ -278,6 +280,7 @@ impl Gpu {
                     String::from_utf8_lossy(&bytes)
                 );
             }
+            self.scroll_glide = None;
             if self.tab().focused().snap_to_bottom() {
                 self.window.request_redraw();
             }
@@ -378,10 +381,11 @@ impl Gpu {
                 self.tab().focused().scroll(-rows);
             }
             Action::ScrollToTop => {
-                self.tab().focused().scroll(isize::MAX / 2);
+                let max = self.focused_scrollback_len();
+                self.glide_focused_to(max, config.behaviour.smooth_scroll);
             }
             Action::ScrollToBottom => {
-                self.tab().focused().snap_to_bottom();
+                self.glide_focused_to(0.0, config.behaviour.smooth_scroll);
             }
             Action::ScrollUp => {
                 self.tab().focused().scroll(3);
@@ -389,8 +393,8 @@ impl Gpu {
             Action::ScrollDown => {
                 self.tab().focused().scroll(-3);
             }
-            Action::JumpPrevPrompt => self.jump_prompt(-1),
-            Action::JumpNextPrompt => self.jump_prompt(1),
+            Action::JumpPrevPrompt => self.jump_prompt(-1, config.behaviour.smooth_scroll),
+            Action::JumpNextPrompt => self.jump_prompt(1, config.behaviour.smooth_scroll),
             Action::SearchScrollback => self.overlay = Some(Overlay::Search(overlay::Search::new())),
 
             Action::FontBigger => self.set_font_px(self.font_px + 1.0, config),
@@ -646,13 +650,14 @@ impl Gpu {
                 self.tab().close_focused(area);
             }
             Action::ScrollToTop => {
-                self.tab().focused().scroll(isize::MAX / 2);
+                let max = self.focused_scrollback_len();
+                self.glide_focused_to(max, config.behaviour.smooth_scroll);
             }
             Action::ScrollToBottom => {
-                self.tab().focused().snap_to_bottom();
+                self.glide_focused_to(0.0, config.behaviour.smooth_scroll);
             }
-            Action::JumpPrevPrompt => self.jump_prompt(-1),
-            Action::JumpNextPrompt => self.jump_prompt(1),
+            Action::JumpPrevPrompt => self.jump_prompt(-1, config.behaviour.smooth_scroll),
+            Action::JumpNextPrompt => self.jump_prompt(1, config.behaviour.smooth_scroll),
             Action::FontBigger => self.set_font_px(self.font_px + 1.0, config),
             Action::FontSmaller => self.set_font_px(self.font_px - 1.0, config),
             Action::FontReset => self.set_font_px(config.font.size, config),
@@ -832,6 +837,27 @@ impl Gpu {
         } else {
             self.window.request_redraw();
         }
+    }
+
+    /// Scrolls the focused pane to an absolute scrollback offset, gliding there with
+    /// easing when `smooth`, else jumping. `target` is clamped by the grid.
+    fn glide_focused_to(&mut self, target: f32, smooth: bool) {
+        let id = self.tab().focused_ptr();
+        let cur = self.tab().focused().grid.lock().unwrap().display_offset() as f32;
+        if !smooth || (target - cur).abs() < 1.0 {
+            let delta = target as isize - cur as isize;
+            self.tab().focused().scroll(delta);
+            self.scroll_glide = None;
+        } else {
+            self.scroll_glide = Some((id, cur, target.max(0.0)));
+            self.window.request_redraw();
+        }
+    }
+
+    /// Max scrollback offset (fully scrolled back) of the focused pane.
+    fn focused_scrollback_len(&mut self) -> f32 {
+        let g = self.tab().focused().grid.lock().unwrap();
+        (g.total_rows() - g.rows()) as f32
     }
 
     fn toggle_zoom(&mut self) {
@@ -1202,23 +1228,23 @@ impl Gpu {
         }
     }
 
-    fn jump_prompt(&mut self, dir: isize) {
-        let pane = self.tab().focused();
-        let mut grid = pane.grid.lock().unwrap();
-        let offsets = grid.prompt_offsets();
-        if offsets.is_empty() {
-            return;
-        }
-        let current = grid.display_offset();
-        // Offsets are how far back each prompt sits; pick the next one in `dir`.
-        let target = if dir < 0 {
-            offsets.iter().copied().filter(|&o| o > current).min()
-        } else {
-            offsets.iter().copied().filter(|&o| o < current).max()
+    fn jump_prompt(&mut self, dir: isize, smooth: bool) {
+        let target = {
+            let grid = self.tab().focused().grid.lock().unwrap();
+            let offsets = grid.prompt_offsets();
+            if offsets.is_empty() {
+                return;
+            }
+            let current = grid.display_offset();
+            // Offsets are how far back each prompt sits; pick the next one in `dir`.
+            if dir < 0 {
+                offsets.iter().copied().filter(|&o| o > current).min()
+            } else {
+                offsets.iter().copied().filter(|&o| o < current).max()
+            }
         };
         if let Some(t) = target {
-            let delta = t as isize - current as isize;
-            grid.scroll_display(delta);
+            self.glide_focused_to(t as f32, smooth);
         }
     }
 

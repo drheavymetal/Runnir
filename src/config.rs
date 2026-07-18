@@ -145,6 +145,14 @@ pub struct Behaviour {
     /// destructive pattern (rm -rf /, dd of=, mkfs, DROP TABLE, git push -f, fork
     /// bomb, …), pressing Enter opens a confirmation instead of running it blindly.
     pub command_guardian: bool,
+    /// Animate scroll jumps (to top/bottom, jump-to-prompt) with an eased glide
+    /// instead of teleporting.
+    #[serde(default = "yes")]
+    pub smooth_scroll: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 impl Default for Behaviour {
@@ -157,6 +165,7 @@ impl Default for Behaviour {
             confirm_close: true,
             restore_session: true,
             command_guardian: true,
+            smooth_scroll: true,
         }
     }
 }

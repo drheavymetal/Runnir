@@ -287,6 +287,9 @@ struct Gpu {
     hover_url: Option<HoverUrl>,
     /// Keyboard copy-mode state, or `None` when off (D12).
     copy_mode: Option<CopyMode>,
+    /// An in-flight eased scroll: (pane id, current offset, target offset) in
+    /// scrollback lines. Drives smooth glide on scroll-to-top/bottom and jumps.
+    scroll_glide: Option<(u64, f32, f32)>,
     /// Cursor trail ghosts (D15): each is a cell rect and the instant it was left
     /// behind; drawn fading toward the background, pruned once faded.
     cursor_trail: Vec<(f32, f32, f32, f32, Instant)>,
@@ -448,6 +451,7 @@ impl App {
             scroll_accum: 0.0,
             hover_url: None,
             copy_mode: None,
+            scroll_glide: None,
             cursor_trail: Vec::new(),
             last_cursor_rect: None,
             font_px,
@@ -630,6 +634,25 @@ impl ApplicationHandler<UserEvent> for App {
                 gpu.window.request_redraw();
                 event_loop.set_control_flow(ControlFlow::WaitUntil(
                     Instant::now() + Duration::from_millis(120),
+                ));
+                return;
+            }
+        }
+
+        // Animate a scroll glide (smooth scroll-to-top/bottom / jump-to-prompt).
+        if let Some((id, cur, target)) = gpu.scroll_glide {
+            let next = cur + (target - cur) * 0.3;
+            let done = (target - next).abs() < 0.5;
+            let pos = if done { target } else { next };
+            if let Some(pane) = gpu.tabs.iter_mut().find_map(|t| t.panes.get_mut(&id)) {
+                let actual = pane.grid.lock().unwrap().display_offset() as isize;
+                pane.scroll(pos.round() as isize - actual);
+            }
+            gpu.scroll_glide = if done { None } else { Some((id, pos, target)) };
+            gpu.window.request_redraw();
+            if !done {
+                event_loop.set_control_flow(ControlFlow::WaitUntil(
+                    Instant::now() + Duration::from_millis(16),
                 ));
                 return;
             }
