@@ -2045,6 +2045,18 @@ mod tests {
     }
 
     #[test]
+    fn clear_drops_live_screen_folds() {
+        let mut g = Grid::new(20, 6);
+        feed(&mut g, "\x1b]133;A\x07$ ls\r\n\x1b]133;C\x07a\r\nb\r\n\x1b]133;D;0\x07");
+        g.fold_all();
+        assert!(g.has_folds());
+        // A clear (CSI 2J) erases the live screen in place: the fold anchored there
+        // must go, or fresh output would render under a stale summary.
+        feed(&mut g, "\x1b[2J");
+        assert!(!g.has_folds(), "clear must drop live-screen folds");
+    }
+
+    #[test]
     fn fold_keeps_the_live_prompt_visible() {
         let mut g = Grid::new(20, 6);
         // A finished command, then the NEXT prompt is emitted (as a real shell does).
