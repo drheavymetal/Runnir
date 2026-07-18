@@ -262,6 +262,21 @@ interpolation → no injection). Reuses the D11 $EDITOR-dump temp plumbing. acti
 - `config.rs` TOML, `session.rs` opt-C persistence, `whisper.rs` NL→actions, `clipboard.rs` wl-clipboard,
   `mouse.rs` SGR/X10, `hints.rs`, `boxdraw.rs`, `layout.rs` split tree + divider_at/set_ratio, `docs.rs` F1 help.
 
+## Per-project session (layout+cwd by project dir)
+
+`project_session.rs` (NEW): persists the split layout + per-pane cwd (NOT scrollback,
+NOT processes) keyed by project. `project_key(path)` = nearest `.git`-dir ancestor,
+else the dir itself (pure, unit-tested). Store = bounded LRU (50 projects) JSON at
+`~/.config/runnir/sessions.json`, written atomically (temp + `O_NOFOLLOW` 0600 +
+rename), mirroring `write_private`. Reuses `session::TabState`/`Tab::from_session` for
+rebuild via `TabLayout::to_tab_state()` (empty scrollback) → `ProjectEntry::to_session()`.
+`Tab::to_project_layout()` captures the descriptor. Config `[behaviour]`: `session_restore`
+(auto-restore on open, default false) + `session_auto_save` (save on exit, default false).
+Palette: SaveProjectSession / RestoreProjectSession (restore APPENDS tabs, non-destructive,
+bumps next_pane_seed). Startup restore in `init_gpu` takes precedence over `restore_session`.
+Caveat: macOS cwd is OSC-7-only (`platform::cwd` returns None) — no shell integration ⇒
+no cwd to key/restore; rely on `behaviour.shell_integration` (default on).
+
 ## Gotchas (do not re-learn)
 
 - wgpu 30 API differs from all tutorials — read vendored source in ~/.cargo/registry/src/*/wgpu-30.0.0.

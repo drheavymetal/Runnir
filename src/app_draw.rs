@@ -585,16 +585,22 @@ impl Gpu {
     /// Writes the current layout and scrollback to the session file. Called before
     /// exit and on a slow autosave timer, so a crash still leaves a recent state.
     pub fn save_session(&self, config: &Config) {
-        if !config.behaviour.restore_session {
-            return;
+        if config.behaviour.restore_session {
+            let mut sess = session::Session::new(self.active);
+            for tab in &self.tabs {
+                let state = tab.to_session();
+                sess.tabs.push(state);
+            }
+            if let Err(e) = sess.save() {
+                eprintln!("runnir: could not save session: {e}");
+            }
         }
-        let mut sess = session::Session::new(self.active);
-        for tab in &self.tabs {
-            let state = tab.to_session();
-            sess.tabs.push(state);
-        }
-        if let Err(e) = sess.save() {
-            eprintln!("runnir: could not save session: {e}");
+        // Per-project layout auto-save (opt-in, independent of restore_session): record
+        // this project's arrangement so reopening in it can restore the panes and cwds.
+        if config.behaviour.session_auto_save {
+            if let Err(e) = self.save_project_session() {
+                eprintln!("runnir: could not save project session: {e}");
+            }
         }
     }
 }
