@@ -26,6 +26,11 @@ pub struct Config {
     /// that ssh's into .3/.7/.9/.188 at once.
     #[serde(default)]
     pub layouts: Vec<LayoutDef>,
+    /// Named command snippets. Pick one from the palette (Insert command snippet) and
+    /// it is typed at the prompt for you to review — never run for you, unless the
+    /// snippet sets `run_now = true`.
+    #[serde(default)]
+    pub snippets: Vec<SnippetDef>,
 }
 
 /// A named layout: a tab split into one pane per command. An empty command opens a
@@ -35,6 +40,21 @@ pub struct LayoutDef {
     pub name: String,
     #[serde(default)]
     pub commands: Vec<String>,
+}
+
+/// A named command snippet (a bookmark). Picked from the palette, its `command` is
+/// typed at the focused prompt for you to review and run yourself — the same safety
+/// model as the AI command-writer. Set `run_now = true` to submit it immediately.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnippetDef {
+    pub name: String,
+    pub command: String,
+    #[serde(default)]
+    pub description: String,
+    /// Submit the command straight away instead of leaving it at the prompt to
+    /// review. Off by default — a snippet is inserted, not executed, unless you opt in.
+    #[serde(default)]
+    pub run_now: bool,
 }
 
 impl Default for Config {
@@ -49,6 +69,7 @@ impl Default for Config {
             ai: Ai::default(),
             keys: HashMap::new(),
             layouts: Vec::new(),
+            snippets: Vec::new(),
         }
     }
 }
@@ -606,6 +627,45 @@ mod tests {
         assert_eq!(cfg.font.size, 4.0);
         assert_eq!(cfg.window.opacity, 1.0);
         assert_eq!(cfg.theme.ansi.len(), 16, "a short palette falls back to the default");
+    }
+
+    #[test]
+    fn snippets_default_to_empty_and_round_trip() {
+        // Absent = empty list, never an error.
+        let cfg: Config = toml::from_str("").unwrap();
+        assert!(cfg.snippets.is_empty());
+
+        // A full entry survives TOML round-trip, defaults and all.
+        let text = r#"
+[[snippets]]
+name = "deploy"
+command = "git push && ssh server deploy.sh"
+description = "ship the current branch"
+run_now = true
+
+[[snippets]]
+name = "logs"
+command = "journalctl -fu runnir"
+"#;
+        let cfg: Config = toml::from_str(text).unwrap();
+        assert_eq!(cfg.snippets.len(), 2);
+        assert_eq!(cfg.snippets[0].name, "deploy");
+        assert_eq!(cfg.snippets[0].command, "git push && ssh server deploy.sh");
+        assert_eq!(cfg.snippets[0].description, "ship the current branch");
+        assert!(cfg.snippets[0].run_now);
+        // description + run_now are optional: missing means empty / false.
+        assert_eq!(cfg.snippets[1].description, "");
+        assert!(!cfg.snippets[1].run_now, "run_now must default to false");
+
+        // The generated file must re-parse (both JSON and TOML), so --write-config
+        // never emits something the loader rejects.
+        let toml_text = toml::to_string_pretty(&cfg).unwrap();
+        let via_toml: Config = toml::from_str(&toml_text).unwrap();
+        assert_eq!(via_toml.snippets.len(), 2);
+        let json_text = serde_json::to_string(&cfg).unwrap();
+        let via_json: Config = serde_json::from_str(&json_text).unwrap();
+        assert_eq!(via_json.snippets[0].name, "deploy");
+        assert!(via_json.snippets[0].run_now);
     }
 
     #[test]

@@ -6,7 +6,7 @@
 //! a second UI system. An overlay builds its grid on demand from its state.
 
 use crate::actions::Action;
-use crate::config::Theme;
+use crate::config::{SnippetDef, Theme};
 use crate::grid::{Cell, Color, Flags, Grid, Pen};
 
 /// Which overlay, if any, is capturing input. Only one is active at a time.
@@ -19,6 +19,7 @@ pub enum Overlay {
     Search(Search),
     Config(ConfigPanel),
     Theme(ThemePicker),
+    Snippets(SnippetPicker),
 }
 
 impl Overlay {
@@ -34,6 +35,7 @@ impl Overlay {
             Overlay::Search(s) => s.render(cols, rows, theme),
             Overlay::Config(c) => c.render(cols, rows, theme),
             Overlay::Theme(t) => t.render(cols, rows, theme),
+            Overlay::Snippets(s) => s.render(cols, rows, theme),
         }
     }
 }
@@ -500,6 +502,102 @@ impl ThemePicker {
     }
 }
 
+// ---- snippet picker --------------------------------------------------------
+
+/// A fuzzy-filterable list of the user's command snippets (bookmarks). Modelled on
+/// [`Palette`]: arrows move, typing filters. Matching is a subsequence over the
+/// snippet's name *and* description, so you can find one by either. Confirming does
+/// not run anything here — the host types the chosen command at the prompt (or, if
+/// the snippet opts into `run_now`, submits it), so review stays the default.
+pub struct SnippetPicker {
+    query: String,
+    all: Vec<SnippetDef>,
+    filtered: Vec<usize>,
+    cursor: usize,
+}
+
+impl SnippetPicker {
+    pub fn new(snippets: Vec<SnippetDef>) -> Self {
+        let filtered = (0..snippets.len()).collect();
+        Self { query: String::new(), all: snippets, filtered, cursor: 0 }
+    }
+
+    pub fn input(&mut self, c: char) {
+        self.query.push(c);
+        self.refilter();
+    }
+
+    pub fn backspace(&mut self) {
+        self.query.pop();
+        self.refilter();
+    }
+
+    pub fn up(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    pub fn down(&mut self) {
+        if self.cursor + 1 < self.filtered.len() {
+            self.cursor += 1;
+        }
+    }
+
+    /// The snippet under the cursor — what the host inserts (or runs) on Enter.
+    pub fn selected(&self) -> Option<SnippetDef> {
+        self.filtered.get(self.cursor).map(|&i| self.all[i].clone())
+    }
+
+    fn refilter(&mut self) {
+        let q = self.query.to_lowercase();
+        self.filtered = (0..self.all.len())
+            .filter(|&i| {
+                // Match against name and description together so either can find it.
+                let hay = format!("{} {}", self.all[i].name, self.all[i].description);
+                fuzzy(&hay.to_lowercase(), &q)
+            })
+            .collect();
+        self.cursor = 0;
+    }
+
+    fn render(&self, cols: usize, rows: usize, theme: &Theme) -> Vec<Panel> {
+        let w = (cols * 6 / 10).clamp(34, 74).min(cols.saturating_sub(2));
+        let visible = 12.min(self.filtered.len()).max(1);
+        let h = visible + 3;
+        let mut g = panel_grid(w, h, theme);
+
+        write(&mut g, 0, 2, "Command snippets", accent());
+        let prompt = format!("> {}", self.query);
+        write(&mut g, 1, 2, &prompt, normal());
+        write(&mut g, 1, 2 + prompt.chars().count(), " ", selected());
+
+        let scroll = self.cursor.saturating_sub(visible - 1);
+        for (line, &idx) in self.filtered.iter().skip(scroll).take(visible).enumerate() {
+            let sel = scroll + line == self.cursor;
+            let snip = &self.all[idx];
+            let row = 3 + line;
+            let pen = if sel { selected() } else { normal() };
+            if sel {
+                write(&mut g, row, 0, &" ".repeat(w), selected());
+            }
+            write(&mut g, row, 2, &snip.name, pen);
+            // The description trails the name, dimmed, clipped to fit the panel.
+            if !snip.description.is_empty() {
+                let x = 2 + snip.name.chars().count() + 2;
+                if x + 1 < w {
+                    let room = w.saturating_sub(x + 1);
+                    let desc: String = snip.description.chars().take(room).collect();
+                    let dp = if sel { selected() } else { dim() };
+                    write(&mut g, row, x, &desc, dp);
+                }
+            }
+        }
+
+        let col = (cols.saturating_sub(w)) / 2;
+        let row = (rows.saturating_sub(h)) / 3;
+        vec![Panel { grid: g, col, row }]
+    }
+}
+
 // ---- docs ------------------------------------------------------------------
 
 pub struct Docs {
@@ -949,6 +1047,75 @@ mod tests {
         // The theme active on open is preserved verbatim for a cancel to restore.
         assert_eq!(p.original().background, original.background);
         assert_eq!(p.original().ansi.len(), 16);
+    }
+
+    fn snippet(name: &str, command: &str, description: &str, run_now: bool) -> SnippetDef {
+        SnippetDef {
+            name: name.into(),
+            command: command.into(),
+            description: description.into(),
+            run_now,
+        }
+    }
+
+    #[test]
+    fn snippet_picker_fuzzy_matches_name_and_description() {
+        let snips = vec![
+            snippet("deploy", "git push", "ship the branch to prod", false),
+            snippet("logs", "journalctl -f", "tail the service logs", false),
+            snippet("build", "cargo build", "compile the crate", true),
+        ];
+        let mut p = SnippetPicker::new(snips);
+        assert_eq!(p.filtered.len(), 3, "empty query lists every snippet");
+
+        // Subsequence over the name.
+        for c in "dep".chars() {
+            p.input(c);
+        }
+        assert_eq!(p.selected().unwrap().name, "deploy");
+
+        // Filtering by a word only in the description still finds the snippet, and
+        // the returned snippet carries its command and run_now flag intact.
+        p.backspace();
+        p.backspace();
+        p.backspace();
+        for c in "prod".chars() {
+            p.input(c);
+        }
+        let hit = p.selected().unwrap();
+        assert_eq!(hit.name, "deploy");
+        assert_eq!(hit.command, "git push");
+        assert!(!hit.run_now);
+    }
+
+    #[test]
+    fn snippet_picker_selection_moves_clamps_and_refilters() {
+        let snips = vec![
+            snippet("one", "echo 1", "", false),
+            snippet("two", "echo 2", "", true),
+        ];
+        let mut p = SnippetPicker::new(snips);
+        p.up(); // already at the top: must not underflow
+        assert_eq!(p.cursor, 0);
+        assert_eq!(p.selected().unwrap().name, "one");
+        p.down();
+        assert_eq!(p.cursor, 1);
+        let two = p.selected().unwrap();
+        assert_eq!(two.name, "two");
+        assert!(two.run_now, "the run_now flag rides along with the selection");
+        p.down(); // past the end: clamps
+        assert_eq!(p.cursor, 1);
+
+        // Typing refilters and snaps the cursor back to the top.
+        p.input('o');
+        p.input('n');
+        p.input('e');
+        assert_eq!(p.cursor, 0);
+        assert_eq!(p.selected().unwrap().name, "one");
+
+        // A query that matches nothing leaves no selection rather than panicking.
+        p.input('z');
+        assert!(p.selected().is_none());
     }
 
     #[test]
