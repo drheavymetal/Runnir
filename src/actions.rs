@@ -56,6 +56,7 @@ pub enum Action {
     HistorySearch,
     WatchKeyword,
     LaunchLayout,
+    OpenSnippets,
     CopyMode,
     FoldOutput,
     // Font
@@ -130,6 +131,7 @@ impl Action {
             HistorySearch => "history_search",
             WatchKeyword => "watch_keyword",
             LaunchLayout => "launch_layout",
+            OpenSnippets => "open_snippets",
             CopyMode => "copy_mode",
             FoldOutput => "fold_output",
             FontBigger => "font_bigger",
@@ -200,6 +202,7 @@ impl Action {
             HistorySearch => "Insert from shell history",
             WatchKeyword => "Watch pane for keyword",
             LaunchLayout => "Launch layout",
+            OpenSnippets => "Insert command snippet",
             CopyMode => "Copy mode (keyboard select)",
             FoldOutput => "Fold / unfold all command output",
             FontBigger => "Increase font size",
@@ -273,6 +276,7 @@ impl Action {
             "history_search" => HistorySearch,
             "watch_keyword" => WatchKeyword,
             "launch_layout" => LaunchLayout,
+            "open_snippets" => OpenSnippets,
             "copy_mode" => CopyMode,
             "fold_output" => FoldOutput,
             "font_bigger" => FontBigger,
@@ -356,6 +360,7 @@ impl Action {
             HistorySearch,
             WatchKeyword,
             LaunchLayout,
+            OpenSnippets,
             CopyMode,
             FoldOutput,
             ScrollToTop,
@@ -542,6 +547,9 @@ fn default_bindings() -> HashMap<Chord, Action> {
     bind(&mut m, "ctrl+shift+enter", Whisper);
     bind(&mut m, "ctrl+shift+b", ToggleBroadcast);
     bind(&mut m, "ctrl+shift+z", ToggleZoom);
+    // Every ctrl+shift+letter is spoken for, so snippets take a free super chord —
+    // the same modifier the tab/resize bindings already use. 's' for snippets.
+    bind(&mut m, "super+s", OpenSnippets);
     m
 }
 
@@ -581,6 +589,7 @@ pub fn default_hints() -> HashMap<String, String> {
         ("reopen_closed", "Ctrl+Shift+U"),
         ("move_tab_left", "Ctrl+Shift+Left"),
         ("move_tab_right", "Ctrl+Shift+Right"),
+        ("open_snippets", "Super+S"),
     ];
     pretty.iter().map(|(a, k)| (a.to_string(), k.to_string())).collect()
 }

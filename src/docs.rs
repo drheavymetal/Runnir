@@ -186,6 +186,29 @@ servers layout that ssh's into several machines at once. In the config:
 An empty command opens a plain shell pane. Commands are split on whitespace (not a
 full shell parse), which covers ssh host, journalctl -f and the like.
 
+# Command snippets (bookmarks)
+
+@ Super+S          fuzzy-pick a saved command; it is typed at the prompt to review.
+
+Save commands you run often as snippets and recall them from the palette (Insert
+command snippet) or the keybind. Type to filter on name or description. Selecting a
+snippet TYPES its command at the focused prompt for you to check and run yourself —
+the same review-first rule as the AI command-writer, never executed behind your back.
+A snippet may set run_now = true to submit itself immediately instead. In the config:
+
+  [[snippets]]
+  name = deploy
+  command = git push && ssh server bin/deploy
+  description = ship the current branch to prod
+
+  [[snippets]]
+  name = tail
+  command = journalctl -fu runnir
+  run_now = true
+
+description and run_now are optional; run_now defaults to false, so a snippet is
+inserted, not executed, unless you opt in.
+
 # Keyword watch
 
 From the palette, Watch pane for keyword arms the focused pane: when a later line

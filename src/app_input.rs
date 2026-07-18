@@ -474,6 +474,7 @@ impl Gpu {
             Action::HistorySearch => self.history_search(),
             Action::WatchKeyword => self.watch_keyword(),
             Action::LaunchLayout => self.open_layout_picker(config),
+            Action::OpenSnippets => self.open_snippet_picker(config),
             Action::CopyMode => self.enter_copy_mode(),
             Action::FoldOutput => self.tab().focused().toggle_fold_all(),
             Action::QuickConnect => self.open_quick_connect(),
@@ -604,6 +605,26 @@ impl Gpu {
                 Key::Character(s) => {
                     for c in s.chars() {
                         t.input(c);
+                    }
+                }
+                _ => {}
+            },
+            Overlay::Snippets(sp) => match key {
+                Key::Named(NamedKey::Escape) => self.overlay = None,
+                Key::Named(NamedKey::ArrowUp) => sp.up(),
+                Key::Named(NamedKey::ArrowDown) => sp.down(),
+                Key::Named(NamedKey::Backspace) => sp.backspace(),
+                Key::Named(NamedKey::Enter) => {
+                    let picked = sp.selected();
+                    self.overlay = None;
+                    if let Some(snip) = picked {
+                        self.use_snippet(snip);
+                    }
+                }
+                Key::Named(NamedKey::Space) => sp.input(' '),
+                Key::Character(s) => {
+                    for c in s.chars() {
+                        sp.input(c);
                     }
                 }
                 _ => {}
@@ -791,6 +812,7 @@ impl Gpu {
             Action::HistorySearch => self.history_search(),
             Action::WatchKeyword => self.watch_keyword(),
             Action::LaunchLayout => self.open_layout_picker(config),
+            Action::OpenSnippets => self.open_snippet_picker(config),
             Action::CopyMode => self.enter_copy_mode(),
             Action::FoldOutput => self.tab().focused().toggle_fold_all(),
             Action::Whisper => self.whisper(),
@@ -1724,6 +1746,37 @@ impl Gpu {
             names,
         )));
         self.window.request_redraw();
+    }
+
+    /// Opens the snippet picker: fuzzy-choose a saved command bookmark. Selecting it
+    /// types the command at the focused prompt for review (or runs it, if the snippet
+    /// set `run_now`). Nothing happens if no `[[snippets]]` are configured.
+    fn open_snippet_picker(&mut self, config: &Config) {
+        if config.snippets.is_empty() {
+            self.status = Some("no [[snippets]] configured — see the docs".into());
+            self.status_expiry = Some(Instant::now() + Duration::from_secs(4));
+            self.window.request_redraw();
+            return;
+        }
+        self.overlay =
+            Some(Overlay::Snippets(overlay::SnippetPicker::new(config.snippets.clone())));
+        self.window.request_redraw();
+    }
+
+    /// Applies a chosen snippet. By default the command is typed at the prompt via the
+    /// same review-first path the AI command-writer uses (`insert_command`), so you
+    /// press Enter yourself. A snippet with `run_now = true` is submitted immediately,
+    /// exactly as the assistant path does when it runs a command.
+    fn use_snippet(&mut self, snip: crate::config::SnippetDef) {
+        if snip.command.trim().is_empty() {
+            return;
+        }
+        self.insert_command(snip.command);
+        if snip.run_now {
+            // insert_command already snapped to the bottom and typed the line; this is
+            // just the Enter, sent to the same focused pane it was typed into.
+            self.tab().focused().write(b"\r");
+        }
     }
 
     /// Launches a named layout: a new tab split into one pane per command. Splits
