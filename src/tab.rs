@@ -50,7 +50,8 @@ impl Tab {
         let padding = config.window.padding;
         let inner = pad(area, padding);
         let (cols, rows) = cells_in(inner, cell);
-        let pane = Pane::new(cols, rows, config.scrollback.lines, cell, spawn, wake)?;
+        let pane =
+            Pane::new(cols, rows, config.scrollback.lines, cell, spawn, config.behaviour.shell_integration, wake)?;
 
         let mut panes = HashMap::new();
         panes.insert(first_id, pane);
@@ -154,6 +155,7 @@ impl Tab {
         let spawn = Spawn {
             command: (!command.is_empty()).then_some(command),
             cwd: self.focused_cwd(),
+            ..Default::default()
         };
         // The tree is kept current in every mode so switching to `Splits` restores a
         // real arrangement. Size the new pane to what the *active* mode will give it.
@@ -166,7 +168,15 @@ impl Tab {
             .unwrap_or(inner);
         let (cols, rows) = cells_in(rect, self.cell);
 
-        let pane = match Pane::new(cols, rows, config.scrollback.lines, self.cell, &spawn, wake) {
+        let pane = match Pane::new(
+            cols,
+            rows,
+            config.scrollback.lines,
+            self.cell,
+            &spawn,
+            config.behaviour.shell_integration,
+            wake,
+        ) {
             Ok(p) => p,
             Err(e) => {
                 // Roll back the structural change so a failed spawn leaves the tab
@@ -410,15 +420,17 @@ impl Tab {
             let spawn = Spawn {
                 command: None,
                 cwd: saved.and_then(|s| s.cwd.clone()),
+                ..Default::default()
             };
             // A single pane that cannot spawn (e.g. its saved cwd is gone) must not
             // discard the whole tab and everyone else's restored history. Retry in
             // the home directory; only give up on the pane if that fails too.
-            let mut pane = match Pane::new(cols, rows, config.scrollback.lines, cell, &spawn, wake(*id)) {
+            let si = config.behaviour.shell_integration;
+            let mut pane = match Pane::new(cols, rows, config.scrollback.lines, cell, &spawn, si, wake(*id)) {
                 Ok(p) => p,
                 Err(_) => {
-                    let fallback = Spawn { command: None, cwd: dirs::home_dir() };
-                    Pane::new(cols, rows, config.scrollback.lines, cell, &fallback, wake(*id))?
+                    let fallback = Spawn { command: None, cwd: dirs::home_dir(), ..Default::default() };
+                    Pane::new(cols, rows, config.scrollback.lines, cell, &fallback, si, wake(*id))?
                 }
             };
             if let Some(s) = saved {

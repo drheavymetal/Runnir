@@ -202,6 +202,15 @@ pub struct Grid {
     /// The PTY reader thread drains these and writes them back to the child. Without
     /// answering DA1, fish waits 10s per query and then disables features.
     responses: Vec<Vec<u8>>,
+    /// Text an OSC 52 write-clipboard request asked us to place on the system
+    /// clipboard. The parser has no clipboard handle (and runs on the reader
+    /// thread), so it queues here and the main thread drains it into `Clipboard`.
+    /// Read requests (`OSC 52 ; c ; ?`) are ignored entirely — never queued —
+    /// because replying would leak clipboard contents to any program.
+    clipboard_writes: Vec<String>,
+    /// Desktop-notification bodies from OSC 9 / OSC 99 / OSC 777. Drained by the
+    /// main thread into `platform::notify`.
+    notifications: Vec<String>,
     /// Inline images (kitty graphics protocol), anchored to a stable row so they
     /// scroll with the content that placed them.
     images: Vec<GridImage>,
@@ -274,6 +283,8 @@ impl Grid {
             dirty: true,
             bell_count: 0,
             responses: Vec::new(),
+            clipboard_writes: Vec::new(),
+            notifications: Vec::new(),
             images: Vec::new(),
             image_serial: 0,
             cell_px: (0.0, 0.0),
@@ -296,6 +307,18 @@ impl Grid {
     /// which the PTY reader writes back. Called after each parse.
     pub fn take_responses(&mut self) -> Vec<Vec<u8>> {
         std::mem::take(&mut self.responses)
+    }
+
+    /// Drains the clipboard writes requested via OSC 52. The main thread sets each
+    /// on the system clipboard (`Clipboard::set`); the parser can't reach it.
+    pub fn take_clipboard_writes(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.clipboard_writes)
+    }
+
+    /// Drains the desktop notifications requested via OSC 9 / 99 / 777. The main
+    /// thread raises each through `platform::notify`.
+    pub fn take_notifications(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.notifications)
     }
 
     /// Places a decoded image at the cursor, reserving its rows so following text
@@ -1617,7 +1640,91 @@ impl Perform for Grid {
                 };
                 self.dirty = true;
             }
+            // OSC 9 desktop notification (iTerm2/kitty growl): `9 ; <message>`.
+            // Note the `9 ; 4 ; ...` progress form is matched above, so this only
+            // catches the plain-message variant. `9 ; 4` alone (no percent) is a
+            // progress clear, not a notification, so require a non-"4" first part.
+            [b"9", first, rest @ ..] if first != b"4" => {
+                // Rejoin a message that contained ';' (vte split it on the separator).
+                let mut body = String::from_utf8_lossy(first).into_owned();
+                for part in rest {
+                    body.push(';');
+                    body.push_str(&String::from_utf8_lossy(part));
+                }
+                self.queue_notification(&body);
+            }
+            // OSC 52 clipboard. `52 ; <targets> ; <base64|?>`. WRITE ONLY: we decode
+            // the base64 and queue it for the clipboard. A read request (`?`) is
+            // ignored outright — echoing the clipboard back to the program is a
+            // security hole (any command could exfiltrate what you copied).
+            [b"52", _targets, payload, ..] => {
+                self.osc52_write(payload);
+            }
+            // OSC 99 kitty desktop notification. The full protocol carries metadata
+            // keys (`i=`, `d=`, `p=`, `e=`) in the first field and the text in the
+            // payload; we support the common simple form `99 ; <metadata> ; <body>`
+            // and route the body to a desktop notification. Body parts may contain
+            // ';' (vte split them), so rejoin the tail.
+            [b"99", _metadata, rest @ ..] if !rest.is_empty() => {
+                let body = rest
+                    .iter()
+                    .map(|p| String::from_utf8_lossy(p))
+                    .collect::<Vec<_>>()
+                    .join(";");
+                self.queue_notification(&body);
+            }
+            // OSC 777 rxvt/urxvt-style notification: `777 ; notify ; <title> ; <body>`.
+            [b"777", b"notify", title, rest @ ..] => {
+                let title = String::from_utf8_lossy(title);
+                let body = rest
+                    .iter()
+                    .map(|p| String::from_utf8_lossy(p))
+                    .collect::<Vec<_>>()
+                    .join(";");
+                let msg = if body.is_empty() {
+                    title.into_owned()
+                } else if title.is_empty() {
+                    body
+                } else {
+                    format!("{title}: {body}")
+                };
+                self.queue_notification(&msg);
+            }
             _ => {}
+        }
+    }
+}
+
+impl Grid {
+    /// Maximum base64 length accepted for an OSC 52 clipboard write. A hostile or
+    /// buggy program could otherwise stream an unbounded payload; past this we drop
+    /// the request rather than buffer it. 100 KB of base64 ≈ 75 KB of text.
+    const OSC52_MAX_B64: usize = 100 * 1024;
+
+    /// Decodes an OSC 52 base64 payload and queues it for the system clipboard.
+    /// Read requests (`?`) and malformed / oversized payloads are ignored.
+    fn osc52_write(&mut self, payload: &[u8]) {
+        use base64::Engine;
+        // A read request carries a literal '?' in the data field — never answer it.
+        if payload == b"?" {
+            return;
+        }
+        if payload.is_empty() || payload.len() > Self::OSC52_MAX_B64 {
+            return;
+        }
+        if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(payload)
+            && let Ok(text) = String::from_utf8(bytes)
+        {
+            self.clipboard_writes.push(text);
+        }
+    }
+
+    /// Queues a non-empty desktop-notification body, trimmed of surrounding
+    /// whitespace. Empty messages are dropped.
+    fn queue_notification(&mut self, body: &str) {
+        let body = body.trim();
+        if !body.is_empty() {
+            self.notifications.push(body.to_string());
         }
     }
 }
@@ -1932,6 +2039,77 @@ mod tests {
         let mut g = Grid::new(10, 1);
         feed(&mut g, "\x1b]0;runnir\x07");
         assert_eq!(g.title, "runnir");
+    }
+
+    #[test]
+    fn osc52_writes_clipboard() {
+        use base64::Engine;
+        let mut g = Grid::new(10, 1);
+        let b64 = base64::engine::general_purpose::STANDARD.encode("hola clipboard");
+        feed(&mut g, &format!("\x1b]52;c;{b64}\x07"));
+        assert_eq!(g.take_clipboard_writes(), vec!["hola clipboard".to_string()]);
+        // Drained: a second take is empty.
+        assert!(g.take_clipboard_writes().is_empty());
+    }
+
+    #[test]
+    fn osc52_ignores_read_requests() {
+        // Security: `?` asks the terminal to REPLY with the clipboard. We must never
+        // answer (would exfiltrate what the user copied) and must not queue anything.
+        let mut g = Grid::new(10, 1);
+        feed(&mut g, "\x1b]52;c;?\x07");
+        assert!(g.take_clipboard_writes().is_empty());
+        assert!(g.take_responses().is_empty(), "must never send clipboard back");
+    }
+
+    #[test]
+    fn osc52_ignores_malformed_and_oversized() {
+        let mut g = Grid::new(10, 1);
+        // Not valid base64.
+        feed(&mut g, "\x1b]52;c;@@@not base64@@@\x07");
+        assert!(g.take_clipboard_writes().is_empty());
+        // Oversized payload is dropped rather than buffered.
+        let big = "A".repeat(Grid::OSC52_MAX_B64 + 4);
+        feed(&mut g, &format!("\x1b]52;c;{big}\x07"));
+        assert!(g.take_clipboard_writes().is_empty());
+    }
+
+    #[test]
+    fn osc52_any_target_maps_to_clipboard() {
+        use base64::Engine;
+        let mut g = Grid::new(10, 1);
+        let b64 = base64::engine::general_purpose::STANDARD.encode("prim");
+        // primary-selection target is still honoured as a clipboard write.
+        feed(&mut g, &format!("\x1b]52;p;{b64}\x07"));
+        assert_eq!(g.take_clipboard_writes(), vec!["prim".to_string()]);
+    }
+
+    #[test]
+    fn osc777_notify_parses_title_and_body() {
+        let mut g = Grid::new(10, 1);
+        feed(&mut g, "\x1b]777;notify;Build;done ok\x07");
+        assert_eq!(g.take_notifications(), vec!["Build: done ok".to_string()]);
+        assert!(g.take_notifications().is_empty());
+    }
+
+    #[test]
+    fn osc99_notify_extracts_body() {
+        let mut g = Grid::new(10, 1);
+        // Simple form: empty metadata, body follows. Body may contain ';'.
+        feed(&mut g, "\x1b]99;;tarea; lista\x07");
+        assert_eq!(g.take_notifications(), vec!["tarea; lista".to_string()]);
+    }
+
+    #[test]
+    fn osc9_plain_message_notifies_but_progress_does_not() {
+        let mut g = Grid::new(10, 1);
+        // Plain OSC 9 message → notification.
+        feed(&mut g, "\x1b]9;compilado\x07");
+        assert_eq!(g.take_notifications(), vec!["compilado".to_string()]);
+        // OSC 9;4 is progress, NOT a notification.
+        feed(&mut g, "\x1b]9;4;1;50\x07");
+        assert!(g.take_notifications().is_empty());
+        assert_eq!(g.progress(), Some((1, 50)));
     }
 
     #[test]

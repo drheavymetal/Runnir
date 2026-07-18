@@ -1679,7 +1679,7 @@ impl Gpu {
         // First command opens the new tab's initial pane.
         let id = self.new_pane_id();
         let first = argv_of(&cmds[0]);
-        let spawn = Spawn { command: (!first.is_empty()).then_some(first), cwd: None };
+        let spawn = Spawn { command: (!first.is_empty()).then_some(first), cwd: None, ..Default::default() };
         let wake = wake_fn(self.proxy.clone());
         let Ok(mut tab) = Tab::new(area, cell, config, id, &spawn, wake) else { return };
         tab.title_override = Some(layout.name.clone());
@@ -1881,7 +1881,7 @@ impl Gpu {
         use crate::control::ControlResponse;
         let area = self.active_area();
         let id = self.new_pane_id();
-        let spawn = Spawn { command: (!command.is_empty()).then_some(command), cwd: None };
+        let spawn = Spawn { command: (!command.is_empty()).then_some(command), cwd: None, ..Default::default() };
         let wake = wake_fn(self.proxy.clone());
         match Tab::new(area, self.renderer.cell_size(), config, id, &spawn, wake) {
             Ok(tab) => {

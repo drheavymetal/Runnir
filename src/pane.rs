@@ -54,13 +54,18 @@ impl Pane {
         scrollback: usize,
         cell_px: (f32, f32),
         spawn: &Spawn,
+        shell_integration: bool,
         wake: impl Fn() + Send + 'static,
     ) -> anyhow::Result<Self> {
         let mut grid = Grid::new(cols, rows);
         grid.set_scrollback_limit(scrollback);
         grid.set_cell_px(cell_px.0, cell_px.1);
         let grid = Arc::new(Mutex::new(grid));
-        let pty = Pty::spawn(grid.clone(), spawn, wake)?;
+        // Inject OSC 133/7 shell integration (env / rcfile tweaks) unless disabled or
+        // the shell is unrecognised — apply() is a no-op in those cases.
+        let mut spawn = spawn.clone();
+        crate::shell_integration::apply(&mut spawn, shell_integration);
+        let pty = Pty::spawn(grid.clone(), &spawn, wake)?;
         Ok(Self {
             grid,
             pty,
@@ -111,6 +116,17 @@ impl Pane {
 
     pub fn alive(&self) -> bool {
         self.pty.alive()
+    }
+
+    /// Drains OSC 52 clipboard-write requests the child made. The caller sets each
+    /// on the system clipboard — the grid can't reach it from the reader thread.
+    pub fn take_clipboard_writes(&mut self) -> Vec<String> {
+        self.grid.lock().unwrap().take_clipboard_writes()
+    }
+
+    /// Drains OSC 9 / 99 / 777 desktop-notification requests the child made.
+    pub fn take_notifications(&mut self) -> Vec<String> {
+        self.grid.lock().unwrap().take_notifications()
     }
 
     /// Whether the grid changed since the last render (used for the tab activity

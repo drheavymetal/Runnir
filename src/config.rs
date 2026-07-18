@@ -176,6 +176,12 @@ pub struct Behaviour {
     /// instead of teleporting.
     #[serde(default = "yes")]
     pub smooth_scroll: bool,
+    /// Inject shell integration (OSC 133 prompt marks + OSC 7 cwd) into fish/zsh/bash
+    /// automatically, without the user editing their rc files. Powers command
+    /// navigation, the pass/fail gutter, and portable cwd tracking. Detection is
+    /// best-effort: an unrecognised shell is spawned unchanged.
+    #[serde(default = "yes")]
+    pub shell_integration: bool,
 }
 
 fn yes() -> bool {
@@ -193,6 +199,7 @@ impl Default for Behaviour {
             restore_session: true,
             command_guardian: true,
             smooth_scroll: true,
+            shell_integration: true,
         }
     }
 }
