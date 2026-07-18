@@ -28,7 +28,8 @@ each, THEN Fable bug-hunt all. Branches + commits + files touched:
 6. Remote control API (`runnir @`, UserEvent::Control, socket): branch
    `worktree-agent-a9f7132d0632d1031` commit 66be1c2 — control.rs (new), main.rs, app_input.rs.
 7. OSC 52 + OSC 99/777 + auto shell-integration: branch
-   `worktree-agent-a054731dbfd456984` — STILL RUNNING at last check (grid.rs osc_dispatch, clipboard.rs, pty.rs, main.rs).
+   `worktree-agent-a054731dbfd456984` commit 67b67d8 — grid.rs (osc_dispatch OSC 52/9/99/777 + clipboard_writes/notifications queues), main.rs (drain in periodic), pane.rs, pty.rs (Spawn.env), clipboard.rs, shell_integration.rs (NEW, behaviour.shell_integration default true).
+ALL 7 CODE BRANCHES DONE — integration in progress. Mark each done here as merged.
 Also running: React docs site → `worktree-agent-aa3ede6dbf9d25c23` (docs-site/ only, additive, merge trivially).
 QUEUED after integration (touch grid/render, would conflict): Unicode/grapheme rigor, IME, Sixel, text-sizing protocol. Then optional: triggers, quick-select, navigable command blocks, file-transfer.
 Merge order suggestion: independent-file first (control.rs, themes.rs, selection.rs, layout.rs) then the grid.rs/app_input.rs-heavy (underlines, keyboard, osc52) resolving cumulatively.
