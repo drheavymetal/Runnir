@@ -96,9 +96,12 @@ fn apply_zsh(spawn: &mut Spawn, base: &Path) {
 
 fn apply_bash(spawn: &mut Spawn, base: &Path, program: &str) {
     let rc = base.join("bash").join("runnir.bash");
+    // `Some(vec![])` means "run $SHELL" to the pty (same as `None`): fall back to
+    // the detected program rather than indexing an empty argv.
     let cmd = spawn
         .command
         .clone()
+        .filter(|c| !c.is_empty())
         .unwrap_or_else(|| vec![program.to_string()]);
     if cmd.iter().any(|a| a == "--rcfile") {
         return; // Caller already set an rcfile: don't fight it.
@@ -191,6 +194,12 @@ const ZSH_ZSHENV: &str = r#"# runnir shell integration — auto-injected via ZDO
 # .zshrc loads next.
 __runnir_self_zdotdir="$ZDOTDIR"
 [[ -f "${RUNNIR_ZDOTDIR:-$HOME}/.zshenv" ]] && source "${RUNNIR_ZDOTDIR:-$HOME}/.zshenv"
+# The user's .zshenv may relocate ZDOTDIR (ZDOTDIR=~/.config/zsh is common). That
+# new dir is where their real startup files live — follow it, or their .zshrc
+# would silently never load.
+if [[ -n "$ZDOTDIR" && "$ZDOTDIR" != "$__runnir_self_zdotdir" ]]; then
+    export RUNNIR_ZDOTDIR="$ZDOTDIR"
+fi
 ZDOTDIR="$__runnir_self_zdotdir"
 unset __runnir_self_zdotdir
 "#;
@@ -198,6 +207,10 @@ unset __runnir_self_zdotdir
 const ZSH_ZPROFILE: &str = r#"# runnir shell integration — auto-injected via ZDOTDIR. Do not edit.
 __runnir_self_zdotdir="$ZDOTDIR"
 [[ -f "${RUNNIR_ZDOTDIR:-$HOME}/.zprofile" ]] && source "${RUNNIR_ZDOTDIR:-$HOME}/.zprofile"
+# Follow a ZDOTDIR relocated by the user's .zprofile, same as in .zshenv.
+if [[ -n "$ZDOTDIR" && "$ZDOTDIR" != "$__runnir_self_zdotdir" ]]; then
+    export RUNNIR_ZDOTDIR="$ZDOTDIR"
+fi
 ZDOTDIR="$__runnir_self_zdotdir"
 unset __runnir_self_zdotdir
 "#;
@@ -220,13 +233,22 @@ if [[ -o interactive ]] && [[ -z "$__runnir_integration" ]]; then
     __runnir_integration=1
     autoload -Uz add-zsh-hook
 
+    # Set when a command actually ran, so precmd only emits D for real commands:
+    # the first prompt and empty Enters must not report a finished command (a
+    # phantom D would count as a completion → bogus notifications, stale gutter).
+    __runnir_ran=
+
     __runnir_precmd() {
         local __ret=$?
-        printf '\e]133;D;%s\e\\' "$__ret"
+        if [[ -n "$__runnir_ran" ]]; then
+            __runnir_ran=
+            printf '\e]133;D;%s\e\\' "$__ret"
+        fi
         printf '\e]7;file://%s%s\e\\' "${HOST}" "${PWD}"
         printf '\e]133;A\e\\'
     }
     __runnir_preexec() {
+        __runnir_ran=1
         printf '\e]133;C\e\\'
     }
     add-zsh-hook precmd __runnir_precmd
@@ -249,27 +271,47 @@ fi
 if [[ $- == *i* ]] && [[ -z "$__runnir_integration" ]]; then
     __runnir_integration=1
 
+    # Armed (empty) only between the end of a full prompt cycle and the next typed
+    # command, so the DEBUG trap fires C exactly once per command — never for this
+    # rc file's own tail, nor for the user's PROMPT_COMMAND entries (which also
+    # run through the trap on every prompt).
+    __runnir_preexec_done=1
+    # Set when a command actually ran, so precmd only emits D for real commands:
+    # the first prompt and empty Enters must not report a finished command (a
+    # phantom D would count as a completion → bogus notifications, stale gutter).
+    __runnir_started=
+
     __runnir_precmd() {
         local __ret=$?
-        printf '\e]133;D;%s\e\\' "$__ret"
+        if [[ -n "$__runnir_started" ]]; then
+            __runnir_started=
+            printf '\e]133;D;%s\e\\' "$__ret"
+        fi
         printf '\e]7;file://%s%s\e\\' "${HOSTNAME}" "${PWD}"
         printf '\e]133;A\e\\'
+        __runnir_preexec_done=1
+    }
+
+    # Re-arms the C mark; runs LAST in PROMPT_COMMAND, after the user's own
+    # entries, so those never consume the mark meant for the next typed command.
+    __runnir_arm() {
         __runnir_preexec_done=
     }
 
     # bash has no native preexec: use the DEBUG trap, firing C once per command.
     __runnir_preexec() {
-        [[ -n "$COMP_LINE" ]] && return                     # completion, not a command
-        [[ "$BASH_COMMAND" == "__runnir_precmd" ]] && return # our own prompt command
-        [[ -n "$__runnir_preexec_done" ]] && return          # already marked this line
+        [[ -n "$COMP_LINE" ]] && return               # completion, not a command
+        [[ "$BASH_COMMAND" == __runnir_* ]] && return # our own hooks
+        [[ -n "$__runnir_preexec_done" ]] && return   # not armed: prompt machinery
         __runnir_preexec_done=1
+        __runnir_started=1
         printf '\e]133;C\e\\'
     }
     trap '__runnir_preexec' DEBUG
 
     case ";${PROMPT_COMMAND};" in
         *";__runnir_precmd;"*) ;;
-        *) PROMPT_COMMAND="__runnir_precmd${PROMPT_COMMAND:+;$PROMPT_COMMAND}" ;;
+        *) PROMPT_COMMAND="__runnir_precmd${PROMPT_COMMAND:+;$PROMPT_COMMAND};__runnir_arm" ;;
     esac
 
     # B mark appended to PS1; \[ \] are bash's zero-width markers.
@@ -349,6 +391,109 @@ mod tests {
         apply(&mut s, true);
         assert!(s.env.is_empty());
         assert_eq!(s.command, Some(vec!["/usr/bin/nu".to_string()]));
+    }
+
+    #[test]
+    fn bash_empty_argv_falls_back_to_the_program() {
+        // `Some(vec![])` is a valid Spawn (pty runs $SHELL for it), so apply() can
+        // route it here when $SHELL is bash. It must stay fail-safe, not panic
+        // indexing an empty argv.
+        let mut s = spawn_with(Some(vec![]));
+        apply_bash(&mut s, Path::new("/tmp/runnir-test-base"), "/bin/bash");
+        let cmd = s.command.expect("command");
+        assert_eq!(cmd[0], "/bin/bash");
+        assert_eq!(cmd[1], "--rcfile");
+    }
+
+    /// Runs a shell with piped stdin, returning its stdout. `None` when the shell
+    /// is unavailable on this machine (callers skip the check).
+    fn run_interactive(
+        shell: &str,
+        args: &[&str],
+        envs: &[(&str, String)],
+        input: &str,
+    ) -> Option<String> {
+        use std::io::Write;
+        let mut cmd = std::process::Command::new(shell);
+        cmd.args(args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null());
+        for (k, v) in envs {
+            cmd.env(k, v);
+        }
+        let mut child = cmd.spawn().ok()?;
+        child.stdin.take()?.write_all(input.as_bytes()).ok()?;
+        let out = child.wait_with_output().ok()?;
+        Some(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
+    #[test]
+    fn bash_snippet_marks_only_real_commands() {
+        let dir = std::env::temp_dir().join("runnir-test-bash-marks");
+        let _ = std::fs::remove_dir_all(&dir);
+        let home = dir.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        // A user PROMPT_COMMAND: its entries run through the DEBUG trap every
+        // prompt and must not consume or emit command marks.
+        std::fs::write(home.join(".bashrc"), "PROMPT_COMMAND='true'\nPS1='$ '\n").unwrap();
+        let rc = dir.join("runnir.bash");
+        std::fs::write(&rc, BASH_SNIPPET).unwrap();
+        let Some(out) = run_interactive(
+            "bash",
+            &["--rcfile", rc.to_str().unwrap(), "-i"],
+            &[("HOME", home.to_string_lossy().into_owned())],
+            "echo MARKER\nexit\n",
+        ) else {
+            return; // bash unavailable: nothing to verify on this machine
+        };
+        // Two typed commands (echo, exit) → exactly two C marks. The rc file's own
+        // tail and the user's PROMPT_COMMAND must not fire C.
+        assert_eq!(out.matches("\x1b]133;C").count(), 2, "C marks: {out:?}");
+        // No stray C before the first prompt's A mark.
+        assert!(
+            out.find("\x1b]133;A").unwrap() < out.find("\x1b]133;C").unwrap(),
+            "stray C before the first prompt: {out:?}"
+        );
+        // Only the echo finished a command; the first prompt must not emit a
+        // phantom D (it would count as a finished command → bogus notifications).
+        assert_eq!(out.matches("\x1b]133;D").count(), 1, "D marks: {out:?}");
+    }
+
+    #[test]
+    fn zsh_snippet_follows_zdotdir_moved_by_the_users_zshenv() {
+        let dir = std::env::temp_dir().join("runnir-test-zsh-zdotdir");
+        let _ = std::fs::remove_dir_all(&dir);
+        let rz = dir.join("rz");
+        let real = dir.join("real");
+        let moved = dir.join("moved");
+        for d in [&rz, &real, &moved] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(rz.join(".zshenv"), ZSH_ZSHENV).unwrap();
+        std::fs::write(rz.join(".zprofile"), ZSH_ZPROFILE).unwrap();
+        std::fs::write(rz.join(".zshrc"), ZSH_ZSHRC).unwrap();
+        // The user's real .zshenv relocates ZDOTDIR (ZDOTDIR=~/.config/zsh is a
+        // very common setup); their actual .zshrc lives in the new location and
+        // must still be sourced.
+        std::fs::write(real.join(".zshenv"), format!("export ZDOTDIR={}\n", moved.display()))
+            .unwrap();
+        std::fs::write(moved.join(".zshrc"), "echo MOVED_ZSHRC_LOADED\n").unwrap();
+        let Some(out) = run_interactive(
+            "zsh",
+            &["-i"],
+            &[
+                ("ZDOTDIR", rz.to_string_lossy().into_owned()),
+                ("RUNNIR_ZDOTDIR", real.to_string_lossy().into_owned()),
+            ],
+            "echo MARKER\nexit\n",
+        ) else {
+            return; // zsh unavailable: nothing to verify on this machine
+        };
+        assert!(out.contains("MOVED_ZSHRC_LOADED"), "user zshrc must load: {out:?}");
+        // One command ran (echo) → one D. The first prompt must not emit a
+        // phantom D before any command has run.
+        assert_eq!(out.matches("\x1b]133;D").count(), 1, "D marks: {out:?}");
     }
 
     #[test]

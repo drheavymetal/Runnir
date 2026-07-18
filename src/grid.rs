@@ -1729,14 +1729,21 @@ impl Grid {
     const OSC52_MAX_B64: usize = 100 * 1024;
 
     /// Decodes an OSC 52 base64 payload and queues it for the system clipboard.
-    /// Read requests (`?`) and malformed / oversized payloads are ignored.
+    /// An empty payload clears the clipboard (xterm semantics); read requests
+    /// (`?`) and malformed / oversized payloads are ignored.
     fn osc52_write(&mut self, payload: &[u8]) {
         use base64::Engine;
         // A read request carries a literal '?' in the data field — never answer it.
         if payload == b"?" {
             return;
         }
-        if payload.is_empty() || payload.len() > Self::OSC52_MAX_B64 {
+        // `52;c;` with no data clears the selection (xterm): queue an empty write
+        // so the main thread empties the system clipboard.
+        if payload.is_empty() {
+            self.clipboard_writes.push(String::new());
+            return;
+        }
+        if payload.len() > Self::OSC52_MAX_B64 {
             return;
         }
         if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(payload)
@@ -2144,6 +2151,15 @@ mod tests {
         feed(&mut g, "\x1b]52;c;?\x07");
         assert!(g.take_clipboard_writes().is_empty());
         assert!(g.take_responses().is_empty(), "must never send clipboard back");
+    }
+
+    #[test]
+    fn osc52_empty_payload_clears_clipboard() {
+        // xterm: `52;c;` with no data clears the selection. An empty write must be
+        // queued (so the main thread empties the system clipboard), not dropped.
+        let mut g = Grid::new(10, 1);
+        feed(&mut g, "\x1b]52;c;\x07");
+        assert_eq!(g.take_clipboard_writes(), vec![String::new()]);
     }
 
     #[test]
