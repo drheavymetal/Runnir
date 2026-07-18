@@ -826,6 +826,24 @@ impl Gpu {
         }
     }
 
+    /// Applies a freshly-loaded config live (hot-reload): theme, opacity and font.
+    /// Key bindings are rebuilt by the caller (they live on `App`, not `Gpu`).
+    fn apply_config(&mut self, config: &Config) {
+        self.renderer.set_theme(config.theme.clone());
+        self.renderer.set_opacity(config.window.opacity);
+        // Rebuild the font only when it actually changed, so a save that only tweaks
+        // colours does not pay for atlas re-rasterisation.
+        if (config.font.size - self.font_px).abs() >= 0.5 {
+            if let Ok(mut font) = FontAtlas::new_with(&config.font.family, config.font.size) {
+                font.ligatures = config.font.ligatures;
+                self.renderer.replace_font(&self.device, font);
+                self.font_px = config.font.size;
+                self.reflow_all();
+            }
+        }
+        self.window.request_redraw();
+    }
+
     fn set_font_px(&mut self, px: f32, config: &Config) {
         let px = px.clamp(6.0, 72.0);
         if (px - self.font_px).abs() < 0.5 {

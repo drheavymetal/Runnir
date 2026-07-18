@@ -205,13 +205,52 @@ struct App {
     /// the compositor's job — Wayland gives no app global hotkeys — so `--quake`
     /// pairs with a Hyprland binding (see the F1 docs).
     quake: bool,
+    /// Config-file mtime last seen, for hot-reload. Refreshed after each apply so a
+    /// single save triggers exactly one reload.
+    config_mtime: Option<std::time::SystemTime>,
+    /// When the config file was last stat'd, to throttle the check to ~1 Hz.
+    last_config_check: Instant,
 }
 
 impl App {
     fn new(proxy: EventLoopProxy<UserEvent>, quake: bool) -> Self {
         let config = Config::load();
         let keymap = Keymap::new(&config.keys);
-        Self { proxy, gpu: None, config, keymap, mods: ModifiersState::empty(), quake }
+        let config_mtime = config_mtime();
+        Self {
+            proxy,
+            gpu: None,
+            config,
+            keymap,
+            mods: ModifiersState::empty(),
+            quake,
+            config_mtime,
+            last_config_check: Instant::now(),
+        }
+    }
+
+    /// Reloads the config when its file has changed on disk, applying the new theme,
+    /// opacity, font and key bindings live. Throttled to once a second so it costs a
+    /// single `stat` per idle wake at most.
+    fn maybe_reload_config(&mut self) {
+        if self.last_config_check.elapsed() < Duration::from_secs(1) {
+            return;
+        }
+        self.last_config_check = Instant::now();
+        let now = config_mtime();
+        if now == self.config_mtime {
+            return;
+        }
+        self.config_mtime = now;
+        let new = Config::load();
+        self.keymap = Keymap::new(&new.keys);
+        if let Some(gpu) = self.gpu.as_mut() {
+            gpu.apply_config(&new);
+            gpu.status = Some("config reloaded".into());
+            gpu.status_expiry = Some(Instant::now() + Duration::from_secs(2));
+            gpu.window.request_redraw();
+        }
+        self.config = new;
     }
 }
 
@@ -393,6 +432,12 @@ impl App {
     }
 }
 
+/// The config file's last-modified time, or `None` if it does not exist yet. Used
+/// by hot-reload to notice edits.
+fn config_mtime() -> Option<std::time::SystemTime> {
+    std::fs::metadata(Config::path()).and_then(|m| m.modified()).ok()
+}
+
 fn content_area(cfg: &wgpu::SurfaceConfiguration, cell: (f32, f32), tab_count: usize) -> Rect {
     let bar = if tab_count > 1 { TABBAR_ROWS * cell.1 } else { 0.0 };
     Rect { x: 0.0, y: bar, w: cfg.width as f32, h: (cfg.height as f32 - bar).max(cell.1) }
@@ -488,6 +533,7 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        self.maybe_reload_config();
         let Some(gpu) = self.gpu.as_mut() else { return };
         if !gpu.reap(&self.config) {
             // Every shell exited: an intentional close. Clear the session so the

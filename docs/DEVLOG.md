@@ -40,7 +40,9 @@ WOW (aim 4–5):
 
 DIFFERENTIAL (aim ~15 total incl. above):
 - [ ] D1 OSC 8 hyperlinks — clickable links apps emit (ls --hyperlink, gcc/cargo).
-- [ ] D2 Config hot-reload — watch ~/.config/runnir/runnir.toml, apply live.
+- [x] D2 Config hot-reload — App::maybe_reload_config (mtime, ~1Hz throttle) in
+      about_to_wait → Config::load + Keymap rebuild + Gpu::apply_config (theme/opacity/font).
+      Opacity opaque↔translucent still needs restart. commit 33.
 - [x] D3 Shell-history fuzzy — src/history.rs recent() (fish/zsh/bash parse+dedup);
       HistorySearch palette action → Prompt(HistoryInsert) → insert_command (typed, not run).
       4 tests. commit 32.
