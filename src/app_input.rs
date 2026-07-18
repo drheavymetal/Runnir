@@ -228,6 +228,20 @@ impl Gpu {
         keymap: &Keymap,
         event_loop: &ActiveEventLoop,
     ) {
+        // Key-release events only reach the child under the kitty keyboard protocol
+        // (the "report event types" flag); they never drive overlays, copy-mode, or
+        // chords. Everything below this point is press-only.
+        if !event.state.is_pressed() {
+            let flags = self.tab().focused().keyboard_flags();
+            if flags & keys::KITTY_REPORT_EVENTS != 0 && self.overlay.is_none() && self.copy_mode.is_none()
+            {
+                if let Some(bytes) = keys::encode_kitty(&event, mods, flags, true) {
+                    self.write_key_bytes(&bytes);
+                }
+            }
+            return;
+        }
+
         // An overlay swallows all keys while open.
         if self.overlay.is_some() {
             self.overlay_key(&event, mods, config);
@@ -272,9 +286,17 @@ impl Gpu {
             }
         }
 
-        // Otherwise it is input for the focused pane's process.
-        let mode = keys::KeyMode { app_cursor: self.tab().focused().app_cursor() };
-        if let Some(bytes) = keys::encode(&event, mods, mode) {
+        // Otherwise it is input for the focused pane's process. Under the kitty
+        // keyboard protocol the pane advertises non-zero flags and keys are encoded
+        // as CSI-u; otherwise the byte-identical legacy encoding is used.
+        let flags = self.tab().focused().keyboard_flags();
+        let bytes = if flags != 0 {
+            keys::encode_kitty(&event, mods, flags, false)
+        } else {
+            let mode = keys::KeyMode { app_cursor: self.tab().focused().app_cursor() };
+            keys::encode(&event, mods, mode)
+        };
+        if let Some(bytes) = bytes {
             // Diagnostic: RUNNIR_KEYLOG=1 logs each keypress → bytes it sends, with
             // the focused pane id and the winit repeat flag, to catch duplication.
             if std::env::var("RUNNIR_KEYLOG").is_ok() {
@@ -286,16 +308,22 @@ impl Gpu {
                     String::from_utf8_lossy(&bytes)
                 );
             }
-            self.scroll_glide = None;
-            if self.tab().focused().snap_to_bottom() {
-                self.window.request_redraw();
-            }
-            self.tab().focused().clear_selection();
-            if self.broadcast {
-                self.broadcast_bytes(&bytes);
-            } else {
-                self.tab().focused().write(&bytes);
-            }
+            self.write_key_bytes(&bytes);
+        }
+    }
+
+    /// Sends encoded key bytes to the focused pane (or all panes when broadcasting),
+    /// snapping the view to the live output and clearing any selection first.
+    fn write_key_bytes(&mut self, bytes: &[u8]) {
+        self.scroll_glide = None;
+        if self.tab().focused().snap_to_bottom() {
+            self.window.request_redraw();
+        }
+        self.tab().focused().clear_selection();
+        if self.broadcast {
+            self.broadcast_bytes(bytes);
+        } else {
+            self.tab().focused().write(bytes);
         }
     }
 
