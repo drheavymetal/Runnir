@@ -98,8 +98,13 @@ impl Session {
 /// ```` ```sh ```` blocks even when told not to.
 fn clean_command(text: &str) -> String {
     let mut s = text.trim();
-    if let Some(rest) = s.strip_prefix("```") {
-        // Drop the opening fence (and any language tag) and the closing one.
+    // The fence may sit after a prose preamble ("Here is the fix:\n```sh\n…"),
+    // so find it anywhere, not just at the start — the fenced content is the
+    // command; the surrounding prose never is.
+    if let Some(idx) = s.find("```") {
+        let rest = &s[idx + 3..];
+        // Drop the opening fence's language-tag line; a one-line fence
+        // (```ls -la```) has no newline, so its content is used whole.
         let rest = rest.splitn(2, '\n').nth(1).unwrap_or(rest);
         s = rest.trim_end_matches("```").trim();
     }
@@ -107,9 +112,12 @@ fn clean_command(text: &str) -> String {
     // Keep only the first line: a command, not a paragraph.
     let mut line = s.lines().next().unwrap_or("").trim();
     // Models like to echo a shell prompt marker in front of the command. Strip a
-    // leading `$` (or `$ `) so a clean, runnable command lands at the prompt.
+    // leading `$` only when followed by whitespace ("$ cmd"): a `$` glued to a
+    // word is a variable — `$EDITOR notes.txt` is a real command, not an echo.
     if let Some(rest) = line.strip_prefix('$') {
-        line = rest.trim_start();
+        if rest.starts_with(char::is_whitespace) {
+            line = rest.trim_start();
+        }
     }
     line.to_string()
 }
@@ -343,9 +351,34 @@ mod tests {
         assert_eq!(clean_command("rm -rf build\nThis deletes the build dir."), "rm -rf build");
         // A leading shell-prompt marker the model echoed is stripped.
         assert_eq!(clean_command("$ cargo build"), "cargo build");
-        assert_eq!(clean_command("$git status"), "git status");
         // All three wrappers at once: fence + backtick residue + prompt marker.
         assert_eq!(clean_command("```sh\n$ ls -la\n```"), "ls -la");
+    }
+
+    #[test]
+    fn clean_command_survives_prose_around_the_fence() {
+        // A model that disobeys "no prose" and prefixes the fence: the fenced
+        // command must win, or English prose gets typed at the shell prompt.
+        assert_eq!(
+            clean_command("Here is the corrected command:\n\n```sh\nmkdir foo\n```"),
+            "mkdir foo"
+        );
+        // Trailing prose after the closing fence is ignored too.
+        assert_eq!(clean_command("```\nls -la\n```\nThis lists the files."), "ls -la");
+        // An unterminated fence (reply cut off) still yields the command.
+        assert_eq!(clean_command("```sh\ncargo build"), "cargo build");
+        // An empty fence collapses to nothing (the app then types nothing).
+        assert_eq!(clean_command("```sh\n```"), "");
+    }
+
+    #[test]
+    fn clean_command_keeps_a_leading_variable_reference() {
+        // `$` glued to a word is a variable expansion, not a prompt echo: the
+        // command must arrive intact, not beheaded into "EDITOR notes.txt".
+        assert_eq!(clean_command("$EDITOR notes.txt"), "$EDITOR notes.txt");
+        assert_eq!(clean_command("`$BROWSER https://crates.io`"), "$BROWSER https://crates.io");
+        // With whitespace after it, it is the echoed prompt marker: strip it.
+        assert_eq!(clean_command("$ $EDITOR notes.txt"), "$EDITOR notes.txt");
     }
 
     #[test]
