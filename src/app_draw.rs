@@ -82,6 +82,12 @@ impl Gpu {
             panes.push(PaneDraw { grid, selection: None, origin: (*ox, *oy), tint: None, focused: true, cursor: None, search: Default::default() });
         }
 
+        // Status bar along the bottom row (cwd, git branch, clock).
+        let status_holder = self.build_status(config, screen);
+        if let Some((grid, ox, oy)) = &status_holder {
+            panes.push(PaneDraw { grid, selection: None, origin: (*ox, *oy), tint: None, focused: true, cursor: None, search: Default::default() });
+        }
+
         // Sticky prompt: while scrolled back, pin the focused command's prompt line
         // at the top of its pane so you always see what you're reading. Built into a
         // local (not self) so it does not conflict with the guards' borrow. Read
@@ -417,6 +423,43 @@ impl Gpu {
         out
     }
 
+    /// The bottom status bar: cwd (home-abbreviated) and git branch on the left, the
+    /// clock on the right. `None` when disabled.
+    fn build_status(&self, config: &Config, screen: (f32, f32)) -> Option<(Grid, f32, f32)> {
+        if !self.status_bar {
+            return None;
+        }
+        let (cw, ch) = self.renderer.cell_size();
+        let cols = (screen.0 / cw).floor().max(1.0) as usize;
+        let y = screen.1 - ch;
+        let mut bar = Grid::new(cols, 1);
+        let bg = Color::Rgb(0x12, 0x13, 0x17);
+        bar.fill(Pen { bg, ..Pen::default() });
+
+        let pane = self.tabs[self.active].focused_ref();
+        let cwd = pane.cwd().map(|p| abbreviate_home(&p)).unwrap_or_default();
+        let branch = pane.cwd().and_then(|p| git_branch(&p));
+        let a = config.theme.accent;
+        let dim = Pen { fg: Color::Rgb(0x8a, 0x8d, 0x94), bg, ..Pen::default() };
+        let accent = Pen { fg: Color::Rgb(a.0, a.1, a.2), bg, ..Pen::default() };
+
+        bar.write_str(0, 1, &cwd, dim);
+        let mut x = 1 + cwd.chars().count() + 2;
+        if let Some(b) = &branch {
+            let s = format!("\u{e0a0} {b}"); //  branch glyph
+            bar.write_str(0, x, &s, accent);
+            x += s.chars().count() + 2;
+        }
+        let _ = x;
+        // Right: clock.
+        if !self.clock.is_empty() {
+            let s = format!("\u{f017} {} ", self.clock); //  clock glyph
+            let right = cols.saturating_sub(s.chars().count());
+            bar.write_str(0, right, &s, dim);
+        }
+        Some((bar, 0.0, y))
+    }
+
     fn build_hints(
         &self,
         area: Rect,
@@ -501,4 +544,38 @@ impl Gpu {
             eprintln!("runnir: could not save session: {e}");
         }
     }
+}
+
+/// Replaces a leading $HOME with `~` for the status bar.
+fn abbreviate_home(p: &std::path::Path) -> String {
+    let s = p.to_string_lossy();
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = home.to_string_lossy();
+        if let Some(rest) = s.strip_prefix(home.as_ref()) {
+            return format!("~{rest}");
+        }
+    }
+    s.into_owned()
+}
+
+/// The current git branch for `dir`, by reading `.git/HEAD` walking up to the repo
+/// root. `None` outside a repo. No git process spawned.
+fn git_branch(dir: &std::path::Path) -> Option<String> {
+    let mut cur = Some(dir);
+    while let Some(d) = cur {
+        let head = d.join(".git/HEAD");
+        if let Ok(content) = std::fs::read_to_string(&head) {
+            let content = content.trim();
+            return Some(
+                content
+                    .strip_prefix("ref: refs/heads/")
+                    .unwrap_or(content)
+                    .chars()
+                    .take(24)
+                    .collect(),
+            );
+        }
+        cur = d.parent();
+    }
+    None
 }

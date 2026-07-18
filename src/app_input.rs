@@ -1326,6 +1326,11 @@ impl Gpu {
     /// Applies a freshly-loaded config live (hot-reload): theme, opacity and font.
     /// Key bindings are rebuilt by the caller (they live on `App`, not `Gpu`).
     fn apply_config(&mut self, config: &Config) {
+        // A status-bar toggle changes the content height, so reflow after.
+        if self.status_bar != config.window.status_bar {
+            self.status_bar = config.window.status_bar;
+            self.reflow_all();
+        }
         self.renderer.set_theme(config.theme.clone());
         // Opacity only when the surface composites with alpha; on an opaque surface
         // it would darken rather than reveal, same guard as at startup.

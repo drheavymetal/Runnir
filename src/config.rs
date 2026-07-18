@@ -79,11 +79,21 @@ pub struct WindowCfg {
     pub padding: f32,
     pub decorations: bool,
     pub opacity: f32,
+    /// Show a status bar along the bottom (cwd, git branch, clock). Costs one row.
+    #[serde(default = "yes")]
+    pub status_bar: bool,
 }
 
 impl Default for WindowCfg {
     fn default() -> Self {
-        Self { width: 1100.0, height: 700.0, padding: 8.0, decorations: false, opacity: 1.0 }
+        Self {
+            width: 1100.0,
+            height: 700.0,
+            padding: 8.0,
+            decorations: false,
+            opacity: 1.0,
+            status_bar: true,
+        }
     }
 }
 

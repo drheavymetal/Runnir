@@ -305,6 +305,13 @@ struct Gpu {
     /// selected). Off means opacity must stay 1.0 or the window merely darkens — the
     /// hot-reload path checks this before re-applying config opacity.
     translucent: bool,
+    /// Show a status bar along the bottom (cwd, git branch, clock). Costs one row.
+    status_bar: bool,
+    /// Cached clock string ("HH:MM"), refreshed periodically to avoid formatting time
+    /// (no chrono dep) every frame.
+    clock: String,
+    /// When the clock was last refreshed.
+    last_clock: Instant,
     ai: ai::Session,
     last_context_refresh: Instant,
     last_autosave: Instant,
@@ -426,7 +433,7 @@ impl App {
                 restore_tabs(&saved, &surface_config, cell, &self.config, self.proxy.clone())
             }
             None => {
-                let area = content_area(&surface_config, cell, 1);
+                let area = content_area(&surface_config, cell, 1, self.config.window.status_bar);
                 let tab = Tab::new(area, cell, &self.config, 1, &Spawn::default(), wake_fn(self.proxy.clone()))
                     .expect("failed to spawn first pane");
                 (vec![tab], 0, 1000)
@@ -461,6 +468,9 @@ impl App {
                 self.config.font.ligatures,
             ),
             translucent,
+            status_bar: self.config.window.status_bar,
+            clock: String::new(),
+            last_clock: Instant::now() - Duration::from_secs(60),
             ai: ai::Session::new(),
             last_context_refresh: Instant::now(),
             last_autosave: Instant::now(),
@@ -513,9 +523,11 @@ struct HoverUrl {
     kind: overlay::HintKind,
 }
 
-fn content_area(cfg: &wgpu::SurfaceConfiguration, cell: (f32, f32), tab_count: usize) -> Rect {
+fn content_area(cfg: &wgpu::SurfaceConfiguration, cell: (f32, f32), tab_count: usize, status: bool) -> Rect {
     let bar = if tab_count > 1 { TABBAR_ROWS * cell.1 } else { 0.0 };
-    Rect { x: 0.0, y: bar, w: cfg.width as f32, h: (cfg.height as f32 - bar).max(cell.1) }
+    let status_h = if status { cell.1 } else { 0.0 };
+    let h = (cfg.height as f32 - bar - status_h).max(cell.1);
+    Rect { x: 0.0, y: bar, w: cfg.width as f32, h }
 }
 
 /// Rebuilds tabs from a saved session. Returns the tabs, the active index, and the
@@ -527,7 +539,7 @@ fn restore_tabs(
     config: &Config,
     proxy: EventLoopProxy<UserEvent>,
 ) -> (Vec<Tab>, usize, u64) {
-    let area = content_area(cfg, cell, saved.tabs.len());
+    let area = content_area(cfg, cell, saved.tabs.len(), config.window.status_bar);
     let mut tabs = Vec::new();
     let mut max_id = 0u64;
     for state in &saved.tabs {
@@ -711,7 +723,7 @@ impl ApplicationHandler<UserEvent> for App {
 
 impl Gpu {
     fn active_area(&self) -> Rect {
-        content_area(&self.surface_config, self.renderer.cell_size(), self.tabs.len())
+        content_area(&self.surface_config, self.renderer.cell_size(), self.tabs.len(), self.status_bar)
     }
 
     /// Detects a bell on any pane of ANY tab: a bell in a background tab still raises
@@ -787,6 +799,18 @@ impl Gpu {
         // render early-returns when the surface is hidden. Cheap: one u64 compare
         // per pane.
         self.check_bells();
+
+        // Refresh the status-bar clock roughly every 20s (formatting local time
+        // without a chrono dependency; `date` handles the timezone).
+        if self.status_bar && (self.clock.is_empty() || self.last_clock.elapsed() >= Duration::from_secs(20)) {
+            self.last_clock = Instant::now();
+            if let Ok(out) = std::process::Command::new("date").arg("+%H:%M").output() {
+                if out.status.success() {
+                    self.clock = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                    self.window.request_redraw();
+                }
+            }
+        }
 
         if self.last_context_refresh.elapsed() >= Duration::from_millis(500) {
             self.last_context_refresh = Instant::now();
