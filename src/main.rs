@@ -17,6 +17,7 @@ mod mouse;
 mod overlay;
 mod pane;
 mod platform;
+mod project_session;
 mod pty;
 mod render;
 mod selection;
@@ -447,16 +448,40 @@ impl App {
 
         let cell = renderer.cell_size();
 
-        // Restore the previous session if enabled and present; otherwise one tab.
-        let restored = self
+        // Restore, in order of precedence:
+        //   1. this project's saved layout (opt-in `session_restore`), keyed by the
+        //      nearest git ancestor of the launch cwd — layout + cwd only;
+        //   2. otherwise the previous whole-window session (`restore_session`);
+        //   3. otherwise a single fresh tab.
+        // The project layout is turned into a `session::Session` so the same
+        // `restore_tabs` / `Tab::from_session` rebuild path serves all cases.
+        let project = self
             .config
             .behaviour
-            .restore_session
-            .then(session::Session::load)
-            .flatten();
+            .session_restore
+            .then(|| std::env::current_dir().ok())
+            .flatten()
+            .map(|cwd| project_session::project_key(&cwd))
+            .and_then(|key| project_session::ProjectSessions::load().get(&key).cloned());
+        let restored = match project {
+            Some(entry) => Some(entry.to_session()),
+            None => {
+                let saved = self
+                    .config
+                    .behaviour
+                    .restore_session
+                    .then(session::Session::load)
+                    .flatten();
+                if saved.is_some() {
+                    // Consume the whole-window snapshot so a later crash cannot
+                    // restore a stale one; the project store is left intact.
+                    session::Session::clear();
+                }
+                saved
+            }
+        };
         let (tabs, active, next_seed) = match restored {
             Some(saved) => {
-                session::Session::clear();
                 restore_tabs(&saved, &surface_config, cell, &self.config, self.proxy.clone())
             }
             None => {

@@ -182,6 +182,18 @@ pub struct Behaviour {
     /// best-effort: an unrecognised shell is spawned unchanged.
     #[serde(default = "yes")]
     pub shell_integration: bool,
+    /// Restore the pane/tab layout last used for this project directory (keyed by the
+    /// nearest git ancestor of the launch cwd) when runnir opens there. Off by
+    /// default — a purely opt-in convenience, separate from `restore_session` (which
+    /// restores the whole previous window regardless of directory). Only the split
+    /// shape and each pane's cwd come back; scrollback and processes do not.
+    #[serde(default)]
+    pub session_restore: bool,
+    /// When `session_restore` is on, also save the current project's layout
+    /// automatically on exit, so you never have to remember to. Off by default;
+    /// the palette command saves on demand regardless.
+    #[serde(default)]
+    pub session_auto_save: bool,
 }
 
 fn yes() -> bool {
@@ -200,6 +212,8 @@ impl Default for Behaviour {
             command_guardian: true,
             smooth_scroll: true,
             shell_integration: true,
+            session_restore: false,
+            session_auto_save: false,
         }
     }
 }

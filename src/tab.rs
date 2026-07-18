@@ -399,6 +399,27 @@ impl Tab {
         }
     }
 
+    /// Captures this tab's layout for a per-project session: the split tree, the
+    /// arrangement mode and each pane's working directory — no scrollback. The
+    /// counterpart to `to_session` for [`crate::project_session`].
+    pub fn to_project_layout(&self) -> crate::project_session::TabLayout {
+        let mut cwds = std::collections::HashMap::new();
+        for (id, pane) in &self.panes {
+            if let Some(dir) = pane.cwd() {
+                cwds.insert(*id, dir);
+            }
+        }
+        crate::project_session::TabLayout {
+            tree: self.tree.clone(),
+            focus: self.focus,
+            title: self.title_override.clone(),
+            mode: self.mode,
+            order: self.order.clone(),
+            master_ratio: Some(self.master_ratio),
+            cwds,
+        }
+    }
+
     /// Rebuilds a tab from a saved state: relaunches a shell per pane in its saved
     /// cwd and loads the saved scrollback above it. Panes named in the tree but
     /// missing from `panes` fall back to a default shell.

@@ -474,6 +474,8 @@ impl Gpu {
             Action::LaunchLayout => self.open_layout_picker(config),
             Action::CopyMode => self.enter_copy_mode(),
             Action::FoldOutput => self.tab().focused().toggle_fold_all(),
+            Action::SaveProjectSession => self.save_project_session_cmd(),
+            Action::RestoreProjectSession => self.restore_project_session_cmd(config),
             Action::QuickConnect => self.open_quick_connect(),
             Action::HintMode => self.open_hints(),
             Action::LaunchClaude => self.launch_claude(config),
@@ -789,6 +791,8 @@ impl Gpu {
             Action::LaunchLayout => self.open_layout_picker(config),
             Action::CopyMode => self.enter_copy_mode(),
             Action::FoldOutput => self.tab().focused().toggle_fold_all(),
+            Action::SaveProjectSession => self.save_project_session_cmd(),
+            Action::RestoreProjectSession => self.restore_project_session_cmd(config),
             Action::Whisper => self.whisper(),
             Action::SearchScrollback => self.overlay = Some(Overlay::Search(overlay::Search::new())),
             Action::QuickConnect => self.open_quick_connect(),
@@ -1235,6 +1239,95 @@ impl Gpu {
             }
             Err(e) => eprintln!("runnir: could not reopen tab: {e}"),
         }
+    }
+
+    // ---- per-project session (layout + cwd) ---------------------------------
+
+    /// The project key for the active tab's focused pane: the nearest git ancestor of
+    /// its working directory, or that directory itself. `None` when the cwd is
+    /// unreadable (e.g. macOS with no OSC 7 report).
+    fn current_project_key(&self) -> Option<std::path::PathBuf> {
+        let cwd = self.tabs[self.active].focused_ref().cwd()?;
+        Some(project_session::project_key(&cwd))
+    }
+
+    /// Records every tab's layout (split shape, mode and per-pane cwd — no scrollback)
+    /// under the current project key. Shared by the palette command and the
+    /// auto-save-on-exit hook. Returns the key so callers can report it.
+    fn save_project_session(&self) -> anyhow::Result<std::path::PathBuf> {
+        let key = self
+            .current_project_key()
+            .ok_or_else(|| anyhow::anyhow!("cannot read the working directory"))?;
+        let mut store = project_session::ProjectSessions::load();
+        store.upsert(project_session::ProjectEntry {
+            key: key.clone(),
+            active: self.active,
+            tabs: self.tabs.iter().map(|t| t.to_project_layout()).collect(),
+            saved_at: 0, // set by upsert
+        });
+        store.save()?;
+        Ok(key)
+    }
+
+    /// Palette "Save session for this project": persist and toast the result.
+    fn save_project_session_cmd(&mut self) {
+        let msg = match self.save_project_session() {
+            Ok(key) => format!("session saved for {}", abbreviate_home(&key)),
+            Err(e) => format!("could not save session: {e}"),
+        };
+        self.status = Some(msg);
+        self.status_expiry = Some(Instant::now() + Duration::from_secs(3));
+        self.window.request_redraw();
+    }
+
+    /// Palette "Restore session for this project": rebuild the saved tabs (each pane a
+    /// fresh shell in its recorded cwd) and append them, focusing the first restored
+    /// tab. Non-destructive — existing tabs are left in place.
+    fn restore_project_session_cmd(&mut self, config: &Config) {
+        let Some(key) = self.current_project_key() else {
+            self.toast("cannot read the working directory");
+            return;
+        };
+        let store = project_session::ProjectSessions::load();
+        let Some(entry) = store.get(&key) else {
+            self.toast(&format!("no saved session for {}", abbreviate_home(&key)));
+            return;
+        };
+        let area = self.active_area();
+        let cell = self.renderer.cell_size();
+        let first_new = self.tabs.len();
+        // Bump the pane-id seed above every restored id so a later split in a restored
+        // tab never reuses one of its own pane ids.
+        let max_id = entry.tabs.iter().flat_map(|t| t.tree.panes()).max().unwrap_or(0);
+        self.next_pane_seed = self.next_pane_seed.max(max_id);
+        for layout in &entry.tabs {
+            let state = layout.to_tab_state();
+            let proxy = self.proxy.clone();
+            let wake = move |_id| -> Box<dyn Fn() + Send + 'static> {
+                let p = proxy.clone();
+                Box::new(move || {
+                    let _ = p.send_event(UserEvent::Redraw);
+                })
+            };
+            match Tab::from_session(&state, area, cell, config, wake) {
+                Ok(tab) => self.tabs.push(tab),
+                Err(e) => eprintln!("runnir: could not restore a tab: {e}"),
+            }
+        }
+        if self.tabs.len() > first_new {
+            self.active = first_new;
+            self.toast(&format!("session restored for {}", abbreviate_home(&key)));
+        } else {
+            self.toast("session had no tabs to restore");
+        }
+        self.reflow_all();
+    }
+
+    /// Shows a short-lived status message and requests a redraw.
+    fn toast(&mut self, msg: &str) {
+        self.status = Some(msg.to_string());
+        self.status_expiry = Some(Instant::now() + Duration::from_secs(3));
+        self.window.request_redraw();
     }
 
     /// Selection mode from click cadence: 1 char, 2 word, 3+ line. Two clicks count

@@ -199,6 +199,29 @@ log tail and a monitor untouched. With no members, broadcast covers every pane.
 @ Ctrl+Shift+U     bring back the last tab you closed, with its layout, working
                    directories and scrollback — like a browser's reopen-closed-tab.
 
+# Per-project sessions
+
+runnir can remember the pane and tab layout you last used in a project and rebuild
+it when you open the terminal there again. The project is the nearest git repository
+above your working directory (or that directory itself when you are outside a repo),
+so a layout saved anywhere inside a repo comes back for the whole repo. Only the
+split shape and each pane's working directory are restored — never the scrollback and
+never the running processes, which do not survive.
+
+From the palette: Save session for this project records the current tabs and panes;
+Restore session for this project rebuilds them in fresh tabs, each shell reopened in
+its recorded directory.
+
+Set behaviour.session_restore = true to rebuild the saved layout automatically when
+you launch runnir inside that project. Add behaviour.session_auto_save = true to also
+save it on exit, closing the loop with no keystroke at all. Both are off by default.
+The store keeps the 50 most recently saved projects in a small file at
+~/.config/runnir/sessions.json, written atomically.
+
+  [behaviour]
+  session_restore = true
+  session_auto_save = true
+
 # Sticky command
 
 While you scroll back, the prompt line of the command whose output you are reading
