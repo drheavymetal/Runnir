@@ -417,6 +417,9 @@ impl Gpu {
             Action::ShowDocs => {
                 self.overlay = Some(Overlay::Docs(overlay::Docs::new(docs::HELP)));
             }
+            Action::OpenConfig => {
+                self.overlay = Some(Overlay::Config(overlay::ConfigPanel::new(config.clone())));
+            }
             Action::ToggleAi => self.toggle_ai(config),
             Action::AskAiAboutError => self.ask_ai_about_error(config),
             Action::AiCommand => self.ai_command(),
@@ -488,6 +491,48 @@ impl Gpu {
                 Key::Named(NamedKey::PageDown) => d.scroll(15),
                 _ => {}
             },
+            Overlay::Config(c) => {
+                let editing = c.editing.is_some();
+                match key {
+                    Key::Named(NamedKey::Escape) => {
+                        if editing {
+                            c.cancel_edit();
+                        } else {
+                            self.overlay = None;
+                        }
+                    }
+                    Key::Named(NamedKey::Enter) => {
+                        if editing {
+                            c.commit_edit();
+                        } else {
+                            c.activate();
+                        }
+                    }
+                    Key::Named(NamedKey::Backspace) if editing => c.backspace(),
+                    Key::Named(NamedKey::ArrowUp) => c.up(),
+                    Key::Named(NamedKey::ArrowDown) => c.down(),
+                    Key::Named(NamedKey::ArrowLeft) if !editing => c.adjust(-1),
+                    Key::Named(NamedKey::ArrowRight) if !editing => c.adjust(1),
+                    Key::Named(NamedKey::Space) if editing => c.input_char(' '),
+                    Key::Character(s) => {
+                        if editing {
+                            for ch in s.chars() {
+                                c.input_char(ch);
+                            }
+                        } else {
+                            match s.chars().next() {
+                                Some('k') => c.up(),
+                                Some('j') => c.down(),
+                                Some('h') => c.adjust(-1),
+                                Some('l' | ' ') => c.adjust(1),
+                                Some('s') => c.save(),
+                                _ => {}
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
             Overlay::Prompt(p) => match key {
                 Key::Named(NamedKey::Escape) => self.overlay = None,
                 Key::Named(NamedKey::ArrowUp) => p.up(),
@@ -580,6 +625,20 @@ impl Gpu {
                 _ => {}
             },
         }
+        // A settings-panel edit applies live: adopt the working config into the
+        // renderer now and hand it to `App` (which owns the config + keymap). Extract
+        // the clone first so the overlay borrow ends before apply_config borrows self.
+        let edited = match self.overlay.as_mut() {
+            Some(Overlay::Config(c)) if c.dirty => {
+                c.dirty = false;
+                Some(c.config.clone())
+            }
+            _ => None,
+        };
+        if let Some(cfg) = edited {
+            self.apply_config(&cfg);
+            self.pending_config = Some(cfg);
+        }
         let _ = mods;
         self.window.request_redraw();
     }
@@ -615,6 +674,7 @@ impl Gpu {
                 self.overlay = Some(Overlay::Palette(Palette::new(&keyhints())))
             }
             Action::ShowDocs => self.overlay = Some(Overlay::Docs(overlay::Docs::new(docs::HELP))),
+            Action::OpenConfig => self.overlay = Some(Overlay::Config(overlay::ConfigPanel::new(config.clone()))),
             Action::ToggleAi => self.toggle_ai(config),
             Action::AskAiAboutError => self.ask_ai_about_error(config),
             Action::AiCommand => self.ai_command(),

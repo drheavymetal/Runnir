@@ -17,6 +17,7 @@ pub enum Overlay {
     Ai(AiPanel),
     Hints(Hints),
     Search(Search),
+    Config(ConfigPanel),
 }
 
 impl Overlay {
@@ -30,6 +31,7 @@ impl Overlay {
             Overlay::Ai(a) => a.render(cols, rows, theme),
             Overlay::Hints(_) => Vec::new(), // Hints annotate panes, drawn elsewhere.
             Overlay::Search(s) => s.render(cols, rows, theme),
+            Overlay::Config(c) => c.render(cols, rows, theme),
         }
     }
 }
@@ -134,6 +136,142 @@ fn selected() -> Pen {
 }
 fn bg() -> Color {
     Color::Rgb(PANEL_BG.0, PANEL_BG.1, PANEL_BG.2)
+}
+
+// ---- settings panel --------------------------------------------------------
+
+use crate::config::Config;
+use crate::settings::{self, Kind, Row};
+
+/// The interactive settings editor. Holds a working `Config`; edits apply live and
+/// are persisted to JSON on save. `dirty` signals the host to apply the change.
+pub struct ConfigPanel {
+    pub config: Config,
+    rows: Vec<Row>,
+    pub cursor: usize,
+    /// Inline text-edit buffer when editing a Text setting, else `None`.
+    pub editing: Option<String>,
+    /// Set after a change so the host re-applies `config`; cleared by the host.
+    pub dirty: bool,
+    /// Transient status line ("saved", "save failed: …").
+    pub status: String,
+}
+
+impl ConfigPanel {
+    pub fn new(config: Config) -> Self {
+        Self { config, rows: settings::rows(), cursor: 0, editing: None, dirty: false, status: String::new() }
+    }
+
+    fn id(&self) -> settings::SettingId {
+        self.rows[self.cursor].id
+    }
+    fn kind(&self) -> Kind {
+        self.rows[self.cursor].kind
+    }
+
+    pub fn up(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+    pub fn down(&mut self) {
+        if self.cursor + 1 < self.rows.len() {
+            self.cursor += 1;
+        }
+    }
+
+    /// Left/right arrow or h/l: step numbers, toggle bools, cycle enums.
+    pub fn adjust(&mut self, dir: i32) {
+        let id = self.id();
+        settings::adjust(&mut self.config, id, dir);
+        self.dirty = true;
+    }
+
+    /// Space/Enter: toggle bool, cycle enum, or begin editing a text field.
+    pub fn activate(&mut self) {
+        match self.kind() {
+            Kind::Bool | Kind::Enum => self.adjust(1),
+            Kind::Text => {
+                self.editing = Some(settings::value(&self.config, self.id()).replace("(none)", ""));
+            }
+            Kind::Float | Kind::Int => self.adjust(1),
+        }
+    }
+
+    pub fn input_char(&mut self, c: char) {
+        if let Some(buf) = self.editing.as_mut() {
+            buf.push(c);
+        }
+    }
+    pub fn backspace(&mut self) {
+        if let Some(buf) = self.editing.as_mut() {
+            buf.pop();
+        }
+    }
+    /// Commit the inline text edit.
+    pub fn commit_edit(&mut self) {
+        if let Some(buf) = self.editing.take() {
+            let id = self.id();
+            settings::set_text(&mut self.config, id, buf);
+            self.dirty = true;
+        }
+    }
+    pub fn cancel_edit(&mut self) {
+        self.editing = None;
+    }
+
+    /// Persists the working config as JSON.
+    pub fn save(&mut self) {
+        self.status = match self.config.save_json() {
+            Ok(()) => "saved to runnir.json".into(),
+            Err(e) => format!("save failed: {e}"),
+        };
+    }
+
+    fn render(&self, cols: usize, rows: usize, theme: &Theme) -> Vec<Panel> {
+        let w = (cols * 7 / 10).clamp(44, 84);
+        let visible = (rows.saturating_sub(6)).clamp(6, self.rows.len() + 8);
+        let h = (visible + 4).min(rows.saturating_sub(2)).max(8);
+        let mut g = panel_grid(w, h, theme);
+        let _ = theme;
+
+        write(&mut g, 0, 2, "Settings", accent());
+        write(&mut g, 0, w.saturating_sub(30), "\u{2191}\u{2193} move  \u{2190}\u{2192} change  s save", dim());
+
+        // Scroll so the cursor stays visible in the list area (rows 2..h-2).
+        let list_h = h.saturating_sub(3);
+        let top = self.cursor.saturating_sub(list_h.saturating_sub(1)).min(self.rows.len().saturating_sub(list_h).max(0));
+
+        let mut last_section = "";
+        for (screen, i) in (top..self.rows.len()).take(list_h).enumerate() {
+            let row = 2 + screen;
+            let r = &self.rows[i];
+            let sel = i == self.cursor;
+            if sel {
+                for c in 0..w {
+                    write(&mut g, row, c, " ", selected());
+                }
+            }
+            let pen = if sel { selected() } else { normal() };
+            let sec = if r.section != last_section { r.section } else { "" };
+            last_section = r.section;
+            write(&mut g, row, 2, sec, if sel { selected() } else { accent() });
+            write(&mut g, row, 12, r.label, pen);
+            let val = if sel && self.editing.is_some() {
+                format!("{}\u{2588}", self.editing.as_deref().unwrap_or(""))
+            } else {
+                settings::value(&self.config, r.id)
+            };
+            let vcol = w.saturating_sub(val.chars().count() + 2);
+            write(&mut g, row, vcol.max(38), &val, pen);
+        }
+
+        if !self.status.is_empty() {
+            write(&mut g, h - 1, 2, &self.status, dim());
+        }
+
+        let col = (cols.saturating_sub(w)) / 2;
+        let row = (rows.saturating_sub(h)) / 4;
+        vec![Panel { grid: g, col, row }]
+    }
 }
 
 // ---- command palette -------------------------------------------------------

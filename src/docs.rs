@@ -248,8 +248,13 @@ matches stay solid.
 
 # Configuration
 
-Config is TOML at ~/.config/runnir/runnir.toml. Run `runnir --write-config` to
-write a fully-commented default. Every setting has a default, so a partial or
+From the palette, Settings opens an interactive panel for every option: arrows (or
+j/k) move, left/right (or h/l) change a value, Enter edits a text field, s saves.
+Saving writes ~/.config/runnir/runnir.json, which is loaded in preference to the
+TOML file; edits apply live as you make them.
+
+Config is TOML at ~/.config/runnir/runnir.toml (or JSON at runnir.json, which wins).
+Run `runnir --write-config` to write a fully-commented default. Every setting has a default, so a partial or
 missing file is fine. API keys are referenced by environment-variable name, so the
 file is safe to keep in a dotfiles repo.
 

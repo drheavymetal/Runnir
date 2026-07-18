@@ -19,6 +19,7 @@ mod pty;
 mod render;
 mod selection;
 mod session;
+mod settings;
 mod tab;
 mod whisper;
 
@@ -290,6 +291,9 @@ struct Gpu {
     /// An in-flight eased scroll: (pane id, current offset, target offset) in
     /// scrollback lines. Drives smooth glide on scroll-to-top/bottom and jumps.
     scroll_glide: Option<(u64, f32, f32)>,
+    /// A config edited in the settings panel, waiting for `App` to adopt it (update
+    /// its own `config` + keymap). Drained after each event.
+    pending_config: Option<Config>,
     /// Cursor trail ghosts (D15): each is a cell rect and the instant it was left
     /// behind; drawn fading toward the background, pruned once faded.
     cursor_trail: Vec<(f32, f32, f32, f32, Instant)>,
@@ -467,6 +471,7 @@ impl App {
             hover_url: None,
             copy_mode: None,
             scroll_glide: None,
+            pending_config: None,
             cursor_trail: Vec::new(),
             last_cursor_rect: None,
             font_px,
@@ -503,7 +508,7 @@ impl App {
 /// The config file's last-modified time, or `None` if it does not exist yet. Used
 /// by hot-reload to notice edits.
 fn config_mtime() -> Option<std::time::SystemTime> {
-    std::fs::metadata(Config::path()).and_then(|m| m.modified()).ok()
+    std::fs::metadata(Config::active_path()).and_then(|m| m.modified()).ok()
 }
 
 /// Keyboard copy-mode (D12): a virtual cursor navigating a pane's scrollback with
@@ -658,6 +663,14 @@ impl ApplicationHandler<UserEvent> for App {
                 if event.state == ElementState::Pressed =>
             {
                 gpu.on_key(event, self.mods, &self.config, &self.keymap, event_loop);
+                // The settings panel may have edited the config: adopt it (and its
+                // key bindings) so behaviour/keys take effect live, and refresh the
+                // hot-reload mtime so the panel's own save doesn't trigger a reload.
+                if let Some(cfg) = gpu.pending_config.take() {
+                    self.keymap = Keymap::new(&cfg.keys);
+                    self.config = cfg;
+                    self.config_mtime = config_mtime();
+                }
             }
             _ => {}
         }

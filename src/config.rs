@@ -394,6 +394,19 @@ impl Config {
         dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")).join("runnir/runnir.toml")
     }
 
+    /// The JSON config the settings panel reads and writes. Preferred over the TOML
+    /// file when it exists.
+    pub fn json_path() -> PathBuf {
+        dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")).join("runnir/runnir.json")
+    }
+
+    /// The config file actually in effect: the JSON one if present, else the TOML.
+    /// Hot-reload watches this so an external edit to whichever file exists applies.
+    pub fn active_path() -> PathBuf {
+        let json = Self::json_path();
+        if json.exists() { json } else { Self::path() }
+    }
+
     /// Loads the config, falling back to defaults. A broken file is reported and
     /// ignored rather than fatal: you should never be locked out of your terminal
     /// by a typo in it.
@@ -402,9 +415,23 @@ impl Config {
     }
 
     /// Loads and validates the config, or `None` if the file is missing or invalid.
-    /// Hot-reload uses this to keep the running config on a parse error rather than
-    /// snapping the live session back to defaults on a mid-edit save.
+    /// Prefers the JSON file (settings panel) over the TOML one. Hot-reload uses this
+    /// to keep the running config on a parse error rather than snapping to defaults.
     pub fn try_load() -> Option<Self> {
+        let json = Self::json_path();
+        if json.exists() {
+            let text = std::fs::read_to_string(&json).ok()?;
+            return match serde_json::from_str::<Self>(&text) {
+                Ok(mut cfg) => {
+                    cfg.validate();
+                    Some(cfg)
+                }
+                Err(err) => {
+                    eprintln!("runnir: {} is invalid, keeping current config\n{err}", json.display());
+                    None
+                }
+            };
+        }
         let path = Self::path();
         let text = std::fs::read_to_string(&path).ok()?;
         match toml::from_str::<Self>(&text) {
@@ -417,6 +444,17 @@ impl Config {
                 None
             }
         }
+    }
+
+    /// Writes the config as pretty JSON to the JSON path (settings-panel save).
+    pub fn save_json(&self) -> std::io::Result<()> {
+        let path = Self::json_path();
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let text = serde_json::to_string_pretty(self)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        std::fs::write(path, text)
     }
 
     /// Clamps values that would render the terminal unusable. A zero font size or
