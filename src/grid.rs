@@ -15,6 +15,35 @@ pub enum Color {
     Rgb(u8, u8, u8),
 }
 
+/// The shape of an underline decoration. `None` means the cell is not
+/// underlined; the rest map to the styled-underline forms neovim/LSP emit for
+/// diagnostics (SGR `4:1`..`4:5`). Kept a plain repr-able enum so it packs into
+/// one byte in the instance stream.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+pub enum UnderlineStyle {
+    #[default]
+    None,
+    Single,
+    Double,
+    Curly,
+    Dotted,
+    Dashed,
+}
+
+impl UnderlineStyle {
+    /// Small integer the shader reads to pick a decoration path.
+    pub fn code(self) -> u32 {
+        match self {
+            UnderlineStyle::None => 0,
+            UnderlineStyle::Single => 1,
+            UnderlineStyle::Double => 2,
+            UnderlineStyle::Curly => 3,
+            UnderlineStyle::Dotted => 4,
+            UnderlineStyle::Dashed => 5,
+        }
+    }
+}
+
 bitflags! {
     #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
     pub struct Flags: u8 {
@@ -34,6 +63,12 @@ pub struct Pen {
     pub fg: Color,
     pub bg: Color,
     pub flags: Flags,
+    /// Underline shape. `Flags::UNDERLINE` is kept in sync (set iff this is not
+    /// `None`) so code that only asks "is it underlined?" still works.
+    pub underline: UnderlineStyle,
+    /// Colour of the underline decoration. `Color::Default` means "follow the
+    /// foreground" (SGR 59); anything else is an explicit colour set by SGR 58.
+    pub underline_color: Color,
     /// OSC 8 hyperlink id: 0 = none, else index+1 into the grid's `links` table.
     /// Kept as an id (not the URI) so a cell stays `Copy` and cheap.
     pub link: u16,
@@ -1079,6 +1114,13 @@ impl Grid {
         self.cells[range].fill(blank);
     }
 
+    /// Sets the underline style and keeps `Flags::UNDERLINE` in sync so the old
+    /// "is it underlined?" checks (and the legacy shader gate) keep working.
+    fn set_underline(&mut self, style: UnderlineStyle) {
+        self.pen.underline = style;
+        self.pen.flags.set(Flags::UNDERLINE, style != UnderlineStyle::None);
+    }
+
     fn sgr(&mut self, params: &Params) {
         if params.is_empty() {
             self.pen = Pen::default();
@@ -1091,13 +1133,33 @@ impl Grid {
                 1 => self.pen.flags.insert(Flags::BOLD),
                 2 => self.pen.flags.insert(Flags::DIM),
                 3 => self.pen.flags.insert(Flags::ITALIC),
-                4 => self.pen.flags.insert(Flags::UNDERLINE),
+                // `4` alone is a single underline; `4:n` (a colon sub-param) picks
+                // a styled form. vte hands us the whole group in `sub`, so the
+                // sub-param, if any, is `sub[1]`.
+                4 => {
+                    let style = match sub.get(1) {
+                        None | Some(1) => UnderlineStyle::Single,
+                        Some(0) => UnderlineStyle::None,
+                        Some(2) => UnderlineStyle::Double,
+                        Some(3) => UnderlineStyle::Curly,
+                        Some(4) => UnderlineStyle::Dotted,
+                        Some(5) => UnderlineStyle::Dashed,
+                        // An unknown sub-param still means "underlined": fall back
+                        // to a single rather than dropping the attribute.
+                        _ => UnderlineStyle::Single,
+                    };
+                    self.set_underline(style);
+                }
                 7 => self.pen.flags.insert(Flags::REVERSE),
                 8 => self.pen.flags.insert(Flags::HIDDEN),
                 9 => self.pen.flags.insert(Flags::STRIKE),
+                21 => self.set_underline(UnderlineStyle::Double),
                 22 => self.pen.flags.remove(Flags::BOLD | Flags::DIM),
                 23 => self.pen.flags.remove(Flags::ITALIC),
-                24 => self.pen.flags.remove(Flags::UNDERLINE),
+                24 => {
+                    self.set_underline(UnderlineStyle::None);
+                    self.pen.underline_color = Color::Default;
+                }
                 27 => self.pen.flags.remove(Flags::REVERSE),
                 28 => self.pen.flags.remove(Flags::HIDDEN),
                 29 => self.pen.flags.remove(Flags::STRIKE),
@@ -1115,6 +1177,14 @@ impl Grid {
                     }
                 }
                 49 => self.pen.bg = Color::Default,
+                // SGR 58 sets the underline's own colour (same wire forms as 38/48);
+                // 59 resets it to "follow the foreground".
+                58 => {
+                    if let Some(c) = ext_color(sub, &mut iter) {
+                        self.pen.underline_color = c;
+                    }
+                }
+                59 => self.pen.underline_color = Color::Default,
                 90..=97 => self.pen.fg = Color::Indexed((sub[0] - 90 + 8) as u8),
                 100..=107 => self.pen.bg = Color::Indexed((sub[0] - 100 + 8) as u8),
                 _ => {}
@@ -1720,6 +1790,58 @@ mod tests {
 
         feed(&mut g, "\x1b[48;5;99mI");
         assert_eq!(g.cell(0, 2).pen.bg, Color::Indexed(99));
+    }
+
+    #[test]
+    fn sgr_styled_underlines() {
+        let mut g = Grid::new(10, 1);
+
+        // Plain `SGR 4` is a single underline and sets the legacy flag too.
+        feed(&mut g, "\x1b[4mA");
+        assert_eq!(g.cell(0, 0).pen.underline, UnderlineStyle::Single);
+        assert!(g.cell(0, 0).pen.flags.contains(Flags::UNDERLINE));
+
+        // Colon sub-params select the styled forms.
+        feed(&mut g, "\x1b[4:3mB");
+        assert_eq!(g.cell(0, 1).pen.underline, UnderlineStyle::Curly);
+        assert!(g.cell(0, 1).pen.flags.contains(Flags::UNDERLINE));
+
+        feed(&mut g, "\x1b[4:2mC");
+        assert_eq!(g.cell(0, 2).pen.underline, UnderlineStyle::Double);
+        feed(&mut g, "\x1b[4:4mD");
+        assert_eq!(g.cell(0, 3).pen.underline, UnderlineStyle::Dotted);
+        feed(&mut g, "\x1b[4:5mE");
+        assert_eq!(g.cell(0, 4).pen.underline, UnderlineStyle::Dashed);
+
+        // `SGR 21` is a double underline; `4:0` and `24` turn it off.
+        feed(&mut g, "\x1b[21mF");
+        assert_eq!(g.cell(0, 5).pen.underline, UnderlineStyle::Double);
+        feed(&mut g, "\x1b[4:0mG");
+        assert_eq!(g.cell(0, 6).pen.underline, UnderlineStyle::None);
+        assert!(!g.cell(0, 6).pen.flags.contains(Flags::UNDERLINE));
+    }
+
+    #[test]
+    fn sgr_underline_color() {
+        let mut g = Grid::new(10, 1);
+
+        // 58 truecolour (colon form with a colourspace slot) and reset with 59.
+        feed(&mut g, "\x1b[4:3;58:2::10:20:30mA");
+        assert_eq!(g.cell(0, 0).pen.underline, UnderlineStyle::Curly);
+        assert_eq!(g.cell(0, 0).pen.underline_color, Color::Rgb(10, 20, 30));
+
+        // 58 indexed form.
+        feed(&mut g, "\x1b[58;5;42mB");
+        assert_eq!(g.cell(0, 1).pen.underline_color, Color::Indexed(42));
+
+        // 59 resets the colour to "follow the foreground".
+        feed(&mut g, "\x1b[59mC");
+        assert_eq!(g.cell(0, 2).pen.underline_color, Color::Default);
+
+        // `SGR 24` clears both the style and any custom colour.
+        feed(&mut g, "\x1b[4;58;5;9m\x1b[24mD");
+        assert_eq!(g.cell(0, 3).pen.underline, UnderlineStyle::None);
+        assert_eq!(g.cell(0, 3).pen.underline_color, Color::Default);
     }
 
     #[test]

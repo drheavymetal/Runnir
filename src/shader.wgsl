@@ -29,6 +29,10 @@ struct Instance {
     @location(7) flags: u32,
     // Cells this glyph spans. A CJK glyph clipped to one cell loses its right half.
     @location(8) width: f32,
+    // Underline shape: 0 none, 1 single, 2 double, 3 curly, 4 dotted, 5 dashed.
+    @location(9) underline_style: u32,
+    // Underline colour; alpha 0 is the sentinel for "use the foreground".
+    @location(10) underline_color: vec4<f32>,
 };
 
 struct VsOut {
@@ -41,6 +45,8 @@ struct VsOut {
     @location(5) fg: vec4<f32>,
     @location(6) bg: vec4<f32>,
     @location(7) @interpolate(flat) flags: u32,
+    @location(8) @interpolate(flat) underline_style: u32,
+    @location(9) @interpolate(flat) underline_color: vec4<f32>,
 };
 
 @vertex
@@ -74,11 +80,52 @@ fn vs_main(@builtin(vertex_index) vi: u32, inst: Instance) -> VsOut {
     out.fg = inst.fg;
     out.bg = inst.bg;
     out.flags = inst.flags;
+    out.underline_style = inst.underline_style;
+    out.underline_color = inst.underline_color;
     return out;
 }
 
 fn in_band(y: f32, band: vec2<f32>) -> bool {
     return y >= band.x && y < band.x + band.y;
+}
+
+// Whether the pixel at `local` (pixels from the cell's top-left) lies on the
+// underline decoration of the given style. `band` is (top y, thickness) of the
+// plain single underline; `cellw` is the cell width in pixels, used as the
+// period for the wavy/dotted/dashed forms. Style 0 draws nothing.
+fn underline_hit(style: u32, local: vec2<f32>, band: vec2<f32>, cellw: f32) -> bool {
+    if style == 0u {
+        return false;
+    }
+    let uy = band.x;
+    let th = band.y;
+    let x = local.x;
+    let y = local.y;
+    // Single: the classic straight band. Unchanged from the legacy path.
+    if style == 1u {
+        return y >= uy && y < uy + th;
+    }
+    // Double: the band plus a second one a thickness-and-a-gap below it.
+    if style == 2u {
+        let gap = th + max(th, 1.0);
+        return (y >= uy && y < uy + th) || (y >= uy + gap && y < uy + gap + th);
+    }
+    // Curly: a sine wave oscillating around the band, drawn with a soft width so
+    // the crests stay solid. Amplitude and half-width scale with the thickness.
+    if style == 3u {
+        let amp = max(th, 1.0);
+        let period = max(cellw * 0.5, 4.0);
+        let center = uy + amp + amp * sin(x / period * 6.28318530718);
+        return abs(y - center) <= th * 0.6 + 0.5;
+    }
+    // Dotted: the band chopped into a short on/off cycle along x.
+    if style == 4u {
+        let period = max(th * 2.0, 2.0);
+        return fract(x / period) < 0.5 && y >= uy && y < uy + th;
+    }
+    // Dashed: the band with a longer on/off cycle.
+    let period = max(cellw * 0.5, 6.0);
+    return fract(x / period) < 0.6 && y >= uy && y < uy + th;
 }
 
 // Straight alpha in, premultiplied out. The pipeline blends with
@@ -114,10 +161,15 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     }
 
     // Decorations sit on top of the glyph, so a strikeout actually strikes it out.
-    let underlined = (in.flags & FLAG_UNDERLINE) != 0u && in_band(in.local.y, u.underline);
+    // The underline follows its own style/colour; the strike stays foreground.
     let struck = (in.flags & FLAG_STRIKE) != 0u && in_band(in.local.y, u.strike);
-    if underlined || struck {
+    if struck {
         color = vec4<f32>(in.fg.rgb, max(out_a, 1.0));
+    }
+    if underline_hit(in.underline_style, in.local, u.underline, u.cell.x) {
+        // Alpha 0 on the underline colour means "reuse the foreground".
+        let deco = select(in.fg.rgb, in.underline_color.rgb, in.underline_color.a > 0.0);
+        color = vec4<f32>(deco, max(out_a, 1.0));
     }
 
     return premul(color);
