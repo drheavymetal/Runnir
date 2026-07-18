@@ -709,6 +709,9 @@ impl Gpu {
         if let Some(pane) = self.copy_pane_mut() {
             pane.begin_selection(anchor, crate::selection::Mode::Char);
             pane.update_selection(cur);
+            // Not an active mouse drag: leave `selecting` false so bare pointer
+            // motion can't drag the copy-mode selection out from under the keyboard.
+            pane.end_selection();
         }
     }
 
@@ -924,6 +927,9 @@ impl Gpu {
             tab.reflow(area);
         }
         self.reapply_zoom();
+        // A relayout moves the cursor's pixel rect without the cursor "moving": drop
+        // the trail baseline so it does not spawn a phantom ghost at the old spot.
+        self.last_cursor_rect = None;
         self.window.request_redraw();
     }
 

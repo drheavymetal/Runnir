@@ -750,6 +750,9 @@ impl Gpu {
             tab.reflow(area);
         }
         self.reapply_zoom();
+        // Window resize moves the cursor rect without a cursor move; drop the trail
+        // baseline so it does not leave a phantom ghost.
+        self.last_cursor_rect = None;
         self.window.request_redraw();
     }
 

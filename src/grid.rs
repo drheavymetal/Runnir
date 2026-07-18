@@ -875,6 +875,7 @@ impl Grid {
             // Marks and images anchored in the erased history are gone; those on
             // the live screen keep their (still valid) stable rows.
             self.prompt_marks.retain(|&m| m >= dropped);
+            self.cmd_exits.retain(|&(p, _)| p >= dropped);
             self.images.retain(|im| im.anchor >= dropped);
             self.display_offset = 0;
             return;
