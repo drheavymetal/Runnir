@@ -209,6 +209,13 @@ pub struct Grid {
     /// Cell size in pixels, needed to size an image's cell footprint. Zero until
     /// set, in which case images fall back to their control-supplied rows.
     cell_px: (f32, f32),
+    /// Kitty keyboard protocol (CSI u) progressive-enhancement flags, kept as a
+    /// stack per the spec: apps push their desired flags on entry and pop on exit.
+    /// The active flags are the top of the stack (0 if empty). See `keyboard_flags`.
+    /// Simplification: the alternate screen shares this one stack, and the flags
+    /// are reset to empty on alt-screen enter/leave rather than kept as a separate
+    /// stack — enough for full-screen apps (vim/nvim) that set flags after switching.
+    kbd_flags_stack: Vec<u8>,
 }
 
 /// An inline image placed in the grid.
@@ -270,7 +277,15 @@ impl Grid {
             images: Vec::new(),
             image_serial: 0,
             cell_px: (0.0, 0.0),
+            kbd_flags_stack: Vec::new(),
         }
+    }
+
+    /// Active kitty keyboard protocol flags: the top of the enhancement stack, or
+    /// 0 when no app has pushed any (legacy keyboard). The input layer reads this to
+    /// decide between legacy and CSI-u key encoding.
+    pub fn keyboard_flags(&self) -> u8 {
+        self.kbd_flags_stack.last().copied().unwrap_or(0)
     }
 
     pub fn set_cell_px(&mut self, w: f32, h: f32) {
@@ -1006,6 +1021,10 @@ impl Grid {
         self.parked = Some((primary, Saved { row: self.row, col: self.col, pen: self.pen }));
         self.row = 0;
         self.col = 0;
+        // Spec: the alternate screen keeps its own keyboard-flags stack. We share a
+        // single stack and reset it, so an app inherits legacy keys on entry and the
+        // shell is back to legacy on exit.
+        self.kbd_flags_stack.clear();
     }
 
     fn leave_alt_screen(&mut self) {
@@ -1015,6 +1034,7 @@ impl Grid {
             self.col = cursor.col.min(self.cols - 1);
             self.pen = cursor.pen;
         }
+        self.kbd_flags_stack.clear();
     }
 
     /// `?`-prefixed CSI h/l. Only the modes runnir actually honours are listed;
@@ -1333,19 +1353,67 @@ impl Perform for Grid {
         let ps: Vec<u16> = params.iter().map(|sub| sub[0]).collect();
 
         if intermediates == b"?" {
-            if let 'h' | 'l' = action {
-                for &mode in &ps {
-                    self.private_mode(mode, action == 'h');
+            match action {
+                'h' | 'l' => {
+                    for &mode in &ps {
+                        self.private_mode(mode, action == 'h');
+                    }
+                    self.dirty = true;
                 }
-                self.dirty = true;
+                // Kitty keyboard protocol query: CSI ? u. Reply with the current
+                // (top-of-stack) flags: CSI ? <flags> u.
+                'u' => {
+                    let flags = self.keyboard_flags();
+                    self.responses.push(format!("\x1b[?{flags}u").into_bytes());
+                }
+                _ => {}
             }
             return;
         }
         // Secondary Device Attributes: CSI > c. Report a VT220-class terminal,
         // version 0. Programs use this alongside DA1 for capability detection.
         if intermediates == b">" {
-            if action == 'c' {
-                self.responses.push(b"\x1b[>1;0;0c".to_vec());
+            match action {
+                'c' => self.responses.push(b"\x1b[>1;0;0c".to_vec()),
+                // Kitty keyboard protocol: CSI > <flags> u pushes flags on the stack.
+                'u' => {
+                    let flags = (ps.first().copied().unwrap_or(0) & 0x1f) as u8;
+                    // Bound the stack so a misbehaving app cannot grow it forever.
+                    if self.kbd_flags_stack.len() >= 128 {
+                        self.kbd_flags_stack.remove(0);
+                    }
+                    self.kbd_flags_stack.push(flags);
+                }
+                _ => {}
+            }
+            return;
+        }
+        // Kitty keyboard protocol: CSI < <number> u pops `number` (default 1) entries.
+        if intermediates == b"<" {
+            if action == 'u' {
+                let n = ps.first().copied().filter(|&v| v != 0).unwrap_or(1) as usize;
+                let keep = self.kbd_flags_stack.len().saturating_sub(n);
+                self.kbd_flags_stack.truncate(keep);
+            }
+            return;
+        }
+        // Kitty keyboard protocol: CSI = <flags> ; <mode> u sets the current flags.
+        // mode 1 = set all, 2 = set bits, 3 = clear bits (default 1).
+        if intermediates == b"=" {
+            if action == 'u' {
+                let flags = (ps.first().copied().unwrap_or(0) & 0x1f) as u8;
+                let mode = ps.get(1).copied().unwrap_or(1);
+                let cur = self.keyboard_flags();
+                let new = match mode {
+                    2 => cur | flags,
+                    3 => cur & !flags,
+                    _ => flags,
+                };
+                if let Some(top) = self.kbd_flags_stack.last_mut() {
+                    *top = new;
+                } else {
+                    self.kbd_flags_stack.push(new);
+                }
             }
             return;
         }
@@ -2386,5 +2454,57 @@ mod tests {
         // The BEL itself leaves no glyph: only 'a' and 'b' land.
         assert_eq!(g.cell(0, 0).ch, 'a');
         assert_eq!(g.cell(0, 1).ch, 'b');
+    }
+
+    #[test]
+    fn kitty_keyboard_flag_stack_push_pop_query_set() {
+        let mut g = Grid::new(20, 3);
+        // Empty stack reports 0.
+        assert_eq!(g.keyboard_flags(), 0);
+        feed(&mut g, "\x1b[?u");
+        assert_eq!(g.take_responses(), vec![b"\x1b[?0u".to_vec()]);
+
+        // Push flags 5, then 9: top wins, query reflects it.
+        feed(&mut g, "\x1b[>5u");
+        assert_eq!(g.keyboard_flags(), 5);
+        feed(&mut g, "\x1b[>9u");
+        assert_eq!(g.keyboard_flags(), 9);
+        feed(&mut g, "\x1b[?u");
+        assert_eq!(g.take_responses(), vec![b"\x1b[?9u".to_vec()]);
+
+        // Set-current (mode 1 default) replaces the top of the stack.
+        feed(&mut g, "\x1b[=3u");
+        assert_eq!(g.keyboard_flags(), 3);
+        // Mode 2 = set bits (OR).
+        feed(&mut g, "\x1b[=8;2u");
+        assert_eq!(g.keyboard_flags(), 11);
+        // Mode 3 = clear bits (AND NOT).
+        feed(&mut g, "\x1b[=1;3u");
+        assert_eq!(g.keyboard_flags(), 10);
+
+        // Pop 1 (default) drops back to the 5 pushed first.
+        feed(&mut g, "\x1b[<u");
+        assert_eq!(g.keyboard_flags(), 5);
+        // Pop more than present clamps to empty (0), never panics.
+        feed(&mut g, "\x1b[<9u");
+        assert_eq!(g.keyboard_flags(), 0);
+    }
+
+    #[test]
+    fn kitty_flags_reset_on_alt_screen_and_ris() {
+        let mut g = Grid::new(20, 3);
+        feed(&mut g, "\x1b[>15u");
+        assert_eq!(g.keyboard_flags(), 15);
+        // Entering the alternate screen resets the (shared) stack.
+        feed(&mut g, "\x1b[?1049h");
+        assert_eq!(g.keyboard_flags(), 0);
+        feed(&mut g, "\x1b[>7u");
+        assert_eq!(g.keyboard_flags(), 7);
+        // Leaving it resets again.
+        feed(&mut g, "\x1b[?1049l");
+        assert_eq!(g.keyboard_flags(), 0);
+        // RIS clears any pushed flags.
+        feed(&mut g, "\x1b[>7u\x1bc");
+        assert_eq!(g.keyboard_flags(), 0);
     }
 }

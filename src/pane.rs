@@ -236,6 +236,12 @@ impl Pane {
         self.grid.lock().unwrap().app_cursor
     }
 
+    /// Active kitty keyboard protocol flags (0 = legacy). The input layer switches
+    /// key encoding on this.
+    pub fn keyboard_flags(&self) -> u8 {
+        self.grid.lock().unwrap().keyboard_flags()
+    }
+
     pub fn bracketed_paste(&self) -> bool {
         self.grid.lock().unwrap().bracketed_paste
     }

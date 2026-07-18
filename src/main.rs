@@ -678,9 +678,10 @@ impl ApplicationHandler<UserEvent> for App {
             // to enter text. Forwarding them to the PTY double-sends the first typed
             // character when a keystroke also brings the window into focus (the
             // "ssh" -> "sssh" bug). Only real, non-synthetic presses produce bytes.
-            WindowEvent::KeyboardInput { event, is_synthetic: false, .. }
-                if event.state == ElementState::Pressed =>
-            {
+            // Both presses and releases are forwarded: releases are needed for the
+            // kitty keyboard protocol's event-type reporting (on_key drops them when
+            // no pane has that flag set, so legacy input is unchanged).
+            WindowEvent::KeyboardInput { event, is_synthetic: false, .. } => {
                 gpu.on_key(event, self.mods, &self.config, &self.keymap, event_loop);
                 // The settings panel may have edited the config: adopt it (and its
                 // key bindings) so behaviour/keys take effect live, and refresh the
