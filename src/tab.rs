@@ -298,6 +298,13 @@ impl Tab {
 
     /// The divider under a pixel point, for starting a mouse resize.
     pub fn divider_at(&self, area: Rect, x: f32, y: f32) -> Option<crate::layout::DividerHit> {
+        // Dividers belong to the split tree, which is only on screen in `Splits`.
+        // In the algorithmic modes a hit here would grab an *invisible* divider:
+        // the press lands mid-pane (swallowing the click) and the drag silently
+        // rewrites the preserved manual arrangement.
+        if self.mode != LayoutMode::Splits {
+            return None;
+        }
         // A grab tolerance a little wider than the visible line, so it is easy to hit.
         self.tree.divider_at(pad(area, self.padding), self.gap, x, y, 5.0)
     }
@@ -411,7 +418,30 @@ impl Tab {
     ) -> anyhow::Result<Self> {
         let padding = config.window.padding;
         let gap = padding.max(6.0);
-        let rects = state.tree.layout(pad(area, padding), gap);
+        let inner = pad(area, padding);
+        let master = state.master_ratio.unwrap_or(DEFAULT_MASTER);
+        // Size each restored pane to what the *restored mode* puts on screen, not
+        // to the tree: in Tall/Fat/Grid the tree is not what is displayed, and the
+        // startup path does not reflow, so tree-sized PTYs (and scrollback wrapped
+        // to their widths) would stay wrong until the window happens to resize.
+        // The effective order mirrors the rebuild below: the saved order filtered
+        // to panes the tree still holds, plus any tree pane the order is missing.
+        let tree_panes = state.tree.panes();
+        let mut ordered: Vec<PaneId> =
+            state.order.iter().copied().filter(|id| tree_panes.contains(id)).collect();
+        for &id in &tree_panes {
+            if !ordered.contains(&id) {
+                ordered.push(id);
+            }
+        }
+        let rects: Vec<(PaneId, Rect)> = match state.mode {
+            LayoutMode::Splits => state.tree.layout(inner, gap),
+            // Any pane may be the one shown, and each fills the tab while it is.
+            LayoutMode::Stack => tree_panes.iter().map(|&id| (id, inner)).collect(),
+            LayoutMode::Tall => crate::layout::tall(&ordered, inner, gap, master),
+            LayoutMode::Fat => crate::layout::fat(&ordered, inner, gap, master),
+            LayoutMode::Grid => crate::layout::grid(&ordered, inner, gap),
+        };
 
         let mut panes = HashMap::new();
         for (id, rect) in &rects {
@@ -447,16 +477,10 @@ impl Tab {
             *panes.keys().next().expect("a tab always has at least one pane")
         };
 
-        // Rebuild the insertion order: use the saved one, but drop any ids that
-        // failed to spawn and append any tree pane it is missing (e.g. an older
-        // session with no saved order at all), so `order` always matches `panes`.
-        let mut order: Vec<PaneId> =
-            state.order.iter().copied().filter(|id| panes.contains_key(id)).collect();
-        for id in state.tree.panes() {
-            if panes.contains_key(&id) && !order.contains(&id) {
-                order.push(id);
-            }
-        }
+        // The insertion order is the effective one computed above, minus any pane
+        // that failed to spawn, so `order` always matches `panes`.
+        let order: Vec<PaneId> =
+            ordered.into_iter().filter(|id| panes.contains_key(id)).collect();
 
         Ok(Self {
             tree: state.tree.clone(),
@@ -465,7 +489,7 @@ impl Tab {
             title_override: state.title.clone(),
             mode: state.mode,
             order,
-            master_ratio: state.master_ratio.unwrap_or(DEFAULT_MASTER),
+            master_ratio: master,
             cell,
             gap,
             padding,
@@ -490,4 +514,83 @@ fn pad(area: Rect, padding: f32) -> Rect {
 
 fn cells_in(rect: Rect, cell: (f32, f32)) -> (usize, usize) {
     ((rect.w / cell.0).floor().max(1.0) as usize, (rect.h / cell.1).floor().max(1.0) as usize)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const AREA: Rect = Rect { x: 0.0, y: 0.0, w: 1000.0, h: 600.0 };
+
+    /// A tab built by hand, with no live panes — enough for the geometry-only
+    /// methods (`layout`, `divider_at`), which never touch the pane map.
+    fn bare_tab(tree: Node, order: Vec<PaneId>, mode: LayoutMode) -> Tab {
+        Tab {
+            tree,
+            panes: HashMap::new(),
+            focus: order[0],
+            title_override: None,
+            mode,
+            order,
+            master_ratio: DEFAULT_MASTER,
+            cell: (10.0, 20.0),
+            gap: 6.0,
+            padding: 0.0,
+        }
+    }
+
+    #[test]
+    fn dividers_are_only_grabbable_in_splits_mode() {
+        // Two panes: the tree's divider sits at half the width (ratio 0.5), but in
+        // Tall mode the on-screen divider is at master_ratio — the tree's is
+        // invisible and runs through the middle of the master pane.
+        let mut tree = Node::leaf(1);
+        tree.split(1, 2, Axis::Horizontal);
+        let mut tab = bare_tab(tree, vec![1, 2], LayoutMode::Splits);
+
+        assert!(
+            tab.divider_at(AREA, 500.0, 300.0).is_some(),
+            "in Splits the tree divider at the midline is grabbable"
+        );
+
+        tab.mode = LayoutMode::Tall;
+        assert!(
+            tab.divider_at(AREA, 500.0, 300.0).is_none(),
+            "in Tall the same point is the middle of a pane; grabbing there would \
+             swallow the click and rewrite the hidden Splits arrangement"
+        );
+    }
+
+    #[test]
+    fn from_session_sizes_panes_for_the_restored_mode() {
+        // A session saved in Tall with master 0.7: the tree (a 50/50 split) puts
+        // the divider somewhere else entirely, so tree-sized PTYs would not match
+        // what the restored layout shows.
+        let config = crate::config::Config::default();
+        let mut tree = Node::leaf(1);
+        tree.split(1, 2, Axis::Horizontal);
+        let state = crate::session::TabState {
+            tree,
+            focus: 1,
+            title: None,
+            panes: HashMap::new(),
+            mode: LayoutMode::Tall,
+            order: vec![1, 2],
+            master_ratio: Some(0.7),
+        };
+        let cell = (10.0, 20.0);
+        let tab = Tab::from_session(&state, AREA, cell, &config, |_| Box::new(|| {}))
+            .expect("restore spawns a shell per pane");
+
+        assert_eq!(tab.mode, LayoutMode::Tall);
+        for (id, rect) in tab.layout(AREA) {
+            let (cols, rows) = cells_in(rect, cell);
+            let grid = tab.panes[&id].grid.lock().unwrap();
+            assert_eq!(
+                (grid.cols(), grid.rows()),
+                (cols, rows),
+                "pane {id} was sized for the tree, not for the restored mode"
+            );
+        }
+    }
 }
