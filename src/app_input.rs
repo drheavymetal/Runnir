@@ -431,6 +431,7 @@ impl Gpu {
             Action::ToggleZoom => self.toggle_zoom(),
             Action::ClearSelectionOrScrollback => {
                 if !self.tab().focused().clear_selection() {
+                    self.scroll_glide = None;
                     self.tab().focused().snap_to_bottom();
                 }
             }
@@ -522,6 +523,7 @@ impl Gpu {
                 match key {
                     Key::Named(NamedKey::Escape) => {
                         self.overlay = None;
+                        self.scroll_glide = None;
                         self.tab().focused().snap_to_bottom();
                     }
                     Key::Named(NamedKey::Enter) | Key::Named(NamedKey::ArrowDown) => {
@@ -1052,6 +1054,10 @@ impl Gpu {
         let click_col = (pos.x as f32 / cw).floor() as usize;
         let cols = (self.surface_config.width as f32 / cw).floor().max(1.0) as usize;
         let (offset, avail_end) = self.tab_scroll(cols);
+        // A click in the right-reserved region (broadcast/context tags) is not a tab.
+        if click_col >= avail_end {
+            return None;
+        }
         // Un-scroll the click into label space and find the tab it lands on.
         let mut x = 1;
         for i in 0..self.tabs.len() {
@@ -1059,7 +1065,7 @@ impl Gpu {
             let drawn = (x as isize - offset as isize) as isize;
             if drawn >= 1 && (drawn as usize) < avail_end {
                 let d = drawn as usize;
-                if click_col >= d && click_col < d + w {
+                if click_col >= d && click_col < (d + w).min(avail_end) {
                     return Some(i);
                 }
             }

@@ -416,7 +416,7 @@ impl Gpu {
             }
             if let Some(label) = self.tabs[self.active].focused_ref().context.label() {
                 let tag = format!(" {label} ");
-                right = right.saturating_sub(tag.chars().count() + 1);
+                right = right.saturating_sub(Self::label_w(&tag) + 1);
                 bar.write_str(0, right, &tag, Pen {
                     fg: Color::Rgb(0xd4, 0xd6, 0xd9),
                     bg: Color::Rgb(0x2a, 0x2c, 0x33),

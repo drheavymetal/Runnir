@@ -83,7 +83,13 @@ existed (56); smooth scroll GLIDE on jumps (behaviour.smooth_scroll, 57); OSC 9;
 progress bar on pane bottom (58); bottom STATUS BAR cwd/git-branch/clock
 (window.status_bar default on, 59). PENDING (heaviest, own batch): background image
 (needs draw-first bg quad + opacity<1) and scrollback minimap.
-NEXT: Fable 5 bug-hunt on this batch, then background image + minimap.
+Bug-hunt (2 agents) → 6 bugs incl. 2 CRITICAL (deadlock ≥2 tabs: build_chrome
+re-locked guards' grids via tab badges → moved before guards; startup panic on
+uptime<60s: Instant-60s → Option<Instant>) + HIGH (build_chrome drew its own label
+not tab_label → wrong clicks/badge) + unicode width + date-storm + glide input
+swallowed. commit 61. Verify → all correct, 4 lows; fixed glide-cancel gaps
+(search Esc / clear), tab-click under reserved tags, context-tag width. commit 62.
+CONVERGED. NEXT: background image + minimap (2 heaviest).
 
 ## Current task: add 15–20 differential features, 4–5 "wow". Document each here.
 
