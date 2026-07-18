@@ -1,6 +1,6 @@
 import { useLang, UI } from '../i18n.jsx'
 
-export default function Hero() {
+export default function Hero({ onInstall }) {
   const { t } = useLang()
   return (
     <header className="hero">
@@ -11,6 +11,10 @@ export default function Hero() {
           <p className="hero-tag">{t(UI.heroTag)}</p>
           <div className="hero-meta">
             {UI.heroPills.map((p, i) => <span className="pill" key={i}>{t(p)}</span>)}
+          </div>
+          <div className="hero-cta-row">
+            <button className="hero-cta" onClick={onInstall}>{t(UI.heroCta)}</button>
+            <span className="hero-cta-hint">{t(UI.heroCtaHint)}</span>
           </div>
         </div>
       </div>

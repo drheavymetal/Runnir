@@ -62,10 +62,12 @@ export const UI = {
   searchPlaceholder: { es: 'Buscar (función, tecla, config)…', en: 'Search (feature, key, config)…' },
 
   navGuide: { es: 'Guía', en: 'Guide' },
+  navInstall: { es: 'Instalación', en: 'Install' },
   navShortcuts: { es: 'Atajos', en: 'Shortcuts' },
   navConfig: { es: 'Config', en: 'Config' },
   navSections: { es: 'Secciones', en: 'Sections' },
 
+  subInstall: { es: 'Cómo instalar runnir.', en: 'How to install runnir.' },
   subShortcuts: { es: 'Referencia de atajos.', en: 'Keybinding reference.' },
   subConfig: { es: 'Todas las opciones de configuración.', en: 'Every config option.' },
 
@@ -97,6 +99,11 @@ export const UI = {
   ],
   heroComment1: { es: '# terminal desplegable', en: '# drop-down terminal' },
   heroComment2: { es: 'la paleta: todo es buscable', en: 'the palette: everything is searchable' },
+  heroCta: { es: 'Instalar runnir', en: 'Install runnir' },
+  heroCtaHint: {
+    es: 'Un comando, compila desde el código fuente, sin sudo.',
+    en: 'One command, builds from source, no sudo.',
+  },
 
   // Guide foot
   footTail: {
@@ -107,6 +114,27 @@ export const UI = {
     es: '"rún" (susurro, en nórdico antiguo) + "-nir" de Mjölnir. Un sitio donde susurrarle a la máquina.',
     en: '"rún" (a whisper, in Old Norse) + "-nir" from Mjölnir. A place to whisper to the machine.',
   },
+
+  // Install page
+  instTitle: { es: 'Instalación', en: 'Installation' },
+  instLede: {
+    es: 'Un solo comando compila runnir desde el código fuente y lo instala en ~/.local — sin sudo. El mismo install.sh gobierna los tres flujos (instalar, actualizar, desinstalar).',
+    en: 'One command builds runnir from source and installs it into ~/.local — no sudo. The same install.sh drives all three flows (install, update, uninstall).',
+  },
+  instAltLabel: { es: 'Con wget:', en: 'With wget:' },
+  instStepsTitle: { es: 'Qué hace', en: 'What it does' },
+  instReqTitle: { es: 'Requisitos y variables', en: 'Requirements and overrides' },
+  instMaintTitle: { es: 'Actualizar y desinstalar', en: 'Update and uninstall' },
+  instPathsTitle: { es: 'Dónde queda cada cosa', en: 'Where everything lands' },
+  instColPath: { es: 'Ruta', en: 'Path' },
+  instColWhat: { es: 'Qué es', en: 'What it is' },
+  instColStep: { es: 'Paso', en: 'Step' },
+  instFlowsNote: {
+    es: 'Desde un checkout del repositorio, sh install.sh --help enumera todas las opciones.',
+    en: 'From a checkout of the repository, sh install.sh --help lists every option.',
+  },
+  instCopy: { es: 'Copiar', en: 'Copy' },
+  instCopied: { es: 'Copiado', en: 'Copied' },
 
   // Keybindings page
   kbTitle: { es: 'Atajos de teclado', en: 'Keybindings' },

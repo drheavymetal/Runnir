@@ -4,6 +4,7 @@ import Hero from './components/Hero.jsx'
 import FeatureCard from './components/FeatureCard.jsx'
 import KeybindingsPage from './components/KeybindingsPage.jsx'
 import ConfigPage from './components/ConfigPage.jsx'
+import InstallPage from './components/InstallPage.jsx'
 import { SECTIONS } from './data/sections.js'
 import { FEATURES } from './data/features.js'
 import { useLang, UI } from './i18n.jsx'
@@ -20,7 +21,7 @@ function matches(f, q, t) {
   return hay.includes(q)
 }
 
-const VIEWS = ['guia', 'atajos', 'config']
+const VIEWS = ['guia', 'instalacion', 'atajos', 'config']
 function initialView() {
   const h = typeof window !== 'undefined' ? window.location.hash.replace('#', '') : ''
   return VIEWS.includes(h) ? h : 'guia'
@@ -90,7 +91,7 @@ export default function App() {
       <main className="content">
         {view === 'guia' && (
           <div className="wrap">
-            {!q && <Hero />}
+            {!q && <Hero onInstall={() => setView('instalacion')} />}
 
             {q && filtered.length === 0 && (
               <p className="empty">{t(UI.emptyPrefix)} “{query}”. {t(UI.emptySuffix)}</p>
@@ -120,6 +121,7 @@ export default function App() {
           </div>
         )}
 
+        {view === 'instalacion' && <InstallPage query={query} />}
         {view === 'atajos' && <KeybindingsPage query={query} />}
         {view === 'config' && <ConfigPage query={query} />}
       </main>
