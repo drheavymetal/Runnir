@@ -41,7 +41,9 @@ WOW (aim 4–5):
 DIFFERENTIAL (aim ~15 total incl. above):
 - [ ] D1 OSC 8 hyperlinks — clickable links apps emit (ls --hyperlink, gcc/cargo).
 - [ ] D2 Config hot-reload — watch ~/.config/runnir/runnir.toml, apply live.
-- [ ] D3 Shell-history fuzzy in palette — read fish/bash/zsh history, fuzzy pick, insert.
+- [x] D3 Shell-history fuzzy — src/history.rs recent() (fish/zsh/bash parse+dedup);
+      HistorySearch palette action → Prompt(HistoryInsert) → insert_command (typed, not run).
+      4 tests. commit 32.
 - [x] D4 Visual + audible bell — BEL bumps grid.bell_count; Pane::take_bell; Gpu
       bell_flash+check_bells+bell_alpha; render() flash param → white fullscreen quad;
       request_user_attention(Critical) when unfocused. commit 26.

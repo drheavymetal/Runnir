@@ -295,6 +295,8 @@ pub enum PromptKind {
     Whisper,
     /// A destructive command held at Enter by the guardian: confirm to run it.
     GuardedCommand,
+    /// A shell-history line to type at the prompt (fuzzy-picked, not run).
+    HistoryInsert,
 }
 
 impl Prompt {

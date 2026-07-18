@@ -203,6 +203,10 @@ file is safe to keep in a dotfiles repo.
 
 @ Ctrl+Shift+P     command palette — every command, fuzzy-searchable
 
+The palette also hosts commands with no default chord, including "Insert from
+shell history" (fuzzy-pick a past command from fish/zsh/bash history and type it
+at the prompt) and "Open scrollback in $EDITOR".
+
 # Why 'runnir'
 
 From Old Norse 'run' (secret, whisper) and the '-nir' of Mjolnir and Gungnir. The

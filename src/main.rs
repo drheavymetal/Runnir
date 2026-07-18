@@ -8,6 +8,7 @@ mod font;
 mod graphics;
 mod grid;
 mod guardian;
+mod history;
 mod hints;
 mod keys;
 mod layout;

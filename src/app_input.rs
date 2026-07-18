@@ -357,6 +357,7 @@ impl Gpu {
             Action::AiExplain => self.ai_explain_selection(config),
             Action::SummarizeSession => self.summarize_session(config),
             Action::OpenScrollbackInEditor => self.open_scrollback_in_editor(config),
+            Action::HistorySearch => self.history_search(),
             Action::QuickConnect => self.open_quick_connect(),
             Action::HintMode => self.open_hints(),
             Action::LaunchClaude => self.launch_claude(config),
@@ -547,6 +548,7 @@ impl Gpu {
             Action::AiExplain => self.ai_explain_selection(config),
             Action::SummarizeSession => self.summarize_session(config),
             Action::OpenScrollbackInEditor => self.open_scrollback_in_editor(config),
+            Action::HistorySearch => self.history_search(),
             Action::Whisper => self.whisper(),
             Action::SearchScrollback => self.overlay = Some(Overlay::Search(overlay::Search::new())),
             Action::QuickConnect => self.open_quick_connect(),
@@ -653,6 +655,10 @@ impl Gpu {
                 // Confirmed: submit the command that was held back. The line is
                 // already typed in the shell, so this is just the Enter we withheld.
                 self.tab().focused().write(b"\r");
+            }
+            PromptKind::HistoryInsert => {
+                // Type the chosen history line at the prompt; the user runs it.
+                self.insert_command(value);
             }
         }
     }

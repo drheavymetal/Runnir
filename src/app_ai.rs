@@ -133,6 +133,24 @@ impl Gpu {
         }
     }
 
+    /// Opens a fuzzy picker over the shell history; the chosen line is typed at the
+    /// prompt (not run), so you review it before pressing Enter.
+    fn history_search(&mut self) {
+        let entries = crate::history::recent(500);
+        if entries.is_empty() {
+            self.status = Some("no shell history found".into());
+            self.status_expiry = Some(Instant::now() + Duration::from_secs(4));
+            self.window.request_redraw();
+            return;
+        }
+        self.overlay = Some(Overlay::Prompt(Prompt::new(
+            PromptKind::HistoryInsert,
+            "History — type to filter, Enter inserts",
+            entries,
+        )));
+        self.window.request_redraw();
+    }
+
     /// Opens the whisper bar: tell the terminal what to do in plain language.
     fn whisper(&mut self) {
         self.overlay = Some(Overlay::Prompt(Prompt::new(
