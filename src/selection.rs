@@ -8,6 +8,9 @@ pub enum Mode {
     Char,
     Word,
     Line,
+    /// Rectangular (block) selection: the cells inside the bounding box
+    /// `[min_row..=max_row] x [min_col..=max_col]`, not the linear text flow.
+    Block,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -41,13 +44,25 @@ impl Selection {
                 start.1 = 0;
                 end.1 = grid.cols() - 1;
             }
+            Mode::Block => {
+                // The bounding box of anchor/head: columns are independent of rows,
+                // so the min/max corner need not sit on the row-normalized endpoints.
+                start = (self.anchor.0.min(self.head.0), self.anchor.1.min(self.head.1));
+                end = (self.anchor.0.max(self.head.0), self.anchor.1.max(self.head.1));
+            }
         }
         (start, end)
     }
 
     pub fn contains(&self, grid: &Grid, at: Point) -> bool {
         let (start, end) = self.range(grid);
-        at >= start && at <= end
+        if self.mode == Mode::Block {
+            // Rectangular hit-test: inside the row band AND the column band, rather
+            // than the linear `start..=end` flow used by the other modes.
+            at.0 >= start.0 && at.0 <= end.0 && at.1 >= start.1 && at.1 <= end.1
+        } else {
+            at >= start && at <= end
+        }
     }
 
     pub fn is_empty(&self, grid: &Grid) -> bool {
@@ -59,7 +74,29 @@ impl Selection {
 
     pub fn text(&self, grid: &Grid) -> String {
         let (start, end) = self.range(grid);
-        grid.text_range(start, end)
+        if self.mode == Mode::Block {
+            // Block copy: each row contributes only its `[min_col..=max_col]` slice,
+            // joined by a newline. Spacers (the right half of a wide glyph) carry no
+            // char, so they are skipped, and each row's trailing blanks are trimmed —
+            // mirroring `Grid::text_range` for the linear modes.
+            let last_row = grid.total_rows().saturating_sub(1);
+            let last_col = grid.cols().saturating_sub(1);
+            let mut out = String::new();
+            for abs in start.0..=end.0.min(last_row) {
+                let line: String = (start.1..=end.1.min(last_col))
+                    .map(|c| grid.abs_cell(abs, c))
+                    .filter(|cell| !cell.is_spacer())
+                    .map(|cell| cell.ch)
+                    .collect();
+                out.push_str(line.trim_end());
+                if abs != end.0 {
+                    out.push('\n');
+                }
+            }
+            out
+        } else {
+            grid.text_range(start, end)
+        }
     }
 }
 
@@ -128,5 +165,82 @@ mod tests {
         // ASCII words still stop at the boundary.
         let sel = Selection::new((0, 8), Mode::Word);
         assert_eq!(sel.text(&g), "abc");
+    }
+
+    fn grid_rows(rows: &[&str]) -> Grid {
+        let mut g = Grid::new(20, rows.len().max(1));
+        let mut p = vte::Parser::new();
+        for (i, line) in rows.iter().enumerate() {
+            if i > 0 {
+                p.advance(&mut g, b"\r\n");
+            }
+            p.advance(&mut g, line.as_bytes());
+        }
+        g
+    }
+
+    #[test]
+    fn block_contains_is_rectangular() {
+        // A 3x3 block anchored at (0,1), head at (2,3): the rectangle
+        // rows 0..=2 x cols 1..=3.
+        let g = grid_rows(&["abcdef", "ghijkl", "mnopqr"]);
+        let sel = Selection::new((0, 1), Mode::Block);
+        let mut sel = sel;
+        sel.update((2, 3));
+
+        // Inside the box on every row (not just the linear start row).
+        for row in 0..=2 {
+            for col in 1..=3 {
+                assert!(sel.contains(&g, (row, col)), "({row},{col}) should be in the block");
+            }
+        }
+        // Columns left/right of the band are excluded even on interior rows — the
+        // key difference from linear Char selection, which would sweep the tail of
+        // row 0, all of row 1, and the head of row 2.
+        assert!(!sel.contains(&g, (1, 0)));
+        assert!(!sel.contains(&g, (1, 4)));
+        assert!(!sel.contains(&g, (0, 0)));
+        assert!(!sel.contains(&g, (2, 4)));
+        // Rows outside the band are excluded.
+        assert!(!sel.contains(&g, (3, 2)));
+    }
+
+    #[test]
+    fn block_text_slices_columns_per_row() {
+        let g = grid_rows(&["abcdef", "ghijkl", "mnopqr"]);
+        let mut sel = Selection::new((0, 1), Mode::Block);
+        sel.update((2, 3));
+        // Each row yields its own [1..=3] slice, joined by newlines.
+        assert_eq!(sel.text(&g), "bcd\nhij\nnop");
+    }
+
+    #[test]
+    fn block_normalizes_anchor_below_right_of_head() {
+        // Anchor at the bottom-right corner, head at the top-left: range() must
+        // still produce the same bounding box and the same block text.
+        let g = grid_rows(&["abcdef", "ghijkl", "mnopqr"]);
+        let mut sel = Selection::new((2, 3), Mode::Block);
+        sel.update((0, 1));
+        let (start, end) = sel.range(&g);
+        assert_eq!(start, (0, 1));
+        assert_eq!(end, (2, 3));
+        assert_eq!(sel.text(&g), "bcd\nhij\nnop");
+        // Mixed diagonal: anchor bottom-left, head top-right still normalizes.
+        let mut sel = Selection::new((2, 1), Mode::Block);
+        sel.update((0, 3));
+        assert_eq!(sel.range(&g), ((0, 1), (2, 3)));
+        assert_eq!(sel.text(&g), "bcd\nhij\nnop");
+    }
+
+    #[test]
+    fn block_over_wide_chars_skips_spacers() {
+        // A block spanning a CJK glyph must not emit the spacer half's '\0'.
+        // "日本語" occupies cols 0..=5 (each glyph = leader + spacer).
+        let g = grid_rows(&["日本語x", "ABCDEFG"]);
+        // Cols 0..=3 cover 日(leader 0, spacer 1) 本(leader 2, spacer 3) on the CJK
+        // row, and the first four ASCII cells on the other — spacers drop out.
+        let mut sel = Selection::new((0, 0), Mode::Block);
+        sel.update((1, 3));
+        assert_eq!(sel.text(&g), "日本\nABCD");
     }
 }
