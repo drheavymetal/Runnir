@@ -259,6 +259,29 @@ impl Gpu {
             self.last_cursor_rect = None;
         }
 
+        // Scroll position indicator: a thin thumb on the right edge of any pane that
+        // is scrolled back, sized and placed by the viewport's position in history.
+        for (_, r, grid, ..) in &guards {
+            let off = grid.display_offset();
+            if off == 0 {
+                continue;
+            }
+            let total = grid.total_rows().max(1) as f32;
+            let rows = grid.rows() as f32;
+            let sb = (grid.total_rows() - grid.rows()) as f32;
+            let top = (sb - off as f32).max(0.0);
+            let thumb_h = (rows / total * r.h).max(8.0);
+            let thumb_y = r.y + (top / total) * r.h;
+            let a = config.theme.accent;
+            decorations.push(crate::render::SolidRect {
+                x: r.x + r.w - 3.0,
+                y: thumb_y.min(r.y + r.h - thumb_h),
+                w: 3.0,
+                h: thumb_h,
+                color: (a.0, a.1, a.2),
+            });
+        }
+
         // Hover underline (D14): a thin accent line under the URL/path the pointer is
         // on, drawn as a decoration so it needs no per-cell plumbing.
         if let Some(h) = &self.hover_url {
