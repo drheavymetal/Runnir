@@ -251,6 +251,7 @@ td .id { font-family: var(--mono); color: var(--fg-faint); font-size: 12px; }
     position: sticky;
     top: 0;
     z-index: 10;
+    align-self: stretch;
     width: auto;
     flex: none;
     height: auto;
