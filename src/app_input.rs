@@ -1566,7 +1566,7 @@ impl Gpu {
         // First command opens the new tab's initial pane.
         let id = self.new_pane_id();
         let first = argv_of(&cmds[0]);
-        let spawn = Spawn { command: (!first.is_empty()).then_some(first), cwd: None };
+        let spawn = Spawn { command: (!first.is_empty()).then_some(first), cwd: None, ..Default::default() };
         let wake = wake_fn(self.proxy.clone());
         let Ok(mut tab) = Tab::new(area, cell, config, id, &spawn, wake) else { return };
         tab.title_override = Some(layout.name.clone());

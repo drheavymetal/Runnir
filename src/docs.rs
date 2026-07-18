@@ -265,6 +265,7 @@ file is safe to keep in a dotfiles repo.
 @ window.minimap   true shows a scrollback minimap on the focused pane; click to jump
 @ cursor.trail     true draws a brief fading trail behind the cursor (flair, off)
 @ behaviour.smooth_scroll  true glides on scroll jumps instead of teleporting
+@ behaviour.shell_integration  true auto-injects OSC 133/7 hooks into fish/zsh/bash (no rc edits)
 
 Each tab shows an icon for its foreground app and a badge: an amber dot for a
 background tab with unseen output, a red cross if its last command failed. The tab

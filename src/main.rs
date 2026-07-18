@@ -21,6 +21,7 @@ mod render;
 mod selection;
 mod session;
 mod settings;
+mod shell_integration;
 mod tab;
 mod whisper;
 
@@ -114,6 +115,7 @@ fn dump(cmd: &str) {
             cmd.into(),
         ]),
         cwd: None,
+        ..Default::default()
     };
     let mut pty = pty::Pty::spawn(grid.clone(), &spawn, || {}).expect("pty");
     pty.wait();
@@ -851,6 +853,21 @@ impl Gpu {
         // render early-returns when the surface is hidden. Cheap: one u64 compare
         // per pane.
         self.check_bells();
+
+        // Drain OSC 52 clipboard writes and OSC 9/99/777 notifications from every
+        // pane on every wake (a PTY produced output → we were woken), so a program's
+        // copy or notification lands promptly rather than waiting on the 500ms
+        // context tick below. Cheap: one lock + take of a usually-empty vec per pane.
+        for tab in &mut self.tabs {
+            for pane in tab.panes.values_mut() {
+                for text in pane.take_clipboard_writes() {
+                    self.clipboard.set(&text);
+                }
+                for body in pane.take_notifications() {
+                    notify(&body);
+                }
+            }
+        }
 
         // Refresh the status-bar clock roughly every 20s (formatting local time
         // without a chrono dependency; `date` handles the timezone).

@@ -921,6 +921,7 @@ pub fn offscreen(path: &str, cmd: &str, font_px: f32, delay_ms: Option<u64>) {
     let spawn = crate::pty::Spawn {
         command: Some(vec![shell(), "-c".into(), cmd.into()]),
         cwd: None,
+        ..Default::default()
     };
     let mut pty = crate::pty::Pty::spawn(grid.clone(), &spawn, || {}).expect("pty");
     match delay_ms {

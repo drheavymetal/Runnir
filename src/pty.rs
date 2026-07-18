@@ -29,6 +29,10 @@ pub struct Spawn {
     pub command: Option<Vec<String>>,
     /// Directory to start in. `None` inherits the parent's.
     pub cwd: Option<std::path::PathBuf>,
+    /// Extra environment variables to set on the child, on top of the inherited
+    /// environment. Used to inject shell integration (ZDOTDIR, XDG_DATA_DIRS, …)
+    /// without editing the user's rc files.
+    pub env: Vec<(String, String)>,
 }
 
 pub struct Pty {
@@ -78,6 +82,11 @@ impl Pty {
         // NOTE: never env_clear() — ssh reads ~/.ssh/config and the 1Password agent
         // through the inherited environment.
         builder.env("TERM", "xterm-256color");
+        // Shell-integration env (ZDOTDIR, XDG_DATA_DIRS, RUNNIR_ZDOTDIR, …). Applied
+        // after TERM so nothing here can accidentally shadow it.
+        for (k, v) in &spawn.env {
+            builder.env(k, v);
+        }
 
         let child = pair.slave.spawn_command(builder)?;
         // The child holds its own slave fd. Ours must go, or the reader never sees
@@ -323,7 +332,7 @@ mod tests {
         // (main holds writer waiting on the child; reader waits on writer and
         // stops draining; child blocks on output and never reads input).
         let grid = Arc::new(Mutex::new(Grid::new(20, 5)));
-        let spawn = Spawn { command: Some(vec!["sleep".into(), "30".into()]), cwd: None };
+        let spawn = Spawn { command: Some(vec!["sleep".into(), "30".into()]), cwd: None, ..Default::default() };
         let mut pty = Pty::spawn(grid, &spawn, || {}).expect("spawn");
         let big = vec![b'x'; 1 << 20]; // far beyond any PTY input buffer
         let start = std::time::Instant::now();
@@ -341,7 +350,7 @@ mod tests {
         // Regression: the child was never killed nor waited on, so every closed
         // pane left a zombie in the process table for the life of the terminal.
         let grid = Arc::new(Mutex::new(Grid::new(20, 5)));
-        let spawn = Spawn { command: Some(vec!["true".into()]), cwd: None };
+        let spawn = Spawn { command: Some(vec!["true".into()]), cwd: None, ..Default::default() };
         let mut pty = Pty::spawn(grid, &spawn, || {}).expect("spawn");
         let pid = pty.child.process_id().expect("child pid") as i32;
         pty.wait(); // the child exits on its own; the reader sees EOF
