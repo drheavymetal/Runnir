@@ -81,15 +81,19 @@ impl Selection {
             // mirroring `Grid::text_range` for the linear modes.
             let last_row = grid.total_rows().saturating_sub(1);
             let last_col = grid.cols().saturating_sub(1);
+            // Clamp once and compare against the clamped row below: checking the
+            // raw `end.0` would append a newline after the final row whenever the
+            // drag ran past the bottom of the grid.
+            let end_row = end.0.min(last_row);
             let mut out = String::new();
-            for abs in start.0..=end.0.min(last_row) {
+            for abs in start.0..=end_row {
                 let line: String = (start.1..=end.1.min(last_col))
                     .map(|c| grid.abs_cell(abs, c))
                     .filter(|cell| !cell.is_spacer())
                     .map(|cell| cell.ch)
                     .collect();
                 out.push_str(line.trim_end());
-                if abs != end.0 {
+                if abs != end_row {
                     out.push('\n');
                 }
             }
@@ -230,6 +234,31 @@ mod tests {
         sel.update((0, 3));
         assert_eq!(sel.range(&g), ((0, 1), (2, 3)));
         assert_eq!(sel.text(&g), "bcd\nhij\nnop");
+    }
+
+    #[test]
+    fn block_overshooting_the_grid_clamps_without_a_trailing_newline() {
+        // Dragging past the bottom-right corner of the grid: the box is clamped
+        // to the real rows/cols, and the last real row must not be followed by a
+        // spurious newline (the loop clamps but the join must clamp identically).
+        let g = grid_rows(&["abcdef", "ghijkl"]);
+        let mut sel = Selection::new((0, 0), Mode::Block);
+        sel.update((5, 30)); // far below and right of the 2x20 grid
+        assert_eq!(sel.text(&g), "abcdef\nghijkl");
+        // A block entirely below the grid selects nothing.
+        let mut sel = Selection::new((4, 0), Mode::Block);
+        sel.update((5, 3));
+        assert_eq!(sel.text(&g), "");
+    }
+
+    #[test]
+    fn single_cell_block_selects_one_char() {
+        let g = grid_rows(&["abcdef"]);
+        let sel = Selection::new((0, 2), Mode::Block);
+        assert_eq!(sel.text(&g), "c");
+        assert!(sel.contains(&g, (0, 2)));
+        assert!(!sel.contains(&g, (0, 1)));
+        assert!(!sel.contains(&g, (0, 3)));
     }
 
     #[test]
