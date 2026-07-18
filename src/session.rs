@@ -12,7 +12,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::layout::{Node, PaneId};
+use crate::layout::{LayoutMode, Node, PaneId};
 
 #[derive(Serialize, Deserialize)]
 pub struct Session {
@@ -27,6 +27,18 @@ pub struct TabState {
     pub focus: PaneId,
     pub title: Option<String>,
     pub panes: HashMap<PaneId, PaneState>,
+    /// The active layout mode. Defaults to `Splits` so sessions written before
+    /// layout modes existed still load.
+    #[serde(default)]
+    pub mode: LayoutMode,
+    /// Insertion order of the panes, the arrangement source for the algorithmic
+    /// modes. Empty in an older session — the tab rebuilds it from the tree.
+    #[serde(default)]
+    pub order: Vec<PaneId>,
+    /// Master pane share for Tall/Fat. `None` in an older session, so the tab uses
+    /// its default.
+    #[serde(default)]
+    pub master_ratio: Option<f32>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -57,7 +69,16 @@ impl Session {
 
     #[cfg(test)]
     pub fn add_tab(&mut self, tree: Node, focus: PaneId, title: Option<String>) -> &mut TabState {
-        self.tabs.push(TabState { tree, focus, title, panes: HashMap::new() });
+        let order = tree.panes();
+        self.tabs.push(TabState {
+            tree,
+            focus,
+            title,
+            panes: HashMap::new(),
+            mode: LayoutMode::default(),
+            order,
+            master_ratio: None,
+        });
         self.tabs.last_mut().unwrap()
     }
 
@@ -86,6 +107,9 @@ impl Session {
                 focus: tab.focus,
                 title: tab.title.clone(),
                 panes,
+                mode: tab.mode,
+                order: tab.order.clone(),
+                master_ratio: tab.master_ratio,
             });
         }
         let json = serde_json::to_string_pretty(&trimmed)?;
@@ -150,6 +174,29 @@ mod tests {
         assert_eq!(back.tabs[0].panes.len(), 2);
         assert_eq!(back.tabs[0].panes[&1].scrollback, vec!["line one", "line two"]);
         assert_eq!(back.tabs[0].panes[&1].cwd.as_deref(), Some(std::path::Path::new("/home/x")));
+    }
+
+    #[test]
+    fn layout_mode_round_trips_and_defaults() {
+        // An explicit mode/order/master survives the round trip...
+        let mut s = sample();
+        s.tabs[0].mode = LayoutMode::Tall;
+        s.tabs[0].order = vec![2, 1];
+        s.tabs[0].master_ratio = Some(0.7);
+        let json = serde_json::to_string(&s).unwrap();
+        let back: Session = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.tabs[0].mode, LayoutMode::Tall);
+        assert_eq!(back.tabs[0].order, vec![2, 1]);
+        assert_eq!(back.tabs[0].master_ratio, Some(0.7));
+
+        // ...and a pre-layout-modes session (no such fields) loads as Splits with an
+        // empty order and no master, so old session files still open.
+        let legacy = r#"{"version":1,"active":0,"tabs":[
+            {"tree":{"Leaf":1},"focus":1,"title":null,"panes":{}}]}"#;
+        let back: Session = serde_json::from_str(legacy).unwrap();
+        assert_eq!(back.tabs[0].mode, LayoutMode::Splits);
+        assert!(back.tabs[0].order.is_empty());
+        assert_eq!(back.tabs[0].master_ratio, None);
     }
 
     #[test]

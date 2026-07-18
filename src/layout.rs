@@ -38,6 +38,50 @@ impl Direction {
     }
 }
 
+/// How a tab arranges its panes. `Splits` is the binary tree the tab has always
+/// used; the rest are algorithmic tilings computed from the ordered pane list
+/// alone (kitty-style layouts), ignoring the tree.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LayoutMode {
+    /// The manual binary split tree (default). Fully user-arranged.
+    #[default]
+    Splits,
+    /// One pane fills the tab; the others are hidden. Focus cycles between them.
+    Stack,
+    /// One master pane on the left, the rest stacked in a column on the right.
+    Tall,
+    /// One master pane on top, the rest in a row below.
+    Fat,
+    /// A near-square grid of every pane, filled row by row.
+    Grid,
+}
+
+impl LayoutMode {
+    /// The next mode in the cycle, wrapping. Order: Splits → Stack → Tall → Fat →
+    /// Grid → Splits.
+    pub fn next(self) -> Self {
+        match self {
+            LayoutMode::Splits => LayoutMode::Stack,
+            LayoutMode::Stack => LayoutMode::Tall,
+            LayoutMode::Tall => LayoutMode::Fat,
+            LayoutMode::Fat => LayoutMode::Grid,
+            LayoutMode::Grid => LayoutMode::Splits,
+        }
+    }
+
+    /// A short human-readable name, for the status toast.
+    pub fn label(self) -> &'static str {
+        match self {
+            LayoutMode::Splits => "splits",
+            LayoutMode::Stack => "stack",
+            LayoutMode::Tall => "tall",
+            LayoutMode::Fat => "fat",
+            LayoutMode::Grid => "grid",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Rect {
     pub x: f32,
@@ -336,6 +380,95 @@ pub fn neighbour(rects: &[(PaneId, Rect)], from: PaneId, dir: Direction) -> Opti
         .map(|(id, _)| *id)
 }
 
+// ---- Algorithmic layouts -------------------------------------------------
+//
+// These arrange the panes from the ORDERED id list alone — no split tree. Order
+// is the tab's insertion order, so a new pane appended to it lands where the
+// algorithm puts the last slot. All tile contiguously with `gap` between panes,
+// and with `gap == 0` fill the area exactly (integer-rounded dividers, the last
+// slot absorbing any rounding remainder), so panes never overlap.
+
+/// Splits `[start, start+len)` into `n` contiguous slots, each shortened by `gap`
+/// on its trailing edge (except the last). Returns `(start, len)` per slot.
+fn tile(start: f32, len: f32, n: usize, gap: f32) -> Vec<(f32, f32)> {
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let a = start + (len * i as f32 / n as f32).round();
+        let b = start + (len * (i + 1) as f32 / n as f32).round();
+        // Reserve the divider gap between this slot and the next; the last slot
+        // runs to the edge so the tiling fills the whole length.
+        let slot = if i + 1 < n { (b - a - gap).max(0.0) } else { b - a };
+        out.push((a, slot));
+    }
+    out
+}
+
+/// Stack mode as rects: only the focused pane is placed (full area); the rest are
+/// hidden. `neighbour`-based focus therefore can't move, so the tab cycles focus
+/// through the ordered list instead.
+pub fn stack(focus: PaneId, area: Rect) -> Vec<(PaneId, Rect)> {
+    vec![(focus, area)]
+}
+
+/// Tall mode: `order[0]` is the master column on the left at `master_ratio` of the
+/// width; the rest stack top-to-bottom in the right column.
+pub fn tall(order: &[PaneId], area: Rect, gap: f32, master_ratio: f32) -> Vec<(PaneId, Rect)> {
+    if order.len() <= 1 {
+        return order.first().map(|&id| (id, area)).into_iter().collect();
+    }
+    let usable = (area.w - gap).max(0.0);
+    let master_w = (usable * master_ratio.clamp(0.05, 0.95)).round();
+    let slave_w = usable - master_w;
+    let slave_x = area.x + master_w + gap;
+    let mut out = Vec::with_capacity(order.len());
+    out.push((order[0], Rect { x: area.x, y: area.y, w: master_w, h: area.h }));
+    for (&id, (y, h)) in order[1..].iter().zip(tile(area.y, area.h, order.len() - 1, gap)) {
+        out.push((id, Rect { x: slave_x, y, w: slave_w, h }));
+    }
+    out
+}
+
+/// Fat mode: `order[0]` is the master row on top at `master_ratio` of the height;
+/// the rest sit left-to-right in the row below.
+pub fn fat(order: &[PaneId], area: Rect, gap: f32, master_ratio: f32) -> Vec<(PaneId, Rect)> {
+    if order.len() <= 1 {
+        return order.first().map(|&id| (id, area)).into_iter().collect();
+    }
+    let usable = (area.h - gap).max(0.0);
+    let master_h = (usable * master_ratio.clamp(0.05, 0.95)).round();
+    let slave_h = usable - master_h;
+    let slave_y = area.y + master_h + gap;
+    let mut out = Vec::with_capacity(order.len());
+    out.push((order[0], Rect { x: area.x, y: area.y, w: area.w, h: master_h }));
+    for (&id, (x, w)) in order[1..].iter().zip(tile(area.x, area.w, order.len() - 1, gap)) {
+        out.push((id, Rect { x, y: slave_y, w, h: slave_h }));
+    }
+    out
+}
+
+/// Grid mode: a near-square grid of every pane, filled row by row. Columns are
+/// `ceil(sqrt(n))`; a short final row spreads its panes across the full width so
+/// no space is left empty.
+pub fn grid(order: &[PaneId], area: Rect, gap: f32) -> Vec<(PaneId, Rect)> {
+    let n = order.len();
+    if n <= 1 {
+        return order.first().map(|&id| (id, area)).into_iter().collect();
+    }
+    let cols = (n as f32).sqrt().ceil() as usize;
+    let rows = n.div_ceil(cols);
+    let row_bands = tile(area.y, area.h, rows, gap);
+    let mut out = Vec::with_capacity(n);
+    for r in 0..rows {
+        let start = r * cols;
+        let in_row = (n - start).min(cols); // the last row may hold fewer
+        let (y, h) = row_bands[r];
+        for (c, (x, w)) in tile(area.x, area.w, in_row, gap).into_iter().enumerate() {
+            out.push((order[start + c], Rect { x, y, w, h }));
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -518,6 +651,129 @@ mod tests {
                 let overlap = (a.x < b.x + b.w && b.x < a.x + a.w)
                     && (a.y < b.y + b.h && b.y < a.y + a.h);
                 assert!(!overlap, "{a:?} overlaps {b:?}");
+            }
+        }
+    }
+
+    // ---- Algorithmic layout modes ---------------------------------------
+
+    /// No two rects overlap.
+    fn no_overlap(rects: &[(PaneId, Rect)]) {
+        for (i, (_, a)) in rects.iter().enumerate() {
+            for (_, b) in rects.iter().skip(i + 1) {
+                let overlap = (a.x < b.x + b.w && b.x < a.x + a.w)
+                    && (a.y < b.y + b.h && b.y < a.y + a.h);
+                assert!(!overlap, "{a:?} overlaps {b:?}");
+            }
+        }
+    }
+
+    /// With no gap the rects must tile the area exactly, cover every id once, and
+    /// keep the given order.
+    fn fills_exactly(rects: &[(PaneId, Rect)], order: &[PaneId]) {
+        let ids: Vec<PaneId> = rects.iter().map(|(id, _)| *id).collect();
+        assert_eq!(ids, order, "order must be preserved and complete");
+        no_overlap(rects);
+        let total: f32 = rects.iter().map(|(_, r)| r.w * r.h).sum();
+        assert!(
+            (total - AREA.w * AREA.h).abs() < 2.0,
+            "gapless tiling must fill the area, got {total}"
+        );
+    }
+
+    #[test]
+    fn stack_shows_only_the_focused_pane_full_size() {
+        // Whatever the order, stack lays out exactly the focused pane at full area.
+        for focus in [1u64, 2, 3, 4] {
+            let rects = stack(focus, AREA);
+            assert_eq!(rects, vec![(focus, AREA)]);
+        }
+    }
+
+    #[test]
+    fn tall_master_left_rest_stacked_right() {
+        for n in 1..=4u64 {
+            let order: Vec<PaneId> = (1..=n).collect();
+            let rects = tall(&order, AREA, 0.0, 0.6);
+            fills_exactly(&rects, &order);
+            if n == 1 {
+                assert_eq!(rects[0].1, AREA);
+                continue;
+            }
+            // Master takes 60% of the width and the full height.
+            assert_eq!(rects[0].1.w, 600.0);
+            assert_eq!(rects[0].1.h, 600.0);
+            assert_eq!(rects[0].1.x, 0.0);
+            // Slaves sit in the right column, share its height, full slave width.
+            for (_, r) in &rects[1..] {
+                assert_eq!(r.x, 600.0);
+                assert_eq!(r.w, 400.0);
+            }
+            // Slave heights sum to the full height (they stack, no gap).
+            let sh: f32 = rects[1..].iter().map(|(_, r)| r.h).sum();
+            assert_eq!(sh, 600.0);
+        }
+    }
+
+    #[test]
+    fn fat_master_top_rest_below() {
+        for n in 1..=4u64 {
+            let order: Vec<PaneId> = (1..=n).collect();
+            let rects = fat(&order, AREA, 0.0, 0.5);
+            fills_exactly(&rects, &order);
+            if n == 1 {
+                assert_eq!(rects[0].1, AREA);
+                continue;
+            }
+            // Master row on top, half the height, full width.
+            assert_eq!(rects[0].1.h, 300.0);
+            assert_eq!(rects[0].1.w, 1000.0);
+            assert_eq!(rects[0].1.y, 0.0);
+            // Slaves sit in the bottom row, sharing the width.
+            for (_, r) in &rects[1..] {
+                assert_eq!(r.y, 300.0);
+                assert_eq!(r.h, 300.0);
+            }
+            let sw: f32 = rects[1..].iter().map(|(_, r)| r.w).sum();
+            assert_eq!(sw, 1000.0);
+        }
+    }
+
+    #[test]
+    fn grid_is_near_square_and_fills() {
+        for n in 1..=4u64 {
+            let order: Vec<PaneId> = (1..=n).collect();
+            let rects = grid(&order, AREA, 0.0);
+            fills_exactly(&rects, &order);
+        }
+        // Four panes make a 2x2 grid: two distinct x's and two distinct y's.
+        let rects = grid(&[1, 2, 3, 4], AREA, 0.0);
+        assert_eq!(rects[0].1, Rect { x: 0.0, y: 0.0, w: 500.0, h: 300.0 });
+        assert_eq!(rects[3].1, Rect { x: 500.0, y: 300.0, w: 500.0, h: 300.0 });
+        // Three panes: row 0 holds two, row 1 holds one spanning the full width.
+        let three = grid(&[1, 2, 3], AREA, 0.0);
+        assert_eq!(three[2].1.w, 1000.0, "the lone last-row pane spans the width");
+        assert_eq!(three[2].1.y, 300.0);
+    }
+
+    #[test]
+    fn a_gap_never_makes_panes_overlap() {
+        // With a real divider gap the tilings must still be overlap-free and stay
+        // inside the area for every mode and pane count.
+        for n in 1..=4u64 {
+            let order: Vec<PaneId> = (1..=n).collect();
+            for rects in [
+                tall(&order, AREA, 10.0, 0.55),
+                fat(&order, AREA, 10.0, 0.55),
+                grid(&order, AREA, 10.0),
+            ] {
+                assert_eq!(rects.len(), n as usize);
+                no_overlap(&rects);
+                for (_, r) in &rects {
+                    assert!(r.w >= 0.0 && r.h >= 0.0);
+                    assert!(r.x >= AREA.x - 0.5 && r.x + r.w <= AREA.x + AREA.w + 0.5);
+                    assert!(r.y >= AREA.y - 0.5 && r.y + r.h <= AREA.y + AREA.h + 0.5);
+                }
             }
         }
     }
