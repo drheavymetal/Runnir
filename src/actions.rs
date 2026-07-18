@@ -64,6 +64,13 @@ pub enum Action {
     SetImageWatchDir,
     SaveProjectSession,
     RestoreProjectSession,
+    // Media (now playing)
+    NowPlaying,
+    MediaPlayPause,
+    MediaNext,
+    MediaPrev,
+    MediaVolumeUp,
+    MediaVolumeDown,
     // Font
     FontBigger,
     FontSmaller,
@@ -145,6 +152,12 @@ impl Action {
             SetImageWatchDir => "set_image_watch_dir",
             SaveProjectSession => "save_project_session",
             RestoreProjectSession => "restore_project_session",
+            NowPlaying => "now_playing",
+            MediaPlayPause => "media_play_pause",
+            MediaNext => "media_next",
+            MediaPrev => "media_prev",
+            MediaVolumeUp => "media_volume_up",
+            MediaVolumeDown => "media_volume_down",
             FontBigger => "font_bigger",
             FontSmaller => "font_smaller",
             FontReset => "font_reset",
@@ -222,6 +235,12 @@ impl Action {
             SetImageWatchDir => "Auto-preview images: set / clear watched dir",
             SaveProjectSession => "Save session for this project",
             RestoreProjectSession => "Restore session for this project",
+            NowPlaying => "Now playing (media overlay)",
+            MediaPlayPause => "Media: play / pause",
+            MediaNext => "Media: next track",
+            MediaPrev => "Media: previous track",
+            MediaVolumeUp => "Media: volume up",
+            MediaVolumeDown => "Media: volume down",
             FontBigger => "Increase font size",
             FontSmaller => "Decrease font size",
             FontReset => "Reset font size",
@@ -302,6 +321,12 @@ impl Action {
             "set_image_watch_dir" => SetImageWatchDir,
             "save_project_session" => SaveProjectSession,
             "restore_project_session" => RestoreProjectSession,
+            "now_playing" => NowPlaying,
+            "media_play_pause" => MediaPlayPause,
+            "media_next" => MediaNext,
+            "media_prev" => MediaPrev,
+            "media_volume_up" => MediaVolumeUp,
+            "media_volume_down" => MediaVolumeDown,
             "font_bigger" => FontBigger,
             "font_smaller" => FontSmaller,
             "font_reset" => FontReset,
@@ -392,6 +417,12 @@ impl Action {
             SetImageWatchDir,
             SaveProjectSession,
             RestoreProjectSession,
+            NowPlaying,
+            MediaPlayPause,
+            MediaNext,
+            MediaPrev,
+            MediaVolumeUp,
+            MediaVolumeDown,
             ScrollToTop,
             ScrollToBottom,
             JumpPrevPrompt,
@@ -586,6 +617,10 @@ fn default_bindings() -> HashMap<Chord, Action> {
     // Every ctrl+shift+letter is spoken for, so snippets take a free super chord —
     // the same modifier the tab/resize bindings already use. 's' for snippets.
     bind(&mut m, "super+s", OpenSnippets);
+    // Now-playing overlay: every ctrl+shift+letter is taken, so it lives on a free
+    // super chord ('p' for playing). Media transport also binds to the XF86 media keys
+    // in the input layer, and the overlay has its own space/n/p/+/- keys.
+    bind(&mut m, "super+p", NowPlaying);
     m
 }
 
@@ -628,6 +663,7 @@ pub fn default_hints() -> HashMap<String, String> {
         ("move_tab_left", "Ctrl+Shift+Left"),
         ("move_tab_right", "Ctrl+Shift+Right"),
         ("open_snippets", "Super+S"),
+        ("now_playing", "Super+P"),
     ];
     pretty.iter().map(|(a, k)| (a.to_string(), k.to_string())).collect()
 }

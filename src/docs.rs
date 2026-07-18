@@ -338,6 +338,45 @@ It can also start on its own. In the config:
 An empty extensions list previews any file. max_width is the widest a preview is
 drawn, in cells; a bigger image is scaled down to it, a smaller one left alone.
 
+# Now playing (media)
+
+See and control whatever is playing without leaving the terminal. An overlay shows
+the current track (title, artist, album), the album art, the playback state, and a
+live audio waveform.
+
+@ Super+P          open the now-playing overlay
+
+Inside the overlay:
+
+@ space            play / pause
+@ n / p            next / previous track
+@ + / -            volume up / down
+@ Esc              close
+
+The XF86 media keys on your keyboard (play/pause, next, previous) also work
+anywhere, and every command is in the palette (Media: play / pause, and so on) for
+a keyboard-only workflow. If no player is active, a brief toast says so.
+
+The album art renders as coloured half-block characters, so it shows on any GPU
+without extra plumbing. The waveform is drawn as Unicode bars that rise and fall
+with the sound.
+
+Requirements: on Linux, playerctl (any MPRIS player: mpv, Spotify, browsers, Music
+Assistant) for metadata and control, and cava for the waveform. On macOS,
+nowplaying-cli if installed, otherwise AppleScript against Music or Spotify; album
+art and the waveform are skipped there. A missing tool degrades gracefully to a
+toast or a plainer overlay, never an error.
+
+In the config:
+
+  [media]
+  waveform = true
+  bars = 24
+  art_cells = 18
+
+waveform draws the cava wave (it shows nothing when cava is absent); bars is how
+many wave columns to compute; art_cells is the album-art width in cells.
+
 # Font
 
 @ Ctrl++ / Ctrl+-  bigger / smaller (live, no restart)

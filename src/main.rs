@@ -13,6 +13,7 @@ mod history;
 mod hints;
 mod keys;
 mod layout;
+mod media;
 mod mouse;
 mod overlay;
 mod pane;
@@ -66,6 +67,10 @@ pub enum UserEvent {
     /// replies; the socket thread waits (bounded) on the other end. This is the only
     /// safe cross-thread path to the terminal state — same reasoning as `Redraw`.
     Control(control::ControlRequest, std::sync::mpsc::Sender<control::ControlResponse>),
+    /// A now-playing update from a media worker: fetched metadata or a waveform frame.
+    /// Delivered off the UI thread via the proxy, same wake pattern as `Ai`, so the
+    /// playerctl / cava subprocess never blocks rendering.
+    Media(media::MediaMsg),
 }
 
 fn main() {
@@ -316,6 +321,12 @@ struct Gpu {
     copy_mode: Option<CopyMode>,
     /// The armed image auto-preview watch, or `None` when not watching.
     image_watch: Option<ImageWatch>,
+    /// The running now-playing waveform worker, or `None`. Dropping it (on overlay
+    /// close, or when a new one starts) stops the worker and kills its cava child.
+    media_wave: Option<media::WaveHandle>,
+    /// When the now-playing overlay last had its metadata refreshed, so a track change
+    /// shows while it stays open without re-fetching on every wake. `None` when closed.
+    media_last_refresh: Option<Instant>,
     /// An in-flight eased scroll: (pane id, current offset, target offset) in
     /// scrollback lines. Drives smooth glide on scroll-to-top/bottom and jumps.
     scroll_glide: Option<(u64, f32, f32)>,
@@ -521,6 +532,8 @@ impl App {
             hover_url: None,
             copy_mode: None,
             image_watch: None,
+            media_wave: None,
+            media_last_refresh: None,
             scroll_glide: None,
             pending_config: None,
             cursor_trail: Vec::new(),
@@ -719,6 +732,7 @@ impl ApplicationHandler<UserEvent> for App {
                 let resp = gpu.handle_control(req, &self.config);
                 let _ = reply.send(resp);
             }
+            UserEvent::Media(msg) => gpu.on_media_msg(msg, &self.config),
         }
     }
 
@@ -842,6 +856,15 @@ impl ApplicationHandler<UserEvent> for App {
         // self-sustaining WaitUntil pattern the blink uses.
         let watch_wake = gpu.image_watch.is_some()
             .then(|| Instant::now() + Duration::from_millis(WATCH_POLL_MS));
+        // The now-playing overlay needs a periodic wake too: to refresh its metadata
+        // (above) and to animate the waveform even on an idle terminal.
+        let media_wake = matches!(gpu.overlay, Some(Overlay::Media(_)))
+            .then(|| Instant::now() + Duration::from_millis(250));
+        // Whichever background timer is soonest is the one to wake on.
+        let extra_wake = match (watch_wake, media_wake) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
 
         // Drive cursor blink. A WaitUntil wake does not itself repaint, so redraw
         // only when the blink phase actually flips — that keeps an idle terminal
@@ -860,12 +883,12 @@ impl ApplicationHandler<UserEvent> for App {
             let since = gpu.start.elapsed().as_millis() as u64;
             let wait = next.saturating_sub(since).max(1);
             let mut deadline = Instant::now() + Duration::from_millis(wait);
-            // Whichever comes first, blink or watch poll, is the one to wake on.
-            if let Some(w) = watch_wake {
+            // Whichever comes first, blink or a background timer, is the one to wake on.
+            if let Some(w) = extra_wake {
                 deadline = deadline.min(w);
             }
             event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
-        } else if let Some(w) = watch_wake {
+        } else if let Some(w) = extra_wake {
             event_loop.set_control_flow(ControlFlow::WaitUntil(w));
         } else {
             event_loop.set_control_flow(ControlFlow::Wait);
@@ -955,6 +978,21 @@ impl Gpu {
         // Poll the image auto-preview watch (no-op unless armed). Runs on the periodic
         // wake driven from about_to_wait; never blocks (one read_dir at most).
         self.poll_image_watch(config);
+
+        // Refresh the now-playing overlay's metadata on a slow timer while it is open,
+        // so a track change shows without reopening. Non-blocking: the fetch runs on a
+        // worker thread and answers via UserEvent::Media.
+        if matches!(self.overlay, Some(Overlay::Media(_))) {
+            let due = self
+                .media_last_refresh
+                .map_or(true, |t| t.elapsed() >= Duration::from_millis(1500));
+            if due {
+                self.media_last_refresh = Some(Instant::now());
+                self.spawn_media_fetch();
+            }
+        } else {
+            self.media_last_refresh = None;
+        }
 
         // Drain OSC 52 clipboard writes and OSC 9/99/777 notifications from every
         // pane on every wake (a PTY produced output → we were woken), so a program's
