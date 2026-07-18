@@ -577,6 +577,10 @@ pub enum PromptKind {
     WatchKeyword,
     /// A named layout to launch in a new tab.
     LaunchLayout,
+    /// A shell command to pipe the last command's output through, in a new split.
+    PipeLastOutput,
+    /// A shell command to pipe the whole scrollback through, in a new split.
+    PipeScrollback,
 }
 
 impl Prompt {

@@ -191,6 +191,17 @@ DIFFERENTIAL (aim ~15 total incl. above):
       (rect+Instant) left on cursor jump, drawn as bg↔cursor pre-blended decorations,
       animated to fade in about_to_wait. commit 47.
 
+## 2026-07-19 — Pipe scrollback / last output through a command
+Palette: Pipe last output through command / Pipe scrollback through command. Each
+opens the reused Prompt overlay (PromptKind::PipeLastOutput/PipeScrollback) to type
+a filter; confirm captures text (Grid::pipe_text(whole): last OSC 133 output block
+vs whole scrollback), writes it 0600 to $XDG_RUNTIME_DIR/runnir-pipe-<pid>.txt
+(write_private), then split_running sh -c 'CMD < "$1"' with the path as $1 (no
+interpolation → no injection). Reuses the D11 $EDITOR-dump temp plumbing. actions.rs
+(2 new actions, palette-only, no chord), overlay.rs (2 PromptKind), app_input.rs
+(open_pipe_prompt/pipe_through + confirm_prompt + both dispatch tables), grid.rs
+(pipe_text + 2 tests), pane.rs (wrapper), docs.rs (new section). 223 tests, 0 warns.
+
 ## Architecture cheatsheet (for fast edits)
 
 - `main.rs` App/Gpu, event loop, UserEvent{Ai,Redraw}, about_to_wait (blink/status/resize).
