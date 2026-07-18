@@ -310,9 +310,18 @@ impl App {
         .expect("failed to create device");
 
         let size = window.inner_size();
-        let surface_config = surface
+        let mut surface_config = surface
             .get_default_config(&adapter, size.width.max(1), size.height.max(1))
             .expect("adapter does not support this surface");
+        // For a translucent window, ask the surface for premultiplied-alpha
+        // compositing so the compositor blends (and can blur) behind us. Fall back to
+        // opaque if the platform does not offer it.
+        if self.config.window.opacity < 1.0 {
+            let caps = surface.get_capabilities(&adapter);
+            if caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::PreMultiplied) {
+                surface_config.alpha_mode = wgpu::CompositeAlphaMode::PreMultiplied;
+            }
+        }
         surface.configure(&device, &surface_config);
         println!("runnir: {} ({:?})", adapter.get_info().name, adapter.get_info().backend);
 
@@ -322,6 +331,7 @@ impl App {
         font.ligatures = self.config.font.ligatures;
         let mut renderer = Renderer::new(&device, surface_config.format, font);
         renderer.set_theme(self.config.theme.clone());
+        renderer.set_opacity(self.config.window.opacity);
 
         let cell = renderer.cell_size();
 

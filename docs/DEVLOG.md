@@ -31,8 +31,10 @@ WOW (aim 4–5):
       `runnir layout <name>` or palette launches N splits running X (e.g. ssh .3/.7/.9/.188).
 - [ ] W4 Keyword alert / watch — per-pane regex; notify (desktop) when output matches
       ("deploy OK", "error", "panic"). For monitoring builds/servers.
-- [ ] W5 Background blur + opacity — window.opacity already in config; wire it + compositor
-      blur hint. (Pedro's kitty had blur 32.)
+- [x] W5 Background blur + opacity — surface alpha_mode=PreMultiplied when opacity<1;
+      shaders emit premultiplied (premul() + PREMULTIPLIED_ALPHA_BLENDING); clear +
+      default-bg cells carry alpha=opacity; text/explicit-bg stay opaque. Compositor
+      blur works behind. Renderer::set_opacity. commit 27.
 
 DIFFERENTIAL (aim ~15 total incl. above):
 - [ ] D1 OSC 8 hyperlinks — clickable links apps emit (ls --hyperlink, gcc/cargo).

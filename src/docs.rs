@@ -167,12 +167,26 @@ support query is answered so tools auto-detect it.
 @ Ctrl++ / Ctrl+-  bigger / smaller (live, no restart)
 @ Ctrl+0           reset to the configured size
 
+# Transparency and blur
+
+Set window.opacity below 1.0 (e.g. 0.9) in the config for a translucent window.
+The default background shows the compositor through, so a blur rule behind runnir
+takes effect; text and colored cells stay fully opaque and readable. For Hyprland:
+
+  windowrulev2 = opacity 1.0 override, class:^(runnir)$
+  blur = yes  (in decoration {}), then the compositor blurs behind runnir
+
+Only the default background is translucent; explicit backgrounds, selections and
+matches stay solid.
+
 # Configuration
 
 Config is TOML at ~/.config/runnir/runnir.toml. Run `runnir --write-config` to
 write a fully-commented default. Every setting has a default, so a partial or
 missing file is fine. API keys are referenced by environment-variable name, so the
 file is safe to keep in a dotfiles repo.
+
+@ window.opacity   0.1..1.0 window translucency (needs a compositor; 1.0 = opaque)
 
 @ Ctrl+Shift+P     command palette — every command, fuzzy-searchable
 

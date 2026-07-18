@@ -43,6 +43,9 @@ pub struct Renderer {
     capacity: usize,
     theme: crate::config::Theme,
     images: ImageLayer,
+    /// Window opacity in 0.1..=1.0. Applied to the clear colour and to every
+    /// default-background cell, so the compositor shows through (and can blur).
+    opacity: f32,
     pub font: FontAtlas,
 }
 
@@ -220,7 +223,7 @@ impl Renderer {
                 // over the panes rather than replacing them.
                 targets: &[Some(wgpu::ColorTargetState {
                     format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
                 compilation_options: Default::default(),
@@ -253,8 +256,14 @@ impl Renderer {
             instances,
             capacity: 0,
             theme: crate::config::Theme::default(),
+            opacity: 1.0,
             font,
         }
+    }
+
+    /// Sets the window opacity (clamped 0.1..=1.0). 1.0 is fully opaque.
+    pub fn set_opacity(&mut self, opacity: f32) {
+        self.opacity = opacity.clamp(0.1, 1.0);
     }
 
     /// The inline images to draw this frame, from every pane, as (grid image,
@@ -380,6 +389,9 @@ impl Renderer {
         self.prepare_images(device, queue, panes, screen);
 
         let clear = self.theme.background;
+        // Premultiplied clear: the surface is composited with PreMultiplied alpha, so
+        // the background colour is scaled by opacity and carries opacity as its alpha.
+        let op = self.opacity as f64;
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("terminal"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -387,7 +399,12 @@ impl Renderer {
                 depth_slice: None,
                 resolve_target: None,
                 ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(to_wgpu(clear, 1.0)),
+                    load: wgpu::LoadOp::Clear(wgpu::Color {
+                        r: to_linear(clear.0) as f64 * op,
+                        g: to_linear(clear.1) as f64 * op,
+                        b: to_linear(clear.2) as f64 * op,
+                        a: op,
+                    }),
                     store: wgpu::StoreOp::Store,
                 },
             })],
@@ -524,8 +541,13 @@ impl Renderer {
                 let mut fg = self.resolve(cell.pen.fg, base_bg, true);
                 // A default background uses the pane's (possibly tinted) base; any
                 // explicit colour resolves normally.
+                // A default background inherits the window opacity so the compositor
+                // (and its blur) shows through; explicit colours stay fully opaque.
                 let mut bg = match cell.pen.bg {
-                    Color::Default => srgb(base_bg.0, base_bg.1, base_bg.2),
+                    Color::Default => {
+                        let [r, g, b, _] = srgb(base_bg.0, base_bg.1, base_bg.2);
+                        [r, g, b, self.opacity]
+                    }
                     other => self.resolve(other, base_bg, false),
                 };
 
@@ -1001,7 +1023,7 @@ impl ImageLayer {
                 entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
                     format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
                 compilation_options: Default::default(),
@@ -1146,15 +1168,6 @@ fn to_linear(c: u8) -> f32 {
 
 fn srgb(r: u8, g: u8, b: u8) -> [f32; 4] {
     [to_linear(r), to_linear(g), to_linear(b), 1.0]
-}
-
-fn to_wgpu(c: crate::config::Rgb, a: f64) -> wgpu::Color {
-    wgpu::Color {
-        r: to_linear(c.0) as f64,
-        g: to_linear(c.1) as f64,
-        b: to_linear(c.2) as f64,
-        a,
-    }
 }
 
 /// Mixes `over` (a raw tint) into `base` by `t`, in sRGB space. Only used for the

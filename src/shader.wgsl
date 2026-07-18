@@ -81,11 +81,18 @@ fn in_band(y: f32, band: vec2<f32>) -> bool {
     return y >= band.x && y < band.x + band.y;
 }
 
+// Straight alpha in, premultiplied out. The pipeline blends with
+// PREMULTIPLIED_ALPHA_BLENDING so a translucent background (opacity < 1) composites
+// correctly against whatever the Wayland compositor shows behind the window.
+fn premul(c: vec4<f32>) -> vec4<f32> {
+    return vec4<f32>(c.rgb * c.a, c.a);
+}
+
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // A solid rect (border/divider) is just its background, no glyph.
     if (in.flags & FLAG_SOLID) != 0u {
-        return in.bg;
+        return premul(in.bg);
     }
     var color = in.bg;
 
@@ -113,5 +120,5 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         color = vec4<f32>(in.fg.rgb, max(out_a, 1.0));
     }
 
-    return color;
+    return premul(color);
 }

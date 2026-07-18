@@ -19,5 +19,7 @@ fn vs_main(@location(0) pos: vec2<f32>, @location(1) uv: vec2<f32>) -> VsOut {
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    return textureSampleLevel(img, img_sampler, in.uv, 0.0);
+    // Premultiplied output to match the text pipeline's PREMULTIPLIED_ALPHA_BLENDING.
+    let c = textureSampleLevel(img, img_sampler, in.uv, 0.0);
+    return vec4<f32>(c.rgb * c.a, c.a);
 }
