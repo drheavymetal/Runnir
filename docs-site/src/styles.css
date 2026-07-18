@@ -63,10 +63,10 @@ code, kbd, pre, .mono { font-family: var(--mono); }
 /* ---------------------------------------------------------------- brand */
 .brand { display: flex; align-items: center; gap: 10px; margin-bottom: 4px; cursor: pointer; }
 .brand-mark {
-  font-family: var(--mono);
-  color: var(--green);
-  font-weight: 700;
-  font-size: 20px;
+  width: 30px;
+  height: 30px;
+  border-radius: 7px;
+  display: block;
 }
 .brand-name { font-family: var(--mono); font-weight: 700; font-size: 20px; letter-spacing: -.5px; }
 .brand-sub { color: var(--fg-faint); font-size: 12px; margin: 0 0 18px 30px; font-family: var(--mono); }
@@ -120,6 +120,8 @@ code, kbd, pre, .mono { font-family: var(--mono); }
 
 /* ---------------------------------------------------------------- hero */
 .hero { padding: 56px 0 34px; border-bottom: 1px solid var(--border-soft); margin-bottom: 8px; }
+.hero-logo { display: block; width: min(440px, 82%); height: auto; margin: 0 0 22px; border-radius: 14px; border: 1px solid var(--border-soft); box-shadow: 0 12px 40px rgba(0,0,0,.45); }
+.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
 .hero-glyph { font-family: var(--mono); color: var(--green); font-size: 15px; letter-spacing: 2px; margin-bottom: 14px; }
 .hero h1 { font-family: var(--mono); font-size: clamp(38px, 7vw, 62px); margin: 0 0 6px; letter-spacing: -2px; font-weight: 700; }
 .hero h1 .cursor { color: var(--green); animation: blink 1.1s steps(1) infinite; }

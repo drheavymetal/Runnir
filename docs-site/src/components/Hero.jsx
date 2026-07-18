@@ -1,8 +1,8 @@
 export default function Hero() {
   return (
     <header className="hero">
-      <div className="hero-glyph">&gt;_ rún · -nir</div>
-      <h1>runnir<span className="cursor">▊</span></h1>
+      <img className="hero-logo" src="./logo.png" alt="runnir — terminal" />
+      <h1 className="sr-only">runnir</h1>
       <p className="hero-tag">
         Un emulador de terminal <b>GPU</b>, <b>keyboard-first</b>, escrito desde cero en
         Rust para <b>Linux y macOS</b>. Rapido, con integracion de shell de verdad,

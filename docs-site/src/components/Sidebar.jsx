@@ -4,7 +4,7 @@ export default function Sidebar({ view, setView, query, setQuery, counts, active
   return (
     <aside className="sidebar">
       <div className="brand" onClick={goHome} role="button" title="Inicio">
-        <span className="brand-mark">&gt;_</span>
+        <img className="brand-mark" src="./icon.png" alt="runnir" width="30" height="30" />
         <span className="brand-name">runnir</span>
       </div>
       <p className="brand-sub">terminal GPU · Rust · docs</p>
