@@ -1019,15 +1019,67 @@ impl Gpu {
             return None; // Below the one-row bar.
         }
         let click_col = (pos.x as f32 / cw).floor() as usize;
+        let cols = (self.surface_config.width as f32 / cw).floor().max(1.0) as usize;
+        let (offset, avail_end) = self.tab_scroll(cols);
+        // Un-scroll the click into label space and find the tab it lands on.
         let mut x = 1;
-        for (i, tab) in self.tabs.iter().enumerate() {
-            let label_len = format!(" {} {} ", i + 1, tab.title()).chars().count();
-            if click_col >= x && click_col < x + label_len {
-                return Some(i);
+        for i in 0..self.tabs.len() {
+            let w = self.tab_label(i).chars().count();
+            let drawn = (x as isize - offset as isize) as isize;
+            if drawn >= 1 && (drawn as usize) < avail_end {
+                let d = drawn as usize;
+                if click_col >= d && click_col < d + w {
+                    return Some(i);
+                }
             }
-            x += label_len + 1;
+            x += w + 1;
         }
         None
+    }
+
+    /// The label drawn for tab `i` in the bar: " N title ".
+    fn tab_label(&self, i: usize) -> String {
+        format!(" {} {} ", i + 1, self.tabs[i].title())
+    }
+
+    /// Cells reserved on the right of the tab bar for the broadcast / context tags,
+    /// so the scrollable tab region does not run under them.
+    fn tab_right_reserved(&self) -> usize {
+        let mut r = 0;
+        if self.broadcast {
+            r += " BROADCAST ".len() + 1;
+        }
+        if let Some(label) = self.tabs[self.active].focused_ref().context.label() {
+            r += format!(" {label} ").chars().count() + 1;
+        }
+        r
+    }
+
+    /// Horizontal scroll of the tab bar so the active tab is always visible when the
+    /// tabs overflow. Returns `(offset_cells, avail_end_col)`: draw tab `i` at its
+    /// natural x minus `offset`, clipped to `[1, avail_end)`.
+    fn tab_scroll(&self, cols: usize) -> (usize, usize) {
+        let avail_end = cols.saturating_sub(self.tab_right_reserved()).max(2);
+        // Natural start column of each tab (1-based, gap of 1 between).
+        let mut starts = Vec::with_capacity(self.tabs.len());
+        let mut x = 1usize;
+        for i in 0..self.tabs.len() {
+            starts.push(x);
+            x += self.tab_label(i).chars().count() + 1;
+        }
+        let total_end = x; // one past the last tab
+        if total_end <= avail_end {
+            return (0, avail_end); // everything fits, no scroll
+        }
+        let active = self.active.min(self.tabs.len() - 1);
+        let aw = self.tab_label(active).chars().count();
+        let a_end = starts[active] + aw;
+        // Show the active tab and as many preceding tabs as fit before its right edge.
+        let mut first = active;
+        while first > 0 && a_end.saturating_sub(starts[first - 1] - 1) <= avail_end {
+            first -= 1;
+        }
+        (starts[first] - 1, avail_end)
     }
 
     fn pane_at(&self, pos: PhysicalPosition<f64>, area: Rect) -> Option<(u64, Rect)> {

@@ -307,23 +307,36 @@ impl Gpu {
         if multi {
             let mut bar = Grid::new(cols, 1);
             bar.fill(Pen { bg: Color::Rgb(0x15, 0x16, 0x1a), ..Pen::default() });
-            let mut x = 1;
+            // Scroll the tab strip so the active tab is always visible when tabs
+            // overflow the bar.
+            let (offset, avail_end) = self.tab_scroll(cols);
+            let mut x = 1usize;
             for (i, tab) in self.tabs.iter().enumerate() {
                 let label = format!(" {} {} ", i + 1, tab.title());
-                let pen = if i == self.active {
-                    Pen {
-                        fg: Color::Rgb(0x0d, 0x0d, 0x0f),
-                        bg: Color::Rgb(config.theme.accent.0, config.theme.accent.1, config.theme.accent.2),
-                        ..Pen::default()
-                    }
-                } else {
-                    Pen { fg: Color::Rgb(0x9a, 0x9d, 0xa4), bg: Color::Rgb(0x15, 0x16, 0x1a), ..Pen::default() }
-                };
-                bar.write_str(0, x, &label, pen);
-                x += label.chars().count() + 1;
-                if x >= cols {
-                    break;
+                let w = label.chars().count();
+                let drawn = x as isize - offset as isize;
+                // Only draw tabs whose start is within the visible window.
+                if drawn >= 1 && (drawn as usize) < avail_end {
+                    let pen = if i == self.active {
+                        Pen {
+                            fg: Color::Rgb(0x0d, 0x0d, 0x0f),
+                            bg: Color::Rgb(config.theme.accent.0, config.theme.accent.1, config.theme.accent.2),
+                            ..Pen::default()
+                        }
+                    } else {
+                        Pen { fg: Color::Rgb(0x9a, 0x9d, 0xa4), bg: Color::Rgb(0x15, 0x16, 0x1a), ..Pen::default() }
+                    };
+                    bar.write_str(0, drawn as usize, &label, pen);
                 }
+                x += w + 1;
+            }
+            // Chevrons hint at tabs scrolled off either edge.
+            let chevron = Pen { fg: Color::Rgb(0x6a, 0x6d, 0x74), bg: Color::Rgb(0x15, 0x16, 0x1a), ..Pen::default() };
+            if offset > 0 {
+                bar.write_str(0, 0, "\u{25c2}", chevron);
+            }
+            if x.saturating_sub(offset) > avail_end {
+                bar.write_str(0, avail_end.saturating_sub(1), "\u{25b8}", chevron);
             }
             // Right-aligned indicators: broadcast, then the focused pane's context
             // (ssh host / root / docker), so the tab bar always says where you are.
