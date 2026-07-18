@@ -52,7 +52,8 @@ DIFFERENTIAL (aim ~15 total incl. above):
 - [x] D4 Visual + audible bell — BEL bumps grid.bell_count; Pane::take_bell; Gpu
       bell_flash+check_bells+bell_alpha; render() flash param → white fullscreen quad;
       request_user_attention(Critical) when unfocused. commit 26.
-- [ ] D5 Primary selection (middle-click paste of last selection) via wl-copy --primary.
+- [x] D5 Primary selection — clipboard set_primary/get_primary (wl-copy/paste --primary);
+      copy_selection seeds PRIMARY; middle-click → paste_primary. commit 36.
 - [ ] D6 Command status gutter — exit code + duration next to each prompt (OSC 133 D + timing).
 - [x] D7 Session summarizer (AI) — SummarizeSession (Ctrl+Shift+I) → scrollback_text
       → AI panel with a concise-summary prompt (tail-truncated 8k). commit 30.

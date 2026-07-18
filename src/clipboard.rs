@@ -25,7 +25,7 @@ impl Clipboard {
     }
 
     pub fn set(&mut self, text: &str) {
-        if self.wayland && wl_copy(text) {
+        if self.wayland && wl_copy(text, false) {
             return;
         }
         if let Some(cb) = self.arboard.as_mut() {
@@ -35,11 +35,30 @@ impl Clipboard {
 
     pub fn get(&mut self) -> Option<String> {
         if self.wayland {
-            if let Some(text) = wl_paste() {
+            if let Some(text) = wl_paste(false) {
                 return Some(text);
             }
         }
         self.arboard.as_mut().and_then(|cb| cb.get_text().ok())
+    }
+
+    /// Sets the PRIMARY selection (middle-click paste on Wayland/X11). A no-op off
+    /// Wayland, where `arboard` has no portable primary-selection support.
+    pub fn set_primary(&mut self, text: &str) {
+        if self.wayland {
+            let _ = wl_copy(text, true);
+        }
+    }
+
+    /// Reads the PRIMARY selection, falling back to the regular clipboard so
+    /// middle-click still pastes something useful off Wayland.
+    pub fn get_primary(&mut self) -> Option<String> {
+        if self.wayland {
+            if let Some(text) = wl_paste(true) {
+                return Some(text);
+            }
+        }
+        self.get()
     }
 }
 
@@ -54,8 +73,12 @@ fn has(cmd: &str) -> bool {
 
 /// Pipes `text` into `wl-copy`. Returns whether it was launched; the process
 /// detaches to keep serving the selection after we return.
-fn wl_copy(text: &str) -> bool {
-    let Ok(mut child) = Command::new("wl-copy")
+fn wl_copy(text: &str, primary: bool) -> bool {
+    let mut cmd = Command::new("wl-copy");
+    if primary {
+        cmd.arg("--primary");
+    }
+    let Ok(mut child) = cmd
         .arg("--type")
         .arg("text/plain")
         .stdin(Stdio::piped())
@@ -72,8 +95,12 @@ fn wl_copy(text: &str) -> bool {
     true
 }
 
-fn wl_paste() -> Option<String> {
-    let out = Command::new("wl-paste")
+fn wl_paste(primary: bool) -> Option<String> {
+    let mut cmd = Command::new("wl-paste");
+    if primary {
+        cmd.arg("--primary");
+    }
+    let out = cmd
         .arg("--no-newline")
         .stderr(Stdio::null())
         .output()

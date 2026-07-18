@@ -44,7 +44,7 @@ whatever order you built the splits in.
 @ wheel / Shift+PageUp/Dn   scroll the history
 @ drag                      select text (copied on release)
 @ Ctrl+Shift+C / V          copy / paste
-@ middle click              paste
+@ middle click              paste the primary selection (the last text selected)
 @ Ctrl+Shift+Home/End       jump to top / live output
 @ Ctrl+Shift+F              search the scrollback; Enter/Up next/prev, Esc closes
 @ Ctrl+Shift+Q              dump the scrollback to $EDITOR in a new split

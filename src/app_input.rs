@@ -124,7 +124,7 @@ impl Gpu {
                     self.copy_selection();
                 }
             }
-            (ElementState::Pressed, MouseButton::Middle) => self.paste(),
+            (ElementState::Pressed, MouseButton::Middle) => self.paste_primary(),
             _ => {}
         }
     }
@@ -822,6 +822,9 @@ impl Gpu {
 
     fn copy_selection(&mut self) {
         if let Some(text) = self.tabs[self.active].focused_ref().selection_text() {
+            // Also seed the PRIMARY selection so middle-click pastes it, matching
+            // the X11/Wayland convention that selecting text makes it available.
+            self.clipboard.set_primary(&text);
             self.set_clipboard(text);
         }
     }
@@ -831,9 +834,20 @@ impl Gpu {
     }
 
     fn paste(&mut self) {
-        let Some(text) = self.clipboard.get() else {
-            return;
-        };
+        if let Some(text) = self.clipboard.get() {
+            self.paste_text(text);
+        }
+    }
+
+    /// Middle-click paste: uses the PRIMARY selection (the last text selected),
+    /// falling back to the clipboard where primary is unavailable.
+    fn paste_primary(&mut self) {
+        if let Some(text) = self.clipboard.get_primary() {
+            self.paste_text(text);
+        }
+    }
+
+    fn paste_text(&mut self, text: String) {
         let bracketed = self.tab().focused().bracketed_paste();
         let pane = self.tab().focused();
         if bracketed {
