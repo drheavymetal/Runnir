@@ -41,6 +41,7 @@ export const KEY_GROUPS = [
     rows: [
       { keys: ['Ctrl+Shift+C'], id: 'copy', title: { es: 'Copiar selección', en: 'Copy selection' } },
       { keys: ['Ctrl+Shift+V'], id: 'paste', title: { es: 'Pegar', en: 'Paste' } },
+      { keys: ['Super+V'], id: 'clipboard_history', title: { es: 'Historial del portapapeles', en: 'Clipboard history' } },
       { keys: [{ es: 'Clic central', en: 'Middle click' }], id: '(primaria)', title: { es: 'Pegar la selección primaria', en: 'Paste the primary selection' } },
       { keys: ['Ctrl+Shift+O'], id: 'copy_last_output', title: { es: 'Copiar la salida del último comando', en: 'Copy last command output' } },
       { keys: ['Ctrl+Shift+F'], id: 'search', title: { es: 'Buscar en el historial', en: 'Search the scrollback' } },
@@ -66,6 +67,7 @@ export const KEY_GROUPS = [
     rows: [
       { keys: ['Ctrl+Shift+A'], id: 'toggle_ai', title: { es: 'Abrir/cerrar el asistente IA', en: 'Toggle the AI assistant' } },
       { keys: ['Ctrl+Shift+G'], id: 'ask_ai_about_error', title: { es: 'IA: por qué ha fallado esto', en: 'AI: why did this fail' } },
+      { keys: ['Super+Shift+G'], id: 'fix_last_command', title: { es: 'IA: arreglar el último comando fallido', en: 'AI: fix the last failed command' } },
       { keys: ['Ctrl+Shift+M'], id: 'ai_command', title: { es: 'IA: lenguaje natural a comando', en: 'AI: natural language to command' } },
       { keys: ['Ctrl+Shift+Y'], id: 'ai_explain', title: { es: 'IA: explicar la selección', en: 'AI: explain the selection' } },
       { keys: ['Ctrl+Shift+I'], id: 'summarize_session', title: { es: 'IA: resumir la sesión', en: 'AI: summarize the session' } },
@@ -81,6 +83,18 @@ export const KEY_GROUPS = [
       { keys: ['Ctrl+Shift+Space'], id: 'hint_mode', title: { es: 'Hint mode (abrir/copiar en pantalla)', en: 'Hint mode (open/copy on screen)' } },
       { keys: ['Ctrl+Shift+S'], id: 'quick_connect', title: { es: 'SSH: conexión rápida', en: 'SSH: quick connect' } },
       { keys: ['Ctrl+Shift+B'], id: 'toggle_broadcast', title: { es: 'Activar/desactivar broadcast', en: 'Toggle broadcast' } },
+      { keys: ['Super+S'], id: 'open_snippets', title: { es: 'Insertar un snippet de comando', en: 'Insert command snippet' } },
+      { keys: ['Super+P'], id: 'now_playing', title: { es: 'Overlay de reproducción (media)', en: 'Now-playing overlay (media)' } },
+    ],
+  },
+  {
+    group: { es: 'Media (dentro del overlay)', en: 'Media (inside the overlay)' },
+    rows: [
+      { keys: [{ es: 'Espacio', en: 'Space' }], id: 'media_play_pause', title: { es: 'Play / pausa', en: 'Play / pause' } },
+      { keys: ['n', 'p'], id: 'media_next / media_prev', title: { es: 'Pista siguiente / anterior', en: 'Next / previous track' } },
+      { keys: ['+', '-'], id: 'media_volume_up / media_volume_down', title: { es: 'Subir / bajar volumen', en: 'Volume up / down' } },
+      { keys: ['Esc', 'q'], id: '', title: { es: 'Cerrar el overlay', en: 'Close the overlay' } },
+      { keys: [{ es: 'Teclas XF86', en: 'XF86 keys' }], id: '', title: { es: 'Play/pausa, siguiente, anterior — funcionan en cualquier parte', en: 'Play/pause, next, previous — work anywhere' } },
     ],
   },
   {
@@ -93,6 +107,12 @@ export const KEY_GROUPS = [
       { keys: [{ es: 'Paleta', en: 'Palette' }], id: 'copy_mode', title: { es: 'Copy mode (selección con teclado)', en: 'Copy mode (keyboard select)' } },
       { keys: [{ es: 'Paleta', en: 'Palette' }], id: 'fold_output', title: { es: 'Plegar / desplegar toda la salida', en: 'Fold / unfold all output' } },
       { keys: [{ es: 'Paleta', en: 'Palette' }], id: 'toggle_broadcast_group', title: { es: 'Marcar/desmarcar el panel en el grupo de broadcast', en: 'Toggle pane in the broadcast group' } },
+      { keys: [{ es: 'Paleta', en: 'Palette' }], id: 'pipe_last_output', title: { es: 'Pasar la última salida por un comando', en: 'Pipe last output through command' } },
+      { keys: [{ es: 'Paleta', en: 'Palette' }], id: 'pipe_scrollback', title: { es: 'Pasar el historial por un comando', en: 'Pipe scrollback through command' } },
+      { keys: [{ es: 'Paleta', en: 'Palette' }], id: 'toggle_image_watch', title: { es: 'Autoprevisualizar imágenes: activar en el dir del panel', en: 'Auto-preview images: toggle on this pane’s dir' } },
+      { keys: [{ es: 'Paleta', en: 'Palette' }], id: 'set_image_watch_dir', title: { es: 'Autoprevisualizar imágenes: fijar / limpiar el dir vigilado', en: 'Auto-preview images: set / clear watched dir' } },
+      { keys: [{ es: 'Paleta', en: 'Palette' }], id: 'save_project_session', title: { es: 'Guardar la sesión de este proyecto', en: 'Save session for this project' } },
+      { keys: [{ es: 'Paleta', en: 'Palette' }], id: 'restore_project_session', title: { es: 'Restaurar la sesión de este proyecto', en: 'Restore session for this project' } },
       { keys: [{ es: 'Paleta', en: 'Palette' }], id: 'quit', title: { es: 'Salir de runnir', en: 'Quit runnir' } },
     ],
   },

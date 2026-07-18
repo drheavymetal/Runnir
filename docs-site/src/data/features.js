@@ -85,6 +85,24 @@ export const FEATURES = [
     config: [{ k: 'behaviour.restore_session', v: 'true', d: { es: 'Restaurar la sesión previa al arrancar.', en: 'Restore the previous session on startup.' } }],
   },
   {
+    key: 'project-session', section: 'core', status: 'shipped',
+    title: { es: 'Sesión por proyecto', en: 'Per-project session' },
+    natural: {
+      es: 'Aparte de la sesión global, runnir recuerda la disposición de paneles y pestañas que usaste en un proyecto y la reconstruye al abrir el terminal ahí. El proyecto es el repositorio git más cercano por encima del directorio de trabajo (o ese directorio si estás fuera de un repo), así que un layout guardado en cualquier punto del repo vuelve para todo el repo. Sólo se restauran la forma de los splits y el cwd de cada panel — nunca el historial ni los procesos.',
+      en: 'On top of the global session, runnir remembers the pane and tab layout you last used in a project and rebuilds it when you open the terminal there. The project is the nearest git repository above your working directory (or that directory itself when you are outside a repo), so a layout saved anywhere inside a repo comes back for the whole repo. Only the split shape and each pane’s working directory are restored — never the scrollback and never the running processes.',
+    },
+    palette: 'Save session for this project / Restore session for this project',
+    config: [
+      { k: 'behaviour.session_restore', v: 'false', d: { es: 'Reconstruir el layout guardado del proyecto al lanzar runnir dentro de él.', en: 'Rebuild the project’s saved layout when you launch runnir inside it.' } },
+      { k: 'behaviour.session_auto_save', v: 'false', d: { es: 'Con session_restore activo, guardar también el layout al salir.', en: 'With session_restore on, also save the layout on exit.' } },
+    ],
+    example: '[behaviour]\nsession_restore = true\nsession_auto_save = true',
+    note: {
+      es: 'Ambos apagados por defecto. El store guarda los 50 proyectos más recientes en ~/.config/runnir/sessions.json, escrito de forma atómica.',
+      en: 'Both off by default. The store keeps the 50 most recently saved projects in ~/.config/runnir/sessions.json, written atomically.',
+    },
+  },
+  {
     key: 'quake', section: 'core', status: 'shipped',
     title: { es: 'Modo quake (desplegable)', en: 'Quake mode (drop-down)' },
     natural: {
@@ -133,6 +151,26 @@ export const FEATURES = [
       en: 'runnir speaks the kitty graphics protocol, so tools that use it draw real images in the grid: previews, matplotlib plots, icons. They scroll with their text and are recycled with the scrollback. runnir answers the support query so tools detect it.',
     },
     example: 'kitten icat foto.png\nchafa --format kitty imagen.jpg',
+  },
+  {
+    key: 'image-watch', section: 'rendering', status: 'shipped',
+    title: { es: 'Autoprevisualización de imágenes', en: 'Image auto-preview' },
+    natural: {
+      es: 'Apunta runnir a un directorio donde escribe tu pipeline de imágenes (SDXL, ComfyUI, Wan) y cada archivo nuevo que suelta se previsualiza en línea en el panel enfocado, escalado para caber. Usa la misma ruta que el protocolo gráfico kitty, así que la vista es idéntica a la de un icat. Sólo disparan los archivos creados o modificados tras armar el watch, así que el contenido previo de la carpeta no inunda el panel; un archivo que aún se está escribiendo se retiene hasta que su tamaño se estabiliza, para no ver una imagen a medias; si llegan varias a la vez, sólo se muestra la más nueva.',
+      en: 'Point runnir at a directory your image pipeline writes to (SDXL, ComfyUI, Wan) and every new file it drops is previewed inline in the focused pane, scaled to fit. It reuses the same path as the kitty graphics protocol, so the preview looks exactly like an icat one. Only files created or modified after you arm the watch fire, so the folder’s existing contents never flood the pane; a file still being written is held back until its size settles, so you never see a half-rendered image; when several land at once only the newest is shown.',
+    },
+    palette: 'Auto-preview images: toggle on this pane\'s dir',
+    config: [
+      { k: 'watch.enabled', v: 'false', d: { es: 'Armar el watcher al arrancar.', en: 'Arm the watcher at startup.' } },
+      { k: 'watch.directory', v: 'null', d: { es: 'Directorio a vigilar; vacío = ninguno todavía (arma desde la paleta el cwd del panel).', en: 'Directory to watch; empty = none yet (arm the pane’s cwd from the palette).' } },
+      { k: 'watch.extensions', v: '[ "png", "jpg", "jpeg", "webp" ]', d: { es: 'Extensiones a previsualizar. Lista vacía = cualquier archivo.', en: 'Extensions to preview. Empty list = any file.' } },
+      { k: 'watch.max_width', v: '40', d: { es: 'Ancho máximo de la vista en celdas; una imagen mayor se reduce, una menor se deja igual.', en: 'Widest a preview is drawn, in cells; a bigger image scales down, a smaller one is left alone.' } },
+    ],
+    example: '[watch]\nenabled = true\ndirectory = "~/comfyui/output"\nextensions = [ "png", "jpg", "webp" ]\nmax_width = 40',
+    note: {
+      es: 'También desde la paleta: "Auto-preview images: set / clear watched dir" teclea un directorio (línea vacía = limpiar). La vista se salta mientras una app de pantalla completa (vim, htop) tiene el panel, y se retoma al salir.',
+      en: 'Also from the palette: "Auto-preview images: set / clear watched dir" types a directory (empty line clears it). A preview is skipped while a full-screen app (vim, htop) holds the pane, and resumes once you leave it.',
+    },
   },
   {
     key: 'cursor', section: 'rendering', status: 'shipped',
@@ -221,6 +259,24 @@ export const FEATURES = [
     },
     keys: [{ es: 'Clic central (pega la selección primaria)', en: 'Middle click (pastes the primary selection)' }],
     note: { es: 'Usa wl-copy/wl-paste --primary en Wayland y PRIMARY en X11.', en: 'Uses wl-copy/wl-paste --primary on Wayland and PRIMARY on X11.' },
+  },
+  {
+    key: 'clipboard-history', section: 'input', status: 'shipped',
+    title: { es: 'Historial del portapapeles', en: 'Clipboard history' },
+    natural: {
+      es: 'Cada copia que hace runnir queda en un anillo en memoria, la más reciente primero: selecciones, Ctrl+Shift+C, yanks del copy mode, copiar la última salida, copias del hint mode y escrituras OSC 52 de los programas. Super+V abre un selector difuso; tecleas para filtrar, Enter pega la entrada resaltada en el panel enfocado por la ruta normal de pegado, Esc cierra. Recopiar una entrada la sube al principio en vez de duplicarla.',
+      en: 'Every copy runnir makes lands in a small in-memory ring, newest first: selection copies, Ctrl+Shift+C, copy-mode yanks, copy-last-output, hint copies and OSC 52 writes from programs. Super+V opens a fuzzy picker; type to filter, Enter pastes the highlighted entry into the focused pane through the normal paste path, Esc closes. Re-copying an entry moves it to the top instead of duplicating it.',
+    },
+    keys: ['Super+V'],
+    palette: 'Clipboard history',
+    config: [
+      { k: 'clipboard.capacity', v: '50', d: { es: 'Cuántas copias recientes guarda el historial.', en: 'How many recent copies the history keeps.' } },
+      { k: 'clipboard.enabled', v: 'true', d: { es: 'Grabar las copias en el historial.', en: 'Record copies into the history.' } },
+    ],
+    note: {
+      es: 'Sólo en memoria: nunca se escribe a disco, porque el portapapeles suele llevar secretos. Se pierde al cerrar.',
+      en: 'In-memory only: never written to disk, since the clipboard often holds secrets. Gone when you close.',
+    },
   },
   {
     key: 'copy-mode', section: 'input', status: 'shipped',
@@ -382,6 +438,17 @@ export const FEATURES = [
     keys: ['Ctrl+Shift+Q'],
     palette: 'Open scrollback in $EDITOR',
   },
+  {
+    key: 'pipe-output', section: 'scrollback', status: 'shipped',
+    title: { es: 'Pasar la salida o el historial por un comando', en: 'Pipe scrollback / last output' },
+    natural: {
+      es: 'Desde la paleta, "Pipe last output through command..." abre una entrada donde tecleas un filtro — grep error, sort -u, jq . — y runnir lo corre en un split nuevo con la salida del último comando en stdin. "Pipe scrollback through command..." hace lo mismo pero con todo el historial del panel. El comando corre a través de sh, así que las tuberías y las redirecciones funcionan.',
+      en: 'From the palette, "Pipe last output through command..." opens an input where you type a filter — grep error, sort -u, jq . — and runnir runs it in a new split with the last command output on stdin. "Pipe scrollback through command..." does the same but feeds the whole pane scrollback. The command runs through sh, so pipes and redirection work.',
+    },
+    palette: 'Pipe last output through command... / Pipe scrollback through command...',
+    example: 'grep -i error\nsort | uniq -c | sort -rn',
+    note: { es: 'La variante de última salida necesita OSC 133 para saber dónde empieza el bloque.', en: 'The last-output variant needs OSC 133 to know where the block starts.' },
+  },
 
   // -------------------------------------------------------------------- IA
   {
@@ -418,6 +485,17 @@ export const FEATURES = [
     },
     keys: ['Ctrl+Shift+G'],
     palette: 'Ask AI: why did this fail?',
+    note: { es: 'Necesita OSC 133 para delimitar el último comando y su salida.', en: 'Needs OSC 133 to delimit the last command and its output.' },
+  },
+  {
+    key: 'ai-fix-run', section: 'ai', status: 'shipped',
+    title: { es: 'IA: arreglar el último comando', en: 'AI fix-and-run' },
+    natural: {
+      es: 'Tras un comando fallido, manda al modelo el comando, su salida y su código de salida distinto de cero, y teclea un comando corregido en el prompt para que lo revises y lo ejecutes tú — nunca lo ejecuta. Por ejemplo, después de que mkdr foo falle, teclea mkdir foo en el prompt. Hermano de "por qué ha fallado esto": aquél explica, éste propone el arreglo listo para ejecutar.',
+      en: 'After a failed command, it sends the model the command, its output and its non-zero exit code, then types a corrected command at the prompt for you to review and run — it never runs it. For example, after mkdr foo fails it types mkdir foo at the prompt. Sibling of "why did this fail": that one explains, this one proposes the fix ready to run.',
+    },
+    keys: ['Super+Shift+G'],
+    palette: 'AI: fix the last failed command',
     note: { es: 'Necesita OSC 133 para delimitar el último comando y su salida.', en: 'Needs OSC 133 to delimit the last command and its output.' },
   },
   {
@@ -506,6 +584,43 @@ export const FEATURES = [
     note: {
       es: 'Los comandos se dividen por espacios (no es un parseo de shell completo), lo que cubre "ssh host", "journalctl -f" y similares.',
       en: 'Commands are split on whitespace (not a full shell parse), which covers "ssh host", "journalctl -f" and the like.',
+    },
+  },
+  {
+    key: 'snippets', section: 'distinctive', status: 'shipped',
+    title: { es: 'Snippets de comandos', en: 'Command snippets' },
+    natural: {
+      es: 'Guarda en el config los comandos que repites como snippets con nombre y recupéralos desde la paleta (Insert command snippet) o con Super+S. Tecleas para filtrar por nombre o descripción; al elegir uno, teclea su comando en el prompt para que lo revises y lo ejecutes tú — la misma regla de revisión previa que el escritor de comandos de la IA, nunca a tus espaldas. Un snippet con run_now = true se envía solo.',
+      en: 'Save the commands you run often as named snippets in the config and recall them from the palette (Insert command snippet) or with Super+S. Type to filter on name or description; selecting one types its command at the prompt for you to check and run yourself — the same review-first rule as the AI command-writer, never behind your back. A snippet with run_now = true submits itself.',
+    },
+    keys: ['Super+S'],
+    palette: 'Insert command snippet',
+    config: [{ k: '[[snippets]]', v: 'name + command + description + run_now', d: { es: 'description y run_now son opcionales; run_now por defecto false (se inserta, no se ejecuta).', en: 'description and run_now are optional; run_now defaults to false (inserted, not executed).' } }],
+    example: '[[snippets]]\nname = "deploy"\ncommand = "git push && ssh server bin/deploy"\ndescription = "ship the current branch to prod"\n\n[[snippets]]\nname = "tail"\ncommand = "journalctl -fu runnir"\nrun_now = true',
+  },
+  {
+    key: 'now-playing', section: 'distinctive', status: 'shipped',
+    title: { es: 'Reproduciendo ahora (media)', en: 'Now playing (media)' },
+    natural: {
+      es: 'Ve y controla lo que suena sin salir del terminal. Super+P abre un overlay con la carátula (medios bloques Unicode de color, así se ve en cualquier GPU), título, artista, álbum, el estado de reproducción y una forma de onda en vivo dibujada con barras Unicode (cava, en Linux). Las teclas multimedia XF86 del teclado (play/pausa, siguiente, anterior) funcionan en cualquier parte, y cada comando está en la paleta (Media: play / pause, etc.). Si no hay reproductor activo, un aviso breve lo dice.',
+      en: 'See and control whatever is playing without leaving the terminal. Super+P opens an overlay with the album art (coloured Unicode half-blocks, so it shows on any GPU), title, artist, album, the playback state and a live waveform drawn as Unicode bars (cava, on Linux). The XF86 media keys on your keyboard (play/pause, next, previous) work anywhere, and every command is in the palette (Media: play / pause, and so on). If no player is active, a brief toast says so.',
+    },
+    keys: [
+      { es: 'Super+P (abrir el overlay)', en: 'Super+P (open the overlay)' },
+      { es: 'Espacio (play / pausa)', en: 'Space (play / pause)' },
+      { es: 'n / p (siguiente / anterior)', en: 'n / p (next / previous)' },
+      { es: '+ / - (subir / bajar volumen)', en: '+ / - (volume up / down)' },
+      { es: 'Esc o q (cerrar)', en: 'Esc or q (close)' },
+    ],
+    palette: 'Now playing (media overlay)',
+    config: [
+      { k: 'media.waveform', v: 'true', d: { es: 'Dibujar la onda de cava (no muestra nada si falta cava).', en: 'Draw the cava waveform (shows nothing if cava is absent).' } },
+      { k: 'media.bars', v: '24', d: { es: 'Cuántas columnas de onda calcula y dibuja.', en: 'How many wave columns to compute and draw.' } },
+      { k: 'media.art_cells', v: '18', d: { es: 'Ancho de la carátula en celdas.', en: 'Album-art width in cells.' } },
+    ],
+    note: {
+      es: 'Requisitos: en Linux, playerctl (cualquier reproductor MPRIS: mpv, Spotify, navegadores, Music Assistant) para metadatos y control, y cava para la onda. En macOS, nowplaying-cli si está, o AppleScript contra Music o Spotify; ahí no hay carátula ni onda. Una herramienta ausente degrada a un aviso o un overlay más simple, nunca a un error.',
+      en: 'Requirements: on Linux, playerctl (any MPRIS player: mpv, Spotify, browsers, Music Assistant) for metadata and control, and cava for the waveform. On macOS, nowplaying-cli if present, else AppleScript against Music or Spotify; no art or waveform there. A missing tool degrades to a toast or a plainer overlay, never an error.',
     },
   },
   {

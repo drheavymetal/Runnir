@@ -15,7 +15,7 @@ export const SECTIONS = [
   {
     id: 'input',
     title: { es: 'Entrada y selección', en: 'Input and selection' },
-    blurb: { es: 'Teclado, ratón, copy-mode y pistas sin ratón.', en: 'Keyboard, mouse, copy mode and mouse-free hints.' },
+    blurb: { es: 'Teclado, ratón, copy-mode, historial del portapapeles y pistas sin ratón.', en: 'Keyboard, mouse, copy mode, clipboard history and mouse-free hints.' },
   },
   {
     id: 'shell',
@@ -25,7 +25,7 @@ export const SECTIONS = [
   {
     id: 'scrollback',
     title: { es: 'Historial', en: 'Scrollback' },
-    blurb: { es: 'Buscar, minimapa, plegado y volcar el historial al editor.', en: 'Search, minimap, folding and dumping history to the editor.' },
+    blurb: { es: 'Buscar, minimapa, plegado, volcar al editor y pasar por un filtro.', en: 'Search, minimap, folding, dumping to the editor and piping through a filter.' },
   },
   {
     id: 'ai',
@@ -35,7 +35,7 @@ export const SECTIONS = [
   {
     id: 'distinctive',
     title: { es: 'Funciones propias', en: 'Signature features' },
-    blurb: { es: 'Guardian de comandos, watch, layouts, broadcast y tintado por SSH.', en: 'Command guardian, watch, layouts, broadcast and SSH tinting.' },
+    blurb: { es: 'Guardian de comandos, watch, layouts, snippets, broadcast, tintado SSH y media.', en: 'Command guardian, watch, layouts, snippets, broadcast, SSH tinting and media.' },
   },
   {
     id: 'appearance',
