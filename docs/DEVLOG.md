@@ -10,6 +10,30 @@ them even inside double quotes and silently drops the word. Use plain quotes.
 Relaunch live: `pkill -x runnir; setsid ./target/release/runnir >/tmp/runnir-live.log 2>&1 </dev/null & disown`.
 Verify headless: `runnir --dump '<cmd>'`, `runnir --render out.png '<cmd>' [ms]`, `runnir --demo out.png`.
 
+## >>> PENDING INTEGRATION (2026-07-19) — parity batch in worktrees, MERGE THESE <<<
+7 code features built by parallel agents in isolated worktrees under
+`.claude/worktrees/`. Integrate each branch into main (cherry-pick/merge), resolve
+conflicts (hot files: app_input.rs, grid.rs, actions.rs), `cargo build`+`test` after
+each, THEN Fable bug-hunt all. Branches + commits + files touched:
+1. Styled underlines (undercurl/dotted/dashed/double + SGR 58 color): branch
+   `worktree-agent-a4570a098001fe55e` commit a67c644 — grid.rs, render.rs, shader.wgsl. Pen gained underline+underline_color; Instance +2 attrs.
+2. Rectangular selection (Alt/Ctrl+drag, Mode::Block): branch
+   `worktree-agent-ad2600a7fb8ef9951` commit b7cd93f — selection.rs, app_input.rs.
+3. Kitty keyboard protocol (CSI u): branch `worktree-agent-ab4f132a097ab2b02`
+   commit 4f35401 — grid.rs (kbd_flags_stack), keys.rs (encode_kitty), app_input.rs, main.rs (forward releases), pane.rs.
+4. Multiple layouts (splits/stack/tall/fat/grid, CycleLayout palette): branch
+   `worktree-agent-ad4a60d7e6818b706` commit 8345bf7 — layout.rs, tab.rs (order Vec), actions.rs, app_input.rs, session.rs.
+5. Theme picker (28 themes, Overlay::Theme, live preview): branch
+   `worktree-agent-afebf5b1b73052bb5` commit 291b120 — themes.rs (new), overlay.rs, actions.rs, app_input.rs, config.rs, docs.rs.
+6. Remote control API (`runnir @`, UserEvent::Control, socket): branch
+   `worktree-agent-a9f7132d0632d1031` commit 66be1c2 — control.rs (new), main.rs, app_input.rs.
+7. OSC 52 + OSC 99/777 + auto shell-integration: branch
+   `worktree-agent-a054731dbfd456984` — STILL RUNNING at last check (grid.rs osc_dispatch, clipboard.rs, pty.rs, main.rs).
+Also running: React docs site → `worktree-agent-aa3ede6dbf9d25c23` (docs-site/ only, additive, merge trivially).
+QUEUED after integration (touch grid/render, would conflict): Unicode/grapheme rigor, IME, Sixel, text-sizing protocol. Then optional: triggers, quick-select, navigable command blocks, file-transfer.
+Merge order suggestion: independent-file first (control.rs, themes.rs, selection.rs, layout.rs) then the grid.rs/app_input.rs-heavy (underlines, keyboard, osc52) resolving cumulatively.
+## >>> END PENDING INTEGRATION <<<
+
 ## Status (2026-07-18)
 
 Done: M0–M7 + 4 feature blocks + kitty graphics + mouse-to-TUIs + scrollback search
