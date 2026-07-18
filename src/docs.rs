@@ -144,6 +144,10 @@ variable named in the config, never stored in the file.
 @ Ctrl+Shift+N     launch Claude Code in a new split
 @ Ctrl+Shift+M     describe a command in plain language; the model writes it and
                    types it at the prompt for you to review and run (not run for you)
+@ Super+Shift+G    fix the last failed command: the model reads the command, its
+                   output and its non-zero exit code, then types a corrected command
+                   at the prompt for you to review and run (never run for you). For
+                   example, after mkdr foo fails it types mkdir foo at the prompt.
 @ Ctrl+Shift+Y     explain the current selection in the assistant panel
 @ Ctrl+Shift+I     summarize this session (commands, results, errors and fixes)
 

@@ -105,7 +105,13 @@ fn clean_command(text: &str) -> String {
     }
     s = s.trim_start_matches('`').trim_end_matches('`');
     // Keep only the first line: a command, not a paragraph.
-    s.lines().next().unwrap_or("").trim().to_string()
+    let mut line = s.lines().next().unwrap_or("").trim();
+    // Models like to echo a shell prompt marker in front of the command. Strip a
+    // leading `$` (or `$ `) so a clean, runnable command lands at the prompt.
+    if let Some(rest) = line.strip_prefix('$') {
+        line = rest.trim_start();
+    }
+    line.to_string()
 }
 
 /// Fires a question at `provider` on a worker thread. The answer arrives later as
@@ -335,6 +341,11 @@ mod tests {
         assert_eq!(clean_command("```\ngit status\n```"), "git status");
         // A model that adds a paragraph: keep only the command line.
         assert_eq!(clean_command("rm -rf build\nThis deletes the build dir."), "rm -rf build");
+        // A leading shell-prompt marker the model echoed is stripped.
+        assert_eq!(clean_command("$ cargo build"), "cargo build");
+        assert_eq!(clean_command("$git status"), "git status");
+        // All three wrappers at once: fence + backtick residue + prompt marker.
+        assert_eq!(clean_command("```sh\n$ ls -la\n```"), "ls -la");
     }
 
     #[test]

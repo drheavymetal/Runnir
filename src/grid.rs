@@ -186,6 +186,10 @@ pub struct Grid {
     folds: Vec<(usize, usize)>,
     /// Stable (start, end) rows of the last finished command's output.
     last_output: Option<(usize, usize)>,
+    /// Text of the command line that produced `last_output`, captured at OSC 133;C
+    /// (before the input mark is cleared) so "fix last command" can send the model
+    /// the exact command that ran, not just its output.
+    last_command_line: Option<String>,
     /// Count of commands finished (OSC 133;D), for completion notifications.
     command_seq: u64,
     /// Inclusive row bounds that scrolling is confined to (DECSTBM).
@@ -275,6 +279,7 @@ impl Grid {
             outputs: Vec::new(),
             folds: Vec::new(),
             last_output: None,
+            last_command_line: None,
             command_seq: 0,
             scroll_top: 0,
             scroll_bot: rows - 1,
@@ -821,6 +826,12 @@ impl Grid {
     /// Whether a command's output is currently being produced (between C and D).
     pub fn command_running(&self) -> bool {
         self.command_start.is_some()
+    }
+
+    /// The command line of the most recently finished command, if OSC 133 marked it
+    /// (captured at C). Backs "fix last command".
+    pub fn last_command_line(&self) -> Option<String> {
+        self.last_command_line.clone()
     }
 
     /// Text of the most recently finished command's output, if OSC 133 marked it.
@@ -1803,6 +1814,24 @@ impl Grid {
             }
             // C: the command's output starts here. Input is done being edited.
             Some(b'C') => {
+                // Capture the command line before the input mark is cleared, so
+                // "fix last command" has the exact command that ran. Prefer the B
+                // mark (input start, past the prompt); fall back to the last prompt
+                // mark when the shell emits no B. The end is the cursor's output-start
+                // row; trimming drops the trailing blank row and the echoed newline.
+                let cur = self.cursor_abs();
+                let start = self
+                    .command_input
+                    .and_then(|(s, col)| self.stable_to_local(s).map(|r| (r, col)))
+                    .or_else(|| {
+                        self.prompt_marks.last().and_then(|&s| self.stable_to_local(s)).map(|r| (r, 0))
+                    });
+                if let Some((row, col)) = start.filter(|&(r, _)| r <= cur) {
+                    let last_col = self.cols.saturating_sub(1);
+                    let text = self.text_range((row, col), (cur, last_col)).replace('\n', " ");
+                    let text = text.trim().to_string();
+                    self.last_command_line = if text.is_empty() { None } else { Some(text) };
+                }
                 self.command_start = Some(self.local_to_stable(self.cursor_abs()));
                 self.command_input = None;
             }
@@ -2629,6 +2658,23 @@ mod tests {
         feed(&mut g, "\x1b]133;A\x07$ false\r\n\x1b]133;C\x07\x1b]133;D;1\x07");
         let m = g.command_markers();
         assert!(m.iter().any(|&(_, e)| e == Some(1)), "second command failed: {m:?}");
+    }
+
+    #[test]
+    fn fix_last_command_captures_command_and_exit() {
+        let mut g = Grid::new(40, 6);
+        // Nothing has run: the guard has no failed command to act on.
+        assert_eq!(g.last_exit(), None);
+        assert_eq!(g.last_command_line(), None);
+        // A failing command with a full A/B/C/D shell-integration sequence.
+        feed(&mut g, "\x1b]133;A\x07$ \x1b]133;B\x07mkdr foo\r\n\x1b]133;C\x07");
+        feed(&mut g, "bash: mkdr: command not found\r\n\x1b]133;D;127\x07");
+        assert_eq!(g.last_exit(), Some(127), "non-zero exit is the guard's trigger");
+        assert_eq!(g.last_command_line().as_deref(), Some("mkdr foo"));
+        // A clean command afterwards: exit 0 means the guard does nothing.
+        feed(&mut g, "\x1b]133;A\x07$ \x1b]133;B\x07true\r\n\x1b]133;C\x07\x1b]133;D;0\x07");
+        assert_eq!(g.last_exit(), Some(0), "success must not trigger a fix");
+        assert_eq!(g.last_command_line().as_deref(), Some("true"));
     }
 
     #[test]

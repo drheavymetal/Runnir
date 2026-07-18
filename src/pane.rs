@@ -306,6 +306,12 @@ impl Pane {
         self.grid.lock().unwrap().pipe_text(whole)
     }
 
+    /// The command line of the last finished command (OSC 133 C mark). `None` if
+    /// there is no mark to anchor on.
+    pub fn last_command_line(&self) -> Option<String> {
+        self.grid.lock().unwrap().last_command_line()
+    }
+
     /// Recomputes the pane's context and title from its foreground process. Cheap
     /// enough (two `/proc` reads) to call on a timer.
     pub fn refresh_context(&mut self, config: &Config) {
