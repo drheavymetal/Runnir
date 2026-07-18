@@ -43,7 +43,9 @@ mod imp {
     }
 
     pub fn notify(body: &str) {
+        // `--` so a body starting with '-' is not eaten as an option.
         let _ = std::process::Command::new("notify-send")
+            .arg("--")
             .arg("runnir")
             .arg(body)
             .stdout(std::process::Stdio::null())
@@ -107,7 +109,13 @@ mod imp {
             return None;
         }
         buf.truncate(size);
-        let argc = i32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+        let argc = i32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]);
+        // Guard the count before allocating: a bogus negative value cast to usize is
+        // enormous and would abort the process on the with_capacity below.
+        if argc <= 0 {
+            return None;
+        }
+        let argc = (argc as usize).min(4096);
         // Skip argc, then the exec path and its trailing NULs.
         let mut i = 4;
         while i < buf.len() && buf[i] != 0 {
@@ -144,7 +152,12 @@ mod imp {
     }
 
     fn applescript_quote(s: &str) -> String {
-        let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
+        // A double-quoted AppleScript literal can't hold a raw newline; escape them.
+        let escaped = s
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', "\\n")
+            .replace('\r', "\\r");
         format!("\"{escaped}\"")
     }
 }

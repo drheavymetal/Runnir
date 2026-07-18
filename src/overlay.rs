@@ -190,7 +190,16 @@ impl ConfigPanel {
         match self.kind() {
             Kind::Bool | Kind::Enum => self.adjust(1),
             Kind::Text => {
-                self.editing = Some(settings::value(&self.config, self.id()).replace("(none)", ""));
+                // Seed from the raw config value, not the display string (which shows
+                // "(none)" for an unset path).
+                let seed = match self.id() {
+                    settings::SettingId::Background => {
+                        self.config.window.background.clone().unwrap_or_default()
+                    }
+                    settings::SettingId::FontFamily => self.config.font.family.clone(),
+                    _ => String::new(),
+                };
+                self.editing = Some(seed);
             }
             Kind::Float | Kind::Int => self.adjust(1),
         }
@@ -224,10 +233,13 @@ impl ConfigPanel {
             Ok(()) => "saved to runnir.json".into(),
             Err(e) => format!("save failed: {e}"),
         };
+        // Mark dirty so the host re-adopts and refreshes the config-file mtime — the
+        // just-written file must not then trigger a redundant hot-reload + toast.
+        self.dirty = true;
     }
 
     fn render(&self, cols: usize, rows: usize, theme: &Theme) -> Vec<Panel> {
-        let w = (cols * 7 / 10).clamp(44, 84);
+        let w = (cols * 7 / 10).clamp(44, 84).min(cols.saturating_sub(2).max(1));
         let visible = (rows.saturating_sub(6)).clamp(6, self.rows.len() + 8);
         let h = (visible + 4).min(rows.saturating_sub(2)).max(8);
         let mut g = panel_grid(w, h, theme);

@@ -509,11 +509,12 @@ impl Gpu {
                         }
                     }
                     Key::Named(NamedKey::Backspace) if editing => c.backspace(),
-                    Key::Named(NamedKey::ArrowUp) => c.up(),
-                    Key::Named(NamedKey::ArrowDown) => c.down(),
+                    Key::Named(NamedKey::ArrowUp) if !editing => c.up(),
+                    Key::Named(NamedKey::ArrowDown) if !editing => c.down(),
                     Key::Named(NamedKey::ArrowLeft) if !editing => c.adjust(-1),
                     Key::Named(NamedKey::ArrowRight) if !editing => c.adjust(1),
                     Key::Named(NamedKey::Space) if editing => c.input_char(' '),
+                    Key::Named(NamedKey::Space) => c.activate(),
                     Key::Character(s) => {
                         if editing {
                             for ch in s.chars() {

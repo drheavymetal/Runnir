@@ -340,11 +340,9 @@ impl Tab {
     }
 
     fn focused_cwd(&self) -> Option<std::path::PathBuf> {
-        // Read the child's cwd straight from /proc, so a split opens where the
-        // focused shell actually is, not where the window was launched.
-        let pane = self.focused_ref();
-        let pid = pane.pty_pid()?;
-        std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
+        // A split opens where the focused shell actually is, not where the window was
+        // launched. Goes through Pane::cwd → platform (Linux /proc, macOS libproc).
+        self.focused_ref().cwd()
     }
 }
 
