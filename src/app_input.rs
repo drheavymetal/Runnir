@@ -373,10 +373,12 @@ impl Gpu {
                 }
             }
             Action::ScrollPageUp => {
+                self.scroll_glide = None;
                 let rows = self.tab().focused().grid.lock().unwrap().rows() as isize;
                 self.tab().focused().scroll(rows);
             }
             Action::ScrollPageDown => {
+                self.scroll_glide = None;
                 let rows = self.tab().focused().grid.lock().unwrap().rows() as isize;
                 self.tab().focused().scroll(-rows);
             }
@@ -388,9 +390,11 @@ impl Gpu {
                 self.glide_focused_to(0.0, config.behaviour.smooth_scroll);
             }
             Action::ScrollUp => {
+                self.scroll_glide = None;
                 self.tab().focused().scroll(3);
             }
             Action::ScrollDown => {
+                self.scroll_glide = None;
                 self.tab().focused().scroll(-3);
             }
             Action::JumpPrevPrompt => self.jump_prompt(-1, config.behaviour.smooth_scroll),
@@ -691,6 +695,7 @@ impl Gpu {
     /// Enters keyboard copy-mode (D12): a virtual cursor starts at the pane's live
     /// cursor; hjkl/arrows move it, v anchors a selection, y/Enter yanks, Esc/q exit.
     fn enter_copy_mode(&mut self) {
+        self.scroll_glide = None;
         let pane_id = self.tab().focused_ptr();
         let (start, dropped) = {
             let g = self.tab().focused().grid.lock().unwrap();
@@ -1050,7 +1055,7 @@ impl Gpu {
         // Un-scroll the click into label space and find the tab it lands on.
         let mut x = 1;
         for i in 0..self.tabs.len() {
-            let w = self.tab_label(i).chars().count();
+            let w = Self::label_w(&self.tab_label(i));
             let drawn = (x as isize - offset as isize) as isize;
             if drawn >= 1 && (drawn as usize) < avail_end {
                 let d = drawn as usize;
@@ -1061,6 +1066,12 @@ impl Gpu {
             x += w + 1;
         }
         None
+    }
+
+    /// Display width (cells) of a string, honouring wide (CJK) glyphs so tab layout,
+    /// click hit-testing and badge placement all agree with what `write_str` draws.
+    fn label_w(s: &str) -> usize {
+        unicode_width::UnicodeWidthStr::width(s)
     }
 
     /// The label drawn for tab `i` in the bar: " <icon> N title <badge> ". The icon is
@@ -1097,7 +1108,7 @@ impl Gpu {
             r += " BROADCAST ".len() + 1;
         }
         if let Some(label) = self.tabs[self.active].focused_ref().context.label() {
-            r += format!(" {label} ").chars().count() + 1;
+            r += Self::label_w(&format!(" {label} ")) + 1;
         }
         r
     }
@@ -1112,14 +1123,14 @@ impl Gpu {
         let mut x = 1usize;
         for i in 0..self.tabs.len() {
             starts.push(x);
-            x += self.tab_label(i).chars().count() + 1;
+            x += Self::label_w(&self.tab_label(i)) + 1;
         }
         let total_end = x; // one past the last tab
         if total_end <= avail_end {
             return (0, avail_end); // everything fits, no scroll
         }
         let active = self.active.min(self.tabs.len() - 1);
-        let aw = self.tab_label(active).chars().count();
+        let aw = Self::label_w(&self.tab_label(active));
         let a_end = starts[active] + aw;
         // Show the active tab and as many preceding tabs as fit before its right edge.
         let mut first = active;

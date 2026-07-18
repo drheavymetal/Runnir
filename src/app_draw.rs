@@ -33,7 +33,15 @@ impl Gpu {
         let rects = self.visible_rects(area);
         let focus = self.tabs[self.active].focus;
 
-        // Clear dirty flags so the next output marks a fresh redraw.
+        // Build the chrome (tab bar, status bar) BEFORE locking the pane grids: the
+        // tab badges read each pane's grid (last exit / dirty), which would re-lock a
+        // grid this thread already holds via `guards` and deadlock. Chrome only needs
+        // transient `&self` reads, so it is safe here.
+        let chrome = self.build_chrome(config, screen);
+        let status_holder = self.build_status(config, screen);
+
+        // Clear dirty flags so the next output marks a fresh redraw. (After chrome, so
+        // the activity badge still reflects this frame's unseen output.)
         for pane in self.tabs[self.active].panes.values() {
             pane.grid.lock().unwrap().dirty = false;
         }
@@ -76,14 +84,10 @@ impl Gpu {
             })
             .collect();
 
-        // The tab bar and any status chrome are grids too, appended as panes.
-        let chrome = self.build_chrome(config, screen);
+        // The tab bar and any status chrome are grids too (built above), appended.
         for (grid, ox, oy) in &chrome {
             panes.push(PaneDraw { grid, selection: None, origin: (*ox, *oy), tint: None, focused: true, cursor: None, search: Default::default() });
         }
-
-        // Status bar along the bottom row (cwd, git branch, clock).
-        let status_holder = self.build_status(config, screen);
         if let Some((grid, ox, oy)) = &status_holder {
             panes.push(PaneDraw { grid, selection: None, origin: (*ox, *oy), tint: None, focused: true, cursor: None, search: Default::default() });
         }
@@ -361,9 +365,11 @@ impl Gpu {
             // overflow the bar.
             let (offset, avail_end) = self.tab_scroll(cols);
             let mut x = 1usize;
-            for (i, tab) in self.tabs.iter().enumerate() {
-                let label = format!(" {} {} ", i + 1, tab.title());
-                let w = label.chars().count();
+            for i in 0..self.tabs.len() {
+                // Use the same label tab_scroll/tab_bar_hit use (icon + badge), and
+                // its display width, so drawing, scrolling and clicks all agree.
+                let label = self.tab_label(i);
+                let w = Self::label_w(&label);
                 let drawn = x as isize - offset as isize;
                 // Only draw tabs whose start is within the visible window.
                 if drawn >= 1 && (drawn as usize) < avail_end {

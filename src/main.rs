@@ -310,8 +310,9 @@ struct Gpu {
     /// Cached clock string ("HH:MM"), refreshed periodically to avoid formatting time
     /// (no chrono dep) every frame.
     clock: String,
-    /// When the clock was last refreshed.
-    last_clock: Instant,
+    /// When the clock was last refreshed (attempted), or `None` before the first
+    /// attempt. `Option` so we never subtract from `Instant` (panics on low uptime).
+    last_clock: Option<Instant>,
     ai: ai::Session,
     last_context_refresh: Instant,
     last_autosave: Instant,
@@ -470,7 +471,7 @@ impl App {
             translucent,
             status_bar: self.config.window.status_bar,
             clock: String::new(),
-            last_clock: Instant::now() - Duration::from_secs(60),
+            last_clock: None,
             ai: ai::Session::new(),
             last_context_refresh: Instant::now(),
             last_autosave: Instant::now(),
@@ -802,8 +803,11 @@ impl Gpu {
 
         // Refresh the status-bar clock roughly every 20s (formatting local time
         // without a chrono dependency; `date` handles the timezone).
-        if self.status_bar && (self.clock.is_empty() || self.last_clock.elapsed() >= Duration::from_secs(20)) {
-            self.last_clock = Instant::now();
+        // Refresh at most every 20s, keyed on the last ATTEMPT (not success) so a
+        // missing/failing `date` can't spawn a process on every event.
+        let due = self.last_clock.map_or(true, |t| t.elapsed() >= Duration::from_secs(20));
+        if self.status_bar && due {
+            self.last_clock = Some(Instant::now());
             if let Ok(out) = std::process::Command::new("date").arg("+%H:%M").output() {
                 if out.status.success() {
                     self.clock = String::from_utf8_lossy(&out.stdout).trim().to_string();
