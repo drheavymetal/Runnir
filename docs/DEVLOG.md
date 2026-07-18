@@ -48,7 +48,7 @@ wrapped across multiple rows + Home + Enter can scan short of the wrapped tail;
 RPROMPT tokens on the input row are in scan range. Pre-existing/deferred: dead
 copy_on_select/confirm_close config, ctrl+plus/minus chord unreachable, RIS wipes
 prompt_marks, broadcast-group last-member widening.
-NEXT: deferred W2 folding / D12 copy-mode / D15 trail (D1 commit 44, D6 commit 45).
+NEXT: deferred W2 folding / D15 trail (D1 c44, D6 c45, D12 c46).
 
 ## Current task: add 15–20 differential features, 4–5 "wow". Document each here.
 
@@ -103,7 +103,9 @@ DIFFERENTIAL (aim ~15 total incl. above):
       sub-line pixel deltas accumulate instead of truncating to zero. commit 38.
 - [x] D10 Pane zoom (Ctrl+Shift+Z) — visible_rects override + resize_one. commit 25.
 - [x] D11 Open scrollback in $EDITOR — dump scrollback_text to temp file, split_running $EDITOR/$VISUAL/vi. commit 31.
-- [ ] D12 Copy-mode with vim motions (keyboard scrollback nav + select).
+- [x] D12 Copy-mode — Gpu.copy_mode (CopyMode{pane,cur,anchor}); enter_copy_mode +
+      copy_mode_key (hjkl/arrows/0/$/g/G/v/y/Esc) drives a virtual cursor, mirrors to
+      pane.selection, scrolls viewport to follow; y yanks. CopyMode palette action. commit 46.
 - [x] D13 Tab reordering — MoveTabLeft/Right (Ctrl+Shift+Left/Right), Vec::swap +
       keep focus, wrap-around. commit 29.
 - [x] D14 URL/path hover underline — Gpu.hover_url via hints::find on mouse move;

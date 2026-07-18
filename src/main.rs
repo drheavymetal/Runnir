@@ -285,6 +285,8 @@ struct Gpu {
     scroll_accum: f32,
     /// The URL/path currently under the pointer, underlined and Ctrl-clickable (D14).
     hover_url: Option<HoverUrl>,
+    /// Keyboard copy-mode state, or `None` when off (D12).
+    copy_mode: Option<CopyMode>,
     font_px: f32,
     /// The (family, size, ligatures) the config last asked for, so hot-reload can
     /// tell an actual font change from an unrelated edit — and so a color-only reload
@@ -439,6 +441,7 @@ impl App {
             broadcast: false,
             scroll_accum: 0.0,
             hover_url: None,
+            copy_mode: None,
             font_px,
             applied_font: (
                 self.config.font.family.clone(),
@@ -470,6 +473,16 @@ impl App {
 /// by hot-reload to notice edits.
 fn config_mtime() -> Option<std::time::SystemTime> {
     std::fs::metadata(Config::path()).and_then(|m| m.modified()).ok()
+}
+
+/// Keyboard copy-mode (D12): a virtual cursor navigating a pane's scrollback with
+/// vim motions, optionally extending a selection, to copy without the mouse.
+struct CopyMode {
+    pane: u64,
+    /// Cursor in absolute grid space (row indexes scrollback ++ screen).
+    cur: crate::selection::Point,
+    /// Selection anchor once `v` is pressed; `None` means just navigating.
+    anchor: Option<crate::selection::Point>,
 }
 
 /// A URL/path under the pointer: which pane, where on screen (absolute row and

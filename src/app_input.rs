@@ -211,6 +211,12 @@ impl Gpu {
             return;
         }
 
+        // Copy-mode owns the keyboard: vim motions drive a virtual cursor/selection.
+        if self.copy_mode.is_some() {
+            self.copy_mode_key(&event);
+            return;
+        }
+
         // A bound chord runs its action and never reaches the child.
         if let Some(action) = keymap.resolve(&event.logical_key, mods) {
             self.run_action(action.clone(), config, event_loop);
@@ -391,6 +397,7 @@ impl Gpu {
             Action::HistorySearch => self.history_search(),
             Action::WatchKeyword => self.watch_keyword(),
             Action::LaunchLayout => self.open_layout_picker(config),
+            Action::CopyMode => self.enter_copy_mode(),
             Action::QuickConnect => self.open_quick_connect(),
             Action::HintMode => self.open_hints(),
             Action::LaunchClaude => self.launch_claude(config),
@@ -585,6 +592,7 @@ impl Gpu {
             Action::HistorySearch => self.history_search(),
             Action::WatchKeyword => self.watch_keyword(),
             Action::LaunchLayout => self.open_layout_picker(config),
+            Action::CopyMode => self.enter_copy_mode(),
             Action::Whisper => self.whisper(),
             Action::SearchScrollback => self.overlay = Some(Overlay::Search(overlay::Search::new())),
             Action::QuickConnect => self.open_quick_connect(),
@@ -658,6 +666,121 @@ impl Gpu {
 
     /// Zooms the focused pane to fill the tab, or unzooms. Resizes its PTY so the
     /// program sees the bigger size, and restores every pane on unzoom.
+    /// Enters keyboard copy-mode (D12): a virtual cursor starts at the pane's live
+    /// cursor; hjkl/arrows move it, v anchors a selection, y/Enter yanks, Esc/q exit.
+    fn enter_copy_mode(&mut self) {
+        let pane_id = self.tab().focused_ptr();
+        let start = {
+            let g = self.tab().focused().grid.lock().unwrap();
+            let row = g.total_rows() - g.rows() + g.cursor().0;
+            (row, g.cursor().1)
+        };
+        self.tab().focused().clear_selection();
+        self.copy_mode = Some(CopyMode { pane: pane_id, cur: start, anchor: None });
+        self.sync_copy_selection();
+        self.status = Some("copy-mode — hjkl move, v select, y yank, Esc exit".into());
+        self.status_expiry = Some(Instant::now() + Duration::from_secs(3));
+        self.window.request_redraw();
+    }
+
+    /// Mirrors the copy-mode cursor/anchor onto the focused pane's selection so the
+    /// existing highlight rendering shows both the cursor cell and any selection.
+    fn sync_copy_selection(&mut self) {
+        let Some(cm) = self.copy_mode.as_ref() else { return };
+        let (anchor, cur) = (cm.anchor.unwrap_or(cm.cur), cm.cur);
+        let pane = self.tab().focused();
+        pane.begin_selection(anchor, crate::selection::Mode::Char);
+        pane.update_selection(cur);
+    }
+
+    /// Ends copy-mode, optionally copying the selection first.
+    fn exit_copy_mode(&mut self, yank: bool) {
+        if yank {
+            if let Some(cm) = self.copy_mode.as_ref() {
+                if cm.anchor.is_some() {
+                    if let Some(text) = self.tab().focused().selection_text() {
+                        self.clipboard.set_primary(&text);
+                        self.set_clipboard(text);
+                    }
+                }
+            }
+        }
+        self.copy_mode = None;
+        self.tab().focused().clear_selection();
+        self.status = None;
+        self.window.request_redraw();
+    }
+
+    fn copy_mode_key(&mut self, event: &winit::event::KeyEvent) {
+        use winit::keyboard::{Key, NamedKey};
+        let Some(cm) = self.copy_mode.as_ref() else { return };
+        // The pane vanished (reaped): leave the mode.
+        if !self.tabs[self.active].panes.contains_key(&cm.pane) {
+            self.copy_mode = None;
+            return;
+        }
+        let (rows, cols, total, top) = {
+            let g = self.tab().focused().grid.lock().unwrap();
+            (g.rows(), g.cols(), g.total_rows(), g.abs_row(0))
+        };
+        let last_col = cols.saturating_sub(1);
+        let last_row = total.saturating_sub(1);
+        let mut cm = self.copy_mode.take().unwrap();
+        let (mut yank, mut exit) = (false, false);
+
+        match &event.logical_key {
+            Key::Named(NamedKey::Escape) => exit = true,
+            Key::Named(NamedKey::Enter) => yank = true,
+            Key::Named(NamedKey::ArrowLeft) => cm.cur.1 = cm.cur.1.saturating_sub(1),
+            Key::Named(NamedKey::ArrowRight) => cm.cur.1 = (cm.cur.1 + 1).min(last_col),
+            Key::Named(NamedKey::ArrowUp) => cm.cur.0 = cm.cur.0.saturating_sub(1),
+            Key::Named(NamedKey::ArrowDown) => cm.cur.0 = (cm.cur.0 + 1).min(last_row),
+            Key::Character(s) => {
+                for c in s.chars() {
+                    match c {
+                        'q' => exit = true,
+                        'y' => yank = true,
+                        'v' | ' ' => {
+                            cm.anchor = if cm.anchor.is_some() { None } else { Some(cm.cur) }
+                        }
+                        'h' => cm.cur.1 = cm.cur.1.saturating_sub(1),
+                        'l' => cm.cur.1 = (cm.cur.1 + 1).min(last_col),
+                        'k' => cm.cur.0 = cm.cur.0.saturating_sub(1),
+                        'j' => cm.cur.0 = (cm.cur.0 + 1).min(last_row),
+                        '0' => cm.cur.1 = 0,
+                        '$' => cm.cur.1 = last_col,
+                        'g' => cm.cur.0 = 0,
+                        'G' => cm.cur.0 = last_row,
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        if exit {
+            self.copy_mode = None;
+            self.tab().focused().clear_selection();
+            self.status = None;
+            self.window.request_redraw();
+            return;
+        }
+        // Keep the cursor on screen: scroll the viewport when it leaves the top or
+        // bottom of the current view.
+        if cm.cur.0 < top {
+            self.tab().focused().scroll((top - cm.cur.0) as isize);
+        } else if cm.cur.0 > top + rows.saturating_sub(1) {
+            self.tab().focused().scroll(-((cm.cur.0 - (top + rows - 1)) as isize));
+        }
+        self.copy_mode = Some(cm);
+        self.sync_copy_selection();
+        if yank {
+            self.exit_copy_mode(true);
+        } else {
+            self.window.request_redraw();
+        }
+    }
+
     fn toggle_zoom(&mut self) {
         let area = self.active_area();
         if self.zoomed.take().is_some() {

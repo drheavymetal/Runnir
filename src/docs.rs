@@ -58,6 +58,21 @@ Hold Shift to override and select text instead, even inside such an app.
 Any key you type snaps the view back to the live output, so you never type into a
 scrolled-back screen and wonder why nothing happens.
 
+# Copy mode (keyboard selection)
+
+From the palette, Copy mode starts a keyboard cursor in the scrollback — no mouse
+needed:
+
+@ h j k l / arrows   move the cursor
+@ 0 / $              start / end of line
+@ g / G              top / bottom
+@ v or Space        start (or drop) a selection
+@ y or Enter        yank the selection to the clipboard and exit
+@ Esc or q          exit
+
+The view scrolls to follow the cursor, so you can select text far up the history
+without reaching for the wheel.
+
 # Shell integration (OSC 133)
 
 If your shell emits OSC 133 marks, runnir understands where each command's prompt,
