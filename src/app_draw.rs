@@ -259,6 +259,27 @@ impl Gpu {
             self.last_cursor_rect = None;
         }
 
+        // Progress bar (OSC 9;4): a thin bar along the bottom edge of any pane whose
+        // foreground reports progress (npm, cargo-style tools) — accent for normal,
+        // red for error, amber for paused, full-width dim for indeterminate.
+        for (_, r, grid, ..) in &guards {
+            let Some((state, pct)) = grid.progress() else { continue };
+            let a = config.theme.accent;
+            let (color, frac) = match state {
+                2 => ((0xe0, 0x4f, 0x4f), pct as f32 / 100.0),
+                4 => ((0xe8, 0xb3, 0x39), pct as f32 / 100.0),
+                3 => ((a.0, a.1, a.2), 1.0),
+                _ => ((a.0, a.1, a.2), pct as f32 / 100.0),
+            };
+            decorations.push(crate::render::SolidRect {
+                x: r.x,
+                y: r.y + r.h - 2.0,
+                w: (r.w * frac).max(1.0),
+                h: 2.0,
+                color,
+            });
+        }
+
         // Scroll position indicator: a thin thumb on the right edge of any pane that
         // is scrolled back, sized and placed by the viewport's position in history.
         for (_, r, grid, ..) in &guards {

@@ -128,6 +128,10 @@ pub struct Grid {
     command_input: Option<(usize, usize)>,
     /// OSC 8 hyperlink URIs. A cell's `pen.link` is index+1 into this (0 = none).
     links: Vec<String>,
+    /// Progress reported via OSC 9;4: `(state, percent)`. state 1 = normal, 2 =
+    /// error, 3 = indeterminate, 4 = paused; `None` = no progress. Drives the tab
+    /// progress bar.
+    progress: Option<(u8, u8)>,
     /// Exit code of finished commands, keyed by the stable row of the prompt that
     /// launched each (OSC 133;D;code). Drives the pass/fail status gutter.
     cmd_exits: Vec<(usize, i32)>,
@@ -206,6 +210,7 @@ impl Grid {
             command_start: None,
             command_input: None,
             links: Vec::new(),
+            progress: None,
             cmd_exits: Vec::new(),
             outputs: Vec::new(),
             folds: Vec::new(),
@@ -529,6 +534,12 @@ impl Grid {
     /// Drives the tab fail badge.
     pub fn last_exit(&self) -> Option<i32> {
         self.cmd_exits.last().map(|&(_, e)| e)
+    }
+
+    /// Reported progress `(state, percent)` from OSC 9;4, or `None`. state 1 normal,
+    /// 2 error, 3 indeterminate, 4 paused.
+    pub fn progress(&self) -> Option<(u8, u8)> {
+        self.progress
     }
 
     // ---- Command output folding (W2) ----------------------------------------
@@ -1396,6 +1407,19 @@ impl Perform for Grid {
                     .join(";");
                 self.set_hyperlink(&uri);
             }
+            // OSC 9;4: progress (ConEmu/Windows Terminal). `9;4;state;percent`.
+            [b"9", b"4", rest @ ..] => {
+                let num = |i: usize| {
+                    rest.get(i).and_then(|b| std::str::from_utf8(b).ok()).and_then(|s| s.trim().parse::<u8>().ok())
+                };
+                let state = num(0).unwrap_or(0);
+                self.progress = if state == 0 {
+                    None
+                } else {
+                    Some((state, num(1).unwrap_or(0).min(100)))
+                };
+                self.dirty = true;
+            }
             _ => {}
         }
     }
@@ -2093,6 +2117,21 @@ mod tests {
         feed(&mut g, "\x1b]133;A\x07$ false\r\n\x1b]133;C\x07\x1b]133;D;1\x07");
         let m = g.command_markers();
         assert!(m.iter().any(|&(_, e)| e == Some(1)), "second command failed: {m:?}");
+    }
+
+    #[test]
+    fn osc9_4_sets_and_clears_progress() {
+        let mut g = Grid::new(20, 3);
+        assert_eq!(g.progress(), None);
+        feed(&mut g, "\x1b]9;4;1;42\x07");
+        assert_eq!(g.progress(), Some((1, 42)));
+        feed(&mut g, "\x1b]9;4;2;90\x07");
+        assert_eq!(g.progress(), Some((2, 90)), "error state");
+        feed(&mut g, "\x1b]9;4;0\x07");
+        assert_eq!(g.progress(), None, "state 0 clears");
+        // Percent is clamped to 100.
+        feed(&mut g, "\x1b]9;4;1;250\x07");
+        assert_eq!(g.progress().map(|(_, p)| p), Some(100));
     }
 
     #[test]
