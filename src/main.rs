@@ -3,6 +3,7 @@ mod ai;
 mod boxdraw;
 mod clipboard;
 mod config;
+mod control;
 mod docs;
 mod font;
 mod graphics;
@@ -56,11 +57,19 @@ pub enum UserEvent {
     /// through the proxy does. Without this, echoed input and command output appear
     /// only on the next keystroke or blink tick — the "typing feels laggy" bug.
     Redraw,
+    /// A remote-control request from the socket thread, paired with a one-shot
+    /// channel to send the response back. The UI thread runs it against `Gpu` and
+    /// replies; the socket thread waits (bounded) on the other end. This is the only
+    /// safe cross-thread path to the terminal state — same reasoning as `Redraw`.
+    Control(control::ControlRequest, std::sync::mpsc::Sender<control::ControlResponse>),
 }
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
+        // `runnir @ <cmd> [flags]` — the remote-control client; talks to a running
+        // terminal over its Unix socket and never opens a window.
+        Some("@") => return control::client_main(&args[2..]),
         Some("--dump") => return dump(args.get(2).map(String::as_str).unwrap_or("echo hola")),
         Some("--render") => {
             let path = args.get(2).map(String::as_str).unwrap_or("/tmp/runnir.png");
@@ -88,8 +97,13 @@ fn main() {
     let event_loop = EventLoop::<UserEvent>::with_user_event().build().unwrap();
     // Wait, not Poll: an idle terminal must not burn a core.
     event_loop.set_control_flow(ControlFlow::Wait);
+    // Start the remote-control listener before the loop spawns the first pane, so
+    // that pane (and every later one) inherits RUNNIR_LISTEN in its environment.
+    control::start_listener(event_loop.create_proxy());
     let mut app = App::new(event_loop.create_proxy(), quake);
     event_loop.run_app(&mut app).unwrap();
+    // Clean up our own socket on a graceful exit (best effort).
+    let _ = std::fs::remove_file(control::socket_path());
 }
 
 fn print_help() {
@@ -99,7 +113,10 @@ fn print_help() {
          runnir                     start the terminal\n  \
          runnir --write-config      write a default config file\n  \
          runnir --dump CMD          run CMD, print the resulting grid (debug)\n  \
-         runnir --render OUT CMD    render CMD's output to a PNG (debug)\n\n\
+         runnir --render OUT CMD    render CMD's output to a PNG (debug)\n  \
+         runnir @ CMD [flags]       remote-control a running terminal\n\n\
+         Remote control (like kitty @): ls, send-text, get-text, focus-tab,\n  \
+         launch, new-tab, close-tab, set-colors. Example: runnir @ send-text --text 'ls\\n'\n\n\
          Press F1 inside runnir for the full key reference.",
         env!("CARGO_PKG_VERSION")
     );
@@ -630,6 +647,12 @@ impl ApplicationHandler<UserEvent> for App {
                     ai::Delivery::ToPanel | ai::Delivery::Nothing => {}
                 }
                 gpu.window.request_redraw();
+            }
+            UserEvent::Control(req, reply) => {
+                // Run the request against the live terminal and answer the socket
+                // thread. A dropped receiver (client hung up) just discards the reply.
+                let resp = gpu.handle_control(req, &self.config);
+                let _ = reply.send(resp);
             }
         }
     }
