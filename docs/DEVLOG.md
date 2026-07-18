@@ -94,8 +94,10 @@ Background image (commit 63): bg_shader.wgsl fullscreen tri, premultiplied, draw
 first; Background struct (own pipeline+texture+uniform, cover-crop scale); needs
 opacity<1 to show; load_background at startup + hot-reload. Minimap (commit 64):
 window.minimap, decorations strip on focused pane right edge (row_fill per sampled
-line + viewport highlight), minimap_jump click-to-scroll. NEXT: Fable rounds on
-background + minimap.
+line + viewport highlight), minimap_jump click-to-scroll. bg+minimap hunt → 4 HIGH (img>8192 panic; opacity forced 1.0 hid bg;
+minimap_jump zoom-rect mismatch; narrow-pane escape) + lows, fixed commit 65.
+Verify → all correct, 1 minor regression (narrow focused pane lost its thumb),
+fixed commit 66. ALL 4 FLASHY BLOCKS DONE + BUG-HUNTED. CONVERGED.
 
 ## Current task: add 15–20 differential features, 4–5 "wow". Document each here.
 

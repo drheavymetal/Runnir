@@ -334,8 +334,10 @@ impl Gpu {
         // Scroll position indicator: a thin thumb on the right edge of any pane that
         // is scrolled back, sized and placed by the viewport's position in history.
         for (id, r, grid, ..) in &guards {
-            // The focused pane's position is already shown by the minimap when on.
-            if config.window.minimap && *id == focus {
+            // The focused pane's position is already shown by the minimap when on —
+            // but only when the minimap actually drew (a pane too narrow for the strip
+            // still needs its thumb).
+            if config.window.minimap && *id == focus && r.w > 46.0 {
                 continue;
             }
             let off = grid.display_offset();
