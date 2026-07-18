@@ -161,8 +161,18 @@ impl Gpu {
                         return;
                     }
                     if let Some(point) = self.point_in(id, rect, self.cursor_px) {
-                        // Double-click selects a word, triple a line.
-                        let mode = self.click_mode(point);
+                        // Alt (kitty default) or Ctrl held on the press starts a
+                        // rectangular block selection; otherwise the click cadence
+                        // picks char/word/line (double-click a word, triple a line).
+                        // We reach this arm only when the click was NOT forwarded to a
+                        // mouse-mode app (no mouse mode, or Shift held to override), so
+                        // block never fights mouse forwarding and Shift-select still
+                        // works — Shift+Alt/Shift+Ctrl block-selects inside such apps.
+                        let mode = if mods.alt_key() || mods.control_key() {
+                            SelMode::Block
+                        } else {
+                            self.click_mode(point)
+                        };
                         self.tab().focused().begin_selection(point, mode);
                         self.window.request_redraw();
                     }
