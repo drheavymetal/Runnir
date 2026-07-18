@@ -26,14 +26,18 @@ pub struct FileStat {
 
 /// The debounce state for one watched directory.
 ///
-/// `seen` holds every file that must never fire again: the snapshot taken when the
-/// watch was armed (so pre-existing files never flood the pane) plus every file
-/// already previewed. `pending` holds candidate new files observed once but not yet
-/// confirmed stable, so a file still being written waits until its size and mtime
-/// stop changing before it is previewed.
+/// `seen` holds every file that must not fire again *at its recorded size and
+/// mtime*: the snapshot taken when the watch was armed (so pre-existing files never
+/// flood the pane) plus every file already previewed. Keying on the stat, not just
+/// the path, means a seen file that is later rewritten (or was still being written
+/// when the watch was armed) re-enters the debounce and fires once it settles —
+/// only a file that is byte-for-byte where we left it stays suppressed. `pending`
+/// holds candidate files observed once but not yet confirmed stable, so a file
+/// still being written waits until its size and mtime stop changing before it is
+/// previewed.
 #[derive(Debug, Default)]
 pub struct WatchState {
-    seen: HashSet<PathBuf>,
+    seen: HashMap<PathBuf, (u64, u128)>,
     pending: HashMap<PathBuf, (u64, u128)>,
 }
 
@@ -41,7 +45,10 @@ impl WatchState {
     /// Arms the watch on an initial listing: every file present now is recorded as
     /// already seen, so only files created or modified after this fire.
     pub fn armed(listing: &[FileStat]) -> Self {
-        Self { seen: listing.iter().map(|f| f.path.clone()).collect(), pending: HashMap::new() }
+        Self {
+            seen: listing.iter().map(|f| (f.path.clone(), (f.size, f.mtime))).collect(),
+            pending: HashMap::new(),
+        }
     }
 
     /// Advances the state machine by one poll and returns the files that became
@@ -57,13 +64,15 @@ impl WatchState {
 
         let mut ready: Vec<(PathBuf, u128)> = Vec::new();
         for f in listing {
-            if self.seen.contains(&f.path) {
+            // Suppressed only while the file is exactly as recorded; a rewrite (new
+            // size or mtime) falls through and debounces like any new file.
+            if self.seen.get(&f.path) == Some(&(f.size, f.mtime)) {
                 continue;
             }
             match self.pending.get(&f.path) {
                 // Unchanged since the previous sighting: fully written, preview it.
                 Some(&(size, mtime)) if size == f.size && mtime == f.mtime => {
-                    self.seen.insert(f.path.clone());
+                    self.seen.insert(f.path.clone(), (f.size, f.mtime));
                     self.pending.remove(&f.path);
                     ready.push((f.path.clone(), f.mtime));
                 }
@@ -119,11 +128,16 @@ pub fn list_dir(dir: &Path, exts: &[String]) -> Vec<FileStat> {
     out
 }
 
-/// Expands a leading `~/` to `$HOME`, leaving every other path untouched. The
-/// watched directory is user-typed (config or the runtime prompt), so a home-tilde
-/// is the one shorthand worth honouring.
+/// Expands a bare `~` or a leading `~/` to `$HOME`, leaving every other path
+/// (including `~user`, which would need a passwd lookup) untouched. The watched
+/// directory is user-typed (config or the runtime prompt), so a home-tilde is the
+/// one shorthand worth honouring.
 pub fn expand_tilde(path: &str) -> PathBuf {
-    if let Some(rest) = path.strip_prefix("~/") {
+    if path == "~" {
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home);
+        }
+    } else if let Some(rest) = path.strip_prefix("~/") {
         if let Some(home) = std::env::var_os("HOME") {
             return PathBuf::from(home).join(rest);
         }
@@ -196,6 +210,34 @@ mod tests {
         // Same name reappears, different content: it debounces from scratch.
         assert!(state.step(&[stat("tmp.png", 9, 2)]).is_empty(), "fresh debounce");
         assert_eq!(state.step(&[stat("tmp.png", 9, 2)]), vec![PathBuf::from("tmp.png")]);
+    }
+
+    #[test]
+    fn a_preexisting_file_still_being_written_at_arm_fires_when_it_settles() {
+        // Arming while the pipeline is mid-write must not swallow that render: the
+        // half-written file is in the arm snapshot, but once its size/mtime move on
+        // and then settle, it is a modified file and fires. Only a file byte-for-byte
+        // where the snapshot left it stays suppressed.
+        let mut state = WatchState::armed(&[stat("render.png", 100, 1)]);
+        // The writer finishes: the stat no longer matches the snapshot.
+        assert!(state.step(&[stat("render.png", 5000, 9)]).is_empty(), "changed: debounce");
+        assert_eq!(
+            state.step(&[stat("render.png", 5000, 9)]),
+            vec![PathBuf::from("render.png")],
+            "a pre-existing file finished after arm fires once stable"
+        );
+        assert!(state.step(&[stat("render.png", 5000, 9)]).is_empty(), "then stays quiet");
+    }
+
+    #[test]
+    fn a_bare_tilde_expands_to_home() {
+        // "~" with no slash is the natural thing to type at the watch-dir prompt; it
+        // must mean $HOME, not a literal ./~ directory. ~user stays untouched.
+        let home = std::env::var_os("HOME").expect("HOME set in tests");
+        assert_eq!(expand_tilde("~"), PathBuf::from(&home));
+        assert_eq!(expand_tilde("~/x"), PathBuf::from(&home).join("x"));
+        assert_eq!(expand_tilde("~other"), PathBuf::from("~other"));
+        assert_eq!(expand_tilde("/abs"), PathBuf::from("/abs"));
     }
 
     #[test]
