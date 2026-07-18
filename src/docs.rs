@@ -255,6 +255,8 @@ file is safe to keep in a dotfiles repo.
 
 @ window.opacity   0.1..1.0 window translucency (needs a compositor; 1.0 = opaque)
 @ window.status_bar  true shows a bottom bar (cwd, git branch, clock); costs a row
+@ window.background  path to an image drawn behind the terminal (needs opacity < 1)
+@ window.background_dim  0..1 how bright the background image is (default 0.35)
 @ cursor.trail     true draws a brief fading trail behind the cursor (flair, off)
 @ behaviour.smooth_scroll  true glides on scroll jumps instead of teleporting
 

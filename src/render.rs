@@ -43,6 +43,7 @@ pub struct Renderer {
     capacity: usize,
     theme: crate::config::Theme,
     images: ImageLayer,
+    background: Background,
     /// Window opacity in 0.1..=1.0. Applied to the clear colour and to every
     /// default-background cell, so the compositor shows through (and can blur).
     opacity: f32,
@@ -69,6 +70,27 @@ struct ImageLayer {
     vcap: usize,
     /// This frame's draw order: (serial, first vertex index).
     frame: Vec<(u64, u32)>,
+}
+
+/// A background image drawn behind the terminal (fullscreen, dimmed, cover-cropped).
+struct Background {
+    pipeline: wgpu::RenderPipeline,
+    layout: wgpu::BindGroupLayout,
+    sampler: wgpu::Sampler,
+    uniforms: wgpu::Buffer,
+    /// Bind group (texture + sampler + uniforms), set when an image is loaded.
+    bind: Option<wgpu::BindGroup>,
+    /// Image aspect (w/h) for cover-cropping to the surface.
+    aspect: f32,
+    dim: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct BgUniforms {
+    scale: [f32; 2],
+    dim: f32,
+    _pad: f32,
 }
 
 /// One pane (or overlay panel) to draw: its grid, where it sits, and how.
@@ -246,11 +268,13 @@ impl Renderer {
         });
 
         let images = ImageLayer::new(device, format);
+        let background = Background::new(device, format);
 
         Self {
             pipeline,
             bind_group,
             images,
+            background,
             uniforms,
             atlas_tex,
             instances,
@@ -264,6 +288,17 @@ impl Renderer {
     /// Sets the window opacity (clamped 0.1..=1.0). 1.0 is fully opaque.
     pub fn set_opacity(&mut self, opacity: f32) {
         self.opacity = opacity.clamp(0.1, 1.0);
+    }
+
+    /// Loads (or clears, with `None`) the background image drawn behind the terminal.
+    pub fn set_background(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        rgba: Option<(&[u8], u32, u32)>,
+        dim: f32,
+    ) {
+        self.background.set_image(device, queue, rgba, dim);
     }
 
     /// The inline images to draw this frame, from every pane, as (grid image,
@@ -387,6 +422,8 @@ impl Renderer {
         // Upload/refresh image textures and build their quads before the pass;
         // resources cannot be created while a pass is recording.
         self.prepare_images(device, queue, panes, screen);
+        // Update the background's cover-crop scale (also a pre-pass write).
+        self.background.prepare(queue, screen);
 
         let clear = self.theme.background;
         // Premultiplied clear: the surface is composited with PreMultiplied alpha, so
@@ -413,6 +450,9 @@ impl Renderer {
             occlusion_query_set: None,
             multiview_mask: None,
         });
+        // Background image first (behind everything); the translucent default-bg
+        // cells then let it show through.
+        self.background.record(&mut pass);
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.bind_group, &[]);
         pass.set_vertex_buffer(0, self.instances.slice(..));
@@ -1210,6 +1250,172 @@ impl ImageLayer {
                 pass.set_bind_group(0, bind_group, &[]);
                 pass.draw(*base..*base + 4, 0..1);
             }
+        }
+    }
+}
+
+impl Background {
+    fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("bg shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("bg_shader.wgsl").into()),
+        });
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("bg bind layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    // The scale is read in the vertex stage, the dim in the fragment.
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("bg pipeline layout"),
+            bind_group_layouts: &[Some(&layout)],
+            immediate_size: 0,
+        });
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("bg pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: Default::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("bg sampler"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        let uniforms = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("bg uniforms"),
+            size: std::mem::size_of::<BgUniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        Self { pipeline, layout, sampler, uniforms, bind: None, aspect: 1.0, dim: 0.35 }
+    }
+
+    fn set_image(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        rgba: Option<(&[u8], u32, u32)>,
+        dim: f32,
+    ) {
+        self.dim = dim.clamp(0.0, 1.0);
+        let Some((pixels, w, h)) = rgba else {
+            self.bind = None;
+            return;
+        };
+        if w == 0 || h == 0 || pixels.len() < (w * h * 4) as usize {
+            self.bind = None;
+            return;
+        }
+        self.aspect = w as f32 / h as f32;
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("bg texture"),
+            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            pixels,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(w * 4),
+                rows_per_image: Some(h),
+            },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        );
+        let view = texture.create_view(&Default::default());
+        let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("bg bind"),
+            layout: &self.layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                wgpu::BindGroupEntry { binding: 2, resource: self.uniforms.as_entire_binding() },
+            ],
+        });
+        self.bind = Some(bind);
+    }
+
+    /// Updates the cover-crop scale for the current surface size. Call before the
+    /// pass (write_buffer cannot run inside a pass).
+    fn prepare(&self, queue: &wgpu::Queue, screen: (f32, f32)) {
+        if self.bind.is_none() {
+            return;
+        }
+        let surface_aspect = screen.0 / screen.1.max(1.0);
+        let ratio = surface_aspect / self.aspect.max(0.001);
+        let scale = [ratio.min(1.0), (1.0 / ratio).min(1.0)];
+        queue.write_buffer(
+            &self.uniforms,
+            0,
+            bytemuck::bytes_of(&BgUniforms { scale, dim: self.dim, _pad: 0.0 }),
+        );
+    }
+
+    fn record(&self, pass: &mut wgpu::RenderPass) {
+        if let Some(bind) = &self.bind {
+            pass.set_pipeline(&self.pipeline);
+            pass.set_bind_group(0, bind, &[]);
+            pass.draw(0..3, 0..1);
         }
     }
 }

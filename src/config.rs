@@ -82,6 +82,17 @@ pub struct WindowCfg {
     /// Show a status bar along the bottom (cwd, git branch, clock). Costs one row.
     #[serde(default = "yes")]
     pub status_bar: bool,
+    /// Path to a background image drawn behind the terminal. Needs opacity < 1 to
+    /// show through. `None` = solid background.
+    #[serde(default)]
+    pub background: Option<String>,
+    /// How much to dim the background image (0 = black, 1 = full brightness).
+    #[serde(default = "default_bg_dim")]
+    pub background_dim: f32,
+}
+
+fn default_bg_dim() -> f32 {
+    0.35
 }
 
 impl Default for WindowCfg {
@@ -93,6 +104,8 @@ impl Default for WindowCfg {
             decorations: false,
             opacity: 1.0,
             status_bar: true,
+            background: None,
+            background_dim: default_bg_dim(),
         }
     }
 }

@@ -418,6 +418,7 @@ impl App {
         // Only apply opacity when the surface actually composites with alpha; on an
         // opaque surface it would merely darken the background, not reveal anything.
         renderer.set_opacity(if translucent { self.config.window.opacity } else { 1.0 });
+        load_background(&self.config, &device, &queue, &mut renderer);
 
         let cell = renderer.cell_size();
 
@@ -522,6 +523,33 @@ struct HoverUrl {
     len: usize,
     text: String,
     kind: overlay::HintKind,
+}
+
+/// Loads the configured background image into the renderer (decodes to RGBA8). A
+/// missing or unreadable path just leaves the background solid.
+fn load_background(config: &Config, device: &wgpu::Device, queue: &wgpu::Queue, renderer: &mut Renderer) {
+    let Some(path) = config.window.background.as_ref() else {
+        renderer.set_background(device, queue, None, config.window.background_dim);
+        return;
+    };
+    let expanded = if let Some(rest) = path.strip_prefix("~/") {
+        std::env::var_os("HOME")
+            .map(|h| std::path::PathBuf::from(h).join(rest))
+            .unwrap_or_else(|| path.into())
+    } else {
+        path.into()
+    };
+    match image::open(&expanded) {
+        Ok(img) => {
+            let rgba = img.to_rgba8();
+            let (w, h) = rgba.dimensions();
+            renderer.set_background(device, queue, Some((&rgba, w, h)), config.window.background_dim);
+        }
+        Err(e) => {
+            eprintln!("runnir: could not load background {}: {e}", expanded.display());
+            renderer.set_background(device, queue, None, config.window.background_dim);
+        }
+    }
 }
 
 fn content_area(cfg: &wgpu::SurfaceConfiguration, cell: (f32, f32), tab_count: usize, status: bool) -> Rect {

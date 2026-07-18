@@ -1353,6 +1353,7 @@ impl Gpu {
         // it would darken rather than reveal, same guard as at startup.
         self.renderer
             .set_opacity(if self.translucent { config.window.opacity } else { 1.0 });
+        crate::load_background(config, &self.device, &self.queue, &mut self.renderer);
         // Rebuild the font only when the CONFIG's font actually changed (family, size
         // or ligatures) — compared against what the config last asked for, not the
         // live size, so a colour-only edit does not snap a runtime zoom back, and a
