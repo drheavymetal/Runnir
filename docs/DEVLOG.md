@@ -48,7 +48,7 @@ wrapped across multiple rows + Home + Enter can scan short of the wrapped tail;
 RPROMPT tokens on the input row are in scan range. Pre-existing/deferred: dead
 copy_on_select/confirm_close config, ctrl+plus/minus chord unreachable, RIS wipes
 prompt_marks, broadcast-group last-member widening.
-NEXT: deferred features W2 folding / D1 OSC 8 / D6 gutter / D12 copy-mode / D15 trail.
+NEXT: deferred W2 folding / D6 gutter / D12 copy-mode / D15 trail (D1 done, commit 44).
 
 ## Current task: add 15–20 differential features, 4–5 "wow". Document each here.
 
@@ -78,7 +78,9 @@ WOW (aim 4–5):
       blur works behind. Renderer::set_opacity. commit 27.
 
 DIFFERENTIAL (aim ~15 total incl. above):
-- [ ] D1 OSC 8 hyperlinks — clickable links apps emit (ls --hyperlink, gcc/cargo).
+- [x] D1 OSC 8 hyperlinks — Pen.link id → Grid.links table; osc_dispatch [b"8",..]
+      set_hyperlink (dedup+cap); link_span; update_hover prefers real OSC 8 link over
+      text detection; Ctrl+click opens. commit 44.
 - [x] D2 Config hot-reload — App::maybe_reload_config (mtime, ~1Hz throttle) in
       about_to_wait → Config::load + Keymap rebuild + Gpu::apply_config (theme/opacity/font).
       Opacity opaque↔translucent still needs restart. commit 33.

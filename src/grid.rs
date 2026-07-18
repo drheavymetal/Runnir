@@ -34,6 +34,9 @@ pub struct Pen {
     pub fg: Color,
     pub bg: Color,
     pub flags: Flags,
+    /// OSC 8 hyperlink id: 0 = none, else index+1 into the grid's `links` table.
+    /// Kept as an id (not the URI) so a cell stays `Copy` and cheap.
+    pub link: u16,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
@@ -114,6 +117,8 @@ pub struct Grid {
     /// column. The guardian scans from here so the prompt text is not part of what
     /// it inspects. Cleared at OSC 133;C (command submitted).
     command_input: Option<(usize, usize)>,
+    /// OSC 8 hyperlink URIs. A cell's `pen.link` is index+1 into this (0 = none).
+    links: Vec<String>,
     /// Stable (start, end) rows of the last finished command's output.
     last_output: Option<(usize, usize)>,
     /// Count of commands finished (OSC 133;D), for completion notifications.
@@ -182,6 +187,7 @@ impl Grid {
             prompt_marks: Vec::new(),
             command_start: None,
             command_input: None,
+            links: Vec::new(),
             last_output: None,
             command_seq: 0,
             scroll_top: 0,
@@ -1214,12 +1220,63 @@ impl Perform for Grid {
             // prompt and each command's output, letting the terminal navigate and
             // extract by command with no guessing.
             [b"133", kind, ..] => self.shell_integration(kind),
+            // OSC 8: hyperlink. `8 ; params ; URI` opens a link that following cells
+            // belong to; `8 ; ; ` (empty URI) closes it. vte split the OSC on ';',
+            // so a URI containing ';' arrives as extra parts — rejoin them.
+            [b"8", _params, rest @ ..] => {
+                let uri = rest
+                    .iter()
+                    .map(|p| String::from_utf8_lossy(p))
+                    .collect::<Vec<_>>()
+                    .join(";");
+                self.set_hyperlink(&uri);
+            }
             _ => {}
         }
     }
 }
 
 impl Grid {
+    /// Opens (non-empty URI) or closes (empty) the current OSC 8 hyperlink. The URI
+    /// is de-duplicated against the table and the id is capped so a link-heavy
+    /// session cannot grow it without bound.
+    fn set_hyperlink(&mut self, uri: &str) {
+        if uri.is_empty() {
+            self.pen.link = 0;
+            return;
+        }
+        if let Some(i) = self.links.iter().position(|u| u == uri) {
+            self.pen.link = (i + 1) as u16;
+            return;
+        }
+        if self.links.len() >= u16::MAX as usize - 1 {
+            // Table full: reuse the last slot rather than overflow the id space.
+            self.pen.link = self.links.len() as u16;
+            return;
+        }
+        self.links.push(uri.to_string());
+        self.pen.link = self.links.len() as u16;
+    }
+
+    /// The contiguous run of cells on `abs_row` sharing the hyperlink under `col`:
+    /// `(start_col, width, uri)`. Backs the hover underline and click for OSC 8 links.
+    pub fn link_span(&self, abs_row: usize, col: usize) -> Option<(usize, usize, String)> {
+        let id = self.abs_cell(abs_row, col).pen.link;
+        if id == 0 {
+            return None;
+        }
+        let mut start = col;
+        while start > 0 && self.abs_cell(abs_row, start - 1).pen.link == id {
+            start -= 1;
+        }
+        let mut end = col;
+        while end + 1 < self.cols && self.abs_cell(abs_row, end + 1).pen.link == id {
+            end += 1;
+        }
+        let uri = self.links.get(id as usize - 1).cloned()?;
+        Some((start, end - start + 1, uri))
+    }
+
     fn shell_integration(&mut self, kind: &[u8]) {
         match kind.first() {
             // A: a fresh prompt begins here.
@@ -1748,6 +1805,19 @@ mod tests {
         // Prompt start (A), the prompt itself, prompt end / input begins (B), command.
         feed(&mut g, "\x1b]133;A\x07pedro$ \x1b]133;B\x07rm -rf /");
         assert_eq!(g.current_command_text(), "rm -rf /");
+    }
+
+    #[test]
+    fn osc8_hyperlink_tags_its_cells() {
+        let mut g = Grid::new(20, 3);
+        // Open a link, print text under it, close it, print plain text.
+        feed(&mut g, "\x1b]8;;https://go2chain.es\x07link\x1b]8;;\x07 x");
+        // The 4 'link' cells share one hyperlink span; the trailing text has none.
+        let span = g.link_span(g.abs_row(0), 1).expect("link on the tagged cells");
+        assert_eq!(span.0, 0, "span starts at column 0");
+        assert_eq!(span.1, 4, "span covers 'link'");
+        assert_eq!(span.2, "https://go2chain.es");
+        assert!(g.link_span(g.abs_row(0), 6).is_none(), "plain text carries no link");
     }
 
     #[test]

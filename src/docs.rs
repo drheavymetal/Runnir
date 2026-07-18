@@ -95,7 +95,9 @@ docker blue. It launches the real ssh, so your ~/.ssh/config, jump hosts and
                    the mouse.
 
 Hovering the pointer over a URL or path also underlines it; Ctrl+click opens a URL
-in the browser or copies a path/hash, without entering hint mode.
+in the browser or copies a path/hash, without entering hint mode. OSC 8 hyperlinks
+(the explicit links ls --hyperlink, gcc and cargo emit) are honoured too: the exact
+link the program declared underlines on hover and opens on Ctrl+click.
 
 # AI assistant
 

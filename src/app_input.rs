@@ -868,6 +868,19 @@ impl Gpu {
             if let Some((id, rect)) = self.pane_at(pos, area) {
                 if let Some((abs_row, col)) = self.point_in(id, rect, pos) {
                     let grid = self.tabs[self.active].panes[&id].grid.lock().unwrap();
+                    // A real OSC 8 hyperlink on the cell wins over text detection: it
+                    // carries an explicit URI the app declared, not a guess.
+                    if let Some((start, len, uri)) = grid.link_span(abs_row, col) {
+                        self.hover_url = Some(HoverUrl {
+                            pane: id,
+                            abs_row,
+                            col: start,
+                            len,
+                            text: uri,
+                            kind: crate::overlay::HintKind::Url,
+                        });
+                        return self.hover_url != prev;
+                    }
                     for h in crate::hints::find(&grid) {
                         // Display width (not char count): a wide glyph spans two grid
                         // cells, so the underline and hit-zone must too.
