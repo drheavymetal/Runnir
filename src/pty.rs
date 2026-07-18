@@ -216,10 +216,12 @@ impl Pty {
 
     /// The command name and full command line of the foreground process, read from
     /// the process group leader. This drives context tinting (ssh/sudo/docker) with
-    /// no cooperation from the remote end. Linux-only; elsewhere returns `None`.
+    /// no cooperation from the remote end. Per-OS via `platform` (Linux /proc, macOS
+    /// libproc); `None` where unsupported.
     pub fn foreground(&self) -> Option<Foreground> {
         let pid = self.master.process_group_leader()?;
-        foreground_of(pid)
+        let (name, argv) = crate::platform::foreground(pid)?;
+        Some(Foreground { name, argv })
     }
 }
 
@@ -270,23 +272,6 @@ impl Foreground {
         }
         None
     }
-}
-
-#[cfg(target_os = "linux")]
-fn foreground_of(pid: i32) -> Option<Foreground> {
-    let name = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
-    let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
-    let argv: Vec<String> = raw
-        .split(|&b| b == 0)
-        .filter(|s| !s.is_empty())
-        .map(|s| String::from_utf8_lossy(s).into_owned())
-        .collect();
-    Some(Foreground { name: name.trim().to_string(), argv })
-}
-
-#[cfg(not(target_os = "linux"))]
-fn foreground_of(_pid: i32) -> Option<Foreground> {
-    None
 }
 
 #[cfg(test)]

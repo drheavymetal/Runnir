@@ -1634,14 +1634,11 @@ fn write_private(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
         .create(true)
         .truncate(true)
         .mode(0o600)
-        .custom_flags(libc_o_nofollow())
+        // libc's constant, so the flag is correct on both Linux and macOS (the raw
+        // value differs between them).
+        .custom_flags(libc::O_NOFOLLOW)
         .open(path)?;
     f.write_all(data)
-}
-
-/// `O_NOFOLLOW` without a libc dependency. The value is stable across Linux archs.
-fn libc_o_nofollow() -> i32 {
-    0o400000
 }
 
 /// A nerd-font icon for a foreground process name (the default font is a Nerd Font).

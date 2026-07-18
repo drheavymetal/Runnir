@@ -23,3 +23,11 @@ ureq = { version = "3.3.0", features = ["json"] }
 vte = "0.15.0"
 wgpu = "30.0.0"
 winit = "0.30.13"
+
+# Unix process/fs bits (O_NOFOLLOW, sysctl on macOS).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# macOS process introspection (cwd + foreground name), the /proc equivalent.
+[target.'cfg(target_os = "macos")'.dependencies]
+libproc = "0.14"

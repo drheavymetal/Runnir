@@ -131,8 +131,7 @@ impl Pane {
     /// The child's current working directory, for session persistence and for a
     /// split to inherit.
     pub fn cwd(&self) -> Option<std::path::PathBuf> {
-        let pid = self.pty.pid()?;
-        std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
+        crate::platform::cwd(self.pty.pid()?)
     }
 
     pub fn scrollback_text(&self) -> Vec<String> {

@@ -15,6 +15,7 @@ mod layout;
 mod mouse;
 mod overlay;
 mod pane;
+mod platform;
 mod pty;
 mod render;
 mod selection;
@@ -348,15 +349,9 @@ struct Gpu {
     proxy: EventLoopProxy<UserEvent>,
 }
 
-/// Fires a desktop notification. Silent on failure — there is nowhere useful to
-/// report that the notifier itself is missing.
+/// Fires a desktop notification (per-OS via `platform`). Silent on failure.
 fn notify(body: &str) {
-    let _ = std::process::Command::new("notify-send")
-        .arg("runnir")
-        .arg(body)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn();
+    platform::notify(body);
 }
 
 /// A PTY wake closure. Sends a user event through the proxy — the reliable way to
