@@ -6,15 +6,17 @@ import KeybindingsPage from './components/KeybindingsPage.jsx'
 import ConfigPage from './components/ConfigPage.jsx'
 import { SECTIONS } from './data/sections.js'
 import { FEATURES } from './data/features.js'
+import { useLang, UI } from './i18n.jsx'
 
-function matches(f, q) {
+// Construye el haystack de búsqueda en el idioma activo. / Search haystack in the active language.
+function matches(f, q, t) {
   if (!q) return true
   const hay = [
-    f.title, f.natural, f.note, f.palette, f.example,
-    ...(f.keys || []),
+    t(f.title), t(f.natural), t(f.note), f.palette, f.example,
+    ...((f.keys || []).map(t)),
     ...(f.escape || []),
-    ...((f.config || []).flatMap((c) => [c.k, c.v, c.d])),
-  ].join(' ').toLowerCase()
+    ...((f.config || []).flatMap((c) => [c.k, c.v, t(c.d)])),
+  ].filter(Boolean).join(' ').toLowerCase()
   return hay.includes(q)
 }
 
@@ -25,6 +27,7 @@ function initialView() {
 }
 
 export default function App() {
+  const { t } = useLang()
   const [view, setViewState] = useState(initialView)
   const setView = (v) => {
     setViewState(v)
@@ -37,7 +40,7 @@ export default function App() {
   const [activeSection, setActiveSection] = useState(SECTIONS[0].id)
   const q = query.trim().toLowerCase()
 
-  const filtered = useMemo(() => FEATURES.filter((f) => matches(f, q)), [q])
+  const filtered = useMemo(() => FEATURES.filter((f) => matches(f, q, t)), [q, t])
 
   const bySection = useMemo(() => {
     const map = {}
@@ -56,7 +59,7 @@ export default function App() {
     return { total: FEATURES.length, shipped, dev: FEATURES.length - shipped }
   }, [])
 
-  // Scrollspy: resalta la seccion visible en la barra lateral.
+  // Scrollspy: resalta la sección visible en la barra lateral.
   useEffect(() => {
     if (view !== 'guia') return
     const obs = new IntersectionObserver(
@@ -90,7 +93,7 @@ export default function App() {
             {!q && <Hero />}
 
             {q && filtered.length === 0 && (
-              <p className="empty">Sin resultados para “{query}”. Prueba con otra palabra.</p>
+              <p className="empty">{t(UI.emptyPrefix)} “{query}”. {t(UI.emptySuffix)}</p>
             )}
 
             {SECTIONS.map((s) => {
@@ -99,20 +102,20 @@ export default function App() {
               return (
                 <section key={s.id}>
                   <div className="section-head" id={`sec-${s.id}`}>
-                    <h2>{s.title}</h2>
-                    <p className="blurb">{s.blurb}</p>
+                    <h2>{t(s.title)}</h2>
+                    <p className="blurb">{t(s.blurb)}</p>
                   </div>
                   <hr className="section-rule" />
-                  {items.map((f) => <FeatureCard key={f.title} f={f} />)}
+                  {items.map((f) => <FeatureCard key={f.key} f={f} />)}
                 </section>
               )
             })}
 
             <p className="foot">
-              runnir — {totals.total} funciones documentadas ({totals.shipped} disponibles,{' '}
-              {totals.dev} en desarrollo). Contenido derivado de docs/DEVLOG.md, src/docs.rs,
-              src/actions.rs y src/config.rs. Capturas generadas con runnir --render / --demo.
-              <br />“rún” (susurro, en nordico antiguo) + “-nir” de Mjölnir. Un sitio donde susurrarle a la maquina.
+              runnir — {totals.total} {t({ es: 'funciones documentadas', en: 'documented features' })} ({totals.shipped}{' '}
+              {t({ es: 'disponibles', en: 'shipped' })}, {totals.dev} {t({ es: 'en desarrollo', en: 'in development' })}).{' '}
+              {t(UI.footTail)}
+              <br />{t(UI.footEtymology)}
             </p>
           </div>
         )}
