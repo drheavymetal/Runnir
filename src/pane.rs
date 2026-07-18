@@ -163,7 +163,19 @@ impl Pane {
     /// so each line notifies at most once.
     pub fn take_watch_hit(&mut self) -> Option<String> {
         let kw = self.watch.clone()?;
-        let (text, end) = self.grid.lock().unwrap().text_since_stable(self.watch_stable);
+        let (text, end) = {
+            let g = self.grid.lock().unwrap();
+            // While a full-screen app is up the primary screen and scrollback are
+            // frozen, and the watch mark is derived from the alt cursor (which moves
+            // up and down as you edit). Scanning it would notify on the file's own
+            // text and, because the mark can regress, re-notify every poll. Skip
+            // entirely and leave watch_stable untouched, so the pre-app mark is
+            // exactly right when the app exits.
+            if g.alt_screen() {
+                return None;
+            }
+            g.text_since_stable(self.watch_stable)
+        };
         self.watch_stable = end;
         text.lines()
             .find(|l| l.to_lowercase().contains(&kw))

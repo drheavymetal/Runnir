@@ -946,11 +946,15 @@ impl Gpu {
     }
 
     fn paste_text(&mut self, text: String) {
-        // Strip the bracketed-paste markers from the payload so a clipboard (or
-        // PRIMARY selection, now reachable by mere selection in another app) that
-        // contains `ESC[201~` cannot close the bracket early and smuggle a trailing
-        // `\r` into the shell as an executed command.
-        let text = text.replace("\x1b[200~", "").replace("\x1b[201~", "");
+        // Sanitize the payload: drop ESC and every other C0 control byte except tab,
+        // newline and carriage return. This removes the bracketed-paste end marker
+        // (`ESC[201~`) a hostile clipboard/PRIMARY might carry — and does so without
+        // the single-pass `replace` splicing trap (`ESC[2`+`ESC[201~`+`01~` would
+        // re-form a marker), since no ESC survives at all to start any sequence.
+        let text: String = text
+            .chars()
+            .filter(|&c| c == '\t' || c == '\n' || c == '\r' || !c.is_control())
+            .collect();
         let bracketed = self.tab().focused().bracketed_paste();
         let pane = self.tab().focused();
         if bracketed {
@@ -966,20 +970,31 @@ impl Gpu {
     /// Key bindings are rebuilt by the caller (they live on `App`, not `Gpu`).
     fn apply_config(&mut self, config: &Config) {
         self.renderer.set_theme(config.theme.clone());
-        self.renderer.set_opacity(config.window.opacity);
+        // Opacity only when the surface composites with alpha; on an opaque surface
+        // it would darken rather than reveal, same guard as at startup.
+        self.renderer
+            .set_opacity(if self.translucent { config.window.opacity } else { 1.0 });
         // Rebuild the font only when the CONFIG's font actually changed (family, size
         // or ligatures) — compared against what the config last asked for, not the
         // live size, so a colour-only edit does not snap a runtime zoom back, and a
         // family/ligature change (same size) is applied.
         let want = (config.font.family.clone(), config.font.size, config.font.ligatures);
         if want != self.applied_font {
-            if let Ok(mut font) = FontAtlas::new_with(&config.font.family, config.font.size) {
-                font.ligatures = config.font.ligatures;
-                self.renderer.replace_font(&self.device, font);
-                self.font_px = config.font.size;
-                self.reflow_all();
+            match FontAtlas::new_with(&config.font.family, config.font.size) {
+                Ok(mut font) => {
+                    font.ligatures = config.font.ligatures;
+                    self.renderer.replace_font(&self.device, font);
+                    self.font_px = config.font.size;
+                    // Only record success: a failed load must be retried on the next
+                    // save, not remembered as if it applied.
+                    self.applied_font = want;
+                    self.reflow_all();
+                }
+                Err(e) => {
+                    self.status = Some(format!("font '{}' failed: {e}", config.font.family));
+                    self.status_expiry = Some(Instant::now() + Duration::from_secs(4));
+                }
             }
-            self.applied_font = want;
         }
         self.window.request_redraw();
     }

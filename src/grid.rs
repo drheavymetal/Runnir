@@ -1179,15 +1179,21 @@ impl Perform for Grid {
                 // The cell pixel size is renderer environment, not terminal
                 // state: losing it would mis-size images placed after a reset.
                 let cell_px = self.cell_px;
-                // The bell counter is UI state the pane compares against; zeroing it
-                // would make a post-reset frame see a phantom bell (0 != last_seen).
+                // Counters the pane compares against are UI state, not screen state:
+                // zeroing bell_count fakes a bell, and zeroing command_seq (compared
+                // with `>`) silently suppresses every completion notification until
+                // the count climbs back. The title is likewise kept, as xterm does.
                 let bells = self.bell_count;
+                let cmd_seq = self.command_seq;
+                let title = std::mem::take(&mut self.title);
                 *self = Grid::new(self.cols, self.rows);
                 self.scrollback_limit = limit;
                 self.scrollback = scrollback;
                 self.dropped = dropped;
                 self.cell_px = cell_px;
                 self.bell_count = bells;
+                self.command_seq = cmd_seq;
+                self.title = title;
             }
             _ => return,
         }
@@ -1739,6 +1745,21 @@ mod tests {
         // Prompt start (A), the prompt itself, prompt end / input begins (B), command.
         feed(&mut g, "\x1b]133;A\x07pedro$ \x1b]133;B\x07rm -rf /");
         assert_eq!(g.current_command_text(), "rm -rf /");
+    }
+
+    #[test]
+    fn ris_preserves_ui_counters() {
+        let mut g = Grid::new(20, 3);
+        g.bell_count = 3;
+        // Two finished commands (OSC 133;D) bump command_seq.
+        feed(&mut g, "\x1b]133;D\x07\x1b]133;D\x07");
+        let seq = g.command_seq();
+        assert!(seq >= 2);
+        // RIS (ESC c) must not zero these, or the pane sees a phantom bell and
+        // suppresses completion notifications (compared with `>`).
+        feed(&mut g, "\x1bc");
+        assert_eq!(g.bell_count, 3, "bell_count reset by RIS");
+        assert_eq!(g.command_seq(), seq, "command_seq reset by RIS");
     }
 
     #[test]

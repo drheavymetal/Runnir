@@ -290,6 +290,10 @@ struct Gpu {
     /// tell an actual font change from an unrelated edit — and so a color-only reload
     /// does not snap a runtime font-zoom back to the configured size.
     applied_font: (String, f32, bool),
+    /// Whether the surface actually composites with alpha (PreMultiplied was
+    /// selected). Off means opacity must stay 1.0 or the window merely darkens — the
+    /// hot-reload path checks this before re-applying config opacity.
+    translucent: bool,
     ai: ai::Session,
     last_context_refresh: Instant,
     last_autosave: Instant,
@@ -441,6 +445,7 @@ impl App {
                 self.config.font.size,
                 self.config.font.ligatures,
             ),
+            translucent,
             ai: ai::Session::new(),
             last_context_refresh: Instant::now(),
             last_autosave: Instant::now(),
