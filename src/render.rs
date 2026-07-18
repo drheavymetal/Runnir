@@ -322,6 +322,7 @@ impl Renderer {
         panes: &[PaneDraw],
         decorations: &[SolidRect],
         overlay: Option<&Overlay>,
+        flash: f32,
         screen: (f32, f32),
     ) {
         // Build instances first: rasterizing a new glyph marks the atlas dirty, so
@@ -334,6 +335,13 @@ impl Renderer {
         // Pane borders / dividers, over the panes.
         for d in decorations {
             instances.push(solid_rect(d));
+        }
+        // A bell flashes the whole surface briefly (white backdrop at low alpha).
+        if flash > 0.0 {
+            let mut q = backdrop(screen, flash);
+            q.fg = [1.0, 1.0, 1.0, flash];
+            q.bg = [1.0, 1.0, 1.0, flash];
+            instances.push(q);
         }
         if let Some(ov) = overlay {
             // A dimming quad over the whole surface, then the overlay panels on top.
@@ -731,7 +739,7 @@ pub fn offscreen_scene(
                 })
                 .collect(),
         });
-        renderer.render(&device, &queue, &mut encoder, &view, &panes, &[], overlay.as_ref(), (width as f32, height as f32));
+        renderer.render(&device, &queue, &mut encoder, &view, &panes, &[], overlay.as_ref(), 0.0, (width as f32, height as f32));
     }
     encoder.copy_texture_to_buffer(
         wgpu::TexelCopyTextureInfo {
@@ -842,6 +850,7 @@ pub fn offscreen(path: &str, cmd: &str, font_px: f32, delay_ms: Option<u64>) {
             &panes,
             &[],
             None,
+            0.0,
             (width as f32, height as f32),
         );
     }

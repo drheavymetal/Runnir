@@ -27,8 +27,13 @@ working directory of the pane you were in, so it opens where you already are.
 @ Ctrl+Shift+D     split left / right
 @ Ctrl+Shift+E     split up / down
 @ Ctrl+Shift+X     close the focused pane
+@ Ctrl+Shift+Z     zoom the focused pane to fill the tab (toggle)
 @ Ctrl+Shift+HJKL  move focus left / down / up / right (vim directions)
 @ Super+arrows     resize the focused pane
+
+A pane that rings the terminal bell (BEL) flashes briefly; if the window is not
+focused it also raises the compositor urgency hint, so a finished build in the
+background gets your attention without stealing focus.
 
 Focus movement is geometric: 'focus right' goes to the pane you see to the right,
 whatever order you built the splits in.

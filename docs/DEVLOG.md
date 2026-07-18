@@ -38,7 +38,9 @@ DIFFERENTIAL (aim ~15 total incl. above):
 - [ ] D1 OSC 8 hyperlinks — clickable links apps emit (ls --hyperlink, gcc/cargo).
 - [ ] D2 Config hot-reload — watch ~/.config/runnir/runnir.toml, apply live.
 - [ ] D3 Shell-history fuzzy in palette — read fish/bash/zsh history, fuzzy pick, insert.
-- [ ] D4 Visual + audible bell — flash pane / urgency hint on BEL.
+- [x] D4 Visual + audible bell — BEL bumps grid.bell_count; Pane::take_bell; Gpu
+      bell_flash+check_bells+bell_alpha; render() flash param → white fullscreen quad;
+      request_user_attention(Critical) when unfocused. commit 26.
 - [ ] D5 Primary selection (middle-click paste of last selection) via wl-copy --primary.
 - [ ] D6 Command status gutter — exit code + duration next to each prompt (OSC 133 D + timing).
 - [ ] D7 Session summarizer (AI) — "what did I do here" from scrollback.

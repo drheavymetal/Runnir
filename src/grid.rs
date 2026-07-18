@@ -126,6 +126,9 @@ pub struct Grid {
     autowrap: bool,
     pub title: String,
     pub dirty: bool,
+    /// Count of BEL (0x07) received. The UI compares it against a last-seen value
+    /// to flash the pane and raise window urgency once per bell.
+    pub bell_count: u64,
     /// Replies the terminal owes the program (Device Attributes, cursor position).
     /// The PTY reader thread drains these and writes them back to the child. Without
     /// answering DA1, fish waits 10s per query and then disables features.
@@ -186,6 +189,7 @@ impl Grid {
             autowrap: true,
             title: String::new(),
             dirty: true,
+            bell_count: 0,
             responses: Vec::new(),
             images: Vec::new(),
             image_serial: 0,
@@ -961,6 +965,13 @@ impl Perform for Grid {
 
     fn execute(&mut self, byte: u8) {
         match byte {
+            0x07 => {
+                // BEL: count it so the UI can flash the pane and mark the window
+                // urgent. Does not move the cursor or clear a pending wrap.
+                self.bell_count = self.bell_count.wrapping_add(1);
+                self.dirty = true;
+                return;
+            }
             0x08 => self.col = self.col.saturating_sub(1),
             0x09 => self.col = (((self.col / 8) + 1) * 8).min(self.cols - 1),
             0x0a | 0x0b | 0x0c => self.linefeed(),
@@ -1652,5 +1663,16 @@ mod tests {
         feed(&mut g, "\x1b[1;1HX\x1b8Y");
         assert_eq!(g.cell(0, 0).ch, 'X');
         assert_eq!(g.cell(1, 4).ch, 'Y');
+    }
+
+    #[test]
+    fn bel_bumps_the_bell_count_without_printing() {
+        let mut g = Grid::new(10, 3);
+        assert_eq!(g.bell_count, 0);
+        feed(&mut g, "a\x07b");
+        assert_eq!(g.bell_count, 1);
+        // The BEL itself leaves no glyph: only 'a' and 'b' land.
+        assert_eq!(g.cell(0, 0).ch, 'a');
+        assert_eq!(g.cell(0, 1).ch, 'b');
     }
 }

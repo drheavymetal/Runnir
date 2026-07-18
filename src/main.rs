@@ -247,6 +247,8 @@ struct Gpu {
     resizing: Option<crate::layout::DividerHit>,
     /// When set, the focused pane of the active tab fills the whole area (zoom).
     zoomed: Option<u64>,
+    /// Until when a bell flash is drawn over the panes.
+    bell_flash: Option<Instant>,
     /// A transient status shown as a toast (e.g. "whispering…") while a background
     /// request is in flight, so an AI action never looks like it did nothing.
     status: Option<String>,
@@ -371,6 +373,7 @@ impl App {
             mouse_down: None,
             resizing: None,
             zoomed: None,
+            bell_flash: None,
             status: None,
             status_expiry: None,
             proxy: self.proxy.clone(),
@@ -531,6 +534,36 @@ impl ApplicationHandler<UserEvent> for App {
 impl Gpu {
     fn active_area(&self) -> Rect {
         content_area(&self.surface_config, self.renderer.cell_size(), self.tabs.len())
+    }
+
+    /// Detects a bell on any pane of the active tab: flashes briefly and raises the
+    /// window's urgency hint so a background bell is noticed.
+    fn check_bells(&mut self) {
+        let mut rang = false;
+        for pane in self.tabs[self.active].panes.values_mut() {
+            if pane.take_bell() {
+                rang = true;
+            }
+        }
+        if rang {
+            self.bell_flash = Some(Instant::now() + Duration::from_millis(120));
+            if !self.window.has_focus() {
+                self.window
+                    .request_user_attention(Some(winit::window::UserAttentionType::Critical));
+            }
+            self.window.request_redraw();
+        }
+    }
+
+    /// Bell-flash overlay alpha for this frame (0 = none), decaying over the window.
+    fn bell_alpha(&self) -> f32 {
+        match self.bell_flash {
+            Some(until) => {
+                let remaining = until.saturating_duration_since(Instant::now()).as_millis() as f32;
+                (remaining / 120.0 * 0.35).clamp(0.0, 0.35)
+            }
+            None => 0.0,
+        }
     }
 
     /// Pane rectangles for the active tab, honouring zoom: a zoomed pane fills the

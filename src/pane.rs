@@ -36,6 +36,7 @@ pub struct Pane {
     /// notifications. Tracked via OSC 133 marks when available, else the foreground.
     running_since: Option<(std::time::Instant, String)>,
     last_command_seq: u64,
+    last_bell: u64,
 }
 
 impl Pane {
@@ -62,6 +63,7 @@ impl Pane {
             title_override: None,
             running_since: None,
             last_command_seq: 0,
+            last_bell: 0,
         })
     }
 
@@ -113,6 +115,18 @@ impl Pane {
 
     pub fn scrollback_text(&self) -> Vec<String> {
         self.grid.lock().unwrap().scrollback_text()
+    }
+
+    /// Whether a bell (BEL) has arrived since the last call. Drives the visual
+    /// flash and window-urgency hint, once per bell.
+    pub fn take_bell(&mut self) -> bool {
+        let c = self.grid.lock().unwrap().bell_count;
+        if c != self.last_bell {
+            self.last_bell = c;
+            true
+        } else {
+            false
+        }
     }
 
     pub fn write(&mut self, bytes: &[u8]) {
