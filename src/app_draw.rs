@@ -327,6 +327,14 @@ impl Gpu {
                         Pen { fg: Color::Rgb(0x9a, 0x9d, 0xa4), bg: Color::Rgb(0x15, 0x16, 0x1a), ..Pen::default() }
                     };
                     bar.write_str(0, drawn as usize, &label, pen);
+                    // Recolour the badge glyph (last non-space cell) red/amber so a
+                    // fail or activity dot stands out from the label text.
+                    if let Some((ch, col)) = self.tab_badge(i) {
+                        let bcol = drawn as usize + w - 2;
+                        if bcol < avail_end {
+                            bar.write_str(0, bcol, &ch.to_string(), Pen { fg: Color::Rgb(col.0, col.1, col.2), bg: pen.bg, ..Pen::default() });
+                        }
+                    }
                 }
                 x += w + 1;
             }

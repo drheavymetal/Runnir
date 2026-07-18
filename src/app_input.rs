@@ -1037,9 +1037,30 @@ impl Gpu {
         None
     }
 
-    /// The label drawn for tab `i` in the bar: " N title ".
+    /// The label drawn for tab `i` in the bar: " <icon> N title <badge> ". The icon is
+    /// a nerd-font glyph for the foreground app; the badge is a dot for a background
+    /// tab with unseen output, or a red dot if its last command failed.
     fn tab_label(&self, i: usize) -> String {
-        format!(" {} {} ", i + 1, self.tabs[i].title())
+        let tab = &self.tabs[i];
+        let icon = tab_icon(&tab.proc_name());
+        let badge = match self.tab_badge(i) {
+            Some((ch, _)) => format!(" {ch}"),
+            None => String::new(),
+        };
+        format!(" {icon} {} {}{badge} ", i + 1, tab.title())
+    }
+
+    /// The status badge for tab `i` (char + colour), or `None`: a red ✗ if its last
+    /// command failed, else an amber ● if a background tab has unseen output.
+    fn tab_badge(&self, i: usize) -> Option<(char, (u8, u8, u8))> {
+        let tab = &self.tabs[i];
+        if tab.failed() {
+            Some(('\u{2717}', (0xe0, 0x4f, 0x4f)))
+        } else if i != self.active && tab.has_activity() {
+            Some(('\u{25cf}', (0xe8, 0xb3, 0x39)))
+        } else {
+            None
+        }
     }
 
     /// Cells reserved on the right of the tab bar for the broadcast / context tags,
@@ -1465,6 +1486,26 @@ fn write_private(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
 /// `O_NOFOLLOW` without a libc dependency. The value is stable across Linux archs.
 fn libc_o_nofollow() -> i32 {
     0o400000
+}
+
+/// A nerd-font icon for a foreground process name (the default font is a Nerd Font).
+/// Falls back to a generic terminal glyph.
+fn tab_icon(name: &str) -> char {
+    let n = name.to_ascii_lowercase();
+    let base = n.rsplit('/').next().unwrap_or(&n);
+    match base {
+        "vim" | "nvim" | "vi" => '\u{e62b}',
+        "git" | "lazygit" | "tig" => '\u{f1d3}',
+        "ssh" | "mosh" => '\u{f233}',
+        "docker" | "podman" | "kubectl" => '\u{f308}',
+        "python" | "python3" | "ipython" => '\u{e606}',
+        "node" | "npm" | "pnpm" | "yarn" | "deno" | "bun" => '\u{e718}',
+        "cargo" | "rustc" | "rust" | "rustup" => '\u{e7a8}',
+        "htop" | "btop" | "top" | "glances" => '\u{f080}',
+        "claude" | "aichat" | "ollama" => '\u{f544}',
+        "fish" | "bash" | "zsh" | "sh" | "dash" | "shell" => '\u{f489}',
+        _ => '\u{f120}',
+    }
 }
 
 /// Splits a layout command string into an argv on whitespace. Not a shell parse —

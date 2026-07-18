@@ -244,6 +244,23 @@ impl Tab {
         self.title_override.clone().unwrap_or_else(|| self.focused_ref().title.clone())
     }
 
+    /// The focused pane's process name, for choosing a tab icon.
+    pub fn proc_name(&self) -> String {
+        self.focused_ref().title.clone()
+    }
+
+    /// Any pane changed since its last render — a background tab's grid stays dirty
+    /// until shown, so this is "has unseen output" for the activity badge.
+    pub fn has_activity(&self) -> bool {
+        self.panes.values().any(|p| p.is_dirty())
+    }
+
+    /// Whether any pane's most recent command failed (non-zero exit), for the fail
+    /// badge.
+    pub fn failed(&self) -> bool {
+        self.panes.values().any(|p| matches!(p.last_exit(), Some(c) if c != 0))
+    }
+
     /// Captures this tab's layout and scrollback for the session file.
     pub fn to_session(&self) -> crate::session::TabState {
         let mut panes = std::collections::HashMap::new();

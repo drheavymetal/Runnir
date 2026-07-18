@@ -525,6 +525,12 @@ impl Grid {
         self.dropped
     }
 
+    /// Exit code of the most recently finished command, if OSC 133;D carried one.
+    /// Drives the tab fail badge.
+    pub fn last_exit(&self) -> Option<i32> {
+        self.cmd_exits.last().map(|&(_, e)| e)
+    }
+
     // ---- Command output folding (W2) ----------------------------------------
 
     /// Whether any output region is currently folded AND folds should apply now.

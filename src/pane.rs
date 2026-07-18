@@ -113,6 +113,17 @@ impl Pane {
         self.pty.alive()
     }
 
+    /// Whether the grid changed since the last render (used for the tab activity
+    /// badge: a background tab's grid stays dirty until it is shown again).
+    pub fn is_dirty(&self) -> bool {
+        self.grid.lock().unwrap().dirty
+    }
+
+    /// Exit code of this pane's most recent finished command, for the fail badge.
+    pub fn last_exit(&self) -> Option<i32> {
+        self.grid.lock().unwrap().last_exit()
+    }
+
     pub fn pty_pid(&self) -> Option<i32> {
         self.pty.pid()
     }
