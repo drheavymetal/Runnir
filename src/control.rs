@@ -318,16 +318,32 @@ pub fn start_listener(proxy: EventLoopProxy<UserEvent>) {
     });
 }
 
+/// The longest request line the server will buffer. A well-formed request is a
+/// few hundred bytes; the cap keeps a client that streams data without a newline
+/// from growing the terminal's memory without bound.
+const MAX_REQUEST: u64 = 64 * 1024;
+
+/// Reads one bounded request line off `reader` and parses it. Any failure —
+/// oversized line, unreadable bytes, malformed JSON — yields the error response
+/// to send back, so a misbehaving client always gets an answer instead of a
+/// silent hangup.
+fn read_request(reader: impl std::io::Read) -> Result<ControlRequest, ControlResponse> {
+    let mut line = String::new();
+    if let Err(e) = BufReader::new(reader.take(MAX_REQUEST)).read_line(&mut line) {
+        return Err(ControlResponse::error(format!("bad request: {e}")));
+    }
+    if !line.ends_with('\n') && line.len() as u64 >= MAX_REQUEST {
+        return Err(ControlResponse::error("request too large"));
+    }
+    serde_json::from_str(line.trim()).map_err(|e| ControlResponse::error(format!("bad request: {e}")))
+}
+
 /// Reads one JSON request line, bridges it to the UI thread, writes the JSON reply.
 fn handle_conn(stream: UnixStream, proxy: EventLoopProxy<UserEvent>) {
-    let mut line = String::new();
     let Ok(read_half) = stream.try_clone() else { return };
-    if BufReader::new(read_half).read_line(&mut line).is_err() {
-        return;
-    }
-    let resp = match serde_json::from_str::<ControlRequest>(line.trim()) {
+    let resp = match read_request(read_half) {
         Ok(req) => bridge(req, &proxy),
-        Err(e) => ControlResponse::error(format!("bad request: {e}")),
+        Err(resp) => resp,
     };
     let mut out = serde_json::to_vec(&resp).unwrap_or_else(|_| b"{\"ok\":false}".to_vec());
     out.push(b'\n');
@@ -547,6 +563,38 @@ mod tests {
     #[test]
     fn a_bare_token_is_rejected() {
         assert!(parse_client_args("send-text", &flags(&["oops"])).is_err());
+    }
+
+    #[test]
+    fn read_request_parses_a_valid_line() {
+        let req = read_request(&b"{\"cmd\":\"ls\"}\n"[..]).unwrap();
+        assert_eq!(req, ControlRequest::Ls);
+    }
+
+    #[test]
+    fn read_request_rejects_an_oversized_line_instead_of_buffering_it() {
+        // A newline-free stream longer than the cap must come back as an error
+        // response (bounded read), not be buffered until the client stops.
+        let big = vec![b'a'; (MAX_REQUEST as usize) + 512];
+        let resp = read_request(&big[..]).unwrap_err();
+        assert!(!resp.ok);
+        assert_eq!(resp.error.as_deref(), Some("request too large"));
+    }
+
+    #[test]
+    fn read_request_answers_unreadable_bytes_with_an_error_response() {
+        // Invalid UTF-8 used to drop the connection with no reply; the client
+        // deserves a response it can print.
+        let resp = read_request(&[0xff, 0xfe, 0xfd][..]).unwrap_err();
+        assert!(!resp.ok);
+        assert!(resp.error.unwrap().starts_with("bad request"));
+    }
+
+    #[test]
+    fn read_request_answers_malformed_json_with_an_error_response() {
+        let resp = read_request(&b"not json\n"[..]).unwrap_err();
+        assert!(!resp.ok);
+        assert!(resp.error.unwrap().starts_with("bad request"));
     }
 
     #[test]
