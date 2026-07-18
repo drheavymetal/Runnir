@@ -307,6 +307,9 @@ struct Gpu {
     translucent: bool,
     /// Show a status bar along the bottom (cwd, git branch, clock). Costs one row.
     status_bar: bool,
+    /// (path, dim) of the background last loaded, so hot-reload only re-decodes on a
+    /// real change (image decode is expensive).
+    applied_bg: (Option<String>, f32),
     /// Cached clock string ("HH:MM"), refreshed periodically to avoid formatting time
     /// (no chrono dep) every frame.
     clock: String,
@@ -415,9 +418,12 @@ impl App {
         font.ligatures = self.config.font.ligatures;
         let mut renderer = Renderer::new(&device, surface_config.format, font);
         renderer.set_theme(self.config.theme.clone());
-        // Only apply opacity when the surface actually composites with alpha; on an
-        // opaque surface it would merely darken the background, not reveal anything.
-        renderer.set_opacity(if translucent { self.config.window.opacity } else { 1.0 });
+        // Apply opacity when the compositor can show through (translucent) OR a
+        // background image is set (the image is drawn in-pass, behind the translucent
+        // cells, so it shows even on an opaque surface). Otherwise 1.0, or opacity
+        // would merely darken a solid background.
+        let want_opacity = translucent || self.config.window.background.is_some();
+        renderer.set_opacity(if want_opacity { self.config.window.opacity } else { 1.0 });
         load_background(&self.config, &device, &queue, &mut renderer);
 
         let cell = renderer.cell_size();
@@ -471,6 +477,7 @@ impl App {
             ),
             translucent,
             status_bar: self.config.window.status_bar,
+            applied_bg: (self.config.window.background.clone(), self.config.window.background_dim),
             clock: String::new(),
             last_clock: None,
             ai: ai::Session::new(),
@@ -541,6 +548,14 @@ fn load_background(config: &Config, device: &wgpu::Device, queue: &wgpu::Queue, 
     };
     match image::open(&expanded) {
         Ok(img) => {
+            // Clamp to the GPU's max texture size (default 8192), or a big wallpaper
+            // is a validation error → wgpu's default handler panics the process.
+            let max = device.limits().max_texture_dimension_2d;
+            let img = if img.width() > max || img.height() > max {
+                img.thumbnail(max, max)
+            } else {
+                img
+            };
             let rgba = img.to_rgba8();
             let (w, h) = rgba.dimensions();
             renderer.set_background(device, queue, Some((&rgba, w, h)), config.window.background_dim);

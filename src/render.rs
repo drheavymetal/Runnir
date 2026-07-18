@@ -1352,7 +1352,7 @@ impl Background {
             self.bind = None;
             return;
         };
-        if w == 0 || h == 0 || pixels.len() < (w * h * 4) as usize {
+        if w == 0 || h == 0 || pixels.len() < (w as usize) * (h as usize) * 4 {
             self.bind = None;
             return;
         }

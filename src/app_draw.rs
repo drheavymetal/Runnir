@@ -294,7 +294,7 @@ impl Gpu {
         // right edge — one dim bar per sampled line (width = how full the line is),
         // with the current viewport window highlighted. Click it to jump.
         if config.window.minimap {
-            if let Some((_, r, grid, ..)) = guards.iter().find(|(id, ..)| *id == focus) {
+            if let Some((_, r, grid, ..)) = guards.iter().find(|(id, ..)| *id == focus).filter(|(_, r, ..)| r.w > 46.0) {
                 let total = grid.total_rows();
                 let strip_w = 46.0f32;
                 let x0 = r.x + r.w - strip_w;

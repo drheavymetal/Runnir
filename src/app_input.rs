@@ -80,16 +80,16 @@ impl Gpu {
         if self.overlay.is_some() {
             return;
         }
+        // A mouse press leaves copy-mode (keyboard mode) before it can redirect focus
+        // onto another pane, which would otherwise strand its selection.
+        if state == ElementState::Pressed && self.copy_mode.is_some() {
+            self.exit_copy_mode(false);
+        }
         // A left press in the focused pane's minimap strip jumps to that position.
         if state == ElementState::Pressed && button == MouseButton::Left && config.window.minimap {
             if self.minimap_jump(self.cursor_px) {
                 return;
             }
-        }
-        // A mouse press leaves copy-mode (keyboard mode) before it can redirect focus
-        // onto another pane, which would otherwise strand its selection.
-        if state == ElementState::Pressed && self.copy_mode.is_some() {
-            self.exit_copy_mode(false);
         }
 
         // A left press on the tab bar switches tab; on a divider starts a resize.
@@ -859,11 +859,16 @@ impl Gpu {
     fn minimap_jump(&mut self, pos: PhysicalPosition<f64>) -> bool {
         let area = self.active_area();
         let focus = self.tab().focused_ptr();
-        let Some((_, r)) = self.tabs[self.active].layout(area).into_iter().find(|(id, _)| *id == focus)
-        else {
+        // Use the rect the minimap was DRAWN in (visible_rects honours zoom), not the
+        // split layout, or a click maps to the wrong region when a pane is zoomed.
+        let Some((_, r)) = self.visible_rects(area).into_iter().find(|(id, _)| *id == focus) else {
             return false;
         };
         let strip_w = 46.0;
+        // A pane narrower than the strip has no minimap (it would escape the pane).
+        if r.w <= strip_w {
+            return false;
+        }
         let (x, y) = (pos.x as f32, pos.y as f32);
         if x < r.x + r.w - strip_w || x > r.x + r.w || y < r.y || y > r.y + r.h {
             return false;
@@ -1385,11 +1390,17 @@ impl Gpu {
             self.reflow_all();
         }
         self.renderer.set_theme(config.theme.clone());
-        // Opacity only when the surface composites with alpha; on an opaque surface
-        // it would darken rather than reveal, same guard as at startup.
+        // Opacity when the compositor shows through OR a background image is set
+        // (same reasoning as at startup).
+        let want_opacity = self.translucent || config.window.background.is_some();
         self.renderer
-            .set_opacity(if self.translucent { config.window.opacity } else { 1.0 });
-        crate::load_background(config, &self.device, &self.queue, &mut self.renderer);
+            .set_opacity(if want_opacity { config.window.opacity } else { 1.0 });
+        // Reload the background only when its path/dim changed (decoding is expensive).
+        let bg = (config.window.background.clone(), config.window.background_dim);
+        if bg != self.applied_bg {
+            self.applied_bg = bg.clone();
+            crate::load_background(config, &self.device, &self.queue, &mut self.renderer);
+        }
         // Rebuild the font only when the CONFIG's font actually changed (family, size
         // or ligatures) — compared against what the config last asked for, not the
         // live size, so a colour-only edit does not snap a runtime zoom back, and a
