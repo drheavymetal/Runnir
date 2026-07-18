@@ -52,7 +52,7 @@ DIFFERENTIAL (aim ~15 total incl. above):
 - [ ] D8 Broadcast groups — broadcast to a named subset of panes.
 - [ ] D9 Smooth/momentum scroll.
 - [x] D10 Pane zoom (Ctrl+Shift+Z) — visible_rects override + resize_one. commit 25.
-- [ ] D11 Open scrollback in $EDITOR / pipe pane to editor.
+- [x] D11 Open scrollback in $EDITOR — dump scrollback_text to temp file, split_running $EDITOR/$VISUAL/vi. commit 31.
 - [ ] D12 Copy-mode with vim motions (keyboard scrollback nav + select).
 - [x] D13 Tab reordering — MoveTabLeft/Right (Ctrl+Shift+Left/Right), Vec::swap +
       keep focus, wrap-around. commit 29.

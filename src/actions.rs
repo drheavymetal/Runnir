@@ -49,6 +49,7 @@ pub enum Action {
     JumpNextPrompt,
     CopyLastOutput,
     SearchScrollback,
+    OpenScrollbackInEditor,
     // Font
     FontBigger,
     FontSmaller,
@@ -111,6 +112,7 @@ impl Action {
             JumpNextPrompt => "jump_next_prompt",
             CopyLastOutput => "copy_last_output",
             SearchScrollback => "search",
+            OpenScrollbackInEditor => "open_scrollback_in_editor",
             FontBigger => "font_bigger",
             FontSmaller => "font_smaller",
             FontReset => "font_reset",
@@ -169,6 +171,7 @@ impl Action {
             JumpNextPrompt => "Jump to next command",
             CopyLastOutput => "Copy last command output",
             SearchScrollback => "Search scrollback",
+            OpenScrollbackInEditor => "Open scrollback in $EDITOR",
             FontBigger => "Increase font size",
             FontSmaller => "Decrease font size",
             FontReset => "Reset font size",
@@ -230,6 +233,7 @@ impl Action {
             "jump_next_prompt" => JumpNextPrompt,
             "copy_last_output" => CopyLastOutput,
             "search" => SearchScrollback,
+            "open_scrollback_in_editor" => OpenScrollbackInEditor,
             "font_bigger" => FontBigger,
             "font_smaller" => FontSmaller,
             "font_reset" => FontReset,
@@ -301,6 +305,7 @@ impl Action {
             Paste,
             CopyLastOutput,
             SearchScrollback,
+            OpenScrollbackInEditor,
             ScrollToTop,
             ScrollToBottom,
             JumpPrevPrompt,
@@ -456,6 +461,7 @@ fn default_bindings() -> HashMap<Chord, Action> {
     bind(&mut m, "ctrl+shift+v", Paste);
     bind(&mut m, "ctrl+shift+o", CopyLastOutput);
     bind(&mut m, "ctrl+shift+f", SearchScrollback);
+    bind(&mut m, "ctrl+shift+q", OpenScrollbackInEditor);
     bind(&mut m, "shift+pageup", ScrollPageUp);
     bind(&mut m, "shift+pagedown", ScrollPageDown);
     bind(&mut m, "ctrl+shift+home", ScrollToTop);
@@ -498,6 +504,7 @@ pub fn default_hints() -> HashMap<String, String> {
         ("paste", "Ctrl+Shift+V"),
         ("copy_last_output", "Ctrl+Shift+O"),
         ("search", "Ctrl+Shift+F"),
+        ("open_scrollback_in_editor", "Ctrl+Shift+Q"),
         ("command_palette", "Ctrl+Shift+P"),
         ("show_docs", "F1"),
         ("toggle_ai", "Ctrl+Shift+A"),

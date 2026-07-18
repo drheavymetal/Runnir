@@ -356,6 +356,7 @@ impl Gpu {
             Action::AiCommand => self.ai_command(),
             Action::AiExplain => self.ai_explain_selection(config),
             Action::SummarizeSession => self.summarize_session(config),
+            Action::OpenScrollbackInEditor => self.open_scrollback_in_editor(config),
             Action::QuickConnect => self.open_quick_connect(),
             Action::HintMode => self.open_hints(),
             Action::LaunchClaude => self.launch_claude(config),
@@ -545,6 +546,7 @@ impl Gpu {
             Action::AiCommand => self.ai_command(),
             Action::AiExplain => self.ai_explain_selection(config),
             Action::SummarizeSession => self.summarize_session(config),
+            Action::OpenScrollbackInEditor => self.open_scrollback_in_editor(config),
             Action::Whisper => self.whisper(),
             Action::SearchScrollback => self.overlay = Some(Overlay::Search(overlay::Search::new())),
             Action::QuickConnect => self.open_quick_connect(),
@@ -829,6 +831,31 @@ impl Gpu {
             self.font_px = px;
             self.reflow_all();
         }
+    }
+
+    /// Dumps the focused pane's scrollback to a temp file and opens it in $EDITOR
+    /// (or $VISUAL, else vi) in a new split — for searching, copying or saving long
+    /// output with a real editor instead of the terminal's own scrollback.
+    fn open_scrollback_in_editor(&mut self, config: &Config) {
+        let text = self.tab().focused().scrollback_text().join("\n");
+        // A per-pane filename (the pty pid) so repeated dumps of the same pane reuse
+        // one path and a fresh dump overwrites the stale one.
+        let pid = self.tab().focused().pty_pid().unwrap_or(0);
+        let path = std::env::temp_dir().join(format!("runnir-scrollback-{pid}.txt"));
+        if let Err(e) = std::fs::write(&path, text) {
+            self.status = Some(format!("could not write scrollback: {e}"));
+            self.status_expiry = Some(Instant::now() + Duration::from_secs(4));
+            self.window.request_redraw();
+            return;
+        }
+        let editor = std::env::var("EDITOR")
+            .or_else(|_| std::env::var("VISUAL"))
+            .unwrap_or_else(|_| "vi".into());
+        // $EDITOR may carry args (e.g. "code -w"); split on whitespace and append the
+        // file. Not a full shell parse, but it covers the common cases.
+        let mut argv: Vec<String> = editor.split_whitespace().map(str::to_string).collect();
+        argv.push(path.to_string_lossy().into_owned());
+        self.split_running(config, argv);
     }
 
     fn split_running(&mut self, config: &Config, command: Vec<String>) {

@@ -47,6 +47,7 @@ whatever order you built the splits in.
 @ middle click              paste
 @ Ctrl+Shift+Home/End       jump to top / live output
 @ Ctrl+Shift+F              search the scrollback; Enter/Up next/prev, Esc closes
+@ Ctrl+Shift+Q              dump the scrollback to $EDITOR in a new split
 
 # Mouse in full-screen apps
 
