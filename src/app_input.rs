@@ -379,7 +379,8 @@ impl Gpu {
             a if a.resize_dir().is_some() => {
                 self.tab().resize_focused(area, a.resize_dir().unwrap());
             }
-            Action::FocusNext => self.tab().focus_next(),
+            Action::FocusNext => self.tab().focus_next(area),
+            Action::CycleLayout => self.cycle_layout(area),
 
             Action::Copy => self.copy_selection(),
             Action::Paste => self.paste(),
@@ -795,6 +796,7 @@ impl Gpu {
             Action::ClosePane => {
                 self.tab().close_focused(area);
             }
+            Action::CycleLayout => self.cycle_layout(area),
             Action::ScrollToTop => {
                 let max = self.focused_scrollback_len();
                 self.glide_focused_to(max, config.behaviour.smooth_scroll);
@@ -1040,6 +1042,16 @@ impl Gpu {
     fn focused_scrollback_len(&mut self) -> f32 {
         let g = self.tab().focused().grid.lock().unwrap();
         (g.total_rows() - g.rows()) as f32
+    }
+
+    /// Cycles the active tab's layout mode and shows the new mode as a brief toast.
+    /// Reapplies any zoom so a zoomed pane stays full-size across the switch.
+    fn cycle_layout(&mut self, area: Rect) {
+        let mode = self.tabs[self.active].cycle_layout(area);
+        self.reapply_zoom();
+        self.status = Some(format!("layout: {}", mode.label()));
+        self.status_expiry = Some(Instant::now() + Duration::from_secs(2));
+        self.window.request_redraw();
     }
 
     fn toggle_zoom(&mut self) {
