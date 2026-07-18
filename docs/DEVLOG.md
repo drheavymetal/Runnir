@@ -5,6 +5,8 @@ Working memory across sessions. When context runs out, read this first to resume
 Repo: `git@github.com:drheavymetal/Runnar.git` (repo **Runnar**, crate **runnir**).
 Commits **unsigned** (`git -c commit.gpgsign=false commit`). Push after each unit.
 Build: `cargo build` / test: `cargo test` / release: `cargo build --release`.
+Shell is fish: NEVER put backticks in `git commit -m "..."` — fish command-substitutes
+them even inside double quotes and silently drops the word. Use plain quotes.
 Relaunch live: `pkill -x runnir; setsid ./target/release/runnir >/tmp/runnir-live.log 2>&1 </dev/null & disown`.
 Verify headless: `runnir --dump '<cmd>'`, `runnir --render out.png '<cmd>' [ms]`, `runnir --demo out.png`.
 
@@ -59,6 +61,8 @@ Fable 5 bug-hunt on the 4 new features → 11 findings fixed (commit 48):
   when scrolled back; Ctrl/Alt/Super exits instead of mis-reading as motion.
 - D15 trail: prune in about_to_wait (was 60Hz spin-loop forever when occluded); skip
   sampling while scrolled back; key last_cursor_rect to pane (no ghost on focus jump).
+Verify round on those 11 fixes → all correct, only 3 lows (commit 49): trail ghost on
+relayout, CSI 3J cmd_exits prune, copy-mode end_selection. CONVERGED.
 NEXT: only W2 folding left (rewrites row/coord mapping — needs a dedicated session).
 
 ## Current task: add 15–20 differential features, 4–5 "wow". Document each here.
