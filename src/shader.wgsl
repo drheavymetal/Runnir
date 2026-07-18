@@ -91,9 +91,12 @@ fn in_band(y: f32, band: vec2<f32>) -> bool {
 
 // Whether the pixel at `local` (pixels from the cell's top-left) lies on the
 // underline decoration of the given style. `band` is (top y, thickness) of the
-// plain single underline; `cellw` is the cell width in pixels, used as the
-// period for the wavy/dotted/dashed forms. Style 0 draws nothing.
-fn underline_hit(style: u32, local: vec2<f32>, band: vec2<f32>, cellw: f32) -> bool {
+// plain single underline; `cell` is the cell size in pixels — x drives the
+// period of the wavy/dotted/dashed forms, y bounds the taller shapes. The quad
+// only covers the cell, so anything past cell.y is silently clipped: double and
+// curly shift up as needed to fit, because the underline position sits within a
+// pixel of the cell bottom at common font sizes. Style 0 draws nothing.
+fn underline_hit(style: u32, local: vec2<f32>, band: vec2<f32>, cell: vec2<f32>) -> bool {
     if style == 0u {
         return false;
     }
@@ -105,18 +108,24 @@ fn underline_hit(style: u32, local: vec2<f32>, band: vec2<f32>, cellw: f32) -> b
     if style == 1u {
         return y >= uy && y < uy + th;
     }
-    // Double: the band plus a second one a thickness-and-a-gap below it.
+    // Double: the band plus a second one a thickness-and-a-gap below it, the
+    // pair shifted up so the second band stays inside the cell — drawn at `uy`
+    // it falls past the bottom edge and double renders as single.
     if style == 2u {
         let gap = th + max(th, 1.0);
-        return (y >= uy && y < uy + th) || (y >= uy + gap && y < uy + gap + th);
+        let top = uy - max(uy + gap + th - cell.y, 0.0);
+        return (y >= top && y < top + th) || (y >= top + gap && y < top + gap + th);
     }
-    // Curly: a sine wave oscillating around the band, drawn with a soft width so
-    // the crests stay solid. Amplitude and half-width scale with the thickness.
+    // Curly: a sine wave spanning [base, base + 2*amp] (plus the stroke's
+    // half-width), drawn soft so the crests stay solid. Shifted up to fit
+    // inside the cell, or the lower crests are cut flat at the bottom edge.
     if style == 3u {
         let amp = max(th, 1.0);
-        let period = max(cellw * 0.5, 4.0);
-        let center = uy + amp + amp * sin(x / period * 6.28318530718);
-        return abs(y - center) <= th * 0.6 + 0.5;
+        let period = max(cell.x * 0.5, 4.0);
+        let half = th * 0.6 + 0.5;
+        let base = uy - max(uy + 2.0 * amp + half - cell.y, 0.0);
+        let center = base + amp + amp * sin(x / period * 6.28318530718);
+        return abs(y - center) <= half;
     }
     // Dotted: the band chopped into a short on/off cycle along x.
     if style == 4u {
@@ -124,7 +133,7 @@ fn underline_hit(style: u32, local: vec2<f32>, band: vec2<f32>, cellw: f32) -> b
         return fract(x / period) < 0.5 && y >= uy && y < uy + th;
     }
     // Dashed: the band with a longer on/off cycle.
-    let period = max(cellw * 0.5, 6.0);
+    let period = max(cell.x * 0.5, 6.0);
     return fract(x / period) < 0.6 && y >= uy && y < uy + th;
 }
 
@@ -166,7 +175,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     if struck {
         color = vec4<f32>(in.fg.rgb, max(out_a, 1.0));
     }
-    if underline_hit(in.underline_style, in.local, u.underline, u.cell.x) {
+    if underline_hit(in.underline_style, in.local, u.underline, u.cell) {
         // Alpha 0 on the underline colour means "reuse the foreground".
         let deco = select(in.fg.rgb, in.underline_color.rgb, in.underline_color.a > 0.0);
         color = vec4<f32>(deco, max(out_a, 1.0));
