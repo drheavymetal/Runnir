@@ -4,11 +4,15 @@ export default function Hero() {
   const { t } = useLang()
   return (
     <header className="hero">
-      <img className="hero-logo" src="./logo.png" alt="runnir — terminal" />
-      <h1 className="sr-only">runnir</h1>
-      <p className="hero-tag">{t(UI.heroTag)}</p>
-      <div className="hero-meta">
-        {UI.heroPills.map((p, i) => <span className="pill" key={i}>{t(p)}</span>)}
+      <div className="hero-top">
+        <img className="hero-logo" src="./logo-t.png" alt="runnir — terminal" />
+        <div className="hero-intro">
+          <h1 className="sr-only">runnir</h1>
+          <p className="hero-tag">{t(UI.heroTag)}</p>
+          <div className="hero-meta">
+            {UI.heroPills.map((p, i) => <span className="pill" key={i}>{t(p)}</span>)}
+          </div>
+        </div>
       </div>
 
       <div className="term">
