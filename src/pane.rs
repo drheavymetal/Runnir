@@ -300,6 +300,12 @@ impl Pane {
         self.grid.lock().unwrap().last_command_output()
     }
 
+    /// Text to pipe into an external command: the whole scrollback when `whole`,
+    /// otherwise just the last command's OSC 133 output block (`None` if unmarked).
+    pub fn pipe_text(&self, whole: bool) -> Option<String> {
+        self.grid.lock().unwrap().pipe_text(whole)
+    }
+
     /// Recomputes the pane's context and title from its foreground process. Cheap
     /// enough (two `/proc` reads) to call on a timer.
     pub fn refresh_context(&mut self, config: &Config) {

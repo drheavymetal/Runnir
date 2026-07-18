@@ -469,6 +469,8 @@ impl Gpu {
             Action::AiExplain => self.ai_explain_selection(config),
             Action::SummarizeSession => self.summarize_session(config),
             Action::OpenScrollbackInEditor => self.open_scrollback_in_editor(config),
+            Action::PipeLastOutput => self.open_pipe_prompt(PromptKind::PipeLastOutput),
+            Action::PipeScrollback => self.open_pipe_prompt(PromptKind::PipeScrollback),
             Action::HistorySearch => self.history_search(),
             Action::WatchKeyword => self.watch_keyword(),
             Action::LaunchLayout => self.open_layout_picker(config),
@@ -784,6 +786,8 @@ impl Gpu {
             Action::AiExplain => self.ai_explain_selection(config),
             Action::SummarizeSession => self.summarize_session(config),
             Action::OpenScrollbackInEditor => self.open_scrollback_in_editor(config),
+            Action::PipeLastOutput => self.open_pipe_prompt(PromptKind::PipeLastOutput),
+            Action::PipeScrollback => self.open_pipe_prompt(PromptKind::PipeScrollback),
             Action::HistorySearch => self.history_search(),
             Action::WatchKeyword => self.watch_keyword(),
             Action::LaunchLayout => self.open_layout_picker(config),
@@ -1174,6 +1178,16 @@ impl Gpu {
             PromptKind::LaunchLayout => {
                 if !value.is_empty() {
                     self.launch_layout(value, config);
+                }
+            }
+            PromptKind::PipeLastOutput => {
+                if !value.trim().is_empty() {
+                    self.pipe_through(value, false, config);
+                }
+            }
+            PromptKind::PipeScrollback => {
+                if !value.trim().is_empty() {
+                    self.pipe_through(value, true, config);
                 }
             }
         }
@@ -1641,6 +1655,56 @@ impl Gpu {
         // file. Not a full shell parse, but it covers the common cases.
         let mut argv: Vec<String> = editor.split_whitespace().map(str::to_string).collect();
         argv.push(path.to_string_lossy().into_owned());
+        self.split_running(config, argv);
+    }
+
+    /// Opens the small text-input overlay to type a filter command; confirming
+    /// pipes the captured text through it (see `pipe_through`).
+    fn open_pipe_prompt(&mut self, kind: PromptKind) {
+        let label = match kind {
+            PromptKind::PipeScrollback => "Pipe scrollback through",
+            _ => "Pipe last output through",
+        };
+        self.overlay = Some(Overlay::Prompt(Prompt::new(kind, label, Vec::new())));
+        self.window.request_redraw();
+    }
+
+    /// Captures text from the focused pane — the last OSC 133 output block, or the
+    /// whole scrollback when `whole` — writes it to a private temp file, and opens
+    /// a new split running the user's command with that text on stdin.
+    fn pipe_through(&mut self, command: String, whole: bool, config: &Config) {
+        let Some(text) = self.tab().focused().pipe_text(whole) else {
+            self.status = Some("no command output marked yet (needs shell integration)".into());
+            self.status_expiry = Some(Instant::now() + Duration::from_secs(4));
+            self.window.request_redraw();
+            return;
+        };
+        // Per-pane filename (the pty pid) in $XDG_RUNTIME_DIR (a per-user 0700 dir),
+        // so a fresh capture overwrites the stale one and the text — which may hold
+        // secrets — is never left world-readable or predictably pre-emptable.
+        let pid = self.tab().focused().pty_pid().unwrap_or(0);
+        let dir = std::env::var_os("XDG_RUNTIME_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let path = dir.join(format!("runnir-pipe-{pid}.txt"));
+        if let Err(e) = write_private(&path, text.as_bytes()) {
+            self.status = Some(format!("could not write pipe input: {e}"));
+            self.status_expiry = Some(Instant::now() + Duration::from_secs(4));
+            self.window.request_redraw();
+            return;
+        }
+        // Run the user's command through a POSIX shell with the captured text on
+        // stdin. The file path is passed as $1 (not interpolated into the script)
+        // so an odd path can neither break the redirect nor inject the command;
+        // the command itself is the user's, so it keeps full shell power.
+        let script = format!("{command} < \"$1\"");
+        let argv = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            script,
+            "runnir-pipe".to_string(),
+            path.to_string_lossy().into_owned(),
+        ];
         self.split_running(config, argv);
     }
 

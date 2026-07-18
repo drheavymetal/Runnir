@@ -826,6 +826,17 @@ impl Grid {
         Some(self.text_range((from, 0), (to.max(from), self.cols.saturating_sub(1))))
     }
 
+    /// Text to feed into a pipe command. When `whole` is true it is the entire
+    /// scrollback (screen included); otherwise it is just the last command's
+    /// OSC 133 output block, which is `None` when no command output was marked.
+    pub fn pipe_text(&self, whole: bool) -> Option<String> {
+        if whole {
+            Some(self.scrollback_text().join("\n"))
+        } else {
+            self.last_command_output()
+        }
+    }
+
     /// Finds every occurrence of `needle` (case-insensitive) across scrollback and
     /// screen, returning each match's absolute `(row, col)` start. Matches within a
     /// single row only — a query does not span a line wrap.
@@ -2443,6 +2454,36 @@ mod tests {
         feed(&mut g, "\x1b]133;D\x07");
         let text = g.last_command_output().expect("output range must survive 3J");
         assert!(text.contains("out"), "the marked output must still resolve: {text:?}");
+    }
+
+    #[test]
+    fn pipe_text_selects_last_output_or_whole_scrollback() {
+        // The pipe feature captures either the last OSC 133 output block or the
+        // entire scrollback; pipe_text must switch between them on `whole`.
+        let mut g = Grid::new(20, 3);
+        feed(&mut g, "intro line\r\n");
+        feed(&mut g, "\x1b]133;C\x07"); // command output begins
+        feed(&mut g, "marked out\r\n");
+        feed(&mut g, "\x1b]133;D\x07"); // command output ends
+
+        let last = g.pipe_text(false).expect("last output must resolve");
+        assert!(last.contains("marked out"), "last output has the marked block: {last:?}");
+        assert!(!last.contains("intro line"), "last output excludes pre-command rows: {last:?}");
+
+        let whole = g.pipe_text(true).expect("scrollback is always available");
+        assert!(whole.contains("marked out"), "whole scrollback has the output: {whole:?}");
+        assert!(whole.contains("intro line"), "whole scrollback has earlier rows: {whole:?}");
+    }
+
+    #[test]
+    fn pipe_text_last_output_is_none_without_marks() {
+        // With no OSC 133 marks there is no last-output range, but the whole
+        // scrollback must still be pipeable.
+        let mut g = Grid::new(20, 3);
+        feed(&mut g, "plain text\r\n");
+        assert!(g.pipe_text(false).is_none(), "no marks means no last-output block");
+        let whole = g.pipe_text(true).expect("scrollback is always available");
+        assert!(whole.contains("plain text"));
     }
 
     #[test]

@@ -100,6 +100,17 @@ For fish, add to config.fish:
     printf '\\e]133;D\\e\\\\'
   end
 
+# Pipe output through a command
+
+From the palette, Pipe last output through command opens a small input where you
+type a filter — grep error, sort -u, jq . — and runnir runs it in a new split with
+the last command output fed to it on stdin. Pipe scrollback through command does
+the same but feeds the whole scrollback. The command runs through sh, so pipes and
+redirection work. The last-output variant needs OSC 133 to know where the block is.
+
+@ example    Pipe last output through, then type: grep -i error
+@ example    Pipe scrollback through, then type: sort | uniq -c | sort -rn
+
 # SSH awareness
 
 runnir watches the foreground process of each pane. When it is ssh, the pane is
