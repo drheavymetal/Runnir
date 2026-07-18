@@ -1,0 +1,106 @@
+// Chuleta de atajos. Derivada de src/actions.rs (default_bindings + default_hints)
+// y src/docs.rs. id = identificador de la accion en el config ([keys]).
+export const KEY_GROUPS = [
+  {
+    group: 'Pestanas',
+    rows: [
+      { keys: ['Ctrl+Shift+T'], id: 'new_tab', title: 'Nueva pestana' },
+      { keys: ['Ctrl+Shift+W'], id: 'close_tab', title: 'Cerrar pestana' },
+      { keys: ['Ctrl+Tab', 'Ctrl+PageDown'], id: 'next_tab', title: 'Pestana siguiente' },
+      { keys: ['Ctrl+Shift+Tab', 'Ctrl+PageUp'], id: 'prev_tab', title: 'Pestana anterior' },
+      { keys: ['Super+1 .. Super+9'], id: 'go_to_tab_N', title: 'Ir a la pestana N' },
+      { keys: ['Ctrl+Shift+R'], id: 'rename_tab', title: 'Renombrar pestana' },
+      { keys: ['Ctrl+Shift+U'], id: 'reopen_closed', title: 'Reabrir pestana cerrada' },
+      { keys: ['Ctrl+Shift+Left'], id: 'move_tab_left', title: 'Mover pestana a la izquierda' },
+      { keys: ['Ctrl+Shift+Right'], id: 'move_tab_right', title: 'Mover pestana a la derecha' },
+    ],
+  },
+  {
+    group: 'Paneles (splits)',
+    rows: [
+      { keys: ['Ctrl+Shift+D'], id: 'split_horizontal', title: 'Dividir izquierda/derecha' },
+      { keys: ['Ctrl+Shift+E'], id: 'split_vertical', title: 'Dividir arriba/abajo' },
+      { keys: ['Ctrl+Shift+X'], id: 'close_pane', title: 'Cerrar panel' },
+      { keys: ['Ctrl+Shift+H'], id: 'focus_left', title: 'Foco al panel de la izquierda' },
+      { keys: ['Ctrl+Shift+J'], id: 'focus_down', title: 'Foco al panel de abajo' },
+      { keys: ['Ctrl+Shift+K'], id: 'focus_up', title: 'Foco al panel de arriba' },
+      { keys: ['Ctrl+Shift+L'], id: 'focus_right', title: 'Foco al panel de la derecha' },
+      { keys: ['Super+Left'], id: 'resize_left', title: 'Encoger panel' },
+      { keys: ['Super+Right'], id: 'resize_right', title: 'Agrandar panel' },
+      { keys: ['Super+Up'], id: 'resize_up', title: 'Agrandar panel hacia arriba' },
+      { keys: ['Super+Down'], id: 'resize_down', title: 'Agrandar panel hacia abajo' },
+      { keys: ['Ctrl+Shift+Z'], id: 'toggle_zoom', title: 'Zoom / des-zoom del panel enfocado' },
+    ],
+  },
+  {
+    group: 'Portapapeles e historial',
+    rows: [
+      { keys: ['Ctrl+Shift+C'], id: 'copy', title: 'Copiar seleccion' },
+      { keys: ['Ctrl+Shift+V'], id: 'paste', title: 'Pegar' },
+      { keys: ['Clic central'], id: '(primaria)', title: 'Pegar la seleccion primaria' },
+      { keys: ['Ctrl+Shift+O'], id: 'copy_last_output', title: 'Copiar la salida del ultimo comando' },
+      { keys: ['Ctrl+Shift+F'], id: 'search', title: 'Buscar en el historial' },
+      { keys: ['Ctrl+Shift+Q'], id: 'open_scrollback_in_editor', title: 'Abrir el historial en $EDITOR' },
+      { keys: ['Shift+PageUp'], id: 'scroll_page_up', title: 'Subir una pagina' },
+      { keys: ['Shift+PageDown'], id: 'scroll_page_down', title: 'Bajar una pagina' },
+      { keys: ['Ctrl+Shift+Home'], id: 'scroll_to_top', title: 'Ir al principio' },
+      { keys: ['Ctrl+Shift+End'], id: 'scroll_to_bottom', title: 'Ir al output en vivo' },
+      { keys: ['Ctrl+Shift+Up'], id: 'jump_prev_prompt', title: 'Saltar al comando anterior' },
+      { keys: ['Ctrl+Shift+Down'], id: 'jump_next_prompt', title: 'Saltar al comando siguiente' },
+    ],
+  },
+  {
+    group: 'Fuente',
+    rows: [
+      { keys: ['Ctrl++', 'Ctrl+='], id: 'font_bigger', title: 'Aumentar tamano de fuente' },
+      { keys: ['Ctrl+-'], id: 'font_smaller', title: 'Reducir tamano de fuente' },
+      { keys: ['Ctrl+0'], id: 'font_reset', title: 'Restablecer tamano de fuente' },
+    ],
+  },
+  {
+    group: 'IA y whisper',
+    rows: [
+      { keys: ['Ctrl+Shift+A'], id: 'toggle_ai', title: 'Abrir/cerrar el asistente IA' },
+      { keys: ['Ctrl+Shift+G'], id: 'ask_ai_about_error', title: 'IA: por que ha fallado esto' },
+      { keys: ['Ctrl+Shift+M'], id: 'ai_command', title: 'IA: lenguaje natural a comando' },
+      { keys: ['Ctrl+Shift+Y'], id: 'ai_explain', title: 'IA: explicar la seleccion' },
+      { keys: ['Ctrl+Shift+I'], id: 'summarize_session', title: 'IA: resumir la sesion' },
+      { keys: ['Ctrl+Shift+N'], id: 'launch_claude', title: 'Lanzar Claude Code' },
+      { keys: ['Ctrl+Shift+Enter'], id: 'whisper', title: 'Whisper (dile al terminal que hacer)' },
+    ],
+  },
+  {
+    group: 'Overlays y misc',
+    rows: [
+      { keys: ['Ctrl+Shift+P'], id: 'command_palette', title: 'Paleta de comandos' },
+      { keys: ['F1'], id: 'show_docs', title: 'Mostrar el manual' },
+      { keys: ['Ctrl+Shift+Space'], id: 'hint_mode', title: 'Hint mode (abrir/copiar en pantalla)' },
+      { keys: ['Ctrl+Shift+S'], id: 'quick_connect', title: 'SSH: conexion rapida' },
+      { keys: ['Ctrl+Shift+B'], id: 'toggle_broadcast', title: 'Activar/desactivar broadcast' },
+    ],
+  },
+  {
+    group: 'Solo en la paleta (sin atajo por defecto)',
+    rows: [
+      { keys: ['Ctrl+Shift+P -> Settings'], id: 'open_config', title: 'Panel de ajustes' },
+      { keys: ['Paleta'], id: 'history_search', title: 'Insertar desde el historial de shell' },
+      { keys: ['Paleta'], id: 'watch_keyword', title: 'Vigilar una palabra en el panel' },
+      { keys: ['Paleta'], id: 'launch_layout', title: 'Lanzar un layout con nombre' },
+      { keys: ['Paleta'], id: 'copy_mode', title: 'Copy mode (seleccion con teclado)' },
+      { keys: ['Paleta'], id: 'fold_output', title: 'Plegar / desplegar toda la salida' },
+      { keys: ['Paleta'], id: 'toggle_broadcast_group', title: 'Marcar/desmarcar el panel en el grupo de broadcast' },
+      { keys: ['Paleta'], id: 'quit', title: 'Salir de runnir' },
+    ],
+  },
+  {
+    group: 'Copy mode (dentro del modo)',
+    rows: [
+      { keys: ['h j k l', 'flechas'], id: '', title: 'Mover el cursor' },
+      { keys: ['0', '$'], id: '', title: 'Inicio / fin de linea' },
+      { keys: ['g', 'G'], id: '', title: 'Arriba / abajo del todo' },
+      { keys: ['v', 'Espacio'], id: '', title: 'Empezar (o soltar) una seleccion' },
+      { keys: ['y', 'Enter'], id: '', title: 'Copiar la seleccion y salir' },
+      { keys: ['Esc', 'q'], id: '', title: 'Salir del copy mode' },
+    ],
+  },
+]
