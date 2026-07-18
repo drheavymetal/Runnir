@@ -11,8 +11,16 @@ Verify headless: `runnir --dump '<cmd>'`, `runnir --render out.png '<cmd>' [ms]`
 ## Status (2026-07-18)
 
 Done: M0–M7 + 4 feature blocks + kitty graphics + mouse-to-TUIs + scrollback search
-+ whisper + live-testing polish + DA1/fish fix. 23 commits, 138 tests, 0 warnings.
++ whisper + live-testing polish + DA1/fish fix. 39 commits, 148 tests, 0 warnings.
 17 agent-found bugs fixed (7 default-model + 10 Fable 5). Logo installed.
+
+Feature sprint this session (commits 26–39): 15 new features shipped —
+WOW: W1 guardian, W3 named layouts, W4 keyword watch, W5 opacity/blur.
+DIFF: D2 hot-reload, D3 history fuzzy, D4 bell, D5 primary selection, D7 AI summary,
+D8 broadcast groups, D9 smooth scroll, D10 zoom, D11 scrollback→$EDITOR, D13 tab
+reorder, D14 URL hover. Deferred (heavier, next session): W2 folding, D1 OSC 8
+hyperlinks, D6 status gutter, D12 copy-mode vim, D15 cursor trail.
+NEXT: Fable 5 bug-hunt round on the sprint code, then fix + retest.
 
 ## Current task: add 15–20 differential features, 4–5 "wow". Document each here.
 
