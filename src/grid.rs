@@ -297,7 +297,11 @@ impl Grid {
             .filter_map(|im| {
                 let local = self.stable_to_local(im.anchor)?;
                 // Viewport row: local rows are scrollback ++ screen; the top of the
-                // view is scrollback.len() - display_offset.
+                // view is scrollback.len() - display_offset. With folds active the row
+                // comes from the plan (an image inside a fold is hidden).
+                if self.has_folds() {
+                    return Some((im.clone(), self.screen_row_of(local)? as isize));
+                }
                 let top = self.scrollback.len() - self.display_offset;
                 let row = local as isize - top as isize;
                 Some((im.clone(), row))
@@ -523,9 +527,12 @@ impl Grid {
 
     // ---- Command output folding (W2) ----------------------------------------
 
-    /// Whether any output region is currently folded.
+    /// Whether any output region is currently folded AND folds should apply now.
+    /// Folds never apply on the alternate screen (a full-screen app owns the rows;
+    /// the folded stable rows would index the alt buffer). One gate covers render,
+    /// hit-testing and click-toggle.
     pub fn has_folds(&self) -> bool {
-        !self.folds.is_empty()
+        !self.folds.is_empty() && self.parked.is_none()
     }
 
     /// Folds every finished command's output region that spans more than one row.
@@ -584,10 +591,12 @@ impl Grid {
             if let Some(&(fs, fe)) = self.folds.iter().find(|&&(s, e)| stable >= s && stable <= e) {
                 let lines = fe - fs + 1;
                 plan.push(PlanRow::Fold { local: abs, lines });
-                // Jump past the folded region (its end mapped back to local).
+                // Jump past the folded region (its end mapped back to local). If the
+                // end fell past the buffer (a window shrink truncated the screen),
+                // jump to the end so the summary is not repeated down the viewport.
                 match self.stable_to_local(fe) {
                     Some(le) => abs = le + 1,
-                    None => abs += 1,
+                    None => abs = total,
                 }
             } else {
                 plan.push(PlanRow::Real(abs));
@@ -986,6 +995,20 @@ impl Grid {
             _ => return,
         };
         self.cells[range].fill(blank);
+        // Erasing the screen in place (2J and friends) invalidates any fold/output
+        // anchored on the live screen: stable coords only track content under
+        // bottom-line scroll, so fresh output written there would otherwise render
+        // collapsed under a stale summary. Drop those; scrollback folds are fine.
+        self.invalidate_screen_folds();
+    }
+
+    /// Drops folds and output regions that touch the live screen (stable row on or
+    /// after the first screen row). Called when the screen is edited in place, where
+    /// stable coordinates no longer track the content.
+    fn invalidate_screen_folds(&mut self) {
+        let screen_top = self.dropped + self.scrollback.len();
+        self.folds.retain(|&(_, e)| e < screen_top);
+        self.outputs.retain(|&(_, e)| e < screen_top);
     }
 
     fn erase_line(&mut self, mode: u16) {
@@ -1425,8 +1448,16 @@ impl Grid {
             // status gutter can mark it pass (green) or fail (red).
             Some(b'D') => {
                 if let Some(start) = self.command_start.take() {
-                    let end = self.local_to_stable(self.cursor_abs());
-                    let end = end.max(start);
+                    // Output ends with a newline, so the cursor sits at column 0 of
+                    // the fresh row the NEXT prompt is about to use. Exclude that row
+                    // from the output range, or a fold would swallow the live prompt
+                    // (and the "N lines" count / copy-last-output would be off by one).
+                    let end_local = if self.col == 0 {
+                        self.cursor_abs().saturating_sub(1)
+                    } else {
+                        self.cursor_abs()
+                    };
+                    let end = self.local_to_stable(end_local).max(start);
                     self.last_output = Some((start, end));
                     // Bank the region for "fold all output"; bound the list.
                     self.outputs.push((start, end));
@@ -1457,18 +1488,30 @@ impl Grid {
         if self.parked.is_some() {
             return Vec::new();
         }
-        let top = self.scrollback.len().saturating_sub(self.display_offset);
         let mut out = Vec::new();
         for &stable in &self.prompt_marks {
             if let Some(local) = self.stable_to_local(stable) {
-                if local >= top && local < top + self.rows {
+                if let Some(screen) = self.screen_row_of(local) {
                     let exit =
                         self.cmd_exits.iter().rev().find(|(p, _)| *p == stable).map(|(_, e)| *e);
-                    out.push((local - top, exit));
+                    out.push((screen, exit));
                 }
             }
         }
         out
+    }
+
+    /// The screen row (0..rows) an absolute (local) row lands on, fold-aware: with
+    /// folds active it is the row's position in the display plan, else `local - top`.
+    /// `None` if the row is off-screen or hidden inside a fold.
+    pub fn screen_row_of(&self, local: usize) -> Option<usize> {
+        let top = self.scrollback.len().saturating_sub(self.display_offset);
+        if !self.has_folds() {
+            return local.checked_sub(top).filter(|&r| r < self.rows);
+        }
+        self.display_plan()
+            .iter()
+            .position(|p| matches!(p, PlanRow::Real(a) if *a == local))
     }
 }
 
@@ -1986,6 +2029,25 @@ mod tests {
         g.unfold_all();
         assert!(!g.has_folds());
         assert!(g.display_plan().iter().all(|p| !matches!(p, PlanRow::Fold { .. })));
+    }
+
+    #[test]
+    fn fold_keeps_the_live_prompt_visible() {
+        let mut g = Grid::new(20, 6);
+        // A finished command, then the NEXT prompt is emitted (as a real shell does).
+        feed(
+            &mut g,
+            "\x1b]133;A\x07$ ls\r\n\x1b]133;C\x07a\r\nb\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ ",
+        );
+        g.fold_all();
+        let plan = g.display_plan();
+        // The cursor's row must still be a Real row (not swallowed by the fold), or
+        // the user would be typing into an invisible prompt.
+        let cur = g.cursor_abs();
+        assert!(
+            plan.iter().any(|p| matches!(p, PlanRow::Real(a) if *a == cur)),
+            "the live prompt row must survive folding: {plan:?}"
+        );
     }
 
     #[test]

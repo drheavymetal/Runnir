@@ -105,11 +105,10 @@ impl Gpu {
         // focused grid is already locked in `guards`, so read its top row from
         // there — locking it again on this thread would deadlock (Mutex is not
         // reentrant).
-        let focus_top = guards
+        let hint_grid = guards
             .iter()
             .find(|(id, ..)| *id == focus)
-            .map(|(_, _, grid, ..)| grid.abs_row(0));
-        let hint_grid = focus_top.and_then(|top| self.build_hints(area, cell, focus, top));
+            .and_then(|(_, _, grid, ..)| self.build_hints(area, cell, focus, grid));
         if let Some((grid, ox, oy)) = &hint_grid {
             panes.push(PaneDraw { grid, selection: None, origin: (*ox, *oy), tint: None, focused: true, cursor: None, search: Default::default() });
         }
@@ -264,20 +263,16 @@ impl Gpu {
         // on, drawn as a decoration so it needs no per-cell plumbing.
         if let Some(h) = &self.hover_url {
             if let Some((_, r, grid, ..)) = guards.iter().find(|(id, ..)| *id == h.pane) {
-                let top = grid.abs_row(0);
-                if h.abs_row >= top {
-                    let local = h.abs_row - top;
-                    if local < grid.rows() {
-                        let (cw, ch) = cell;
-                        let a = config.theme.accent;
-                        decorations.push(crate::render::SolidRect {
-                            x: r.x + h.col as f32 * cw,
-                            y: r.y + (local as f32 + 1.0) * ch - 2.0,
-                            w: h.len as f32 * cw,
-                            h: 1.5,
-                            color: (a.0, a.1, a.2),
-                        });
-                    }
+                if let Some(local) = grid.screen_row_of(h.abs_row) {
+                    let (cw, ch) = cell;
+                    let a = config.theme.accent;
+                    decorations.push(crate::render::SolidRect {
+                        x: r.x + h.col as f32 * cw,
+                        y: r.y + (local as f32 + 1.0) * ch - 2.0,
+                        w: h.len as f32 * cw,
+                        h: 1.5,
+                        color: (a.0, a.1, a.2),
+                    });
                 }
             }
         }
@@ -362,7 +357,7 @@ impl Gpu {
         area: Rect,
         cell: (f32, f32),
         focus: u64,
-        top_abs: usize,
+        src: &crate::grid::Grid,
     ) -> Option<(Grid, f32, f32)> {
         let Some(Overlay::Hints(h)) = &self.overlay else { return None };
         let rect = self.tabs[self.active].layout(area).into_iter().find(|(id, _)| *id == focus)?.1;
@@ -375,10 +370,11 @@ impl Gpu {
         grid.fill(Pen { bg: Color::Default, ..Pen::default() });
 
         for hint in &h.hints {
-            if hint.abs_row < top_abs || hint.abs_row >= top_abs + rows {
+            // Fold-aware placement: a hint on a folded (hidden) row is skipped.
+            let Some(row) = src.screen_row_of(hint.abs_row) else { continue };
+            if row >= rows {
                 continue;
             }
-            let row = hint.abs_row - top_abs;
             let pen = Pen {
                 fg: Color::Rgb(0x0d, 0x0d, 0x0f),
                 bg: Color::Rgb(0xf5, 0xd5, 0x43),

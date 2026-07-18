@@ -144,7 +144,11 @@ impl Gpu {
                 if let Some((id, rect)) = self.pane_at(self.cursor_px, area) {
                     // A click on a fold summary unfolds it instead of selecting.
                     if let Some(local) = self.fold_row_at(id, rect, self.cursor_px) {
-                        self.tabs[self.active].panes.get_mut(&id).unwrap().toggle_fold_at(local);
+                        let pane = self.tabs[self.active].panes.get_mut(&id).unwrap();
+                        pane.toggle_fold_at(local);
+                        // Drop any stale selection so the coming left-release does not
+                        // re-copy it as if this were a normal click.
+                        pane.clear_selection();
                         self.window.request_redraw();
                         return;
                     }

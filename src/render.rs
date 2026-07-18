@@ -518,6 +518,7 @@ impl Renderer {
         ox: f32,
         y: f32,
         cw: f32,
+        cols: usize,
         lines: usize,
         base_bg: crate::config::Rgb,
         dim: f32,
@@ -532,7 +533,9 @@ impl Renderer {
             let [r, g, b, _] = srgb(base_bg.0, base_bg.1, base_bg.2);
             [r, g, b, self.opacity]
         };
-        for (i, ch) in label.chars().enumerate() {
+        // Clamp to the pane width so a narrow pane's summary can't bleed into a
+        // neighbour (there is no per-pane scissor for decorations).
+        for (i, ch) in label.chars().take(cols).enumerate() {
             let glyph = self.font.glyph(ch, Style::REGULAR);
             out.push(Instance {
                 pos_px: [ox + i as f32 * cw, y],
@@ -585,7 +588,7 @@ impl Renderer {
             let abs = match prow {
                 crate::grid::PlanRow::Real(a) => *a,
                 crate::grid::PlanRow::Fold { lines, .. } => {
-                    self.emit_fold_summary(out, ox, y, cw, *lines, base_bg, dim);
+                    self.emit_fold_summary(out, ox, y, cw, grid.cols(), *lines, base_bg, dim);
                     continue;
                 }
                 crate::grid::PlanRow::Blank => continue,

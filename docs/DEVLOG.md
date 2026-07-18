@@ -64,7 +64,13 @@ Fable 5 bug-hunt on the 4 new features → 11 findings fixed (commit 48):
 Verify round on those 11 fixes → all correct, only 3 lows (commit 49): trail ghost on
 relayout, CSI 3J cmd_exits prune, copy-mode end_selection. CONVERGED.
 ALL 16 planned features DONE (W2 = commit 50, view-only fold plan, no coord rewrite).
-NEXT: Fable 5 bug-hunt on W2 (render/plan/mouse/cursor interactions).
+Fable 5 bug-hunt on W2 → 5 bugs fixed (commit 51): OSC 133;D banked the next
+prompt row as output end → fold swallowed the live prompt+cursor (exclude cursor
+row when col==0); folds applied on alt-screen (has_folds gated on !parked); gutter/
+images/hover/hints used raw local-top → added grid.screen_row_of() fold-aware
+mapping; clear/2J left stale live-screen folds → invalidate_screen_folds; resize
+shrink duplicated summary → jump to total on evicted fold end. + label clamp,
+fold-click clears selection. ALL 16 FEATURES DONE + BUG-HUNTED. CONVERGED.
 
 ## Current task: add 15–20 differential features, 4–5 "wow". Document each here.
 
