@@ -60,6 +60,7 @@ pub enum Action {
     AskAiAboutError,
     AiCommand,
     AiExplain,
+    SummarizeSession,
     QuickConnect,
     HintMode,
     // Launchers
@@ -119,6 +120,7 @@ impl Action {
             AskAiAboutError => "ask_ai_about_error",
             AiCommand => "ai_command",
             AiExplain => "ai_explain",
+            SummarizeSession => "summarize_session",
             QuickConnect => "quick_connect",
             HintMode => "hint_mode",
             LaunchClaude => "launch_claude",
@@ -176,6 +178,7 @@ impl Action {
             AskAiAboutError => "Ask AI: why did this fail?",
             AiCommand => "AI: natural language to command",
             AiExplain => "AI: explain the selection",
+            SummarizeSession => "AI: summarize this session",
             QuickConnect => "SSH quick connect",
             HintMode => "Hint mode (open/copy on screen)",
             LaunchClaude => "Launch Claude Code",
@@ -236,6 +239,7 @@ impl Action {
             "ask_ai_about_error" => AskAiAboutError,
             "ai_command" => AiCommand,
             "ai_explain" => AiExplain,
+            "summarize_session" => SummarizeSession,
             "quick_connect" => QuickConnect,
             "hint_mode" => HintMode,
             "launch_claude" => LaunchClaude,
@@ -309,6 +313,7 @@ impl Action {
             AskAiAboutError,
             AiCommand,
             AiExplain,
+            SummarizeSession,
             QuickConnect,
             HintMode,
             LaunchClaude,
@@ -469,6 +474,7 @@ fn default_bindings() -> HashMap<Chord, Action> {
     bind(&mut m, "ctrl+shift+g", AskAiAboutError);
     bind(&mut m, "ctrl+shift+m", AiCommand);
     bind(&mut m, "ctrl+shift+y", AiExplain);
+    bind(&mut m, "ctrl+shift+i", SummarizeSession);
     bind(&mut m, "ctrl+shift+s", QuickConnect);
     bind(&mut m, "ctrl+shift+space", HintMode);
     bind(&mut m, "ctrl+shift+n", LaunchClaude);
@@ -498,6 +504,7 @@ pub fn default_hints() -> HashMap<String, String> {
         ("ask_ai_about_error", "Ctrl+Shift+G"),
         ("ai_command", "Ctrl+Shift+M"),
         ("ai_explain", "Ctrl+Shift+Y"),
+        ("summarize_session", "Ctrl+Shift+I"),
         ("quick_connect", "Ctrl+Shift+S"),
         ("hint_mode", "Ctrl+Shift+Space"),
         ("launch_claude", "Ctrl+Shift+N"),

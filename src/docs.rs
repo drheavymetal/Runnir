@@ -106,6 +106,7 @@ variable named in the config, never stored in the file.
 @ Ctrl+Shift+M     describe a command in plain language; the model writes it and
                    types it at the prompt for you to review and run (not run for you)
 @ Ctrl+Shift+Y     explain the current selection in the assistant panel
+@ Ctrl+Shift+I     summarize this session (commands, results, errors and fixes)
 
 # Whisper — talk to the terminal
 

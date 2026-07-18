@@ -99,6 +99,31 @@ impl Gpu {
         self.send_ai(format!("Explain this concisely:\n\n{}", truncate(&text, 4000)), config);
     }
 
+    /// Asks the assistant to summarise this pane's session: what was done, what
+    /// broke, how it was fixed. Reads the scrollback, so it works retroactively on a
+    /// session you have been in for a while.
+    fn summarize_session(&mut self, config: &Config) {
+        let text = self.tab().focused().scrollback_text().join("\n");
+        if text.trim().is_empty() {
+            self.status = Some("nothing in the scrollback to summarize yet".into());
+            self.status_expiry = Some(Instant::now() + Duration::from_secs(4));
+            self.window.request_redraw();
+            return;
+        }
+        let provider = config.ai.default.clone();
+        if !matches!(self.overlay, Some(Overlay::Ai(_))) {
+            self.ai.provider = Some(provider.clone());
+            self.overlay = Some(Overlay::Ai(overlay::AiPanel::new(provider)));
+        }
+        let question = format!(
+            "This is a terminal session transcript. Summarise what was done: the key \
+             commands, what they accomplished, any errors and how they were resolved. \
+             Be concise — a short bulleted list, no preamble.\n\n{}",
+            truncate(&text, 8000)
+        );
+        self.send_ai(question, config);
+    }
+
     /// Types an AI-produced command at the focused shell prompt without running it.
     fn insert_command(&mut self, cmd: String) {
         if !cmd.is_empty() {

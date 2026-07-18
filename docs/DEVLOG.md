@@ -47,7 +47,8 @@ DIFFERENTIAL (aim ~15 total incl. above):
       request_user_attention(Critical) when unfocused. commit 26.
 - [ ] D5 Primary selection (middle-click paste of last selection) via wl-copy --primary.
 - [ ] D6 Command status gutter — exit code + duration next to each prompt (OSC 133 D + timing).
-- [ ] D7 Session summarizer (AI) — "what did I do here" from scrollback.
+- [x] D7 Session summarizer (AI) — SummarizeSession (Ctrl+Shift+I) → scrollback_text
+      → AI panel with a concise-summary prompt (tail-truncated 8k). commit 30.
 - [ ] D8 Broadcast groups — broadcast to a named subset of panes.
 - [ ] D9 Smooth/momentum scroll.
 - [x] D10 Pane zoom (Ctrl+Shift+Z) — visible_rects override + resize_one. commit 25.
