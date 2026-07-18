@@ -146,7 +146,12 @@ fn encode_kitty_inner(
             NamedKey::Escape => KittyKey::Unicode(27),
             NamedKey::Backspace => KittyKey::Unicode(127),
             NamedKey::Space => {
-                assoc_text = Some(' ');
+                // Space is a text-producing key: like a letter it keeps its plain
+                // text unless a forcing modifier or report-all sends it to CSI form.
+                if !ctrl && !sup {
+                    assoc_text = Some(' ');
+                    plain = Some(b" ".to_vec());
+                }
                 KittyKey::Unicode(32)
             }
             NamedKey::ArrowUp => KittyKey::Legacy('A'),
@@ -207,13 +212,17 @@ fn encode_kitty_inner(
         }
     }
 
-    // Legacy-compatible keys (Enter/Tab/Escape/Backspace) stay as their classic
-    // single byte when unmodified and not forced to CSI form.
+    // Legacy-compatible keys (Enter/Tab/Backspace) stay as their classic single
+    // byte when unmodified and not forced to CSI form. Esc is NOT among them: a
+    // lone 0x1b is exactly the ambiguity bit 0 removes, so once the app opts into
+    // disambiguation Esc must be reported as CSI 27 u.
     if !force_csi && mods_val == 1 && event_type == 1 {
         match logical_key {
             Key::Named(NamedKey::Enter) => return Some(b"\r".to_vec()),
             Key::Named(NamedKey::Tab) => return Some(b"\t".to_vec()),
-            Key::Named(NamedKey::Escape) => return Some(b"\x1b".to_vec()),
+            Key::Named(NamedKey::Escape) if flags & KITTY_DISAMBIGUATE == 0 => {
+                return Some(b"\x1b".to_vec());
+            }
             Key::Named(NamedKey::Backspace) => return Some(b"\x7f".to_vec()),
             _ => {}
         }
@@ -397,11 +406,10 @@ mod tests {
 
     #[test]
     fn plain_legacy_keys_roundtrip_in_kitty_mode() {
-        // Enter/Tab/Escape/Backspace unmodified keep their legacy single byte unless
+        // Enter/Tab/Backspace unmodified keep their legacy single byte unless
         // report-all-keys is set.
         let f = DISAMB;
         assert_eq!(kit(&Key::Named(NamedKey::Enter), Some("\r"), m(false, false, false, false), f).unwrap(), b"\r");
-        assert_eq!(kit(&Key::Named(NamedKey::Escape), Some("\x1b"), m(false, false, false, false), f).unwrap(), b"\x1b");
         assert_eq!(kit(&Key::Named(NamedKey::Backspace), Some("\x7f"), m(false, false, false, false), f).unwrap(), b"\x7f");
         // A plain letter is just its text.
         assert_eq!(kit(&ch("a"), Some("a"), m(false, false, false, false), f).unwrap(), b"a");
@@ -447,6 +455,48 @@ mod tests {
         // Tilde keys keep their number.
         assert_eq!(kit(&Key::Named(NamedKey::Delete), None, m(false, false, false, false), ALL).unwrap(), b"\x1b[3~");
         assert_eq!(kit(&Key::Named(NamedKey::Delete), None, m(true, false, false, false), DISAMB).unwrap(), b"\x1b[3;2~");
+    }
+
+    #[test]
+    fn esc_is_csi_27_u_under_disambiguate() {
+        // A lone 0x1b is the ambiguity bit 0 exists to remove: with disambiguate
+        // set, Esc must be reported as CSI 27 u.
+        assert_eq!(
+            kit(&Key::Named(NamedKey::Escape), Some("\x1b"), m(false, false, false, false), DISAMB)
+                .unwrap(),
+            b"\x1b[27u"
+        );
+        // Without bit 0 (or report-all) — e.g. only report-text pushed — the legacy
+        // byte stays.
+        assert_eq!(
+            kit(&Key::Named(NamedKey::Escape), Some("\x1b"), m(false, false, false, false), KITTY_REPORT_TEXT)
+                .unwrap(),
+            b"\x1b"
+        );
+    }
+
+    #[test]
+    fn plain_space_stays_text_in_kitty_mode() {
+        // Space is a text key: under disambiguate it must type a space, not CSI 32 u.
+        assert_eq!(
+            kit(&Key::Named(NamedKey::Space), Some(" "), m(false, false, false, false), DISAMB).unwrap(),
+            b" "
+        );
+        // Shift alone never forces the escape form for text keys.
+        assert_eq!(
+            kit(&Key::Named(NamedKey::Space), Some(" "), m(true, false, false, false), DISAMB).unwrap(),
+            b" "
+        );
+        // Ctrl+Space is an escape-forcing chord: CSI 32 ; 5 u.
+        assert_eq!(
+            kit(&Key::Named(NamedKey::Space), None, m(false, true, false, false), DISAMB).unwrap(),
+            b"\x1b[32;5u"
+        );
+        // Report-all still forces the CSI form even for a plain space.
+        assert_eq!(
+            kit(&Key::Named(NamedKey::Space), Some(" "), m(false, false, false, false), ALL).unwrap(),
+            b"\x1b[32u"
+        );
     }
 
     #[test]
