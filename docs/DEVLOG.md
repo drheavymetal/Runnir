@@ -35,6 +35,18 @@ QUEUED after integration (touch grid/render, would conflict): Unicode/grapheme r
 Merge order suggestion: independent-file first (control.rs, themes.rs, selection.rs, layout.rs) then the grid.rs/app_input.rs-heavy (underlines, keyboard, osc52) resolving cumulatively.
 ## >>> END PENDING INTEGRATION <<<
 
+## 2026-07-19 — AI fix-and-run for a failed command
+FixLastCommand action (Super+Shift+G — every ctrl+shift letter was taken; mirrors
+ask-why ctrl+shift+G on super; palette "AI: fix the last failed command"). Guards on
+last_exit(): only fires when OSC 133 recorded a non-zero exit, else a toast. Sends the
+failed command + output + exit code asking for ONLY a corrected command, then reuses
+Purpose::InsertCommand to TYPE it at the prompt (never runs it). New grid field
+last_command_line captured at OSC 133;C (B mark, falls back to prompt mark) with a
+last_command_line() accessor on Grid+Pane, alongside last_command_output()/last_exit().
+ai::clean_command now also strips a leading `$` prompt marker. Tests: clean_command
++prompt-marker cases, grid fix_last_command_captures_command_and_exit (capture+guard
+data). cargo build + test 222 green, 0 warnings. app_ai.rs::fix_last_command.
+
 ## Status (2026-07-18)
 
 Done: M0–M7 + 4 feature blocks + kitty graphics + mouse-to-TUIs + scrollback search

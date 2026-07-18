@@ -88,6 +88,56 @@ impl Gpu {
         self.window.request_redraw();
     }
 
+    /// Asks the assistant for a corrected version of the last command that failed
+    /// (non-zero exit, known via OSC 133), then TYPES it at the prompt for review —
+    /// never runs it. Reuses the same command-block capture as "why did this fail?"
+    /// and the same type-at-prompt path as the natural-language command translator.
+    fn fix_last_command(&mut self, config: &Config) {
+        let pane = self.tab().focused_ref();
+        // Guard: only act when the last command actually failed. No OSC 133 data, or
+        // a clean exit, means there is nothing to fix.
+        match pane.last_exit() {
+            Some(code) if code != 0 => {}
+            Some(_) => {
+                self.status = Some("last command succeeded — nothing to fix".into());
+                self.status_expiry = Some(Instant::now() + Duration::from_secs(4));
+                self.window.request_redraw();
+                return;
+            }
+            None => {
+                self.status =
+                    Some("no failed command to fix (enable OSC 133 shell integration)".into());
+                self.status_expiry = Some(Instant::now() + Duration::from_secs(4));
+                self.window.request_redraw();
+                return;
+            }
+        }
+
+        let command = self.tab().focused().last_command_line().unwrap_or_default();
+        let output = self.tab().focused().last_command_output().unwrap_or_default();
+        let exit = self.tab().focused().last_exit().unwrap_or(-1);
+        let provider = config.ai.default.clone();
+
+        let prompt = format!(
+            "A shell command failed in my Linux terminal. Give me the single corrected \
+             command that fixes it. Reply with ONLY the command on one line — no prose, \
+             no explanation, no backticks, no code fences, no leading prompt marker.\n\n\
+             Failed command: {}\nExit code: {}\nOutput:\n{}",
+            if command.is_empty() { "(not captured)" } else { &command },
+            exit,
+            truncate(&output, 4000),
+        );
+        self.status = Some(format!("asking {provider} to fix the last command…"));
+        self.status_expiry = None; // In-flight: the reply (typed at the prompt) clears it.
+        if let Err(e) =
+            ai::ask(&mut self.ai, config, &provider, prompt, ai::Purpose::InsertCommand, self.proxy.clone())
+        {
+            self.status = Some(format!("fix command failed: {e}"));
+            self.status_expiry = Some(Instant::now() + Duration::from_secs(5));
+        }
+        self.window.request_redraw();
+    }
+
     /// Sends the current selection to the assistant to be explained.
     fn ai_explain_selection(&mut self, config: &Config) {
         let Some(text) = self.tab().focused().selection_text() else { return };

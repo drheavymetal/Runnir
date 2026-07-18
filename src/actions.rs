@@ -68,6 +68,7 @@ pub enum Action {
     ToggleAi,
     AskAiAboutError,
     AiCommand,
+    FixLastCommand,
     AiExplain,
     SummarizeSession,
     QuickConnect,
@@ -138,6 +139,7 @@ impl Action {
             ToggleAi => "toggle_ai",
             AskAiAboutError => "ask_ai_about_error",
             AiCommand => "ai_command",
+            FixLastCommand => "fix_last_command",
             AiExplain => "ai_explain",
             SummarizeSession => "summarize_session",
             QuickConnect => "quick_connect",
@@ -206,6 +208,7 @@ impl Action {
             ToggleAi => "Toggle AI assistant",
             AskAiAboutError => "Ask AI: why did this fail?",
             AiCommand => "AI: natural language to command",
+            FixLastCommand => "AI: fix the last failed command",
             AiExplain => "AI: explain the selection",
             SummarizeSession => "AI: summarize this session",
             QuickConnect => "SSH quick connect",
@@ -277,6 +280,7 @@ impl Action {
             "toggle_ai" => ToggleAi,
             "ask_ai_about_error" => AskAiAboutError,
             "ai_command" => AiCommand,
+            "fix_last_command" => FixLastCommand,
             "ai_explain" => AiExplain,
             "summarize_session" => SummarizeSession,
             "quick_connect" => QuickConnect,
@@ -361,6 +365,7 @@ impl Action {
             ToggleAi,
             AskAiAboutError,
             AiCommand,
+            FixLastCommand,
             AiExplain,
             SummarizeSession,
             QuickConnect,
@@ -523,6 +528,9 @@ fn default_bindings() -> HashMap<Chord, Action> {
     bind(&mut m, "f1", ShowDocs);
     bind(&mut m, "ctrl+shift+a", ToggleAi);
     bind(&mut m, "ctrl+shift+g", AskAiAboutError);
+    // Every ctrl+shift+letter is taken; fix-last-command mirrors ask-why (…+G) on
+    // super so it still sits with the assistant family without shadowing the shell.
+    bind(&mut m, "super+shift+g", FixLastCommand);
     bind(&mut m, "ctrl+shift+m", AiCommand);
     bind(&mut m, "ctrl+shift+y", AiExplain);
     bind(&mut m, "ctrl+shift+i", SummarizeSession);
@@ -554,6 +562,7 @@ pub fn default_hints() -> HashMap<String, String> {
         ("show_docs", "F1"),
         ("toggle_ai", "Ctrl+Shift+A"),
         ("ask_ai_about_error", "Ctrl+Shift+G"),
+        ("fix_last_command", "Super+Shift+G"),
         ("ai_command", "Ctrl+Shift+M"),
         ("ai_explain", "Ctrl+Shift+Y"),
         ("summarize_session", "Ctrl+Shift+I"),
