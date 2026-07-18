@@ -35,6 +35,18 @@ QUEUED after integration (touch grid/render, would conflict): Unicode/grapheme r
 Merge order suggestion: independent-file first (control.rs, themes.rs, selection.rs, layout.rs) then the grid.rs/app_input.rs-heavy (underlines, keyboard, osc52) resolving cumulatively.
 ## >>> END PENDING INTEGRATION <<<
 
+## 2026-07-19 — image auto-preview watch (branch worktree-agent-a752120c0a0af7272)
+New `[watch]` config block (enabled/directory/extensions/max_width, all defaulted,
+serde round-trips TOML+JSON) + src/watch.rs: pure `WatchState`/`step` debounce state
+machine (snapshot on arm so old files never fire; a new file waits one stable tick;
+newest of a batch previewed). Polled from Gpu::poll_image_watch on the periodic tick
+(WATCH_POLL_MS=700, self-sustaining WaitUntil added in about_to_wait next to blink;
+skipped on alt-screen). preview_image decodes + downscales to max_width cells (capped
+at max_texture_dimension_2d, the 8192 guard) then reuses Grid::place_image (no new
+image drawing). Two palette actions: ToggleImageWatch (arms on focused pane cwd) and
+SetImageWatchDir (PromptKind::ImageWatchDir, empty clears). 8 new tests. Caveat:
+previews are injected at the live cursor, best viewed at an idle prompt.
+
 ## Status (2026-07-18)
 
 Done: M0–M7 + 4 feature blocks + kitty graphics + mouse-to-TUIs + scrollback search

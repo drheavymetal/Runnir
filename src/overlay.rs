@@ -577,6 +577,8 @@ pub enum PromptKind {
     WatchKeyword,
     /// A named layout to launch in a new tab.
     LaunchLayout,
+    /// A directory to auto-preview new images from (empty clears the watch).
+    ImageWatchDir,
 }
 
 impl Prompt {

@@ -19,6 +19,8 @@ pub struct Config {
     pub theme: Theme,
     pub behaviour: Behaviour,
     pub ai: Ai,
+    /// Auto-preview of images dropped into a watched directory.
+    pub watch: Watch,
     /// Extra keybindings, merged over the built-in ones. `"ctrl+shift+t" = "new_tab"`.
     pub keys: HashMap<String, String>,
     /// Named workspace layouts. Each opens a fresh tab split into one pane per
@@ -47,6 +49,7 @@ impl Default for Config {
             theme: Theme::default(),
             behaviour: Behaviour::default(),
             ai: Ai::default(),
+            watch: Watch::default(),
             keys: HashMap::new(),
             layouts: Vec::new(),
         }
@@ -200,6 +203,42 @@ impl Default for Behaviour {
             command_guardian: true,
             smooth_scroll: true,
             shell_integration: true,
+        }
+    }
+}
+
+// ---- Watch (image auto-preview) -------------------------------------------
+
+/// Watches a directory and previews newly generated images inline in the focused
+/// pane. Built for a local media pipeline (SDXL / ComfyUI / Wan) that drops PNG /
+/// JPG / WebP files into an output folder: a new file appears, runnir shows it.
+///
+/// A missing `[watch]` block is fine — every field defaults, and the watcher is off
+/// until `enabled = true` (or you toggle it from the palette at runtime).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Watch {
+    /// Arm the watcher at startup. Off by default; the palette can also toggle it on
+    /// the focused pane's working directory without editing the config.
+    pub enabled: bool,
+    /// Directory to watch. `None` means "no directory yet" — set one here, or point
+    /// the watch at the current pane's cwd from the palette.
+    pub directory: Option<String>,
+    /// Extensions to preview, without the dot, matched case-insensitively. An empty
+    /// list previews any file that lands in the directory.
+    pub extensions: Vec<String>,
+    /// The widest a preview is drawn, in terminal cells. A larger image is scaled
+    /// down to this; a smaller one is shown at its own size.
+    pub max_width: usize,
+}
+
+impl Default for Watch {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            directory: None,
+            extensions: vec!["png".into(), "jpg".into(), "jpeg".into(), "webp".into()],
+            max_width: 40,
         }
     }
 }
@@ -472,6 +511,8 @@ impl Config {
         self.window.padding = self.window.padding.clamp(0.0, 200.0);
         self.behaviour.wheel_lines = self.behaviour.wheel_lines.clamp(1.0, 50.0);
         self.scrollback.lines = self.scrollback.lines.min(1_000_000);
+        // A zero-width preview draws nothing; an absurd one would fill the pane.
+        self.watch.max_width = self.watch.max_width.clamp(1, 1000);
         if self.cursor.blink_interval < 50 {
             self.cursor.blink_interval = 50;
         }
@@ -524,6 +565,44 @@ mod tests {
         let parsed: Config = toml::from_str(&text).expect("default config must re-parse");
         assert_eq!(parsed.font.family, Config::default().font.family);
         assert_eq!(parsed.theme.ansi.len(), 16);
+    }
+
+    #[test]
+    fn watch_block_round_trips_through_toml_and_json() {
+        // The auto-preview settings must survive a full serialize→parse cycle in both
+        // formats, and a missing block must fall back to the (disabled) defaults.
+        let mut cfg = Config::default();
+        cfg.watch.enabled = true;
+        cfg.watch.directory = Some("~/comfyui/output".into());
+        cfg.watch.extensions = vec!["png".into(), "webp".into()];
+        cfg.watch.max_width = 60;
+
+        let toml_text = toml::to_string_pretty(&cfg).unwrap();
+        let from_toml: Config = toml::from_str(&toml_text).expect("watch must re-parse from toml");
+        assert!(from_toml.watch.enabled);
+        assert_eq!(from_toml.watch.directory.as_deref(), Some("~/comfyui/output"));
+        assert_eq!(from_toml.watch.extensions, vec!["png".to_string(), "webp".to_string()]);
+        assert_eq!(from_toml.watch.max_width, 60);
+
+        let json_text = serde_json::to_string(&cfg).unwrap();
+        let from_json: Config = serde_json::from_str(&json_text).expect("watch must re-parse from json");
+        assert_eq!(from_json.watch.max_width, 60);
+
+        // A file with no [watch] block leaves the watcher off.
+        let none: Config = toml::from_str("[font]\nsize = 15.0\n").unwrap();
+        assert!(!none.watch.enabled, "absent block defaults to disabled");
+        assert_eq!(none.watch.max_width, 40);
+    }
+
+    #[test]
+    fn watch_max_width_is_clamped() {
+        let mut cfg = Config::default();
+        cfg.watch.max_width = 0;
+        cfg.validate();
+        assert_eq!(cfg.watch.max_width, 1, "a zero-width preview is unusable");
+        cfg.watch.max_width = 100_000;
+        cfg.validate();
+        assert_eq!(cfg.watch.max_width, 1000, "an absurd width is capped");
     }
 
     #[test]
