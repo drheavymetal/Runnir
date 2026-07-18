@@ -75,6 +75,16 @@ wiping primary folds → gated on !parked; now range-based (only erased rows, no
 screen, so prompt-redraw clr_eos doesn't pop folds); also invalidates last_output.
 Fixes 1/2/3/5/6 verified correct. ALL 16 FEATURES DONE + BUG-HUNTED. CONVERGED.
 
+## 2026-07-18 later — "resultonas y bonitas" batch (commits 54+)
+Pedro picked all 4 flashy blocks + reported the tab bar overflowing.
+Done: tab-bar horizontal scroll to active (fix, commit 54); tab icons (nerd-font per
+app) + activity/fail badges (55); scroll position thumb + note search N/M already
+existed (56); smooth scroll GLIDE on jumps (behaviour.smooth_scroll, 57); OSC 9;4
+progress bar on pane bottom (58); bottom STATUS BAR cwd/git-branch/clock
+(window.status_bar default on, 59). PENDING (heaviest, own batch): background image
+(needs draw-first bg quad + opacity<1) and scrollback minimap.
+NEXT: Fable 5 bug-hunt on this batch, then background image + minimap.
+
 ## Current task: add 15–20 differential features, 4–5 "wow". Document each here.
 
 User wants all of these, in batches, committing each, updating this file. Then run

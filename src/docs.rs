@@ -254,7 +254,14 @@ missing file is fine. API keys are referenced by environment-variable name, so t
 file is safe to keep in a dotfiles repo.
 
 @ window.opacity   0.1..1.0 window translucency (needs a compositor; 1.0 = opaque)
+@ window.status_bar  true shows a bottom bar (cwd, git branch, clock); costs a row
 @ cursor.trail     true draws a brief fading trail behind the cursor (flair, off)
+@ behaviour.smooth_scroll  true glides on scroll jumps instead of teleporting
+
+Each tab shows an icon for its foreground app and a badge: an amber dot for a
+background tab with unseen output, a red cross if its last command failed. The tab
+bar scrolls to keep the active tab visible. A pane scrolled back shows a thin
+position thumb; a tool emitting OSC 9;4 progress draws a bar along its bottom edge.
 
 The config hot-reloads: save the file and runnir applies the new theme, font and
 key bindings within a second, no restart. Toggling window.opacity between opaque
