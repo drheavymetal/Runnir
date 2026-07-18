@@ -151,6 +151,22 @@ impl Gpu {
         self.window.request_redraw();
     }
 
+    /// Opens a prompt to set (or clear) the keyword the focused pane watches for.
+    /// When output on that pane contains the keyword, a desktop notification fires.
+    fn watch_keyword(&mut self) {
+        let current = self.tab().focused_ref().watching().unwrap_or("").to_string();
+        let mut prompt = Prompt::new(
+            PromptKind::WatchKeyword,
+            "Watch this pane for (empty clears)",
+            Vec::new(),
+        );
+        for c in current.chars() {
+            prompt.input_char(c);
+        }
+        self.overlay = Some(Overlay::Prompt(prompt));
+        self.window.request_redraw();
+    }
+
     /// Opens the whisper bar: tell the terminal what to do in plain language.
     fn whisper(&mut self) {
         self.overlay = Some(Overlay::Prompt(Prompt::new(

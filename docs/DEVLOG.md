@@ -31,8 +31,10 @@ WOW (aim 4–5):
       fold/unfold current, fold-all. Big cargo build → one line.
 - [ ] W3 Named layouts / workspaces — config `[[layout]]` defines panes+commands;
       `runnir layout <name>` or palette launches N splits running X (e.g. ssh .3/.7/.9/.188).
-- [ ] W4 Keyword alert / watch — per-pane regex; notify (desktop) when output matches
-      ("deploy OK", "error", "panic"). For monitoring builds/servers.
+- [x] W4 Keyword watch — Pane.watch (lowercased kw) + watch_stable high-water; grid
+      stable_end/text_since_stable; periodic scans new lines → notify(). WatchKeyword
+      palette action → Prompt(WatchKeyword). Substring (case-insensitive), not regex.
+      commit 34.
 - [x] W5 Background blur + opacity — surface alpha_mode=PreMultiplied when opacity<1;
       shaders emit premultiplied (premul() + PREMULTIPLIED_ALPHA_BLENDING); clear +
       default-bg cells carry alpha=opacity; text/explicit-bg stay opaque. Compositor

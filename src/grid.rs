@@ -493,6 +493,25 @@ impl Grid {
         self.text_range((start_row, 0), (cur, col_c.min(self.cols.saturating_sub(1))))
     }
 
+    /// The stable index one past the last row: a monotonic high-water mark the
+    /// keyword watcher (W4) uses to remember what it has already scanned.
+    pub fn stable_end(&self) -> usize {
+        self.dropped + self.total_rows()
+    }
+
+    /// Text of every row with a stable index >= `from_stable`, plus the new
+    /// high-water mark. Rows already evicted from scrollback are simply not there,
+    /// so the watcher scans from the oldest still-present row in that case.
+    pub fn text_since_stable(&self, from_stable: usize) -> (String, usize) {
+        let from_local = self.stable_to_local(from_stable).unwrap_or(0);
+        let last = self.total_rows().saturating_sub(1);
+        if from_local > last {
+            return (String::new(), self.stable_end());
+        }
+        let text = self.text_range((from_local, 0), (last, self.cols.saturating_sub(1)));
+        (text, self.stable_end())
+    }
+
     /// Scroll offsets, oldest first, that put each prompt at the top of the view.
     /// Backs "jump to previous/next command".
     pub fn prompt_offsets(&self) -> Vec<usize> {

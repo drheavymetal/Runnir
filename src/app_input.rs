@@ -358,6 +358,7 @@ impl Gpu {
             Action::SummarizeSession => self.summarize_session(config),
             Action::OpenScrollbackInEditor => self.open_scrollback_in_editor(config),
             Action::HistorySearch => self.history_search(),
+            Action::WatchKeyword => self.watch_keyword(),
             Action::QuickConnect => self.open_quick_connect(),
             Action::HintMode => self.open_hints(),
             Action::LaunchClaude => self.launch_claude(config),
@@ -549,6 +550,7 @@ impl Gpu {
             Action::SummarizeSession => self.summarize_session(config),
             Action::OpenScrollbackInEditor => self.open_scrollback_in_editor(config),
             Action::HistorySearch => self.history_search(),
+            Action::WatchKeyword => self.watch_keyword(),
             Action::Whisper => self.whisper(),
             Action::SearchScrollback => self.overlay = Some(Overlay::Search(overlay::Search::new())),
             Action::QuickConnect => self.open_quick_connect(),
@@ -659,6 +661,16 @@ impl Gpu {
             PromptKind::HistoryInsert => {
                 // Type the chosen history line at the prompt; the user runs it.
                 self.insert_command(value);
+            }
+            PromptKind::WatchKeyword => {
+                let watching = !value.trim().is_empty();
+                self.tab().focused().set_watch(value);
+                self.status = Some(if watching {
+                    "watching this pane".into()
+                } else {
+                    "watch cleared".into()
+                });
+                self.status_expiry = Some(Instant::now() + Duration::from_secs(2));
             }
         }
     }

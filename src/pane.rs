@@ -37,6 +37,11 @@ pub struct Pane {
     running_since: Option<(std::time::Instant, String)>,
     last_command_seq: u64,
     last_bell: u64,
+    /// Keyword to watch for in this pane's output (lowercased), or `None`. When set,
+    /// a matching line raises a desktop notification (W4).
+    watch: Option<String>,
+    /// Next unscanned stable row for the watcher, so each line fires at most once.
+    watch_stable: usize,
 }
 
 impl Pane {
@@ -64,6 +69,8 @@ impl Pane {
             running_since: None,
             last_command_seq: 0,
             last_bell: 0,
+            watch: None,
+            watch_stable: 0,
         })
     }
 
@@ -127,6 +134,36 @@ impl Pane {
         } else {
             false
         }
+    }
+
+    /// Sets (or clears, with an empty string) the keyword this pane watches for.
+    /// Scanning starts from the current bottom, so pre-existing scrollback does not
+    /// fire a flood of stale matches.
+    pub fn set_watch(&mut self, keyword: String) {
+        let kw = keyword.trim();
+        if kw.is_empty() {
+            self.watch = None;
+        } else {
+            self.watch = Some(kw.to_lowercase());
+            self.watch_stable = self.grid.lock().unwrap().stable_end();
+        }
+    }
+
+    /// Whether this pane is currently watching for a keyword.
+    pub fn watching(&self) -> Option<&str> {
+        self.watch.as_deref()
+    }
+
+    /// Returns a description of the first new line matching the watched keyword since
+    /// the last call, or `None`. Scans only rows produced since the previous check,
+    /// so each line notifies at most once.
+    pub fn take_watch_hit(&mut self) -> Option<String> {
+        let kw = self.watch.clone()?;
+        let (text, end) = self.grid.lock().unwrap().text_since_stable(self.watch_stable);
+        self.watch_stable = end;
+        text.lines()
+            .find(|l| l.to_lowercase().contains(&kw))
+            .map(|l| format!("{}: {}", self.title, l.trim()))
     }
 
     pub fn write(&mut self, bytes: &[u8]) {

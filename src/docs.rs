@@ -135,6 +135,15 @@ SQL DROP/TRUNCATE, git force-push and the classic fork bomb. Only a bare Enter a
 the live prompt is guarded, so editing history and full-screen apps are untouched.
 Turn it off with behaviour.command_guardian = false.
 
+# Keyword watch
+
+From the palette, Watch pane for keyword arms the focused pane: when a later line
+of its output contains that word (case-insensitive), runnir raises a desktop
+notification with the matching line. Point it at a build, a deploy or a tail -f
+and walk away — you get pinged on deploy OK, error, panic, whatever you set. An
+empty keyword clears the watch. Scanning starts from the current bottom, so old
+scrollback never fires.
+
 # Broadcast input
 
 @ Ctrl+Shift+B     toggle broadcast: what you type goes to every pane in the tab at

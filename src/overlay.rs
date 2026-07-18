@@ -297,6 +297,8 @@ pub enum PromptKind {
     GuardedCommand,
     /// A shell-history line to type at the prompt (fuzzy-picked, not run).
     HistoryInsert,
+    /// A keyword to watch for in the focused pane's output (empty clears it).
+    WatchKeyword,
 }
 
 impl Prompt {

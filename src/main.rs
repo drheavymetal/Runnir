@@ -662,6 +662,13 @@ impl Gpu {
                             notify(&msg);
                         }
                     }
+                    // Keyword watch (W4): fires whether focused or not — it is an
+                    // explicit "tell me when this appears" on a monitored pane.
+                    if pane.watching().is_some() {
+                        if let Some(hit) = pane.take_watch_hit() {
+                            notify(&hit);
+                        }
+                    }
                 }
             }
             if self.last_autosave.elapsed() >= Duration::from_secs(30) {
