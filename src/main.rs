@@ -301,6 +301,9 @@ struct Gpu {
     closed_tabs: Vec<session::TabState>,
     cursor_px: PhysicalPosition<f64>,
     clipboard: clipboard::Clipboard,
+    /// Bounded, in-memory ring of recent copies (selection, OSC 52, yank, hint, …),
+    /// offered by the Super+V picker for re-paste. Never persisted (privacy).
+    clip_history: clipboard::ClipHistory,
     broadcast: bool,
     /// Fractional scroll carry-over, so slow touchpad swipes (sub-line pixel deltas)
     /// accumulate into smooth motion instead of being truncated to zero (D9).
@@ -481,6 +484,10 @@ impl App {
             closed_tabs: Vec::new(),
             cursor_px: PhysicalPosition::new(0.0, 0.0),
             clipboard: clipboard::Clipboard::new(),
+            clip_history: clipboard::ClipHistory::new(
+                self.config.clipboard.capacity,
+                self.config.clipboard.enabled,
+            ),
             broadcast: false,
             scroll_accum: 0.0,
             hover_url: None,
@@ -886,6 +893,11 @@ impl Gpu {
         for tab in &mut self.tabs {
             for pane in tab.panes.values_mut() {
                 for text in pane.take_clipboard_writes() {
+                    // Record OSC 52 writes in the history too, then set the clipboard.
+                    // Field accesses stay disjoint from the `&mut self.tabs` loop above,
+                    // so this is inlined rather than routed through `set_clipboard`
+                    // (which would borrow all of `self`).
+                    self.clip_history.push(&text);
                     self.clipboard.set(&text);
                 }
                 for body in pane.take_notifications() {

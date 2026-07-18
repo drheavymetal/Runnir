@@ -412,6 +412,7 @@ impl Gpu {
 
             Action::Copy => self.copy_selection(),
             Action::Paste => self.paste(),
+            Action::ClipboardHistory => self.open_clip_history(),
             Action::CopyLastOutput => {
                 if let Some(text) = self.tab().focused().last_command_output() {
                     self.set_clipboard(text);
@@ -602,6 +603,28 @@ impl Gpu {
                 Key::Character(s) => {
                     for c in s.chars() {
                         t.input(c);
+                    }
+                }
+                _ => {}
+            },
+            Overlay::ClipHistory(p) => match key {
+                Key::Named(NamedKey::Escape) => self.overlay = None,
+                Key::Named(NamedKey::ArrowUp) => p.up(),
+                Key::Named(NamedKey::ArrowDown) => p.down(),
+                Key::Named(NamedKey::Backspace) => p.backspace(),
+                Key::Named(NamedKey::Enter) => {
+                    let sel = p.selected();
+                    self.overlay = None;
+                    // Paste through the normal paste path (bracketed-paste aware,
+                    // control-byte sanitised) so re-paste behaves like any other paste.
+                    if let Some(text) = sel {
+                        self.paste_text(text);
+                    }
+                }
+                Key::Named(NamedKey::Space) => p.input(' '),
+                Key::Character(s) => {
+                    for c in s.chars() {
+                        p.input(c);
                     }
                 }
                 _ => {}
@@ -803,6 +826,7 @@ impl Gpu {
             }
             Action::Copy => self.copy_selection(),
             Action::Paste => self.paste(),
+            Action::ClipboardHistory => self.open_clip_history(),
             Action::CopyLastOutput => {
                 if let Some(text) = self.tab().focused().last_command_output() {
                     self.set_clipboard(text);
@@ -1420,7 +1444,9 @@ impl Gpu {
         // switch or a scroll can leave a stale target under the old coordinates.
         self.update_hover(self.cursor_px);
         let Some(h) = self.hover_url.clone() else { return false };
-        crate::hints::act(&h.text, h.kind, &mut self.clipboard);
+        if let Some(text) = crate::hints::act(&h.text, h.kind) {
+            self.set_clipboard(text);
+        }
         true
     }
 
@@ -1516,8 +1542,18 @@ impl Gpu {
         }
     }
 
+    /// The single sink every copy runs through: it records the text in the in-memory
+    /// clipboard history (for the Super+V picker) and then sets the system clipboard.
     fn set_clipboard(&mut self, text: String) {
+        self.clip_history.push(&text);
         self.clipboard.set(&text);
+    }
+
+    /// Opens the clipboard-history picker over the current history snapshot.
+    fn open_clip_history(&mut self) {
+        self.overlay = Some(Overlay::ClipHistory(overlay::ClipHistoryPicker::new(
+            self.clip_history.entries(),
+        )));
     }
 
     fn paste(&mut self) {
@@ -1564,6 +1600,8 @@ impl Gpu {
             self.reflow_all();
         }
         self.renderer.set_theme(config.theme.clone());
+        // Adopt clipboard-history sizing/enablement (trims the ring if it shrank).
+        self.clip_history.configure(config.clipboard.capacity, config.clipboard.enabled);
         // Opacity when the compositor shows through OR a background image is set
         // (same reasoning as at startup).
         let want_opacity = self.translucent || config.window.background.is_some();

@@ -124,6 +124,26 @@ minimap_jump zoom-rect mismatch; narrow-pane escape) + lows, fixed commit 65.
 Verify → all correct, 1 minor regression (narrow focused pane lost its thumb),
 fixed commit 66. ALL 4 FLASHY BLOCKS DONE + BUG-HUNTED. CONVERGED.
 
+## 2026-07-19 — Clipboard history (branch worktree-agent-a3c7d5968d006b569)
+In-memory ring of recent copies + fuzzy picker to re-paste. clipboard.rs gained
+ClipHistory (VecDeque, bounded, dedup-to-top on repeat, skips blank, off when
+disabled; never persisted — privacy). set_clipboard() (app_input.rs) is now the ONE
+sink: it pushes to history then sets the OS clipboard. Every copy routes through it —
+selection/Ctrl+Shift+C (copy_selection), copy-mode yank (exit_copy_mode),
+copy-last-output, OSC 52 (main.rs periodic drain, inlined push+set to keep the field
+borrow disjoint from &mut self.tabs), and hint copies (hints::act now RETURNS
+Option<String> instead of taking &mut Clipboard, callers route through set_clipboard).
+Config: new [clipboard] block {capacity=50, enabled=true}, serde default + JSON/TOML
+round-trip. Action::ClipboardHistory (id clipboard_history) bound to Super+V — every
+ctrl+shift+letter was already taken, so it lives on the super layer (Win+V mnemonic).
+Overlay::ClipHistory(ClipHistoryPicker) mirrors Palette/ThemePicker: filters on the
+full entry text, one-line preview per row (pilcrow marks multi-line), Enter pastes
+the FULL entry via paste_text (bracketed-paste + control-byte sanitised), Esc closes.
+apply_config re-configures the ring on hot-reload. docs.rs: new # Clipboard history
+section + @ Super+V lines + config flags. Tests: ring (evict/dedup/disabled/
+configure/blank), config round-trip JSON+TOML, picker preview/filter. 228 pass, 0
+warnings.
+
 ## Current task: add 15–20 differential features, 4–5 "wow". Document each here.
 
 User wants all of these, in batches, committing each, updating this file. Then run

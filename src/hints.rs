@@ -98,15 +98,19 @@ fn classify(token: &str) -> Option<HintKind> {
     None
 }
 
-/// What to do once a hint is chosen. URLs open in the browser; paths and hashes go
-/// to the clipboard, which is the safe, useful default (you usually want to paste
-/// a path into a command, not launch it).
-pub fn act(text: &str, kind: HintKind, clipboard: &mut crate::clipboard::Clipboard) {
+/// What to do once a hint is chosen. URLs open in the browser and yield `None`;
+/// paths and hashes yield `Some(text)` for the caller to copy — routed through the
+/// app's copy path so a hint-copy also lands in the clipboard history. Copying is
+/// the safe, useful default (you usually want to paste a path into a command, not
+/// launch it).
+#[must_use]
+pub fn act(text: &str, kind: HintKind) -> Option<String> {
     match kind {
-        HintKind::Url => open_in_browser(text),
-        HintKind::Path | HintKind::Hash => {
-            clipboard.set(text);
+        HintKind::Url => {
+            open_in_browser(text);
+            None
         }
+        HintKind::Path | HintKind::Hash => Some(text.to_string()),
     }
 }
 

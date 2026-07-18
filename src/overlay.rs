@@ -19,6 +19,7 @@ pub enum Overlay {
     Search(Search),
     Config(ConfigPanel),
     Theme(ThemePicker),
+    ClipHistory(ClipHistoryPicker),
 }
 
 impl Overlay {
@@ -34,6 +35,7 @@ impl Overlay {
             Overlay::Search(s) => s.render(cols, rows, theme),
             Overlay::Config(c) => c.render(cols, rows, theme),
             Overlay::Theme(t) => t.render(cols, rows, theme),
+            Overlay::ClipHistory(p) => p.render(cols, rows, theme),
         }
     }
 }
@@ -500,6 +502,118 @@ impl ThemePicker {
     }
 }
 
+// ---- clipboard history picker ---------------------------------------------
+
+/// A fuzzy-filterable list of recent clipboard copies, newest first. Modelled on
+/// [`Palette`]: arrows move, typing filters. Each row shows a one-line, truncated
+/// preview of the entry; confirming pastes the full entry into the focused pane via
+/// the normal paste path. The full text is kept alongside the preview so a
+/// multi-line copy pastes whole even though only its first line is shown.
+pub struct ClipHistoryPicker {
+    query: String,
+    /// (full entry, one-line preview), newest first.
+    all: Vec<(String, String)>,
+    filtered: Vec<usize>,
+    cursor: usize,
+}
+
+impl ClipHistoryPicker {
+    pub fn new(entries: &std::collections::VecDeque<String>) -> Self {
+        let all: Vec<(String, String)> =
+            entries.iter().map(|e| (e.clone(), clip_preview(e))).collect();
+        let filtered = (0..all.len()).collect();
+        Self { query: String::new(), all, filtered, cursor: 0 }
+    }
+
+    pub fn input(&mut self, c: char) {
+        self.query.push(c);
+        self.refilter();
+    }
+
+    pub fn backspace(&mut self) {
+        self.query.pop();
+        self.refilter();
+    }
+
+    pub fn up(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    pub fn down(&mut self) {
+        if self.cursor + 1 < self.filtered.len() {
+            self.cursor += 1;
+        }
+    }
+
+    /// The full text of the highlighted entry — what gets pasted on confirm.
+    pub fn selected(&self) -> Option<String> {
+        self.filtered.get(self.cursor).map(|&i| self.all[i].0.clone())
+    }
+
+    fn refilter(&mut self) {
+        // Filter against the whole entry, not just the shown preview, so a match on a
+        // later line still surfaces it.
+        let q = self.query.to_lowercase();
+        self.filtered =
+            (0..self.all.len()).filter(|&i| fuzzy(&self.all[i].0.to_lowercase(), &q)).collect();
+        self.cursor = 0;
+    }
+
+    fn render(&self, cols: usize, rows: usize, theme: &Theme) -> Vec<Panel> {
+        let w = (cols * 6 / 10).clamp(30, 80).min(cols.saturating_sub(2));
+        let visible = 12.min(self.filtered.len().max(1)).max(1);
+        let h = visible + 3;
+        let mut g = panel_grid(w, h, theme);
+
+        write(&mut g, 0, 2, "Clipboard history", accent());
+        let prompt = format!("> {}", self.query);
+        write(&mut g, 1, 2, &prompt, normal());
+        write(&mut g, 1, 2 + prompt.chars().count(), " ", selected());
+
+        if self.all.is_empty() {
+            write(&mut g, 3, 2, "nothing copied yet", dim());
+        } else if self.filtered.is_empty() {
+            write(&mut g, 3, 2, "no matches", dim());
+        }
+
+        let scroll = self.cursor.saturating_sub(visible - 1);
+        for (line, &idx) in self.filtered.iter().skip(scroll).take(visible).enumerate() {
+            let sel = scroll + line == self.cursor;
+            let preview = &self.all[idx].1;
+            let row = 3 + line;
+            let pen = if sel { selected() } else { normal() };
+            if sel {
+                write(&mut g, row, 0, &" ".repeat(w), selected());
+            }
+            let clipped: String = preview.chars().take(w.saturating_sub(4)).collect();
+            write(&mut g, row, 2, &clipped, pen);
+        }
+
+        let col = (cols.saturating_sub(w)) / 2;
+        let row = (rows.saturating_sub(h)) / 3;
+        vec![Panel { grid: g, col, row }]
+    }
+}
+
+/// A one-line, length-capped preview of a clipboard entry for the picker list: the
+/// first non-blank line, trimmed, with a marker when more lines follow.
+fn clip_preview(entry: &str) -> String {
+    const CAP: usize = 76;
+    let first = entry.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
+    let multiline = entry.lines().filter(|l| !l.trim().is_empty()).count() > 1;
+    let mut out: String = if first.chars().count() > CAP {
+        let mut s: String = first.chars().take(CAP - 1).collect();
+        s.push('\u{2026}');
+        s
+    } else {
+        first.to_string()
+    };
+    if multiline {
+        out.push_str(" \u{00b6}"); // pilcrow: this entry spans more than one line
+    }
+    out
+}
+
 // ---- docs ------------------------------------------------------------------
 
 pub struct Docs {
@@ -949,6 +1063,27 @@ mod tests {
         // The theme active on open is preserved verbatim for a cancel to restore.
         assert_eq!(p.original().background, original.background);
         assert_eq!(p.original().ansi.len(), 16);
+    }
+
+    #[test]
+    fn clip_picker_previews_filters_and_pastes_full_entry() {
+        let entries: std::collections::VecDeque<String> =
+            ["first line\nsecond line", "cargo build", "hello world"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+        let mut p = ClipHistoryPicker::new(&entries);
+        // Selecting the top entry yields its full (multi-line) text, not the preview.
+        assert_eq!(p.selected().as_deref(), Some("first line\nsecond line"));
+        // The preview is one line, first non-blank, marked as multi-line.
+        assert!(p.all[0].1.starts_with("first line"));
+        assert!(p.all[0].1.contains('\u{00b6}'), "multi-line entries are marked");
+        // Typing filters against the full entry text; a match on a body line surfaces it.
+        for c in "second".chars() {
+            p.input(c);
+        }
+        assert_eq!(p.filtered.len(), 1);
+        assert_eq!(p.selected().as_deref(), Some("first line\nsecond line"));
     }
 
     #[test]

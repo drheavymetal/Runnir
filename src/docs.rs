@@ -44,10 +44,27 @@ whatever order you built the splits in.
 @ wheel / Shift+PageUp/Dn   scroll the history
 @ drag                      select text (copied on release)
 @ Ctrl+Shift+C / V          copy / paste
+@ Super+V                   clipboard history: re-paste a recent copy (see below)
 @ middle click              paste the primary selection (the last text selected)
 @ Ctrl+Shift+Home/End       jump to top / live output
 @ Ctrl+Shift+F              search the scrollback; Enter/Up next/prev, Esc closes
 @ Ctrl+Shift+Q              dump the scrollback to $EDITOR in a new split
+
+# Clipboard history
+
+Every copy runnir makes is remembered in a small in-memory ring, newest first:
+selection copies, Ctrl+Shift+C, copy-mode yanks, copy-last-output, hint copies and
+OSC 52 writes from programs all land there. Open the picker to re-paste an earlier
+copy without hunting for it again.
+
+@ Super+V     open the clipboard-history picker (also in the palette)
+
+Type to fuzzy-search the entries, arrows to move, Enter pastes the highlighted one
+into the focused pane through the normal paste path, Esc closes. Each row shows a
+one-line preview (a pilcrow marks a multi-line entry); re-copying an entry moves it
+to the top instead of duplicating it. The history is never written to disk, since
+the clipboard often holds secrets. Size it with clipboard.capacity (default 50) and
+turn it off with clipboard.enabled = false.
 
 # Mouse in full-screen apps
 
@@ -266,6 +283,8 @@ file is safe to keep in a dotfiles repo.
 @ cursor.trail     true draws a brief fading trail behind the cursor (flair, off)
 @ behaviour.smooth_scroll  true glides on scroll jumps instead of teleporting
 @ behaviour.shell_integration  true auto-injects OSC 133/7 hooks into fish/zsh/bash (no rc edits)
+@ clipboard.capacity   how many recent copies the Super+V history keeps (default 50)
+@ clipboard.enabled    false stops recording copies into the history
 
 Each tab shows an icon for its foreground app and a badge: an amber dot for a
 background tab with unseen output, a red cross if its last command failed. The tab
