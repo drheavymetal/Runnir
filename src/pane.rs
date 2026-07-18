@@ -182,6 +182,22 @@ impl Pane {
             .map(|l| format!("{}: {}", self.title, l.trim()))
     }
 
+    /// Toggles folding of every finished command's output (W2): folds all if none is
+    /// folded, else clears all folds.
+    pub fn toggle_fold_all(&mut self) {
+        let mut g = self.grid.lock().unwrap();
+        if g.has_folds() {
+            g.unfold_all();
+        } else {
+            g.fold_all();
+        }
+    }
+
+    /// Toggles the fold covering the command at a given absolute (local) row.
+    pub fn toggle_fold_at(&mut self, local_row: usize) {
+        self.grid.lock().unwrap().toggle_fold_at(local_row);
+    }
+
     pub fn write(&mut self, bytes: &[u8]) {
         self.pty.write(bytes);
     }

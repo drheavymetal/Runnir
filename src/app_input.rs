@@ -142,6 +142,12 @@ impl Gpu {
             (ElementState::Pressed, MouseButton::Left) => {
                 let area = self.active_area();
                 if let Some((id, rect)) = self.pane_at(self.cursor_px, area) {
+                    // A click on a fold summary unfolds it instead of selecting.
+                    if let Some(local) = self.fold_row_at(id, rect, self.cursor_px) {
+                        self.tabs[self.active].panes.get_mut(&id).unwrap().toggle_fold_at(local);
+                        self.window.request_redraw();
+                        return;
+                    }
                     if let Some(point) = self.point_in(id, rect, self.cursor_px) {
                         // Double-click selects a word, triple a line.
                         let mode = self.click_mode(point);
@@ -403,6 +409,7 @@ impl Gpu {
             Action::WatchKeyword => self.watch_keyword(),
             Action::LaunchLayout => self.open_layout_picker(config),
             Action::CopyMode => self.enter_copy_mode(),
+            Action::FoldOutput => self.tab().focused().toggle_fold_all(),
             Action::QuickConnect => self.open_quick_connect(),
             Action::HintMode => self.open_hints(),
             Action::LaunchClaude => self.launch_claude(config),
@@ -598,6 +605,7 @@ impl Gpu {
             Action::WatchKeyword => self.watch_keyword(),
             Action::LaunchLayout => self.open_layout_picker(config),
             Action::CopyMode => self.enter_copy_mode(),
+            Action::FoldOutput => self.tab().focused().toggle_fold_all(),
             Action::Whisper => self.whisper(),
             Action::SearchScrollback => self.overlay = Some(Overlay::Search(overlay::Search::new())),
             Action::QuickConnect => self.open_quick_connect(),
@@ -1088,7 +1096,33 @@ impl Gpu {
         let pane = self.tabs[self.active].panes.get(&id)?;
         let grid = pane.grid.lock().unwrap();
         let row = row.min(grid.rows().saturating_sub(1));
-        Some((grid.abs_row(row), col.min(grid.cols().saturating_sub(1))))
+        // With folds active a screen row maps through the display plan; a click on a
+        // fold summary or blank padding is not a real cell (returns None).
+        let abs = if grid.has_folds() {
+            match grid.display_plan().get(row) {
+                Some(crate::grid::PlanRow::Real(a)) => *a,
+                _ => return None,
+            }
+        } else {
+            grid.abs_row(row)
+        };
+        Some((abs, col.min(grid.cols().saturating_sub(1))))
+    }
+
+    /// If a mouse click at `pos` lands on a fold summary row, the local row to toggle
+    /// (unfold). `None` otherwise.
+    fn fold_row_at(&self, id: u64, rect: Rect, pos: PhysicalPosition<f64>) -> Option<usize> {
+        let (_, ch) = self.renderer.cell_size();
+        let row = (((pos.y as f32 - rect.y) / ch).floor().max(0.0)) as usize;
+        let pane = self.tabs[self.active].panes.get(&id)?;
+        let grid = pane.grid.lock().unwrap();
+        if !grid.has_folds() {
+            return None;
+        }
+        match grid.display_plan().get(row) {
+            Some(crate::grid::PlanRow::Fold { local, .. }) => Some(*local),
+            _ => None,
+        }
     }
 
     fn jump_prompt(&mut self, dir: isize) {

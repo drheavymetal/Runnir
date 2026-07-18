@@ -63,7 +63,8 @@ Fable 5 bug-hunt on the 4 new features → 11 findings fixed (commit 48):
   sampling while scrolled back; key last_cursor_rect to pane (no ghost on focus jump).
 Verify round on those 11 fixes → all correct, only 3 lows (commit 49): trail ghost on
 relayout, CSI 3J cmd_exits prune, copy-mode end_selection. CONVERGED.
-NEXT: only W2 folding left (rewrites row/coord mapping — needs a dedicated session).
+ALL 16 planned features DONE (W2 = commit 50, view-only fold plan, no coord rewrite).
+NEXT: Fable 5 bug-hunt on W2 (render/plan/mouse/cursor interactions).
 
 ## Current task: add 15–20 differential features, 4–5 "wow". Document each here.
 
@@ -78,8 +79,11 @@ WOW (aim 4–5):
       intercepts bare Enter → Grid::current_command_text (last prompt mark→cursor) →
       PromptKind::GuardedCommand confirm; Enter runs, Esc edits. behaviour.command_guardian
       (default true). 6 unit tests. commit 28. (Rule-based, not the LLM — instant, offline.)
-- [ ] W2 Semantic command folding — collapse a command's output block (OSC 133 marks);
-      fold/unfold current, fold-all. Big cargo build → one line.
+- [x] W2 Command output folding — grid.folds/outputs (stable ranges, OSC 133 C→D),
+      PlanRow enum + display_plan() (fold-aware row plan); render pane_instances iterates
+      the plan, emit_fold_summary draws "N lines folded", cursor_screen from plan;
+      point_in/fold_row_at map clicks through the plan (click summary → unfold);
+      FoldOutput palette action (toggle fold-all). View-only, no coord mutation. commit 50.
 - [x] W3 Named layouts — config [[layouts]] {name, commands[]}; palette LaunchLayout
       → Prompt(LaunchLayout) → launch_layout: new Tab running cmd[0], splits alternating
       axis for the rest (argv_of whitespace-split). commit 35.

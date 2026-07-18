@@ -45,6 +45,15 @@ pub struct Cell {
     pub pen: Pen,
 }
 
+/// One screen row in a fold-aware display plan (W2): a real grid row, a collapsed
+/// fold summary standing in for `lines` hidden rows, or blank padding past content.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PlanRow {
+    Real(usize),
+    Fold { local: usize, lines: usize },
+    Blank,
+}
+
 /// Second half of a double-width glyph. Holds no character of its own: the glyph
 /// in the cell to its left is drawn across both. Never a printable codepoint, so
 /// it cannot collide with real content.
@@ -122,6 +131,12 @@ pub struct Grid {
     /// Exit code of finished commands, keyed by the stable row of the prompt that
     /// launched each (OSC 133;D;code). Drives the pass/fail status gutter.
     cmd_exits: Vec<(usize, i32)>,
+    /// Output regions of finished commands as stable (start, end) inclusive rows
+    /// (OSC 133 C→D). Backs "fold all output" (W2).
+    outputs: Vec<(usize, usize)>,
+    /// Folded output regions: stable (start, end) inclusive rows hidden behind a
+    /// one-line summary. A subset of `outputs` (W2).
+    folds: Vec<(usize, usize)>,
     /// Stable (start, end) rows of the last finished command's output.
     last_output: Option<(usize, usize)>,
     /// Count of commands finished (OSC 133;D), for completion notifications.
@@ -192,6 +207,8 @@ impl Grid {
             command_input: None,
             links: Vec::new(),
             cmd_exits: Vec::new(),
+            outputs: Vec::new(),
+            folds: Vec::new(),
             last_output: None,
             command_seq: 0,
             scroll_top: 0,
@@ -504,6 +521,82 @@ impl Grid {
         self.dropped
     }
 
+    // ---- Command output folding (W2) ----------------------------------------
+
+    /// Whether any output region is currently folded.
+    pub fn has_folds(&self) -> bool {
+        !self.folds.is_empty()
+    }
+
+    /// Folds every finished command's output region that spans more than one row.
+    pub fn fold_all(&mut self) {
+        self.folds.clear();
+        for &(s, e) in &self.outputs {
+            if e > s {
+                self.folds.push((s, e));
+            }
+        }
+        self.folds.sort_unstable();
+        self.folds.dedup();
+        self.dirty = true;
+    }
+
+    /// Removes every fold (shows all output again).
+    pub fn unfold_all(&mut self) {
+        if !self.folds.is_empty() {
+            self.folds.clear();
+            self.dirty = true;
+        }
+    }
+
+    /// Toggles the fold covering the command at absolute (local) `row`: if that row
+    /// is inside a fold, unfold it; else if it is inside a finished command's output,
+    /// fold that. Used for click-to-toggle on a summary line or a command's output.
+    pub fn toggle_fold_at(&mut self, local_row: usize) {
+        let stable = self.local_to_stable(local_row);
+        if let Some(i) = self.folds.iter().position(|&(s, e)| stable >= s && stable <= e) {
+            self.folds.remove(i);
+            self.dirty = true;
+            return;
+        }
+        if let Some(&(s, e)) = self.outputs.iter().find(|&&(s, e)| stable >= s && stable <= e && e > s)
+        {
+            self.folds.push((s, e));
+            self.folds.sort_unstable();
+            self.dirty = true;
+        }
+    }
+
+    /// The rows to display for the current viewport, folds collapsed. Exactly `rows`
+    /// entries (padded with blanks past the end of content).
+    pub fn display_plan(&self) -> Vec<PlanRow> {
+        let top = self.scrollback.len() - self.display_offset;
+        let total = self.total_rows();
+        let mut plan = Vec::with_capacity(self.rows);
+        let mut abs = top;
+        while plan.len() < self.rows {
+            if abs >= total {
+                plan.push(PlanRow::Blank);
+                abs += 1;
+                continue;
+            }
+            let stable = self.local_to_stable(abs);
+            if let Some(&(fs, fe)) = self.folds.iter().find(|&&(s, e)| stable >= s && stable <= e) {
+                let lines = fe - fs + 1;
+                plan.push(PlanRow::Fold { local: abs, lines });
+                // Jump past the folded region (its end mapped back to local).
+                match self.stable_to_local(fe) {
+                    Some(le) => abs = le + 1,
+                    None => abs += 1,
+                }
+            } else {
+                plan.push(PlanRow::Real(abs));
+                abs += 1;
+            }
+        }
+        plan
+    }
+
     /// The text currently on the command line: from the OSC 133;B command-input mark
     /// (end of prompt) when the shell emits one, else the last prompt-start mark,
     /// else the cursor's own row — down to the cursor. Used by the command guardian
@@ -739,6 +832,8 @@ impl Grid {
                 self.images.retain(|im| im.anchor >= dropped);
                 self.prompt_marks.retain(|&m| m >= dropped);
                 self.cmd_exits.retain(|&(p, _)| p >= dropped);
+                self.outputs.retain(|&(s, _)| s >= dropped);
+                self.folds.retain(|&(s, _)| s >= dropped);
             }
             // Keep the viewport pinned to the same content while scrolled back,
             // instead of letting it drift as new lines arrive.
@@ -876,6 +971,8 @@ impl Grid {
             // the live screen keep their (still valid) stable rows.
             self.prompt_marks.retain(|&m| m >= dropped);
             self.cmd_exits.retain(|&(p, _)| p >= dropped);
+            self.outputs.retain(|&(s, _)| s >= dropped);
+            self.folds.retain(|&(s, _)| s >= dropped);
             self.images.retain(|im| im.anchor >= dropped);
             self.display_offset = 0;
             return;
@@ -1329,7 +1426,13 @@ impl Grid {
             Some(b'D') => {
                 if let Some(start) = self.command_start.take() {
                     let end = self.local_to_stable(self.cursor_abs());
-                    self.last_output = Some((start, end.max(start)));
+                    let end = end.max(start);
+                    self.last_output = Some((start, end));
+                    // Bank the region for "fold all output"; bound the list.
+                    self.outputs.push((start, end));
+                    if self.outputs.len() > 512 {
+                        self.outputs.drain(0..256);
+                    }
                 }
                 if let (Some(code), Some(&prompt)) = (exit, self.prompt_marks.last()) {
                     self.cmd_exits.push((prompt, code));
@@ -1865,6 +1968,24 @@ mod tests {
         // Prompt start (A), the prompt itself, prompt end / input begins (B), command.
         feed(&mut g, "\x1b]133;A\x07pedro$ \x1b]133;B\x07rm -rf /");
         assert_eq!(g.current_command_text(), "rm -rf /");
+    }
+
+    #[test]
+    fn fold_collapses_command_output_in_the_plan() {
+        let mut g = Grid::new(20, 6);
+        // Prompt, command, three lines of output, done.
+        feed(&mut g, "\x1b]133;A\x07$ ls\r\n\x1b]133;C\x07a\r\nb\r\nc\r\n\x1b]133;D;0\x07");
+        assert!(!g.has_folds());
+        g.fold_all();
+        assert!(g.has_folds(), "an output region of >1 row should fold");
+        let plan = g.display_plan();
+        assert_eq!(plan.len(), g.rows());
+        let folds = plan.iter().filter(|p| matches!(p, PlanRow::Fold { .. })).count();
+        assert_eq!(folds, 1, "the output collapses to one summary row: {plan:?}");
+        // Unfolding restores plain rows.
+        g.unfold_all();
+        assert!(!g.has_folds());
+        assert!(g.display_plan().iter().all(|p| !matches!(p, PlanRow::Fold { .. })));
     }
 
     #[test]

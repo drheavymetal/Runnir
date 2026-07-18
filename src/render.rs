@@ -510,6 +510,45 @@ impl Renderer {
         out
     }
 
+    /// Draws a fold summary line standing in for `lines` collapsed rows (W2): a dim
+    /// accent label like "⋯ 42 lines folded", left-aligned on the row.
+    fn emit_fold_summary(
+        &mut self,
+        out: &mut Vec<Instance>,
+        ox: f32,
+        y: f32,
+        cw: f32,
+        lines: usize,
+        base_bg: crate::config::Rgb,
+        dim: f32,
+    ) {
+        let label = format!("\u{25b8} {lines} lines folded");
+        let a = self.theme.accent;
+        let mut fg = srgb(a.0, a.1, a.2);
+        for c in &mut fg[..3] {
+            *c *= 0.75 * dim;
+        }
+        let bg = {
+            let [r, g, b, _] = srgb(base_bg.0, base_bg.1, base_bg.2);
+            [r, g, b, self.opacity]
+        };
+        for (i, ch) in label.chars().enumerate() {
+            let glyph = self.font.glyph(ch, Style::REGULAR);
+            out.push(Instance {
+                pos_px: [ox + i as f32 * cw, y],
+                glyph_offset: glyph.offset,
+                glyph_size: glyph.size,
+                uv_min: glyph.uv_min,
+                uv_max: glyph.uv_max,
+                fg,
+                bg,
+                flags: if glyph.color { FLAG_COLOR } else { 0 },
+                width: 1.0,
+                _pad: [0; 2],
+            });
+        }
+    }
+
     fn pane_instances(&mut self, pane: &PaneDraw, out: &mut Vec<Instance>) {
         let grid = pane.grid;
         let (ox, oy) = pane.origin;
@@ -528,10 +567,30 @@ impl Renderer {
         // An unfocused pane dims so the eye finds the active one at a glance.
         let dim = if pane.focused { 1.0 } else { 0.62 };
 
-        for row in 0..grid.rows() {
-            let abs = grid.abs_row(row);
-            let ligated = self.ligatures_for(grid, abs, cursor_abs, cur_col, selection);
+        // Fold-aware row plan (W2): with folds active a screen row may stand in for a
+        // collapsed output region; without folds it is the plain viewport rows.
+        let plan: Vec<crate::grid::PlanRow> = if grid.has_folds() {
+            grid.display_plan()
+        } else {
+            (0..grid.rows()).map(|r| crate::grid::PlanRow::Real(grid.abs_row(r))).collect()
+        };
+        // Screen row the cursor lands on, accounting for folds above it (None if it
+        // is hidden inside a fold — only finished output folds, so this is rare).
+        let cursor_screen = plan
+            .iter()
+            .position(|p| matches!(p, crate::grid::PlanRow::Real(a) if *a == cursor_abs));
+
+        for (row, prow) in plan.iter().enumerate() {
             let y = oy + row as f32 * ch;
+            let abs = match prow {
+                crate::grid::PlanRow::Real(a) => *a,
+                crate::grid::PlanRow::Fold { lines, .. } => {
+                    self.emit_fold_summary(out, ox, y, cw, *lines, base_bg, dim);
+                    continue;
+                }
+                crate::grid::PlanRow::Blank => continue,
+            };
+            let ligated = self.ligatures_for(grid, abs, cursor_abs, cur_col, selection);
 
             for col in 0..grid.cols() {
                 let cell = grid.abs_cell(abs, col);
@@ -633,12 +692,9 @@ impl Renderer {
                 _ => None,
             };
             if let Some(bar_ch) = bar {
-                // Viewport row of the cursor, folding in the scrollback offset so a
-                // beam/underline bar tracks the cursor off-screen while scrolled
-                // back, exactly as the in-loop block cursor does.
-                let top = grid.abs_row(0);
-                if cursor_abs >= top && cursor_abs - top < grid.rows() {
-                    let row = cursor_abs - top;
+                // Screen row of the cursor from the fold-aware plan, so the bar tracks
+                // the cursor whether scrolled back or shifted up by folds above it.
+                if let Some(row) = cursor_screen {
                     let g = self.font.glyph(bar_ch, Style::REGULAR);
                     let cur = self.theme.cursor;
                     out.push(Instance {

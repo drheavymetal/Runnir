@@ -85,6 +85,10 @@ input and output begin. That powers:
 Each command's prompt row also gets a status bar at the left edge: green when it
 exited 0, red when it failed, dim while it runs — a glanceable pass/fail history.
 
+From the palette, Fold / unfold all command output collapses every finished
+command's output into a one-line summary, so a screen full of build noise becomes
+a list of commands. Click a summary line to unfold just that one. Needs OSC 133.
+
 For fish, add to config.fish:
   function runnir_prompt --on-event fish_prompt
     printf '\\e]133;A\\e\\\\'
