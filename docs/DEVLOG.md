@@ -59,7 +59,8 @@ DIFFERENTIAL (aim ~15 total incl. above):
       → AI panel with a concise-summary prompt (tail-truncated 8k). commit 30.
 - [x] D8 Broadcast groups — Pane.in_group + ToggleBroadcastGroup (palette); broadcast_bytes
       scopes to members when any exist, else all panes. commit 37.
-- [ ] D9 Smooth/momentum scroll.
+- [x] D9 Smooth scroll — Gpu.scroll_accum carries fractional lines; slow touchpad
+      sub-line pixel deltas accumulate instead of truncating to zero. commit 38.
 - [x] D10 Pane zoom (Ctrl+Shift+Z) — visible_rects override + resize_one. commit 25.
 - [x] D11 Open scrollback in $EDITOR — dump scrollback_text to temp file, split_running $EDITOR/$VISUAL/vi. commit 31.
 - [ ] D12 Copy-mode with vim motions (keyboard scrollback nav + select).

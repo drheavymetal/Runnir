@@ -15,9 +15,16 @@ impl Gpu {
         // A mouse-mode app (unless Shift is held) gets the wheel as button events.
         let lines = wheel_lines(delta, config.behaviour.wheel_lines, self.renderer.cell_size().1);
         if !mods.shift_key() && self.forward_wheel(lines) {
+            self.scroll_accum = 0.0;
             return;
         }
-        if self.tab().focused().scroll(lines as isize) {
+        // Accumulate fractional lines so a slow touchpad swipe (sub-line pixel
+        // deltas) scrolls smoothly instead of being truncated to nothing. The whole
+        // part moves now; the remainder carries to the next event.
+        self.scroll_accum += lines;
+        let whole = self.scroll_accum.trunc();
+        self.scroll_accum -= whole;
+        if whole != 0.0 && self.tab().focused().scroll(whole as isize) {
             self.window.request_redraw();
         }
     }

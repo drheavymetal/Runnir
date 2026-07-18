@@ -271,6 +271,9 @@ struct Gpu {
     cursor_px: PhysicalPosition<f64>,
     clipboard: clipboard::Clipboard,
     broadcast: bool,
+    /// Fractional scroll carry-over, so slow touchpad swipes (sub-line pixel deltas)
+    /// accumulate into smooth motion instead of being truncated to zero (D9).
+    scroll_accum: f32,
     font_px: f32,
     ai: ai::Session,
     last_context_refresh: Instant,
@@ -411,6 +414,7 @@ impl App {
             cursor_px: PhysicalPosition::new(0.0, 0.0),
             clipboard: clipboard::Clipboard::new(),
             broadcast: false,
+            scroll_accum: 0.0,
             font_px,
             ai: ai::Session::new(),
             last_context_refresh: Instant::now(),
