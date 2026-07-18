@@ -23,6 +23,7 @@ mod selection;
 mod session;
 mod settings;
 mod tab;
+mod themes;
 mod whisper;
 
 use std::sync::{Arc, Mutex};

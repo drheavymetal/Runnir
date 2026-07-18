@@ -420,6 +420,10 @@ impl Gpu {
             Action::OpenConfig => {
                 self.overlay = Some(Overlay::Config(overlay::ConfigPanel::new(config.clone())));
             }
+            Action::OpenThemePicker => {
+                self.overlay =
+                    Some(Overlay::Theme(overlay::ThemePicker::new(config.theme.clone())));
+            }
             Action::ToggleAi => self.toggle_ai(config),
             Action::AskAiAboutError => self.ask_ai_about_error(config),
             Action::AiCommand => self.ai_command(),
@@ -534,6 +538,35 @@ impl Gpu {
                     _ => {}
                 }
             }
+            Overlay::Theme(t) => match key {
+                // Cancel: restore the theme that was live when the picker opened, so a
+                // browse leaves no trace.
+                Key::Named(NamedKey::Escape) => {
+                    let original = t.original();
+                    self.overlay = None;
+                    self.renderer.set_theme(original);
+                }
+                // Confirm: keep the highlighted theme and persist it via the same
+                // apply/pending/save path the settings panel uses.
+                Key::Named(NamedKey::Enter) => {
+                    let picked = t.selected_theme();
+                    let name = t.selected_name();
+                    self.overlay = None;
+                    if let Some(theme) = picked {
+                        self.keep_theme(theme, name, config);
+                    }
+                }
+                Key::Named(NamedKey::ArrowUp) => t.up(),
+                Key::Named(NamedKey::ArrowDown) => t.down(),
+                Key::Named(NamedKey::Backspace) => t.backspace(),
+                Key::Named(NamedKey::Space) => t.input(' '),
+                Key::Character(s) => {
+                    for c in s.chars() {
+                        t.input(c);
+                    }
+                }
+                _ => {}
+            },
             Overlay::Prompt(p) => match key {
                 Key::Named(NamedKey::Escape) => self.overlay = None,
                 Key::Named(NamedKey::ArrowUp) => p.up(),
@@ -640,8 +673,35 @@ impl Gpu {
             self.apply_config(&cfg);
             self.pending_config = Some(cfg);
         }
+        // Theme picker: live-preview the highlighted theme so the terminal behind the
+        // picker updates as the selection moves. This runs only while it is open and
+        // navigating — Enter/Esc have already closed it (and applied or restored),
+        // so `as_ref` is `None` on those and the preview is skipped.
+        if let Some(Overlay::Theme(t)) = self.overlay.as_ref()
+            && let Some(theme) = t.selected_theme()
+        {
+            self.renderer.set_theme(theme);
+        }
         let _ = mods;
         self.window.request_redraw();
+    }
+
+    /// Keeps a theme picked from the theme picker: applies it live and persists it
+    /// through the same path the settings panel uses (adopt into the renderer, hand
+    /// to `App` via `pending_config`, and write the JSON config so it survives a
+    /// restart). Refreshing the config via `pending_config` also updates the
+    /// hot-reload mtime, so the just-written file does not trigger a redundant reload.
+    fn keep_theme(&mut self, theme: crate::config::Theme, name: Option<&str>, config: &Config) {
+        let mut cfg = config.clone();
+        cfg.theme = theme;
+        self.apply_config(&cfg);
+        self.status = Some(match (cfg.save_json(), name) {
+            (Ok(()), Some(n)) => format!("theme: {n}"),
+            (Ok(()), None) => "theme applied".into(),
+            (Err(e), _) => format!("theme applied (save failed: {e})"),
+        });
+        self.status_expiry = Some(Instant::now() + Duration::from_secs(2));
+        self.pending_config = Some(cfg);
     }
 
     fn run_palette_action(&mut self, action: Action, config: &Config) {
@@ -676,6 +736,9 @@ impl Gpu {
             }
             Action::ShowDocs => self.overlay = Some(Overlay::Docs(overlay::Docs::new(docs::HELP))),
             Action::OpenConfig => self.overlay = Some(Overlay::Config(overlay::ConfigPanel::new(config.clone()))),
+            Action::OpenThemePicker => {
+                self.overlay = Some(Overlay::Theme(overlay::ThemePicker::new(config.theme.clone())))
+            }
             Action::ToggleAi => self.toggle_ai(config),
             Action::AskAiAboutError => self.ask_ai_about_error(config),
             Action::AiCommand => self.ai_command(),

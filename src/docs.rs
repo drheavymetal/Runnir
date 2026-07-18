@@ -279,7 +279,8 @@ and translucent is the one change that still needs a restart.
 
 The palette also hosts commands with no default chord, including Insert from
 shell history (fuzzy-pick a past command from fish/zsh/bash history and type it
-at the prompt) and Open scrollback in $EDITOR.
+at the prompt), Open scrollback in $EDITOR, and the Theme picker (browse the
+bundled colour themes with live preview; Enter keeps and saves one, Esc restores).
 
 # Why 'runnir'
 
