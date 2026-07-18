@@ -365,6 +365,7 @@ impl Gpu {
             Action::LaunchClaude => self.launch_claude(config),
             Action::Whisper => self.whisper(),
             Action::ToggleBroadcast => self.broadcast = !self.broadcast,
+            Action::ToggleBroadcastGroup => self.toggle_broadcast_group(),
             Action::ToggleZoom => self.toggle_zoom(),
             Action::ClearSelectionOrScrollback => {
                 if !self.tab().focused().clear_selection() {
@@ -600,6 +601,7 @@ impl Gpu {
             Action::FontSmaller => self.set_font_px(self.font_px - 1.0, config),
             Action::FontReset => self.set_font_px(config.font.size, config),
             Action::ToggleBroadcast => self.broadcast = !self.broadcast,
+            Action::ToggleBroadcastGroup => self.toggle_broadcast_group(),
             Action::ToggleZoom => self.toggle_zoom(),
             Action::MoveTabLeft => self.move_tab(-1),
             Action::MoveTabRight => self.move_tab(1),
@@ -815,9 +817,30 @@ impl Gpu {
     }
 
     fn broadcast_bytes(&mut self, bytes: &[u8]) {
+        // If any pane is a group member, broadcast is scoped to the group; with no
+        // members it falls back to every pane (the simple whole-tab broadcast).
+        let scoped = self.tab().panes.values().any(|p| p.in_group);
         for pane in self.tab().panes.values_mut() {
-            pane.write(bytes);
+            if !scoped || pane.in_group {
+                pane.write(bytes);
+            }
         }
+    }
+
+    /// Toggles the focused pane's membership in the broadcast group (D8).
+    fn toggle_broadcast_group(&mut self) {
+        let member = {
+            let p = self.tab().focused();
+            p.in_group = !p.in_group;
+            p.in_group
+        };
+        self.status = Some(if member {
+            "pane added to broadcast group".into()
+        } else {
+            "pane removed from broadcast group".into()
+        });
+        self.status_expiry = Some(Instant::now() + Duration::from_secs(2));
+        self.window.request_redraw();
     }
 
     fn copy_selection(&mut self) {

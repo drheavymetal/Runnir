@@ -162,6 +162,11 @@ scrollback never fires.
 @ Ctrl+Shift+B     toggle broadcast: what you type goes to every pane in the tab at
                    once. Useful for driving several servers together.
 
+From the palette, Toggle pane in broadcast group marks the focused pane as a group
+member. Once any pane in a tab is a member, broadcast is scoped to just the group
+instead of the whole tab — so you can broadcast to three of five panes and leave a
+log tail and a monitor untouched. With no members, broadcast covers every pane.
+
 # Reopen a closed tab
 
 @ Ctrl+Shift+U     bring back the last tab you closed, with its layout, working

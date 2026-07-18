@@ -42,6 +42,9 @@ pub struct Pane {
     watch: Option<String>,
     /// Next unscanned stable row for the watcher, so each line fires at most once.
     watch_stable: usize,
+    /// Membership in the broadcast group. When any pane in a tab is a member,
+    /// broadcast input goes only to members; otherwise it goes to every pane (D8).
+    pub in_group: bool,
 }
 
 impl Pane {
@@ -71,6 +74,7 @@ impl Pane {
             last_bell: 0,
             watch: None,
             watch_stable: 0,
+            in_group: false,
         })
     }
 

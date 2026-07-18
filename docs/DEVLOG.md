@@ -57,7 +57,8 @@ DIFFERENTIAL (aim ~15 total incl. above):
 - [ ] D6 Command status gutter — exit code + duration next to each prompt (OSC 133 D + timing).
 - [x] D7 Session summarizer (AI) — SummarizeSession (Ctrl+Shift+I) → scrollback_text
       → AI panel with a concise-summary prompt (tail-truncated 8k). commit 30.
-- [ ] D8 Broadcast groups — broadcast to a named subset of panes.
+- [x] D8 Broadcast groups — Pane.in_group + ToggleBroadcastGroup (palette); broadcast_bytes
+      scopes to members when any exist, else all panes. commit 37.
 - [ ] D9 Smooth/momentum scroll.
 - [x] D10 Pane zoom (Ctrl+Shift+Z) — visible_rects override + resize_one. commit 25.
 - [x] D11 Open scrollback in $EDITOR — dump scrollback_text to temp file, split_running $EDITOR/$VISUAL/vi. commit 31.
