@@ -29,17 +29,21 @@ const VERSION: u32 = 1;
 ///
 /// This is the "project key": two panes anywhere under the same repo map to the
 /// same key, so the layout you saved from `~/proj/src` restores when you reopen in
-/// `~/proj`. A pure function of the path (no filesystem writes) so it is trivially
-/// unit-testable; it does touch the filesystem to look for `.git`.
+/// `~/proj`. The path is canonicalized first, because the same project is reported
+/// through different spellings — OSC 7 gives the shell's logical (symlinked) path
+/// while `/proc` and `env::current_dir()` give the resolved one — and the key must
+/// be identical for all of them or a saved session is never found again. A path
+/// that cannot be resolved (already gone) is used as given.
 pub fn project_key(start: &Path) -> PathBuf {
-    let mut cur = Some(start);
+    let canon = start.canonicalize().unwrap_or_else(|_| start.to_path_buf());
+    let mut cur = Some(canon.as_path());
     while let Some(dir) = cur {
         if dir.join(".git").is_dir() {
             return dir.to_path_buf();
         }
         cur = dir.parent();
     }
-    start.to_path_buf()
+    canon
 }
 
 /// One tab's layout: the split tree, the arrangement mode, and where each pane's
@@ -89,6 +93,52 @@ impl TabLayout {
             order: self.order.clone(),
             master_ratio: self.master_ratio,
         }
+    }
+
+    /// A copy of this layout with every pane id rewritten to fresh, sequential ids
+    /// starting at `first_id`, returning the layout and the next unused id.
+    ///
+    /// Pane ids are global across the whole window (scroll animation, copy mode and
+    /// remote control all resolve a pane by id across every tab), so an *additive*
+    /// restore must never re-introduce the ids the layout was saved with — they very
+    /// likely already belong to open panes, and a second restore of the same entry
+    /// would certainly duplicate them. Tree shape, focus, order and cwds all follow
+    /// the same old→new mapping, so the layout is identical up to renumbering.
+    pub fn remapped_from(&self, first_id: PaneId) -> (TabLayout, PaneId) {
+        let mut next = first_id;
+        let mut map: HashMap<PaneId, PaneId> = HashMap::new();
+        for old in self.tree.panes() {
+            map.entry(old).or_insert_with(|| {
+                let id = next;
+                next += 1;
+                id
+            });
+        }
+        let renamed = |id: PaneId| map.get(&id).copied().unwrap_or(id);
+        let layout = TabLayout {
+            tree: remap_node(&self.tree, &map),
+            focus: renamed(self.focus),
+            title: self.title.clone(),
+            mode: self.mode,
+            order: self.order.iter().map(|&id| renamed(id)).collect(),
+            master_ratio: self.master_ratio,
+            cwds: self.cwds.iter().map(|(&id, p)| (renamed(id), p.clone())).collect(),
+        };
+        (layout, next)
+    }
+}
+
+/// Rebuilds a split tree with every leaf's pane id passed through `map` (an id the
+/// map does not know — impossible for a map built from this very tree — is kept).
+fn remap_node(node: &Node, map: &HashMap<PaneId, PaneId>) -> Node {
+    match node {
+        Node::Leaf(id) => Node::Leaf(map.get(id).copied().unwrap_or(*id)),
+        Node::Split { axis, ratio, first, second } => Node::Split {
+            axis: *axis,
+            ratio: *ratio,
+            first: Box::new(remap_node(first, map)),
+            second: Box::new(remap_node(second, map)),
+        },
     }
 }
 
@@ -200,7 +250,7 @@ fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
 
     let tmp = path.with_extension("json.tmp");
-    {
+    let write = || -> std::io::Result<()> {
         let mut f = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
@@ -211,8 +261,15 @@ fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
             .open(&tmp)?;
         f.write_all(data)?;
         f.sync_all()?;
+        Ok(())
+    };
+    // Any failure past creating the temp file must remove it, or an aborted save
+    // strands a stale .tmp next to the store forever.
+    let result = write().and_then(|()| std::fs::rename(&tmp, path));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
     }
-    std::fs::rename(&tmp, path)
+    result
 }
 
 #[cfg(test)]
@@ -254,6 +311,22 @@ mod tests {
 
         assert_eq!(project_key(&x), inner, "the nearest .git wins");
         cleanup(&outer);
+    }
+
+    #[test]
+    fn a_symlinked_path_keys_to_the_same_project_as_the_real_one() {
+        // The shell's OSC 7 cwd may spell the project through a symlink while the
+        // startup cwd is resolved; both must produce the same key or the saved
+        // session is invisible on restart.
+        let root = tempdir();
+        let repo = root.join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let link = root.join("alias");
+        std::os::unix::fs::symlink(&repo, &link).unwrap();
+
+        assert_eq!(project_key(&link), project_key(&repo), "symlink and real path agree");
+        assert_eq!(project_key(&link), repo, "and the key is the resolved repo root");
+        cleanup(&root);
     }
 
     #[test]
@@ -333,6 +406,41 @@ mod tests {
     }
 
     #[test]
+    fn remapping_renumbers_every_pane_reference_consistently() {
+        // An additive restore must never reuse the saved pane ids (they collide with
+        // panes already open); the remap gives fresh ids while tree shape, focus,
+        // order and cwds all follow the same mapping.
+        let mut tree = Node::leaf(1);
+        tree.split(1, 2, Axis::Horizontal);
+        tree.split(2, 3, Axis::Vertical);
+        let mut cwds = HashMap::new();
+        cwds.insert(1, PathBuf::from("/a"));
+        cwds.insert(3, PathBuf::from("/c"));
+        let layout = TabLayout {
+            tree,
+            focus: 2,
+            title: None,
+            mode: LayoutMode::Tall,
+            order: vec![3, 1, 2],
+            master_ratio: Some(0.6),
+            cwds,
+        };
+
+        let (out, next) = layout.remapped_from(1001);
+        // Tree traversal order is 1, 2, 3 → 1001, 1002, 1003.
+        assert_eq!(out.tree.panes(), vec![1001, 1002, 1003], "fresh ids, same shape");
+        assert_eq!(next, 1004, "the next unused id is reported");
+        assert_eq!(out.focus, 1002, "focus follows its pane");
+        assert_eq!(out.order, vec![1003, 1001, 1002], "order follows the mapping");
+        assert_eq!(out.cwds[&1001], PathBuf::from("/a"), "cwds follow their panes");
+        assert_eq!(out.cwds[&1003], PathBuf::from("/c"));
+        assert!(!out.cwds.contains_key(&1), "no stale old-id entries remain");
+        // The crux: none of the original ids survive, so nothing can collide with
+        // panes already on screen.
+        assert!(out.tree.panes().iter().all(|id| ![1u64, 2, 3].contains(id)));
+    }
+
+    #[test]
     fn upsert_is_lru_and_bounded() {
         let mut store = ProjectSessions::default();
         // Fill past the cap; each new key lands at the front.
@@ -352,6 +460,24 @@ mod tests {
         store.upsert(entry_for(existing.to_str().unwrap()));
         assert_eq!(store.projects.len(), before, "an existing key is not duplicated");
         assert_eq!(store.projects[0].key, existing, "a re-save moves it to the front");
+    }
+
+    #[test]
+    fn a_failed_atomic_write_does_not_strand_a_temp_file() {
+        // Force the final rename to fail (the target is a directory): the write must
+        // report the error AND clean up its temp file, not leave a stale .tmp beside
+        // the store forever.
+        let dir = tempdir();
+        let target = dir.join("sessions.json");
+        std::fs::create_dir_all(&target).unwrap();
+
+        let err = write_atomic(&target, b"{}");
+        assert!(err.is_err(), "renaming over a directory must fail");
+        assert!(
+            !dir.join("sessions.json.tmp").exists(),
+            "the temp file must be removed on failure"
+        );
+        cleanup(&dir);
     }
 
     #[test]
@@ -390,7 +516,9 @@ mod tests {
         let n = N.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!("runnir-projtest-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        dir
+        // Canonicalized, so comparisons against project_key (which canonicalizes)
+        // hold even where the system temp dir is itself behind a symlink.
+        dir.canonicalize().unwrap()
     }
 
     fn cleanup(dir: &Path) {

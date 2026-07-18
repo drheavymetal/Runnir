@@ -1373,12 +1373,21 @@ impl Gpu {
         let area = self.active_area();
         let cell = self.renderer.cell_size();
         let first_new = self.tabs.len();
-        // Bump the pane-id seed above every restored id so a later split in a restored
-        // tab never reuses one of its own pane ids.
-        let max_id = entry.tabs.iter().flat_map(|t| t.tree.panes()).max().unwrap_or(0);
-        self.next_pane_seed = self.next_pane_seed.max(max_id);
+        // Renumber every restored pane with fresh ids from the seed: pane ids are
+        // global across tabs (scroll glide, copy mode and remote control resolve a
+        // pane by id through every tab), and the saved ids very likely already belong
+        // to panes on screen — the startup tab is pane 1, exactly what a saved layout
+        // starts at. Restoring verbatim (or twice) would duplicate ids and make those
+        // features act on the wrong pane.
+        let mut next_id = self.next_pane_seed + 1;
+        let mut states = Vec::new();
         for layout in &entry.tabs {
-            let state = layout.to_tab_state();
+            let (remapped, next) = layout.remapped_from(next_id);
+            next_id = next;
+            states.push(remapped.to_tab_state());
+        }
+        self.next_pane_seed = next_id.saturating_sub(1);
+        for state in &states {
             let proxy = self.proxy.clone();
             let wake = move |_id| -> Box<dyn Fn() + Send + 'static> {
                 let p = proxy.clone();
@@ -1386,7 +1395,7 @@ impl Gpu {
                     let _ = p.send_event(UserEvent::Redraw);
                 })
             };
-            match Tab::from_session(&state, area, cell, config, wake) {
+            match Tab::from_session(state, area, cell, config, wake) {
                 Ok(tab) => self.tabs.push(tab),
                 Err(e) => eprintln!("runnir: could not restore a tab: {e}"),
             }
