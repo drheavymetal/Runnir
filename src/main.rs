@@ -287,6 +287,11 @@ struct Gpu {
     hover_url: Option<HoverUrl>,
     /// Keyboard copy-mode state, or `None` when off (D12).
     copy_mode: Option<CopyMode>,
+    /// Cursor trail ghosts (D15): each is a cell rect and the instant it was left
+    /// behind; drawn fading toward the background, pruned once faded.
+    cursor_trail: Vec<(f32, f32, f32, f32, Instant)>,
+    /// The focused cursor's cell rect last frame, to detect a jump for the trail.
+    last_cursor_rect: Option<(f32, f32, f32, f32)>,
     font_px: f32,
     /// The (family, size, ligatures) the config last asked for, so hot-reload can
     /// tell an actual font change from an unrelated edit — and so a color-only reload
@@ -442,6 +447,8 @@ impl App {
             scroll_accum: 0.0,
             hover_url: None,
             copy_mode: None,
+            cursor_trail: Vec::new(),
+            last_cursor_rect: None,
             font_px,
             applied_font: (
                 self.config.font.family.clone(),
@@ -636,6 +643,14 @@ impl ApplicationHandler<UserEvent> for App {
             }
             gpu.bell_flash = None;
             gpu.window.request_redraw();
+        }
+
+        // Animate the cursor trail (D15) to completion, same as the bell flash.
+        if !gpu.cursor_trail.is_empty() {
+            gpu.window.request_redraw();
+            event_loop
+                .set_control_flow(ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(16)));
+            return;
         }
 
         // Drive cursor blink. A WaitUntil wake does not itself repaint, so redraw

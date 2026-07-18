@@ -102,11 +102,15 @@ pub struct CursorCfg {
     pub blink: bool,
     /// Milliseconds per blink phase.
     pub blink_interval: u64,
+    /// Draw a brief fading trail behind the cursor as it jumps (flair, off by
+    /// default).
+    #[serde(default)]
+    pub trail: bool,
 }
 
 impl Default for CursorCfg {
     fn default() -> Self {
-        Self { shape: CursorShape::Block, blink: true, blink_interval: 600 }
+        Self { shape: CursorShape::Block, blink: true, blink_interval: 600, trail: false }
     }
 }
 

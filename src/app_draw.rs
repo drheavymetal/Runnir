@@ -209,6 +209,43 @@ impl Gpu {
             }
         }
 
+        // Cursor trail (D15, opt-in flair): leave fading ghosts where the focused
+        // cursor was as it jumps. Ghosts fade toward the background, so they can be
+        // drawn as opaque decorations (colour pre-blended by remaining life).
+        if config.cursor.trail {
+            let (cw, ch) = cell;
+            if let Some((_, r, grid, ..)) = guards.iter().find(|(id, ..)| *id == focus) {
+                let (crow, ccol) = grid.cursor();
+                let rect = (r.x + ccol as f32 * cw, r.y + crow as f32 * ch, cw, ch);
+                if self.last_cursor_rect.is_some_and(|p| p != rect) {
+                    let p = self.last_cursor_rect.unwrap();
+                    self.cursor_trail.push((p.0, p.1, p.2, p.3, std::time::Instant::now()));
+                }
+                self.last_cursor_rect = Some(rect);
+            }
+            let now = std::time::Instant::now();
+            const LIFE_MS: f32 = 180.0;
+            self.cursor_trail
+                .retain(|g| now.saturating_duration_since(g.4).as_millis() as f32 <= LIFE_MS);
+            let cc = config.theme.cursor;
+            let bg = config.theme.background;
+            for g in &self.cursor_trail {
+                let age = now.saturating_duration_since(g.4).as_millis() as f32;
+                let f = (1.0 - age / LIFE_MS).clamp(0.0, 1.0) * 0.45;
+                let mix = |a: u8, b: u8| (a as f32 * (1.0 - f) + b as f32 * f) as u8;
+                decorations.push(crate::render::SolidRect {
+                    x: g.0,
+                    y: g.1,
+                    w: g.2,
+                    h: g.3,
+                    color: (mix(bg.0, cc.0), mix(bg.1, cc.1), mix(bg.2, cc.2)),
+                });
+            }
+        } else if !self.cursor_trail.is_empty() {
+            self.cursor_trail.clear();
+            self.last_cursor_rect = None;
+        }
+
         // Hover underline (D14): a thin accent line under the URL/path the pointer is
         // on, drawn as a decoration so it needs no per-cell plumbing.
         if let Some(h) = &self.hover_url {

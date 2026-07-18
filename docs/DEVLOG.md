@@ -48,7 +48,8 @@ wrapped across multiple rows + Home + Enter can scan short of the wrapped tail;
 RPROMPT tokens on the input row are in scan range. Pre-existing/deferred: dead
 copy_on_select/confirm_close config, ctrl+plus/minus chord unreachable, RIS wipes
 prompt_marks, broadcast-group last-member widening.
-NEXT: deferred W2 folding / D15 trail (D1 c44, D6 c45, D12 c46).
+NEXT: only W2 folding left (rewrites row/coord mapping — needs a dedicated session).
+D1 c44, D6 c45, D12 c46, D15 c47. 15 of 16 planned features done (all but W2).
 
 ## Current task: add 15–20 differential features, 4–5 "wow". Document each here.
 
@@ -110,7 +111,9 @@ DIFFERENTIAL (aim ~15 total incl. above):
       keep focus, wrap-around. commit 29.
 - [x] D14 URL/path hover underline — Gpu.hover_url via hints::find on mouse move;
       underline drawn as SolidRect decoration; Ctrl+click → hints::act. commit 39.
-- [ ] D15 Config: cursor trail / animations toggle (optional flair).
+- [x] D15 Cursor trail — config cursor.trail (default off); Gpu.cursor_trail ghosts
+      (rect+Instant) left on cursor jump, drawn as bg↔cursor pre-blended decorations,
+      animated to fade in about_to_wait. commit 47.
 
 ## Architecture cheatsheet (for fast edits)
 

@@ -250,6 +250,7 @@ missing file is fine. API keys are referenced by environment-variable name, so t
 file is safe to keep in a dotfiles repo.
 
 @ window.opacity   0.1..1.0 window translucency (needs a compositor; 1.0 = opaque)
+@ cursor.trail     true draws a brief fading trail behind the cursor (flair, off)
 
 The config hot-reloads: save the file and runnir applies the new theme, font and
 key bindings within a second, no restart. Toggling window.opacity between opaque
