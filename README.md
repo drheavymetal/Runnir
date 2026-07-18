@@ -8,6 +8,56 @@ A GPU-accelerated terminal emulator, written from scratch in Rust.
 
 The name is coined from Old Norse **rún** — which meant *secret, whisper, counsel spoken low* long before it meant *carved letter* — and the suffix **-nir** of Mjölnir, Gungnir and Sleipnir. The rune-artifact. A terminal is where you whisper to the machine.
 
+## Install
+
+One command builds runnir from source and installs it into `~/.local` — no sudo:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/drheavymetal/Runnar/main/install.sh | sh
+```
+
+(`wget -qO- https://raw.githubusercontent.com/drheavymetal/Runnar/main/install.sh | sh` works too.)
+
+This clones the repo into `~/.local/share/runnir/src`, runs `cargo build --release`,
+installs the binary to `~/.local/bin/runnir`, and drops two helper commands next to it.
+On Linux it also installs a `.desktop` entry and icon so runnir shows in your app
+launcher. On macOS the `.desktop` step is skipped (the binary still installs).
+
+**Update** to the latest commit (rebuilds, keeps your config):
+
+```sh
+runnir-update
+```
+
+**Uninstall** (removes the binary, helpers and desktop entry; keeps your config and
+cached source unless you pass `--purge`):
+
+```sh
+runnir-uninstall
+```
+
+### Requirements & overrides
+
+- **Rust toolchain.** runnir builds from source, so `cargo` must be available. If it
+  isn't, the installer points you at [rustup](https://rustup.rs) — and, when run
+  interactively, offers to install it for you (never silently). Piped installs stop
+  with instructions rather than installing a toolchain without consent.
+- **`PREFIX`** overrides the install prefix (default `$HOME/.local`); the binary lands
+  in `$PREFIX/bin/runnir`. Example: `PREFIX=/usr/local sh install.sh` for a system-wide
+  install (the only case where running as root is allowed).
+- **PATH.** If `~/.local/bin` isn't on your `PATH`, the installer tells you how to add it.
+  The default shell here is fish:
+
+  ```fish
+  fish_add_path ~/.local/bin
+  ```
+
+  For bash/zsh/sh: `export PATH="$HOME/.local/bin:$PATH"` in your shell rc.
+
+The same [`install.sh`](install.sh) drives all three flows — `install` (default when
+piped), `update`, and `uninstall` — so `sh install.sh --help` from a checkout shows
+every option.
+
 ## Status
 
 Working: window, PTY, VT parser, GPU renderer, keyboard, scrollback, selection, fonts.
