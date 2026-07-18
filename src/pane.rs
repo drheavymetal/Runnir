@@ -149,7 +149,7 @@ impl Pane {
             self.watch = None;
         } else {
             self.watch = Some(kw.to_lowercase());
-            self.watch_stable = self.grid.lock().unwrap().stable_end();
+            self.watch_stable = self.grid.lock().unwrap().watch_mark();
         }
     }
 

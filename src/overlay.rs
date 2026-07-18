@@ -285,6 +285,9 @@ pub struct Prompt {
     pub cursor: usize,
 }
 
+/// How many suggestion rows a prompt renders (and thus how far Down navigates).
+const PROMPT_ROWS: usize = 8;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum PromptKind {
     RenameTab,
@@ -322,7 +325,11 @@ impl Prompt {
     }
 
     pub fn down(&mut self) {
-        if self.cursor + 1 < self.visible().len() {
+        // Only the first PROMPT_ROWS suggestions are rendered, so navigation stops
+        // there — otherwise the highlight would leave the visible list and Enter
+        // would insert an entry the user never saw. Type to narrow the list instead.
+        let cap = self.visible().len().min(PROMPT_ROWS);
+        if self.cursor + 1 < cap {
             self.cursor += 1;
         }
     }
@@ -344,7 +351,7 @@ impl Prompt {
     fn render(&self, cols: usize, rows: usize, theme: &Theme) -> Vec<Panel> {
         let visible = self.visible();
         let w = (cols * 6 / 10).clamp(30, 70);
-        let list = visible.len().min(8);
+        let list = visible.len().min(PROMPT_ROWS);
         let h = 3 + list;
         let mut g = panel_grid(w, h, theme);
 

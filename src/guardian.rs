@@ -52,13 +52,18 @@ pub fn danger(line: &str) -> Option<&'static str> {
     None
 }
 
-/// The last stage of a pipeline / command list, so leading `sudo`, earlier pipe
-/// stages and a shell prompt do not mask (or fabricate) a hazard in the tail.
+/// The last stage of a command list / pipeline, so leading `sudo`, earlier stages
+/// and a shell prompt do not mask (or fabricate) a hazard in the tail. Splits on
+/// `;`, `|` and `&&` and takes the last NON-EMPTY segment, so `rm -rf /;` (trailing
+/// separator) and `cd x && rm -rf /` (a dangerous tail after a harmless head) are
+/// both caught.
 fn last_command(line: &str) -> String {
-    line.rsplit(['|', ';'])
-        .next()
-        .unwrap_or(line)
-        .trim()
+    line.split("&&")
+        .flat_map(|s| s.split([';', '|']))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .last()
+        .unwrap_or("")
         .trim_start_matches("sudo ")
         .trim()
         .to_string()
@@ -162,5 +167,23 @@ mod tests {
         assert!(danger("cat list | sudo rm -rf /").is_some());
         // A prompt-like prefix does not create a false positive.
         assert!(danger("echo rm -rf / is dangerous").is_none());
+    }
+
+    #[test]
+    fn catches_trailing_separator_and_and_chains() {
+        // A trailing ';' must not leave an empty tail that skips every check.
+        assert!(danger("rm -rf /;").is_some());
+        // A dangerous tail after a harmless head (&&) is still caught.
+        assert!(danger("cd /tmp && rm -rf /").is_some());
+        assert!(danger("make && sudo rm -rf /usr").is_some());
+        // Only the tail is judged: a dangerous head with a harmless tail is not
+        // flagged (documented limitation — the tail is what runs last).
+        assert!(danger("rm -rf / && echo done").is_none());
+    }
+
+    #[test]
+    fn empty_line_is_safe() {
+        assert!(danger("").is_none());
+        assert!(danger("   ").is_none());
     }
 }

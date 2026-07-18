@@ -7,13 +7,22 @@
 use crate::grid::Grid;
 use crate::overlay::{Hint, HintKind, hint_labels};
 
-/// Finds targets on the currently visible rows of `grid`.
+/// Finds targets on the currently visible rows of `grid`. The reported column is a
+/// real grid column (accounting for wide/spacer cells), so a hint label or a hover
+/// underline lands on the target even on a row with CJK or emoji.
 pub fn find(grid: &Grid) -> Vec<Hint> {
     let mut raw: Vec<(usize, usize, String, HintKind)> = Vec::new();
     for row in 0..grid.rows() {
         let abs = grid.abs_row(row);
-        let line = row_text(grid, abs);
-        scan_line(abs, &line, &mut raw);
+        let (line, col_map) = row_text(grid, abs);
+        let mut row_hits: Vec<(usize, usize, String, HintKind)> = Vec::new();
+        scan_line(abs, &line, &mut row_hits);
+        // scan_line records a char index into the spacer-stripped line; translate it
+        // back to the grid column via the map so wide chars before it are accounted.
+        for (a, char_col, text, kind) in row_hits {
+            let grid_col = col_map.get(char_col).copied().unwrap_or(char_col);
+            raw.push((a, grid_col, text, kind));
+        }
     }
 
     let labels = hint_labels(raw.len());
@@ -23,12 +32,19 @@ pub fn find(grid: &Grid) -> Vec<Hint> {
         .collect()
 }
 
-fn row_text(grid: &Grid, abs: usize) -> String {
-    (0..grid.cols())
-        .map(|c| grid.abs_cell(abs, c))
-        .filter(|cell| !cell.is_spacer())
-        .map(|cell| cell.ch)
-        .collect()
+/// The row's text (spacers stripped) plus, for each char, its real grid column.
+fn row_text(grid: &Grid, abs: usize) -> (String, Vec<usize>) {
+    let mut s = String::new();
+    let mut cols = Vec::new();
+    for c in 0..grid.cols() {
+        let cell = grid.abs_cell(abs, c);
+        if cell.is_spacer() {
+            continue;
+        }
+        s.push(cell.ch);
+        cols.push(c);
+    }
+    (s, cols)
 }
 
 /// Extracts targets from one line, recording each one's starting column.

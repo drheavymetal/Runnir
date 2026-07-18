@@ -3,17 +3,24 @@
 
 impl Gpu {
     fn on_wheel(&mut self, delta: MouseScrollDelta, config: &Config, mods: ModifiersState) {
-        // While an overlay owns input, the wheel scrolls it, not the terminal.
+        let cell_h = self.renderer.cell_size().1;
+        // While an overlay owns input, the wheel scrolls it, not the terminal. Use
+        // the real cell height so a touchpad's pixel deltas map to sane line counts.
         if let Some(ov) = self.overlay.as_mut() {
-            let lines = wheel_lines(delta, config.behaviour.wheel_lines, 1.0);
+            let lines = wheel_lines(delta, config.behaviour.wheel_lines, cell_h);
             if let Overlay::Docs(d) = ov {
-                d.scroll(-lines as isize);
+                d.scroll(-lines.round() as isize);
             }
             self.window.request_redraw();
             return;
         }
         // A mouse-mode app (unless Shift is held) gets the wheel as button events.
-        let lines = wheel_lines(delta, config.behaviour.wheel_lines, self.renderer.cell_size().1);
+        let lines = wheel_lines(delta, config.behaviour.wheel_lines, cell_h);
+        // A zero delta (horizontal-only scroll event) must not synthesise a vertical
+        // wheel report or a scroll — bail before either path.
+        if lines == 0.0 {
+            return;
+        }
         if !mods.shift_key() && self.forward_wheel(lines) {
             self.scroll_accum = 0.0;
             return;
@@ -219,7 +226,12 @@ impl Gpu {
             && mods.is_empty()
             && !self.broadcast
         {
-            let line = self.tab().focused().grid.lock().unwrap().current_command_text();
+            let line = {
+                let g = self.tab().focused().grid.lock().unwrap();
+                // A full-screen app (vim, htop) has no shell command line to guard;
+                // scanning its buffer would pop the confirm over unrelated content.
+                if g.alt_screen() { String::new() } else { g.current_command_text() }
+            };
             if let Some(reason) = crate::guardian::danger(&line) {
                 let label = format!("Run this? {reason}");
                 self.overlay = Some(Overlay::Prompt(Prompt::new(
@@ -637,7 +649,10 @@ impl Gpu {
             return;
         }
         let to = (self.active as isize + delta).rem_euclid(n as isize) as usize;
-        self.tabs.swap(self.active, to);
+        // Remove + insert, not swap: at the wrap boundary a swap would fling the far
+        // tab across the bar; remove+insert genuinely shifts one slot in every case.
+        let tab = self.tabs.remove(self.active);
+        self.tabs.insert(to, tab);
         self.active = to;
         self.window.request_redraw();
     }
@@ -817,7 +832,9 @@ impl Gpu {
                 if let Some((abs_row, col)) = self.point_in(id, rect, pos) {
                     let grid = self.tabs[self.active].panes[&id].grid.lock().unwrap();
                     for h in crate::hints::find(&grid) {
-                        let len = h.text.chars().count();
+                        // Display width (not char count): a wide glyph spans two grid
+                        // cells, so the underline and hit-zone must too.
+                        let len = unicode_width::UnicodeWidthStr::width(h.text.as_str()).max(1);
                         if h.abs_row == abs_row && col >= h.col && col < h.col + len {
                             self.hover_url = Some(HoverUrl {
                                 pane: id,
@@ -929,6 +946,11 @@ impl Gpu {
     }
 
     fn paste_text(&mut self, text: String) {
+        // Strip the bracketed-paste markers from the payload so a clipboard (or
+        // PRIMARY selection, now reachable by mere selection in another app) that
+        // contains `ESC[201~` cannot close the bracket early and smuggle a trailing
+        // `\r` into the shell as an executed command.
+        let text = text.replace("\x1b[200~", "").replace("\x1b[201~", "");
         let bracketed = self.tab().focused().bracketed_paste();
         let pane = self.tab().focused();
         if bracketed {
@@ -945,15 +967,19 @@ impl Gpu {
     fn apply_config(&mut self, config: &Config) {
         self.renderer.set_theme(config.theme.clone());
         self.renderer.set_opacity(config.window.opacity);
-        // Rebuild the font only when it actually changed, so a save that only tweaks
-        // colours does not pay for atlas re-rasterisation.
-        if (config.font.size - self.font_px).abs() >= 0.5 {
+        // Rebuild the font only when the CONFIG's font actually changed (family, size
+        // or ligatures) — compared against what the config last asked for, not the
+        // live size, so a colour-only edit does not snap a runtime zoom back, and a
+        // family/ligature change (same size) is applied.
+        let want = (config.font.family.clone(), config.font.size, config.font.ligatures);
+        if want != self.applied_font {
             if let Ok(mut font) = FontAtlas::new_with(&config.font.family, config.font.size) {
                 font.ligatures = config.font.ligatures;
                 self.renderer.replace_font(&self.device, font);
                 self.font_px = config.font.size;
                 self.reflow_all();
             }
+            self.applied_font = want;
         }
         self.window.request_redraw();
     }
@@ -979,8 +1005,14 @@ impl Gpu {
         // A per-pane filename (the pty pid) so repeated dumps of the same pane reuse
         // one path and a fresh dump overwrites the stale one.
         let pid = self.tab().focused().pty_pid().unwrap_or(0);
-        let path = std::env::temp_dir().join(format!("runnir-scrollback-{pid}.txt"));
-        if let Err(e) = std::fs::write(&path, text) {
+        // Prefer $XDG_RUNTIME_DIR (a per-user 0700 dir) over world-writable /tmp, so a
+        // predictable filename can't be pre-empted by a symlink from another user, and
+        // scrollback (which may hold secrets) isn't left world-readable.
+        let dir = std::env::var_os("XDG_RUNTIME_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let path = dir.join(format!("runnir-scrollback-{pid}.txt"));
+        if let Err(e) = write_private(&path, text.as_bytes()) {
             self.status = Some(format!("could not write scrollback: {e}"));
             self.status_expiry = Some(Instant::now() + Duration::from_secs(4));
             self.window.request_redraw();
@@ -1045,6 +1077,16 @@ impl Gpu {
             let wake = wake_fn(self.proxy.clone());
             let _ = self.tab().split_running_with_id(area, axis, config, id, argv_of(cmd), wake);
         }
+        // A split silently no-ops when the window is too small, so a command may have
+        // been dropped: tell the user rather than leaving a connection missing.
+        let got = self.tab().panes.len();
+        if got < cmds.len() {
+            self.status = Some(format!(
+                "layout truncated: only {got} of {} panes fit — resize and relaunch",
+                cmds.len()
+            ));
+            self.status_expiry = Some(Instant::now() + Duration::from_secs(5));
+        }
         self.reflow_all();
         self.window.request_redraw();
     }
@@ -1077,6 +1119,27 @@ fn wheel_lines(delta: MouseScrollDelta, wheel_lines: f32, cell_h: f32) -> f32 {
         MouseScrollDelta::LineDelta(_, y) => y * wheel_lines,
         MouseScrollDelta::PixelDelta(p) => p.y as f32 / cell_h.max(1.0),
     }
+}
+
+/// Writes `data` to `path` with 0600 permissions, truncating an existing file we
+/// own. `O_NOFOLLOW` refuses to follow a symlink planted at the path, so a shared
+/// temp dir cannot be used to clobber another file through us.
+fn write_private(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .custom_flags(libc_o_nofollow())
+        .open(path)?;
+    f.write_all(data)
+}
+
+/// `O_NOFOLLOW` without a libc dependency. The value is stable across Linux archs.
+fn libc_o_nofollow() -> i32 {
+    0o400000
 }
 
 /// Splits a layout command string into an argv on whitespace. Not a shell parse —

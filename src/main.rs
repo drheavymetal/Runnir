@@ -242,7 +242,16 @@ impl App {
             return;
         }
         self.config_mtime = now;
-        let new = Config::load();
+        // Keep the running config (and custom keybindings) when the file is mid-edit
+        // or has a typo, instead of snapping the live session back to defaults.
+        let Some(new) = Config::try_load() else {
+            if let Some(gpu) = self.gpu.as_mut() {
+                gpu.status = Some("config error — keeping previous".into());
+                gpu.status_expiry = Some(Instant::now() + Duration::from_secs(3));
+                gpu.window.request_redraw();
+            }
+            return;
+        };
         self.keymap = Keymap::new(&new.keys);
         if let Some(gpu) = self.gpu.as_mut() {
             gpu.apply_config(&new);
@@ -277,6 +286,10 @@ struct Gpu {
     /// The URL/path currently under the pointer, underlined and Ctrl-clickable (D14).
     hover_url: Option<HoverUrl>,
     font_px: f32,
+    /// The (family, size, ligatures) the config last asked for, so hot-reload can
+    /// tell an actual font change from an unrelated edit — and so a color-only reload
+    /// does not snap a runtime font-zoom back to the configured size.
+    applied_font: (String, f32, bool),
     ai: ai::Session,
     last_context_refresh: Instant,
     last_autosave: Instant,
@@ -362,10 +375,12 @@ impl App {
         // For a translucent window, ask the surface for premultiplied-alpha
         // compositing so the compositor blends (and can blur) behind us. Fall back to
         // opaque if the platform does not offer it.
+        let mut translucent = false;
         if self.config.window.opacity < 1.0 {
             let caps = surface.get_capabilities(&adapter);
             if caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::PreMultiplied) {
                 surface_config.alpha_mode = wgpu::CompositeAlphaMode::PreMultiplied;
+                translucent = true;
             }
         }
         surface.configure(&device, &surface_config);
@@ -377,7 +392,9 @@ impl App {
         font.ligatures = self.config.font.ligatures;
         let mut renderer = Renderer::new(&device, surface_config.format, font);
         renderer.set_theme(self.config.theme.clone());
-        renderer.set_opacity(self.config.window.opacity);
+        // Only apply opacity when the surface actually composites with alpha; on an
+        // opaque surface it would merely darken the background, not reveal anything.
+        renderer.set_opacity(if translucent { self.config.window.opacity } else { 1.0 });
 
         let cell = renderer.cell_size();
 
@@ -419,6 +436,11 @@ impl App {
             scroll_accum: 0.0,
             hover_url: None,
             font_px,
+            applied_font: (
+                self.config.font.family.clone(),
+                self.config.font.size,
+                self.config.font.ligatures,
+            ),
             ai: ai::Session::new(),
             last_context_refresh: Instant::now(),
             last_autosave: Instant::now(),
@@ -583,6 +605,21 @@ impl ApplicationHandler<UserEvent> for App {
             }
         }
 
+        // Animate the bell flash to completion: without this, an idle window (blink
+        // off, or an overlay open) would freeze the flash on screen until the next
+        // event. Drive redraws until it expires, then clear it and repaint once to
+        // erase the last frame.
+        if let Some(until) = gpu.bell_flash {
+            if Instant::now() < until {
+                gpu.window.request_redraw();
+                event_loop
+                    .set_control_flow(ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(16)));
+                return;
+            }
+            gpu.bell_flash = None;
+            gpu.window.request_redraw();
+        }
+
         // Drive cursor blink. A WaitUntil wake does not itself repaint, so redraw
         // only when the blink phase actually flips — that keeps an idle terminal
         // repainting at exactly the blink rate, not on every timer tick, and never
@@ -613,22 +650,31 @@ impl Gpu {
         content_area(&self.surface_config, self.renderer.cell_size(), self.tabs.len())
     }
 
-    /// Detects a bell on any pane of the active tab: flashes briefly and raises the
-    /// window's urgency hint so a background bell is noticed.
+    /// Detects a bell on any pane of ANY tab: a bell in a background tab still raises
+    /// the window's urgency hint, but only a bell in the active tab flashes the
+    /// screen (a background tab's flash would be meaningless). Draining `take_bell`
+    /// on every tab also stops a stale bell from flashing later on tab switch.
     fn check_bells(&mut self) {
-        let mut rang = false;
-        for pane in self.tabs[self.active].panes.values_mut() {
-            if pane.take_bell() {
-                rang = true;
+        let active = self.active;
+        let mut active_rang = false;
+        let mut any_rang = false;
+        for (i, tab) in self.tabs.iter_mut().enumerate() {
+            for pane in tab.panes.values_mut() {
+                if pane.take_bell() {
+                    any_rang = true;
+                    if i == active {
+                        active_rang = true;
+                    }
+                }
             }
         }
-        if rang {
+        if active_rang {
             self.bell_flash = Some(Instant::now() + Duration::from_millis(120));
-            if !self.window.has_focus() {
-                self.window
-                    .request_user_attention(Some(winit::window::UserAttentionType::Critical));
-            }
             self.window.request_redraw();
+        }
+        if any_rang && !self.window.has_focus() {
+            self.window
+                .request_user_attention(Some(winit::window::UserAttentionType::Critical));
         }
     }
 

@@ -358,18 +358,23 @@ impl Config {
     /// ignored rather than fatal: you should never be locked out of your terminal
     /// by a typo in it.
     pub fn load() -> Self {
+        Self::try_load().unwrap_or_default()
+    }
+
+    /// Loads and validates the config, or `None` if the file is missing or invalid.
+    /// Hot-reload uses this to keep the running config on a parse error rather than
+    /// snapping the live session back to defaults on a mid-edit save.
+    pub fn try_load() -> Option<Self> {
         let path = Self::path();
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            return Self::default();
-        };
+        let text = std::fs::read_to_string(&path).ok()?;
         match toml::from_str::<Self>(&text) {
             Ok(mut cfg) => {
                 cfg.validate();
-                cfg
+                Some(cfg)
             }
             Err(err) => {
-                eprintln!("runnir: {} is invalid, using defaults\n{err}", path.display());
-                Self::default()
+                eprintln!("runnir: {} is invalid, keeping current config\n{err}", path.display());
+                None
             }
         }
     }

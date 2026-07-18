@@ -20,7 +20,26 @@ DIFF: D2 hot-reload, D3 history fuzzy, D4 bell, D5 primary selection, D7 AI summ
 D8 broadcast groups, D9 smooth scroll, D10 zoom, D11 scrollback→$EDITOR, D13 tab
 reorder, D14 URL hover. Deferred (heavier, next session): W2 folding, D1 OSC 8
 hyperlinks, D6 status gutter, D12 copy-mode vim, D15 cursor trail.
-NEXT: Fable 5 bug-hunt round on the sprint code, then fix + retest.
+Fable 5 bug-hunt round 1 (4 parallel agents) → 25 findings, fixed in commit 40:
+- Guardian: OSC 133;B mark → scan excludes prompt prefix (was missing rm -rf / in
+  real shells!); split on && and trailing ; take last non-empty; skip on alt-screen.
+- W4 watch: watch_mark (cursor-row high-water, not stable_end) + text_since_stable
+  saturating_sub — fixes infinite notify spam + missed on-screen lines.
+- Bell: about_to_wait drives flash decay (was frozen); check_bells all tabs (urgency)
+  flash only active; RIS preserves bell_count (was phantom bell on `reset`).
+- Opacity: only applied when PreMultiplied actually selected (else darkened).
+- Config hot-reload: try_load keeps previous on parse error; apply_config rebuilds on
+  family/ligature change and no longer snaps runtime font-zoom.
+- Layouts: toast when splits truncated (window too small).
+- Paste: strip bracketed-paste markers (injection); insert_command flattens newlines
+  (history multiline could self-execute).
+- Clipboard: reap wl-copy (zombie leak); X11 PRIMARY via arboard ext.
+- Scroll: zero-delta guard (spurious wheel), docs-overlay uses real cell height.
+- move_tab: remove+insert (swap scrambled at wrap). History: single-pass fish
+  unescape, zsh unmetafy. Hover: real grid columns + display width (wide chars).
+- Scrollback dump: $XDG_RUNTIME_DIR + 0600 + O_NOFOLLOW (was predictable /tmp).
+- Picker: Down clamped to rendered window. 155 tests.
+NEXT: Fable 5 round 2 on the fixes; deferred features W2/D1/D6/D12/D15.
 
 ## Current task: add 15–20 differential features, 4–5 "wow". Document each here.
 

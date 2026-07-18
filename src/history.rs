@@ -26,7 +26,15 @@ pub fn recent(limit: usize) -> Vec<String> {
     let ordered = order_by_shell(&shell, candidates);
 
     for (kind, path) in ordered {
-        let Ok(raw) = std::fs::read_to_string(&path) else { continue };
+        let Ok(bytes) = std::fs::read(&path) else { continue };
+        // zsh "metafies" bytes >= 0x80 (0x83 marker, next byte XOR 0x20), which makes
+        // the file invalid UTF-8; un-metafy before a lossy decode so non-ASCII
+        // history is not silently dropped.
+        let raw = if kind == "zsh" {
+            String::from_utf8_lossy(&unmetafy(&bytes)).into_owned()
+        } else {
+            String::from_utf8_lossy(&bytes).into_owned()
+        };
         let mut cmds = match kind {
             "fish" => parse_fish(&raw),
             "zsh" => parse_zsh(&raw),
@@ -65,8 +73,27 @@ fn parse_fish(raw: &str) -> Vec<String> {
 }
 
 fn unescape_fish(s: &str) -> String {
-    // fish escapes backslashes and newlines in the YAML value.
-    s.replace("\\n", "\n").replace("\\\\", "\\")
+    // fish escapes backslashes and newlines in the YAML value. A single left-to-right
+    // pass is required: sequential `replace` calls mis-decode `\\n` (escaped
+    // backslash + n) into a backslash + real newline.
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('n') => out.push('\n'),
+                Some('\\') => out.push('\\'),
+                Some(other) => {
+                    out.push('\\');
+                    out.push(other);
+                }
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 fn parse_zsh(raw: &str) -> Vec<String> {
@@ -80,6 +107,22 @@ fn parse_zsh(raw: &str) -> Vec<String> {
         })
         .filter(|s| !s.trim().is_empty())
         .collect()
+}
+
+/// Reverses zsh's metafication: a 0x83 byte marks the next byte as XOR-0x20.
+fn unmetafy(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut it = bytes.iter().copied();
+    while let Some(b) = it.next() {
+        if b == 0x83 {
+            if let Some(n) = it.next() {
+                out.push(n ^ 0x20);
+            }
+        } else {
+            out.push(b);
+        }
+    }
+    out
 }
 
 fn parse_bash(raw: &str) -> Vec<String> {
@@ -111,6 +154,22 @@ mod tests {
     fn parses_fish_entries() {
         let raw = "- cmd: git status\n  when: 1\n- cmd: cargo build\n  when: 2\n";
         assert_eq!(parse_fish(raw), vec!["git status", "cargo build"]);
+    }
+
+    #[test]
+    fn fish_unescape_is_single_pass() {
+        // A real newline in a multiline command: fish stores it as backslash-n.
+        assert_eq!(unescape_fish("line1\\nline2"), "line1\nline2");
+        // An escaped backslash followed by n must NOT become a newline.
+        assert_eq!(unescape_fish("printf '\\\\n'"), "printf '\\n'");
+    }
+
+    #[test]
+    fn unmetafy_restores_high_bytes() {
+        // 0x83 marks the next byte as XOR 0x20: 0x83,0xA9 -> 0xA9^0x20 = 0x89.
+        assert_eq!(unmetafy(&[b'a', 0x83, 0xA9, b'b']), vec![b'a', 0x89, b'b']);
+        // A plain byte stream is unchanged.
+        assert_eq!(unmetafy(b"plain"), b"plain".to_vec());
     }
 
     #[test]

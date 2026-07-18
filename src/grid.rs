@@ -110,6 +110,10 @@ pub struct Grid {
     /// Stable row where the command currently running started its output, set at
     /// OSC 133;C and cleared at OSC 133;D.
     command_start: Option<usize>,
+    /// Where the command input begins (OSC 133;B, end of prompt): stable row and
+    /// column. The guardian scans from here so the prompt text is not part of what
+    /// it inspects. Cleared at OSC 133;C (command submitted).
+    command_input: Option<(usize, usize)>,
     /// Stable (start, end) rows of the last finished command's output.
     last_output: Option<(usize, usize)>,
     /// Count of commands finished (OSC 133;D), for completion notifications.
@@ -177,6 +181,7 @@ impl Grid {
             display_offset: 0,
             prompt_marks: Vec::new(),
             command_start: None,
+            command_input: None,
             last_output: None,
             command_seq: 0,
             scroll_top: 0,
@@ -477,39 +482,56 @@ impl Grid {
         self.scrollback.len() + self.row
     }
 
-    /// The text currently on the command line: from the most recent prompt mark
-    /// down to the cursor, or — with no OSC 133 marks — the cursor's own row. Used
-    /// by the command guardian to scan what is about to run when Enter is pressed.
+    /// Whether the alternate screen is active (a full-screen app like vim/htop).
+    /// The guardian skips these — there is no shell command line to inspect.
+    pub fn alt_screen(&self) -> bool {
+        self.parked.is_some()
+    }
+
+    /// The text currently on the command line: from the OSC 133;B command-input mark
+    /// (end of prompt) when the shell emits one, else the last prompt-start mark,
+    /// else the cursor's own row — down to the cursor. Used by the command guardian
+    /// so the prompt's own text is not mistaken for the command about to run.
     pub fn current_command_text(&self) -> String {
         let cur = self.cursor_abs();
-        let (col_r, col_c) = self.cursor();
-        let _ = col_r;
+        let (_, col_c) = self.cursor();
+        let end_col = col_c.min(self.cols.saturating_sub(1));
+        // Prefer the B mark (prompt end): scan from exactly where input begins.
+        if let Some((stable, col)) = self.command_input {
+            if let Some(row) = self.stable_to_local(stable).filter(|&r| r <= cur) {
+                let start_col = if row == cur { col.min(end_col) } else { col };
+                return self.text_range((row, start_col), (cur, end_col));
+            }
+        }
         let start_row = self
             .prompt_marks
             .last()
             .and_then(|&s| self.stable_to_local(s))
             .filter(|&r| r <= cur)
             .unwrap_or(cur);
-        self.text_range((start_row, 0), (cur, col_c.min(self.cols.saturating_sub(1))))
+        self.text_range((start_row, 0), (cur, end_col))
     }
 
-    /// The stable index one past the last row: a monotonic high-water mark the
-    /// keyword watcher (W4) uses to remember what it has already scanned.
-    pub fn stable_end(&self) -> usize {
-        self.dropped + self.total_rows()
+    /// The stable index one past the last row that actually holds output — the
+    /// cursor's row — for the keyword watcher's high-water mark. Using the cursor
+    /// row (not the screen height) means blank rows below the cursor are not counted
+    /// as already-scanned, so a line later written there is still seen (W4).
+    pub fn watch_mark(&self) -> usize {
+        self.dropped + self.scrollback.len() + self.row + 1
     }
 
-    /// Text of every row with a stable index >= `from_stable`, plus the new
-    /// high-water mark. Rows already evicted from scrollback are simply not there,
-    /// so the watcher scans from the oldest still-present row in that case.
+    /// Text of every row from `from_stable` up to the cursor row, plus the new
+    /// high-water mark. When `from_stable` is at or past the cursor row nothing new
+    /// has arrived and the text is empty; an evicted mark saturates to the oldest
+    /// surviving row, all of which are newer than an evicted mark, so no re-scan.
     pub fn text_since_stable(&self, from_stable: usize) -> (String, usize) {
-        let from_local = self.stable_to_local(from_stable).unwrap_or(0);
-        let last = self.total_rows().saturating_sub(1);
+        let from_local = from_stable.saturating_sub(self.dropped);
+        let last = self.scrollback.len() + self.row;
         if from_local > last {
-            return (String::new(), self.stable_end());
+            return (String::new(), self.watch_mark());
         }
         let text = self.text_range((from_local, 0), (last, self.cols.saturating_sub(1)));
-        (text, self.stable_end())
+        (text, self.watch_mark())
     }
 
     /// Scroll offsets, oldest first, that put each prompt at the top of the view.
@@ -1157,11 +1179,15 @@ impl Perform for Grid {
                 // The cell pixel size is renderer environment, not terminal
                 // state: losing it would mis-size images placed after a reset.
                 let cell_px = self.cell_px;
+                // The bell counter is UI state the pane compares against; zeroing it
+                // would make a post-reset frame see a phantom bell (0 != last_seen).
+                let bells = self.bell_count;
                 *self = Grid::new(self.cols, self.rows);
                 self.scrollback_limit = limit;
                 self.scrollback = scrollback;
                 self.dropped = dropped;
                 self.cell_px = cell_px;
+                self.bell_count = bells;
             }
             _ => return,
         }
@@ -1195,8 +1221,15 @@ impl Grid {
                     self.prompt_marks.push(mark);
                 }
             }
-            // C: the command's output starts here.
-            Some(b'C') => self.command_start = Some(self.local_to_stable(self.cursor_abs())),
+            // B: the prompt ends / command input begins, at the cursor.
+            Some(b'B') => {
+                self.command_input = Some((self.local_to_stable(self.cursor_abs()), self.col));
+            }
+            // C: the command's output starts here. Input is done being edited.
+            Some(b'C') => {
+                self.command_start = Some(self.local_to_stable(self.cursor_abs()));
+                self.command_input = None;
+            }
             // D: the command finished. Bank its output range for "copy last output".
             Some(b'D') => {
                 if let Some(start) = self.command_start.take() {
@@ -1698,6 +1731,31 @@ mod tests {
         feed(&mut g, "\x1b[1;1HX\x1b8Y");
         assert_eq!(g.cell(0, 0).ch, 'X');
         assert_eq!(g.cell(1, 4).ch, 'Y');
+    }
+
+    #[test]
+    fn command_text_excludes_the_prompt_via_osc133_b() {
+        let mut g = Grid::new(40, 3);
+        // Prompt start (A), the prompt itself, prompt end / input begins (B), command.
+        feed(&mut g, "\x1b]133;A\x07pedro$ \x1b]133;B\x07rm -rf /");
+        assert_eq!(g.current_command_text(), "rm -rf /");
+    }
+
+    #[test]
+    fn command_text_falls_back_to_cursor_row_without_marks() {
+        let mut g = Grid::new(40, 3);
+        feed(&mut g, "some text here");
+        assert_eq!(g.current_command_text(), "some text here");
+    }
+
+    #[test]
+    fn watch_scan_reports_nothing_when_no_new_output() {
+        let mut g = Grid::new(20, 3);
+        feed(&mut g, "hello\r\n");
+        let mark = g.watch_mark();
+        let (text, next) = g.text_since_stable(mark);
+        assert!(text.is_empty(), "no new output since the mark, got {text:?}");
+        assert_eq!(next, g.watch_mark());
     }
 
     #[test]

@@ -42,20 +42,35 @@ impl Clipboard {
         self.arboard.as_mut().and_then(|cb| cb.get_text().ok())
     }
 
-    /// Sets the PRIMARY selection (middle-click paste on Wayland/X11). A no-op off
-    /// Wayland, where `arboard` has no portable primary-selection support.
+    /// Sets the PRIMARY selection (middle-click paste). Uses `wl-copy --primary` on
+    /// Wayland and arboard's Linux primary-selection extension on X11.
     pub fn set_primary(&mut self, text: &str) {
         if self.wayland {
             let _ = wl_copy(text, true);
+            return;
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(cb) = self.arboard.as_mut() {
+            use arboard::{LinuxClipboardKind, SetExtLinux};
+            let _ = cb.set().clipboard(LinuxClipboardKind::Primary).text(text.to_string());
         }
     }
 
     /// Reads the PRIMARY selection, falling back to the regular clipboard so
-    /// middle-click still pastes something useful off Wayland.
+    /// middle-click still pastes something useful when primary is unavailable.
     pub fn get_primary(&mut self) -> Option<String> {
         if self.wayland {
             if let Some(text) = wl_paste(true) {
                 return Some(text);
+            }
+        }
+        #[cfg(target_os = "linux")]
+        if !self.wayland {
+            if let Some(cb) = self.arboard.as_mut() {
+                use arboard::{GetExtLinux, LinuxClipboardKind};
+                if let Ok(text) = cb.get().clipboard(LinuxClipboardKind::Primary).text() {
+                    return Some(text);
+                }
             }
         }
         self.get()
@@ -91,7 +106,12 @@ fn wl_copy(text: &str, primary: bool) -> bool {
     if let Some(mut stdin) = child.stdin.take() {
         let _ = stdin.write_all(text.as_bytes());
     }
-    // Do not wait: wl-copy stays alive to serve the clipboard until replaced.
+    // wl-copy forks a daemon and its foreground process exits at once. Reap that
+    // process on a detached thread so it does not linger as a zombie — a selection
+    // spawns two of these (clipboard + primary), so not reaping piles them up.
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
     true
 }
 

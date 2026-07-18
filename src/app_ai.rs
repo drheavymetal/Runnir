@@ -124,8 +124,16 @@ impl Gpu {
         self.send_ai(question, config);
     }
 
-    /// Types an AI-produced command at the focused shell prompt without running it.
+    /// Types a command at the focused shell prompt WITHOUT running it. Newlines are
+    /// flattened to spaces so a multiline suggestion (or a multiline history entry)
+    /// cannot submit itself line by line — the whole point is that you review it and
+    /// press Enter yourself.
     fn insert_command(&mut self, cmd: String) {
+        let cmd: String = cmd
+            .chars()
+            .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+            .collect();
+        let cmd = cmd.trim_end();
         if !cmd.is_empty() {
             self.tab().focused().snap_to_bottom();
             self.tab().focused().write(cmd.as_bytes());
