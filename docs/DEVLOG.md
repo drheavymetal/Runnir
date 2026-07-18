@@ -29,8 +29,9 @@ WOW (aim 4–5):
       (default true). 6 unit tests. commit 28. (Rule-based, not the LLM — instant, offline.)
 - [ ] W2 Semantic command folding — collapse a command's output block (OSC 133 marks);
       fold/unfold current, fold-all. Big cargo build → one line.
-- [ ] W3 Named layouts / workspaces — config `[[layout]]` defines panes+commands;
-      `runnir layout <name>` or palette launches N splits running X (e.g. ssh .3/.7/.9/.188).
+- [x] W3 Named layouts — config [[layouts]] {name, commands[]}; palette LaunchLayout
+      → Prompt(LaunchLayout) → launch_layout: new Tab running cmd[0], splits alternating
+      axis for the rest (argv_of whitespace-split). commit 35.
 - [x] W4 Keyword watch — Pane.watch (lowercased kw) + watch_stable high-water; grid
       stable_end/text_since_stable; periodic scans new lines → notify(). WatchKeyword
       palette action → Prompt(WatchKeyword). Substring (case-insensitive), not regex.

@@ -359,6 +359,7 @@ impl Gpu {
             Action::OpenScrollbackInEditor => self.open_scrollback_in_editor(config),
             Action::HistorySearch => self.history_search(),
             Action::WatchKeyword => self.watch_keyword(),
+            Action::LaunchLayout => self.open_layout_picker(config),
             Action::QuickConnect => self.open_quick_connect(),
             Action::HintMode => self.open_hints(),
             Action::LaunchClaude => self.launch_claude(config),
@@ -551,6 +552,7 @@ impl Gpu {
             Action::OpenScrollbackInEditor => self.open_scrollback_in_editor(config),
             Action::HistorySearch => self.history_search(),
             Action::WatchKeyword => self.watch_keyword(),
+            Action::LaunchLayout => self.open_layout_picker(config),
             Action::Whisper => self.whisper(),
             Action::SearchScrollback => self.overlay = Some(Overlay::Search(overlay::Search::new())),
             Action::QuickConnect => self.open_quick_connect(),
@@ -671,6 +673,11 @@ impl Gpu {
                     "watch cleared".into()
                 });
                 self.status_expiry = Some(Instant::now() + Duration::from_secs(2));
+            }
+            PromptKind::LaunchLayout => {
+                if !value.is_empty() {
+                    self.launch_layout(value, config);
+                }
             }
         }
     }
@@ -894,6 +901,59 @@ impl Gpu {
         self.split_running(config, argv);
     }
 
+    /// Opens the layout picker (W3): choose a named layout from the config and it
+    /// launches a fresh tab split into one pane per command.
+    fn open_layout_picker(&mut self, config: &Config) {
+        if config.layouts.is_empty() {
+            self.status = Some("no [[layouts]] configured — see the docs".into());
+            self.status_expiry = Some(Instant::now() + Duration::from_secs(4));
+            self.window.request_redraw();
+            return;
+        }
+        let names: Vec<String> = config.layouts.iter().map(|l| l.name.clone()).collect();
+        self.overlay = Some(Overlay::Prompt(Prompt::new(
+            PromptKind::LaunchLayout,
+            "Launch layout",
+            names,
+        )));
+        self.window.request_redraw();
+    }
+
+    /// Launches a named layout: a new tab split into one pane per command. Splits
+    /// alternate axis so several commands tile rather than stacking one way.
+    fn launch_layout(&mut self, name: String, config: &Config) {
+        let Some(layout) = config.layouts.iter().find(|l| l.name == name).cloned() else {
+            return;
+        };
+        let area = self.active_area();
+        let cell = self.renderer.cell_size();
+        let cmds = if layout.commands.is_empty() {
+            vec![String::new()]
+        } else {
+            layout.commands.clone()
+        };
+
+        // First command opens the new tab's initial pane.
+        let id = self.new_pane_id();
+        let first = argv_of(&cmds[0]);
+        let spawn = Spawn { command: (!first.is_empty()).then_some(first), cwd: None };
+        let wake = wake_fn(self.proxy.clone());
+        let Ok(mut tab) = Tab::new(area, cell, config, id, &spawn, wake) else { return };
+        tab.title_override = Some(layout.name.clone());
+        self.tabs.push(tab);
+        self.active = self.tabs.len() - 1;
+
+        // The rest become splits of the newest pane, alternating axis for a tile.
+        for (i, cmd) in cmds.iter().enumerate().skip(1) {
+            let axis = if i % 2 == 1 { Axis::Vertical } else { Axis::Horizontal };
+            let id = self.new_pane_id();
+            let wake = wake_fn(self.proxy.clone());
+            let _ = self.tab().split_running_with_id(area, axis, config, id, argv_of(cmd), wake);
+        }
+        self.reflow_all();
+        self.window.request_redraw();
+    }
+
     fn split_running(&mut self, config: &Config, command: Vec<String>) {
         let area = self.active_area();
         let id = self.new_pane_id();
@@ -922,6 +982,13 @@ fn wheel_lines(delta: MouseScrollDelta, wheel_lines: f32, cell_h: f32) -> f32 {
         MouseScrollDelta::LineDelta(_, y) => y * wheel_lines,
         MouseScrollDelta::PixelDelta(p) => p.y as f32 / cell_h.max(1.0),
     }
+}
+
+/// Splits a layout command string into an argv on whitespace. Not a shell parse —
+/// good enough for `ssh host`, `htop`, `journalctl -f`; an empty string yields an
+/// empty argv, which spawns the default shell.
+fn argv_of(cmd: &str) -> Vec<String> {
+    cmd.split_whitespace().map(str::to_string).collect()
 }
 
 /// Key hints for the palette: action id -> the first chord bound to it.

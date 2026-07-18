@@ -135,6 +135,19 @@ SQL DROP/TRUNCATE, git force-push and the classic fork bomb. Only a bare Enter a
 the live prompt is guarded, so editing history and full-screen apps are untouched.
 Turn it off with behaviour.command_guardian = false.
 
+# Named layouts (workspaces)
+
+Define layouts in the config and launch one from the palette (Launch layout): it
+opens a fresh tab split into one pane per command, tiling them. Perfect for a
+servers layout that ssh's into several machines at once. In the config:
+
+  [[layouts]]
+  name = servers
+  commands = [ssh 192.168.1.3, ssh 192.168.1.7, ssh 192.168.1.9, htop]
+
+An empty command opens a plain shell pane. Commands are split on whitespace (not a
+full shell parse), which covers ssh host, journalctl -f and the like.
+
 # Keyword watch
 
 From the palette, Watch pane for keyword arms the focused pane: when a later line

@@ -299,6 +299,8 @@ pub enum PromptKind {
     HistoryInsert,
     /// A keyword to watch for in the focused pane's output (empty clears it).
     WatchKeyword,
+    /// A named layout to launch in a new tab.
+    LaunchLayout,
 }
 
 impl Prompt {

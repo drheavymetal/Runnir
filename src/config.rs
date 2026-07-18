@@ -21,6 +21,20 @@ pub struct Config {
     pub ai: Ai,
     /// Extra keybindings, merged over the built-in ones. `"ctrl+shift+t" = "new_tab"`.
     pub keys: HashMap<String, String>,
+    /// Named workspace layouts. Each opens a fresh tab split into one pane per
+    /// command. Launch from the palette (Launch layout) — e.g. a `servers` layout
+    /// that ssh's into .3/.7/.9/.188 at once.
+    #[serde(default)]
+    pub layouts: Vec<LayoutDef>,
+}
+
+/// A named layout: a tab split into one pane per command. An empty command opens a
+/// plain shell pane.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LayoutDef {
+    pub name: String,
+    #[serde(default)]
+    pub commands: Vec<String>,
 }
 
 impl Default for Config {
@@ -34,6 +48,7 @@ impl Default for Config {
             behaviour: Behaviour::default(),
             ai: Ai::default(),
             keys: HashMap::new(),
+            layouts: Vec::new(),
         }
     }
 }
