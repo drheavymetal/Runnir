@@ -53,7 +53,8 @@ DIFFERENTIAL (aim ~15 total incl. above):
 - [x] D10 Pane zoom (Ctrl+Shift+Z) — visible_rects override + resize_one. commit 25.
 - [ ] D11 Open scrollback in $EDITOR / pipe pane to editor.
 - [ ] D12 Copy-mode with vim motions (keyboard scrollback nav + select).
-- [ ] D13 Tab reordering (drag / move-left/right).
+- [x] D13 Tab reordering — MoveTabLeft/Right (Ctrl+Shift+Left/Right), Vec::swap +
+      keep focus, wrap-around. commit 29.
 - [ ] D14 URL/path auto-underline on hover (not just hint mode).
 - [ ] D15 Config: cursor trail / animations toggle (optional flair).
 

@@ -284,6 +284,8 @@ impl Gpu {
                     Vec::new(),
                 )));
             }
+            Action::MoveTabLeft => self.move_tab(-1),
+            Action::MoveTabRight => self.move_tab(1),
 
             Action::SplitHorizontal | Action::SplitVertical => {
                 let axis = action.split_axis().unwrap();
@@ -589,8 +591,23 @@ impl Gpu {
             Action::FontReset => self.set_font_px(config.font.size, config),
             Action::ToggleBroadcast => self.broadcast = !self.broadcast,
             Action::ToggleZoom => self.toggle_zoom(),
+            Action::MoveTabLeft => self.move_tab(-1),
+            Action::MoveTabRight => self.move_tab(1),
             _ => {}
         }
+    }
+
+    /// Reorders the active tab one slot left (-1) or right (+1), wrapping around,
+    /// and keeps it focused. The tab bar reflects the new order immediately.
+    fn move_tab(&mut self, delta: isize) {
+        let n = self.tabs.len();
+        if n < 2 {
+            return;
+        }
+        let to = (self.active as isize + delta).rem_euclid(n as isize) as usize;
+        self.tabs.swap(self.active, to);
+        self.active = to;
+        self.window.request_redraw();
     }
 
     /// Zooms the focused pane to fill the tab, or unzooms. Resizes its PTY so the

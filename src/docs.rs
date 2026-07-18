@@ -16,6 +16,7 @@ Press Esc to close.
 @ Ctrl+Shift+T     new tab
 @ Ctrl+Shift+W     close tab
 @ Ctrl+PageUp/Dn   previous / next tab
+@ Ctrl+Shift+Left/Right  move the current tab left / right in the bar
 @ Super+1..9       jump to tab N
 @ Ctrl+Shift+R     rename the current tab
 
