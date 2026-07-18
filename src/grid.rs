@@ -132,6 +132,9 @@ pub struct Grid {
     /// error, 3 = indeterminate, 4 = paused; `None` = no progress. Drives the tab
     /// progress bar.
     progress: Option<(u8, u8)>,
+    /// The shell's working directory as reported by OSC 7 (`file://host/path`). The
+    /// portable cwd source — works on macOS where `/proc` doesn't exist.
+    cwd: Option<std::path::PathBuf>,
     /// Exit code of finished commands, keyed by the stable row of the prompt that
     /// launched each (OSC 133;D;code). Drives the pass/fail status gutter.
     cmd_exits: Vec<(usize, i32)>,
@@ -211,6 +214,7 @@ impl Grid {
             command_input: None,
             links: Vec::new(),
             progress: None,
+            cwd: None,
             cmd_exits: Vec::new(),
             outputs: Vec::new(),
             folds: Vec::new(),
@@ -557,6 +561,11 @@ impl Grid {
     /// 2 error, 3 indeterminate, 4 paused.
     pub fn progress(&self) -> Option<(u8, u8)> {
         self.progress
+    }
+
+    /// The shell's working directory from OSC 7, if it has reported one.
+    pub fn cwd(&self) -> Option<std::path::PathBuf> {
+        self.cwd.clone()
     }
 
     // ---- Command output folding (W2) ----------------------------------------
@@ -1159,6 +1168,26 @@ fn ext_color<'a>(sub: &[u16], iter: &mut impl Iterator<Item = &'a [u16]>) -> Opt
     }
 }
 
+/// Decodes `%XX` escapes in an OSC 7 path (spaces etc. arrive percent-encoded).
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hex = |b: u8| (b as char).to_digit(16);
+            if let (Some(h), Some(l)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 impl Perform for Grid {
     fn print(&mut self, c: char) {
         // Zero-width (combining marks, ZWJ) attach to the previous cell; drawing
@@ -1401,6 +1430,19 @@ impl Perform for Grid {
             [b"0" | b"2", title, ..] => {
                 self.title = String::from_utf8_lossy(title).into_owned();
                 self.dirty = true;
+            }
+            // OSC 7: the shell reports its working directory as `file://host/path`.
+            // The portable cwd source (macOS has no /proc).
+            [b"7", url, ..] => {
+                let s = String::from_utf8_lossy(url);
+                if let Some(rest) = s.strip_prefix("file://") {
+                    // Drop the host component; keep the absolute path after it.
+                    let path = rest.find('/').map(|i| &rest[i..]).unwrap_or(rest);
+                    let decoded = percent_decode(path);
+                    if !decoded.is_empty() {
+                        self.cwd = Some(std::path::PathBuf::from(decoded));
+                    }
+                }
             }
             // OSC 133: shell integration (FinalTerm/iTerm2). The shell brackets its
             // prompt and each command's output, letting the terminal navigate and
@@ -2134,6 +2176,14 @@ mod tests {
         feed(&mut g, "\x1b]133;A\x07$ false\r\n\x1b]133;C\x07\x1b]133;D;1\x07");
         let m = g.command_markers();
         assert!(m.iter().any(|&(_, e)| e == Some(1)), "second command failed: {m:?}");
+    }
+
+    #[test]
+    fn osc7_reports_working_directory() {
+        let mut g = Grid::new(20, 3);
+        assert_eq!(g.cwd(), None);
+        feed(&mut g, "\x1b]7;file://host/home/pedro/my%20dir\x07");
+        assert_eq!(g.cwd(), Some(std::path::PathBuf::from("/home/pedro/my dir")));
     }
 
     #[test]

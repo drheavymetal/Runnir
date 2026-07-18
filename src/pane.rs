@@ -131,6 +131,11 @@ impl Pane {
     /// The child's current working directory, for session persistence and for a
     /// split to inherit.
     pub fn cwd(&self) -> Option<std::path::PathBuf> {
+        // Prefer the shell's own OSC 7 report (portable, works on macOS); fall back
+        // to the OS process query (Linux /proc) when the shell doesn't emit it.
+        if let Some(dir) = self.grid.lock().unwrap().cwd() {
+            return Some(dir);
+        }
         crate::platform::cwd(self.pty.pid()?)
     }
 

@@ -60,10 +60,11 @@ mod imp {
 mod imp {
     use super::PathBuf;
 
-    pub fn cwd(pid: i32) -> Option<PathBuf> {
-        // PROC_PIDVNODEPATHINFO gives the process's cwd path.
-        use libproc::proc_pid;
-        proc_pid::pidcwd(pid).ok()
+    pub fn cwd(_pid: i32) -> Option<PathBuf> {
+        // libproc 0.14's pidcwd is a stub on macOS (returns Err), and replicating
+        // proc_pidinfo(PROC_PIDVNODEPATHINFO) here is fragile. macOS relies on the
+        // shell's OSC 7 report instead (Pane::cwd prefers it), so this is None.
+        None
     }
 
     pub fn foreground(pid: i32) -> Option<(String, Vec<String>)> {
