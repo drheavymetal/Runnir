@@ -514,28 +514,70 @@ impl Chord {
     }
 }
 
+/// Default chord that arms the leader layer. Alt+Space is free in every tiling
+/// compositor checked (Hyprland, sway, GNOME) and is not an editing key in the
+/// shell, unlike the alt+letter Meta bindings readline owns.
+pub const DEFAULT_LEADER: &str = "alt+space";
+
+/// Prefix marking a user binding as living on the leader layer: `"leader+v"`.
+const LEADER_PREFIX: &str = "leader+";
+
 /// User chords resolved against the built-in defaults.
 pub struct Keymap {
     bindings: HashMap<Chord, Action>,
+    /// The chord that arms the leader layer, if one is configured.
+    leader: Option<Chord>,
+    /// Actions reached by pressing the leader, releasing it, then this chord.
+    /// Kept apart from `bindings` because these are *unmodified* keys — bare `v`
+    /// is an action here and a literal `v` everywhere else.
+    leader_bindings: HashMap<Chord, Action>,
 }
 
 impl Keymap {
-    pub fn new(user: &HashMap<String, String>) -> Self {
+    pub fn new(user: &HashMap<String, String>, leader: &str) -> Self {
         let mut bindings = default_bindings();
+        let mut leader_bindings = default_leader_bindings();
         for (chord_spec, action_id) in user {
-            match (Chord::parse(chord_spec), Action::parse(action_id)) {
+            let (spec, map) = match chord_spec.trim().strip_prefix(LEADER_PREFIX) {
+                Some(rest) => (rest, &mut leader_bindings),
+                None => (chord_spec.as_str(), &mut bindings),
+            };
+            match (Chord::parse(spec), Action::parse(action_id)) {
                 (Some(chord), Some(action)) => {
-                    bindings.insert(chord, action);
+                    map.insert(chord, action);
                 }
                 (None, _) => eprintln!("runnir: unparseable key {chord_spec:?}"),
                 (_, None) => eprintln!("runnir: unknown action {action_id:?}"),
             }
         }
-        Self { bindings }
+        // An empty leader spec disables the layer rather than binding some fallback
+        // chord the user never asked for.
+        let leader = if leader.trim().is_empty() {
+            None
+        } else {
+            Chord::parse(leader).or_else(|| {
+                eprintln!("runnir: unparseable leader key {leader:?}, using {DEFAULT_LEADER}");
+                Chord::parse(DEFAULT_LEADER)
+            })
+        };
+        Self { bindings, leader, leader_bindings }
     }
 
     pub fn resolve(&self, key: &Key, mods: ModifiersState) -> Option<&Action> {
         Chord::from_event(key, mods).and_then(|c| self.bindings.get(&c))
+    }
+
+    /// True when this key arms the leader layer.
+    pub fn is_leader(&self, key: &Key, mods: ModifiersState) -> bool {
+        match (&self.leader, Chord::from_event(key, mods)) {
+            (Some(l), Some(c)) => *l == c,
+            _ => false,
+        }
+    }
+
+    /// Resolves a key pressed while the leader layer is armed.
+    pub fn resolve_leader(&self, key: &Key, mods: ModifiersState) -> Option<&Action> {
+        Chord::from_event(key, mods).and_then(|c| self.leader_bindings.get(&c))
     }
 }
 
@@ -558,9 +600,9 @@ fn default_bindings() -> HashMap<Chord, Action> {
     bind(&mut m, "ctrl+shift+tab", PrevTab);
     bind(&mut m, "ctrl+pageup", PrevTab);
     bind(&mut m, "ctrl+pagedown", NextTab);
-    for n in 1..=9 {
-        bind(&mut m, &format!("super+{n}"), GoToTab(n));
-    }
+    // Tab switching lives on the leader layer only. `super+N` was grabbed by every
+    // tiling compositor tried (Hyprland/GNOME bind it to workspaces), and `alt+N` is
+    // readline's digit-argument, so neither can be a default here.
     bind(&mut m, "ctrl+shift+r", RenameTab);
     bind(&mut m, "ctrl+shift+u", ReopenClosed);
     bind(&mut m, "ctrl+shift+left", MoveTabLeft);
@@ -573,16 +615,18 @@ fn default_bindings() -> HashMap<Chord, Action> {
     bind(&mut m, "ctrl+shift+l", FocusRight);
     bind(&mut m, "ctrl+shift+k", FocusUp);
     bind(&mut m, "ctrl+shift+j", FocusDown);
-    bind(&mut m, "super+left", ResizeLeft);
-    bind(&mut m, "super+right", ResizeRight);
-    bind(&mut m, "super+up", ResizeUp);
-    bind(&mut m, "super+down", ResizeDown);
+    // The alt+shift layer replaces the old super chords: a compositor almost always
+    // owns super, and an app can never win that race — the key never reaches us.
+    bind(&mut m, "alt+shift+left", ResizeLeft);
+    bind(&mut m, "alt+shift+right", ResizeRight);
+    bind(&mut m, "alt+shift+up", ResizeUp);
+    bind(&mut m, "alt+shift+down", ResizeDown);
 
     bind(&mut m, "ctrl+shift+c", Copy);
     bind(&mut m, "ctrl+shift+v", Paste);
-    // Super+V mirrors the familiar clipboard-history chord; every ctrl+shift+letter
-    // is already taken, so this lives on the super layer alongside tab/resize chords.
-    bind(&mut m, "super+v", ClipboardHistory);
+    // Every ctrl+shift+letter is already taken, so this lives on the alt+shift layer
+    // alongside the resize chords. Also on the leader layer as `leader v`.
+    bind(&mut m, "alt+shift+v", ClipboardHistory);
     bind(&mut m, "ctrl+shift+o", CopyLastOutput);
     bind(&mut m, "ctrl+shift+f", SearchScrollback);
     bind(&mut m, "ctrl+shift+q", OpenScrollbackInEditor);
@@ -602,9 +646,9 @@ fn default_bindings() -> HashMap<Chord, Action> {
     bind(&mut m, "f1", ShowDocs);
     bind(&mut m, "ctrl+shift+a", ToggleAi);
     bind(&mut m, "ctrl+shift+g", AskAiAboutError);
-    // Every ctrl+shift+letter is taken; fix-last-command mirrors ask-why (…+G) on
-    // super so it still sits with the assistant family without shadowing the shell.
-    bind(&mut m, "super+shift+g", FixLastCommand);
+    // Fix-last-command mirrors ask-why (…+G) on the alt+shift layer, so it still sits
+    // with the assistant family without shadowing the shell.
+    bind(&mut m, "alt+shift+g", FixLastCommand);
     bind(&mut m, "ctrl+shift+m", AiCommand);
     bind(&mut m, "ctrl+shift+y", AiExplain);
     bind(&mut m, "ctrl+shift+i", SummarizeSession);
@@ -614,13 +658,39 @@ fn default_bindings() -> HashMap<Chord, Action> {
     bind(&mut m, "ctrl+shift+enter", Whisper);
     bind(&mut m, "ctrl+shift+b", ToggleBroadcast);
     bind(&mut m, "ctrl+shift+z", ToggleZoom);
-    // Every ctrl+shift+letter is spoken for, so snippets take a free super chord —
-    // the same modifier the tab/resize bindings already use. 's' for snippets.
-    bind(&mut m, "super+s", OpenSnippets);
-    // Now-playing overlay: every ctrl+shift+letter is taken, so it lives on a free
-    // super chord ('p' for playing). Media transport also binds to the XF86 media keys
-    // in the input layer, and the overlay has its own space/n/p/+/- keys.
-    bind(&mut m, "super+p", NowPlaying);
+    bind(&mut m, "alt+shift+s", OpenSnippets);
+    // Now-playing overlay ('p' for playing). Media transport also binds to the XF86
+    // media keys in the input layer, and the overlay has its own space/n/p/+/- keys.
+    bind(&mut m, "alt+shift+p", NowPlaying);
+    m
+}
+
+/// Actions on the leader layer: press the leader, release it, then one plain key.
+///
+/// This layer exists because a compositor wins every modifier race — Hyprland and
+/// GNOME both claim most of the super layer, and an app cannot bind around that.
+/// After the leader is armed the keys are unmodified, so the namespace is wide and
+/// nothing outside runnir can take it.
+fn default_leader_bindings() -> HashMap<Chord, Action> {
+    use Action::*;
+    let mut m = HashMap::new();
+    for n in 1..=9 {
+        bind(&mut m, &n.to_string(), GoToTab(n));
+    }
+    // Both the arrows and the vim row resize, matching ctrl+shift+hjkl for focus.
+    bind(&mut m, "left", ResizeLeft);
+    bind(&mut m, "right", ResizeRight);
+    bind(&mut m, "up", ResizeUp);
+    bind(&mut m, "down", ResizeDown);
+    bind(&mut m, "h", ResizeLeft);
+    bind(&mut m, "l", ResizeRight);
+    bind(&mut m, "k", ResizeUp);
+    bind(&mut m, "j", ResizeDown);
+
+    bind(&mut m, "v", ClipboardHistory);
+    bind(&mut m, "s", OpenSnippets);
+    bind(&mut m, "p", NowPlaying);
+    bind(&mut m, "g", FixLastCommand);
     m
 }
 
@@ -636,7 +706,7 @@ pub fn default_hints() -> HashMap<String, String> {
         ("close_pane", "Ctrl+Shift+X"),
         ("copy", "Ctrl+Shift+C"),
         ("paste", "Ctrl+Shift+V"),
-        ("clipboard_history", "Super+V"),
+        ("clipboard_history", "Alt+Shift+V"),
         ("copy_last_output", "Ctrl+Shift+O"),
         ("search", "Ctrl+Shift+F"),
         ("open_scrollback_in_editor", "Ctrl+Shift+Q"),
@@ -644,7 +714,7 @@ pub fn default_hints() -> HashMap<String, String> {
         ("show_docs", "F1"),
         ("toggle_ai", "Ctrl+Shift+A"),
         ("ask_ai_about_error", "Ctrl+Shift+G"),
-        ("fix_last_command", "Super+Shift+G"),
+        ("fix_last_command", "Alt+Shift+G"),
         ("ai_command", "Ctrl+Shift+M"),
         ("ai_explain", "Ctrl+Shift+Y"),
         ("summarize_session", "Ctrl+Shift+I"),
@@ -662,8 +732,8 @@ pub fn default_hints() -> HashMap<String, String> {
         ("reopen_closed", "Ctrl+Shift+U"),
         ("move_tab_left", "Ctrl+Shift+Left"),
         ("move_tab_right", "Ctrl+Shift+Right"),
-        ("open_snippets", "Super+S"),
-        ("now_playing", "Super+P"),
+        ("open_snippets", "Alt+Shift+S"),
+        ("now_playing", "Alt+Shift+P"),
     ];
     pretty.iter().map(|(a, k)| (a.to_string(), k.to_string())).collect()
 }
@@ -786,14 +856,49 @@ mod tests {
     fn user_binding_overrides_default() {
         let mut user = HashMap::new();
         user.insert("ctrl+shift+t".into(), "quit".into());
-        let map = Keymap::new(&user);
+        let map = Keymap::new(&user, DEFAULT_LEADER);
         let chord = Chord::parse("ctrl+shift+t").unwrap();
         assert_eq!(map.bindings.get(&chord), Some(&Action::Quit));
     }
 
     #[test]
+    fn defaults_avoid_the_compositor_owned_super_layer() {
+        // A compositor grabs super before the app ever sees the key, so a super
+        // default is a binding that silently does nothing (Hyprland and GNOME both
+        // claim most of that layer). The leader layer exists to replace it.
+        for chord in default_bindings().keys() {
+            assert!(!chord.supr, "super chord {chord:?} would never reach runnir");
+        }
+    }
+
+    #[test]
+    fn leader_layer_binds_plain_keys_without_touching_the_normal_map() {
+        let map = Keymap::new(&HashMap::new(), DEFAULT_LEADER);
+        let v = Chord::parse("v").unwrap();
+        assert_eq!(map.leader_bindings.get(&v), Some(&Action::ClipboardHistory));
+        // A bare `v` must stay a literal `v` outside the leader layer.
+        assert_eq!(map.bindings.get(&v), None);
+        assert_eq!(map.leader_bindings.get(&Chord::parse("3").unwrap()), Some(&Action::GoToTab(3)));
+    }
+
+    #[test]
+    fn user_can_bind_and_disable_the_leader_layer() {
+        let mut user = HashMap::new();
+        user.insert("leader+z".into(), "quit".into());
+        let map = Keymap::new(&user, "ctrl+alt+space");
+        assert_eq!(map.leader_bindings.get(&Chord::parse("z").unwrap()), Some(&Action::Quit));
+        assert_eq!(map.leader, Chord::parse("ctrl+alt+space"));
+        // The default leader entries survive a user addition.
+        assert_eq!(map.leader_bindings.get(&Chord::parse("v").unwrap()), Some(&Action::ClipboardHistory));
+
+        // An empty spec turns the layer off rather than falling back to a chord the
+        // user did not ask for.
+        assert_eq!(Keymap::new(&HashMap::new(), "").leader, None);
+    }
+
+    #[test]
     fn default_palette_shortcut_is_bound() {
-        let map = Keymap::new(&HashMap::new());
+        let map = Keymap::new(&HashMap::new(), DEFAULT_LEADER);
         let chord = Chord::parse("ctrl+shift+p").unwrap();
         assert_eq!(map.bindings.get(&chord), Some(&Action::CommandPalette));
     }

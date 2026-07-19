@@ -54,6 +54,13 @@ use crate::tab::Tab;
 /// Height of the tab bar, in cells. Shown only when more than one tab exists.
 const TABBAR_ROWS: f32 = 1.0;
 
+/// How long the leader layer stays armed waiting for its second key.
+pub const LEADER_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Width of the minimap strip, in pixels. Like the tab bar, this is chrome that
+/// overlaps the pane, so the text grid must reserve it — see `tab::cells_in`.
+pub const MINIMAP_W: f32 = 46.0;
+
 /// A message from a background worker back to the UI thread.
 pub enum UserEvent {
     Ai(ai::Reply),
@@ -244,7 +251,7 @@ struct App {
 impl App {
     fn new(proxy: EventLoopProxy<UserEvent>, quake: bool) -> Self {
         let config = Config::load();
-        let keymap = Keymap::new(&config.keys);
+        let keymap = Keymap::new(&config.keys, &config.leader);
         let config_mtime = config_mtime();
         Self {
             proxy,
@@ -281,7 +288,7 @@ impl App {
             }
             return;
         };
-        self.keymap = Keymap::new(&new.keys);
+        self.keymap = Keymap::new(&new.keys, &new.leader);
         if let Some(gpu) = self.gpu.as_mut() {
             gpu.apply_config(&new);
             gpu.status = Some("config reloaded".into());
@@ -319,6 +326,11 @@ struct Gpu {
     hover_url: Option<HoverUrl>,
     /// Keyboard copy-mode state, or `None` when off (D12).
     copy_mode: Option<CopyMode>,
+    /// When the leader layer was armed: the next key resolves against the leader
+    /// bindings instead of reaching the pane. Disarmed by any key, or by
+    /// `LEADER_TIMEOUT` — an indefinitely armed leader would turn a keystroke typed
+    /// minutes later into an action the user never asked for.
+    leader_armed: Option<Instant>,
     /// The armed image auto-preview watch, or `None` when not watching.
     image_watch: Option<ImageWatch>,
     /// The running now-playing waveform worker, or `None`. Dropping it (on overlay
@@ -531,6 +543,7 @@ impl App {
             scroll_accum: 0.0,
             hover_url: None,
             copy_mode: None,
+            leader_armed: None,
             image_watch: None,
             media_wave: None,
             media_last_refresh: None,
@@ -765,7 +778,7 @@ impl ApplicationHandler<UserEvent> for App {
                 // key bindings) so behaviour/keys take effect live, and refresh the
                 // hot-reload mtime so the panel's own save doesn't trigger a reload.
                 if let Some(cfg) = gpu.pending_config.take() {
-                    self.keymap = Keymap::new(&cfg.keys);
+                    self.keymap = Keymap::new(&cfg.keys, &cfg.leader);
                     self.config = cfg;
                     self.config_mtime = config_mtime();
                 }

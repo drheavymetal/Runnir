@@ -11,13 +11,36 @@ runnir is a GPU-accelerated terminal. This page lives in the binary, so it alway
 matches the version you are running. Scroll with the arrows or PageUp/PageDown.
 Press Esc to close.
 
+# The leader key
+
+Compositors win every modifier race. Hyprland and GNOME both claim most of the
+Super layer for workspaces, and a key they grab never reaches runnir at all — an
+app cannot bind around that. So runnir keeps its own layer behind a leader key.
+
+Press Alt+Space, let go, then press one plain key. The sequence has three seconds
+before it lapses; any unbound key just cancels it, and nothing leaks to the shell.
+
+@ Leader 1..9      jump to tab N
+@ Leader hjkl      resize the focused pane (arrows work too)
+@ Leader V         clipboard history
+@ Leader S         command snippets
+@ Leader P         now playing
+@ Leader G         fix the last failed command
+
+Rebind the leader itself with the `leader` setting (an empty string turns the
+layer off), and bind your own sequences with a `leader+` prefix in [keys] — see
+the config section below.
+
+Everything on the leader layer is also in the command palette (Ctrl+Shift+P),
+which stays the way to find a command you have not memorised.
+
 # Tabs
 
 @ Ctrl+Shift+T     new tab
 @ Ctrl+Shift+W     close tab
 @ Ctrl+PageUp/Dn   previous / next tab
 @ Ctrl+Shift+Left/Right  move the current tab left / right in the bar
-@ Super+1..9       jump to tab N
+@ Leader 1..9      jump to tab N
 @ Ctrl+Shift+R     rename the current tab
 
 # Splits (panes)
@@ -30,7 +53,7 @@ working directory of the pane you were in, so it opens where you already are.
 @ Ctrl+Shift+X     close the focused pane
 @ Ctrl+Shift+Z     zoom the focused pane to fill the tab (toggle)
 @ Ctrl+Shift+HJKL  move focus left / down / up / right (vim directions)
-@ Super+arrows     resize the focused pane
+@ Alt+Shift+arrows resize the focused pane (also Leader hjkl / arrows)
 
 A pane that rings the terminal bell (BEL) flashes briefly; if the window is not
 focused it also raises the compositor urgency hint, so a finished build in the
@@ -44,7 +67,7 @@ whatever order you built the splits in.
 @ wheel / Shift+PageUp/Dn   scroll the history
 @ drag                      select text (copied on release)
 @ Ctrl+Shift+C / V          copy / paste
-@ Super+V                   clipboard history: re-paste a recent copy (see below)
+@ Alt+Shift+V               clipboard history: re-paste a recent copy (see below)
 @ middle click              paste the primary selection (the last text selected)
 @ Ctrl+Shift+Home/End       jump to top / live output
 @ Ctrl+Shift+F              search the scrollback; Enter/Up next/prev, Esc closes
@@ -57,7 +80,7 @@ selection copies, Ctrl+Shift+C, copy-mode yanks, copy-last-output, hint copies a
 OSC 52 writes from programs all land there. Open the picker to re-paste an earlier
 copy without hunting for it again.
 
-@ Super+V     open the clipboard-history picker (also in the palette)
+@ Alt+Shift+V open the clipboard-history picker (also in the palette)
 
 Type to fuzzy-search the entries, arrows to move, Enter pastes the highlighted one
 into the focused pane through the normal paste path, Esc closes. Each row shows a
@@ -161,7 +184,7 @@ variable named in the config, never stored in the file.
 @ Ctrl+Shift+N     launch Claude Code in a new split
 @ Ctrl+Shift+M     describe a command in plain language; the model writes it and
                    types it at the prompt for you to review and run (not run for you)
-@ Super+Shift+G    fix the last failed command: the model reads the command, its
+@ Alt+Shift+G      fix the last failed command: the model reads the command, its
                    output and its non-zero exit code, then types a corrected command
                    at the prompt for you to review and run (never run for you). For
                    example, after mkdr foo fails it types mkdir foo at the prompt.
@@ -209,7 +232,7 @@ full shell parse), which covers ssh host, journalctl -f and the like.
 
 # Command snippets (bookmarks)
 
-@ Super+S          fuzzy-pick a saved command; it is typed at the prompt to review.
+@ Alt+Shift+S      fuzzy-pick a saved command; it is typed at the prompt to review.
 
 Save commands you run often as snippets and recall them from the palette (Insert
 command snippet) or the keybind. Type to filter on name or description. Selecting a
@@ -344,7 +367,7 @@ See and control whatever is playing without leaving the terminal. An overlay sho
 the current track (title, artist, album), the album art, the playback state, and a
 live audio waveform.
 
-@ Super+P          open the now-playing overlay
+@ Alt+Shift+P      open the now-playing overlay
 
 Inside the overlay:
 
@@ -414,7 +437,7 @@ file is safe to keep in a dotfiles repo.
 @ cursor.trail     true draws a brief fading trail behind the cursor (flair, off)
 @ behaviour.smooth_scroll  true glides on scroll jumps instead of teleporting
 @ behaviour.shell_integration  true auto-injects OSC 133/7 hooks into fish/zsh/bash (no rc edits)
-@ clipboard.capacity   how many recent copies the Super+V history keeps (default 50)
+@ clipboard.capacity   how many recent copies the clipboard history keeps (default 50)
 @ clipboard.enabled    false stops recording copies into the history
 
 Each tab shows an icon for its foreground app and a badge: an amber dot for a

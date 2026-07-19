@@ -294,9 +294,9 @@ impl Gpu {
         // right edge — one dim bar per sampled line (width = how full the line is),
         // with the current viewport window highlighted. Click it to jump.
         if config.window.minimap {
-            if let Some((_, r, grid, ..)) = guards.iter().find(|(id, ..)| *id == focus).filter(|(_, r, ..)| r.w > 46.0) {
+            if let Some((_, r, grid, ..)) = guards.iter().find(|(id, ..)| *id == focus).filter(|(_, r, ..)| r.w > crate::MINIMAP_W) {
                 let total = grid.total_rows();
-                let strip_w = 46.0f32;
+                let strip_w = crate::MINIMAP_W;
                 let x0 = r.x + r.w - strip_w;
                 let rows_px = (r.h as usize).max(1);
                 // One screen pixel-row per map entry, sampling the scrollback.
@@ -337,7 +337,7 @@ impl Gpu {
             // The focused pane's position is already shown by the minimap when on —
             // but only when the minimap actually drew (a pane too narrow for the strip
             // still needs its thumb).
-            if config.window.minimap && *id == focus && r.w > 46.0 {
+            if config.window.minimap && *id == focus && r.w > crate::MINIMAP_W {
                 continue;
             }
             let off = grid.display_offset();

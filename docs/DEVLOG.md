@@ -35,6 +35,62 @@ QUEUED after integration (touch grid/render, would conflict): Unicode/grapheme r
 Merge order suggestion: independent-file first (control.rs, themes.rs, selection.rs, layout.rs) then the grid.rs/app_input.rs-heavy (underlines, keyboard, osc52) resolving cumulatively.
 ## >>> END PENDING INTEGRATION <<<
 
+## 2026-07-19 — Leader key + minimap column reserve (Hyprland fallout)
+
+Two bugs Pedro hit on his Hyprland setup.
+
+**1. The super layer never reached runnir.** A compositor grabs its modifiers before
+the app sees the key, so every `super+*` default was dead: Hyprland binds super+1..9
+(workspaces), super+arrows (movefocus), super+v (togglefloating), super+s
+(togglespecialworkspace), super+p (pseudo). GNOME claims the same layer. This is not
+fixable by picking a different super chord — the whole layer belongs to the WM.
+Fix, two parts:
+- The super defaults moved to `alt+shift` (resize arrows, clipboard-history V,
+  snippets S, now-playing P, fix-last-command G). New test
+  `defaults_avoid_the_compositor_owned_super_layer` fails the build if a super chord
+  is ever added back.
+- New LEADER LAYER (actions.rs): `alt+space`, release, then one plain key. Keymap
+  gained `leader: Option<Chord>` + `leader_bindings` (a separate map — bare `v` is an
+  action there and a literal `v` everywhere else). `config.leader` rebinds it, `""`
+  disables it. User bindings take a `leader+` prefix in `[keys]`.
+  Defaults: 1..9 go-to-tab (they could NOT go on alt+N — that is readline's
+  digit-argument), hjkl/arrows resize, v/s/p/g as above.
+  State is `Gpu.leader_armed: Option<Instant>` + `LEADER_TIMEOUT` 3s (an
+  indefinitely armed leader would turn a keystroke typed minutes later into an
+  action). Handled in `on_key` after the overlay/copy-mode gates: a modifier press
+  alone does not consume the arming, ANY other key ends the sequence bound or not
+  (falling through would leak a stray char into the shell after a mistype), and an
+  expired arm falls through to the pane instead of being eaten.
+
+**2. Text rendered underneath the minimap.** `app_draw` drew the 46px strip at the
+pane's right edge, but `tab::cells_in` sized the grid from the FULL pane width, so
+the last ~5 columns were painted under it. The tab bar and status bar had always
+reserved their rows in `content_area`; the minimap never got the same treatment.
+`cells_in` now takes the flag and subtracts `crate::MINIMAP_W` (the magic 46.0 was
+duplicated in 3 places, now one const). Reserved on EVERY pane, not just the focused
+one that draws the map: making it follow focus would reflow and re-wrap two grids on
+every focus change. A pane too narrow to draw the strip does not pay for it, matching
+the draw guard. `Tab.minimap` field + `set_minimap` so hot-reload can adopt a toggle
+and reflow (mirrors how `status_bar` is handled in `apply_config`).
+
+Verified end-to-end, not just by unit test — both headless modes (`--dump`,
+`--render`) use a fixed 80x24 grid and never touch `Tab`, so neither can catch this
+class of bug. Instead: launched a real instance under `XDG_CONFIG_HOME` pointed at a
+scratch config (so the running terminal was untouched), floated+sized the window with
+`hyprctl` (tiling made every launch a different width — measurements were pure noise
+until pinned), and read `tput cols` back over the control socket, targeted by
+`RUNNIR_LISTEN=$XDG_RUNTIME_DIR/runnir-<pid>.sock` so the client could not talk to
+the wrong instance. 1000px window: 98 cols minimap off, 93 on — exactly the 5 columns
+reserved. For the leader, `runnir @ send-text` is useless (it writes to the PTY,
+bypassing `on_key`); `hyprctl dispatch sendshortcut` injects real key events, so
+alt+space then `t` with `"leader+t" = "new_tab"` took the tab count 1 → 2, and
+alt+space then an unbound `z` left the prompt with exactly one `z` (the leader ate
+the first, the plain keypress after wrote the second).
+
+283 tests pass. `shell_integration::fish_prepends_xdg_data_dirs` fails in this shell
+both before and after these changes — it needs `XDG_DATA_DIRS` set, which fish here
+does not export. Pre-existing, untouched.
+
 ## 2026-07-19 — AI fix-and-run for a failed command
 FixLastCommand action (Super+Shift+G — every ctrl+shift letter was taken; mirrors
 ask-why ctrl+shift+G on super; palette "AI: fix the last failed command"). Guards on

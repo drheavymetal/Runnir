@@ -31,6 +31,10 @@ pub struct Tab {
     cell: (f32, f32),
     gap: f32,
     padding: f32,
+    /// Whether the minimap strip is on, so pane grids reserve room for it.
+    /// Kept on the tab (not read from `Config` at use) because `reflow` and
+    /// `resize_one` are called from paths that do not carry the config.
+    minimap: bool,
 }
 
 /// Default master share for Tall/Fat: a touch over half, so the master reads as
@@ -49,7 +53,7 @@ impl Tab {
     ) -> anyhow::Result<Self> {
         let padding = config.window.padding;
         let inner = pad(area, padding);
-        let (cols, rows) = cells_in(inner, cell);
+        let (cols, rows) = cells_in(inner, cell, config.window.minimap);
         let pane =
             Pane::new(cols, rows, config.scrollback.lines, cell, spawn, config.behaviour.shell_integration, wake)?;
 
@@ -66,6 +70,7 @@ impl Tab {
             cell,
             gap: config.window.padding.max(6.0),
             padding,
+            minimap: config.window.minimap,
         })
     }
 
@@ -109,9 +114,19 @@ impl Tab {
         pad(area, self.padding)
     }
 
+    pub fn minimap(&self) -> bool {
+        self.minimap
+    }
+
+    /// Adopts a new minimap setting on hot-reload. The caller reflows: the pane
+    /// grids only pick up the changed reserve when they are resized.
+    pub fn set_minimap(&mut self, on: bool) {
+        self.minimap = on;
+    }
+
     /// Resizes one pane's grid/PTY to `rect` (used when zooming a single pane).
     pub fn resize_one(&mut self, id: PaneId, rect: Rect) {
-        let (cols, rows) = cells_in(rect, self.cell);
+        let (cols, rows) = cells_in(rect, self.cell, self.minimap);
         if let Some(pane) = self.panes.get_mut(&id) {
             pane.resize(cols, rows);
         }
@@ -166,7 +181,7 @@ impl Tab {
         let rect = self
             .provisional_layout(area, id)
             .unwrap_or(inner);
-        let (cols, rows) = cells_in(rect, self.cell);
+        let (cols, rows) = cells_in(rect, self.cell, self.minimap);
 
         let pane = match Pane::new(
             cols,
@@ -325,7 +340,7 @@ impl Tab {
     /// each child PTY learns its true size.
     pub fn reflow(&mut self, area: Rect) {
         for (id, rect) in self.layout(area) {
-            let (cols, rows) = cells_in(rect, self.cell);
+            let (cols, rows) = cells_in(rect, self.cell, self.minimap);
             if let Some(pane) = self.panes.get_mut(&id) {
                 pane.resize(cols, rows);
             }
@@ -466,7 +481,7 @@ impl Tab {
 
         let mut panes = HashMap::new();
         for (id, rect) in &rects {
-            let (cols, rows) = cells_in(*rect, cell);
+            let (cols, rows) = cells_in(*rect, cell, config.window.minimap);
             let saved = state.panes.get(id);
             let spawn = Spawn {
                 command: None,
@@ -514,6 +529,7 @@ impl Tab {
             cell,
             gap,
             padding,
+            minimap: config.window.minimap,
         })
     }
 
@@ -533,8 +549,21 @@ fn pad(area: Rect, padding: f32) -> Rect {
     }
 }
 
-fn cells_in(rect: Rect, cell: (f32, f32)) -> (usize, usize) {
-    ((rect.w / cell.0).floor().max(1.0) as usize, (rect.h / cell.1).floor().max(1.0) as usize)
+/// Cell grid that fits in `rect`. With the minimap on, the text stops short of the
+/// strip: it is drawn *over* the pane's right edge, so columns sized to the full
+/// width would render underneath it and be invisible. The narrow-pane exemption
+/// mirrors the draw guard in `app_draw` — a pane too small for the strip never
+/// shows one, so it must not pay for it either.
+///
+/// The reserve applies to every pane, not just the focused one that draws the map:
+/// making it follow focus would reflow (and re-wrap) two grids on every focus
+/// change.
+fn cells_in(rect: Rect, cell: (f32, f32), minimap: bool) -> (usize, usize) {
+    let reserve = if minimap && rect.w > crate::MINIMAP_W { crate::MINIMAP_W } else { 0.0 };
+    (
+        ((rect.w - reserve) / cell.0).floor().max(1.0) as usize,
+        (rect.h / cell.1).floor().max(1.0) as usize,
+    )
 }
 
 #[cfg(test)]
@@ -557,7 +586,25 @@ mod tests {
             cell: (10.0, 20.0),
             gap: 6.0,
             padding: 0.0,
+            minimap: false,
         }
+    }
+
+    #[test]
+    fn minimap_reserves_columns_so_text_never_lands_under_the_strip() {
+        let cell = (10.0, 20.0);
+        let rect = Rect { x: 0.0, y: 0.0, w: 1000.0, h: 600.0 };
+        let (plain, rows) = cells_in(rect, cell, false);
+        let (mapped, mapped_rows) = cells_in(rect, cell, true);
+        assert_eq!(plain, 100);
+        // 46px of strip costs the 5 columns it overlaps (4.6 rounded up by floor).
+        assert_eq!(mapped, 95);
+        assert_eq!(rows, mapped_rows, "the strip is vertical: rows are untouched");
+
+        // A pane too narrow to draw the strip does not pay for it either — this
+        // mirrors the draw guard in app_draw.
+        let narrow = Rect { w: crate::MINIMAP_W, ..rect };
+        assert_eq!(cells_in(narrow, cell, true).0, cells_in(narrow, cell, false).0);
     }
 
     #[test]
@@ -605,7 +652,7 @@ mod tests {
 
         assert_eq!(tab.mode, LayoutMode::Tall);
         for (id, rect) in tab.layout(AREA) {
-            let (cols, rows) = cells_in(rect, cell);
+            let (cols, rows) = cells_in(rect, cell, config.window.minimap);
             let grid = tab.panes[&id].grid.lock().unwrap();
             assert_eq!(
                 (grid.cols(), grid.rows()),

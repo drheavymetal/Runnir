@@ -27,7 +27,13 @@ pub struct Config {
     #[serde(default)]
     pub media: Media,
     /// Extra keybindings, merged over the built-in ones. `"ctrl+shift+t" = "new_tab"`.
+    /// A `"leader+v"` key binds on the leader layer instead of as a plain chord.
     pub keys: HashMap<String, String>,
+    /// Chord that arms the leader layer (`"alt+space"` by default). Set it to an
+    /// empty string to turn the layer off. The leader exists because compositors
+    /// win every modifier race — see `actions::default_leader_bindings`.
+    #[serde(default = "default_leader")]
+    pub leader: String,
     /// Named workspace layouts. Each opens a fresh tab split into one pane per
     /// command. Launch from the palette (Launch layout) — e.g. a `servers` layout
     /// that ssh's into .3/.7/.9/.188 at once.
@@ -78,6 +84,7 @@ impl Default for Config {
             watch: Watch::default(),
             media: Media::default(),
             keys: HashMap::new(),
+            leader: default_leader(),
             layouts: Vec::new(),
             snippets: Vec::new(),
         }
@@ -127,6 +134,10 @@ pub struct WindowCfg {
 
 fn default_bg_dim() -> f32 {
     0.35
+}
+
+fn default_leader() -> String {
+    crate::actions::DEFAULT_LEADER.to_string()
 }
 
 impl Default for WindowCfg {
@@ -185,7 +196,7 @@ impl Default for Scrollback {
 }
 
 /// Clipboard history: an in-memory ring of recent copies you can re-paste from the
-/// picker (palette: Clipboard history, or Super+V). Never written to disk.
+/// picker (palette: Clipboard history, or Alt+Shift+V). Never written to disk.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ClipboardCfg {

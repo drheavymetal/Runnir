@@ -264,6 +264,42 @@ impl Gpu {
             return;
         }
 
+        // The leader layer. A modifier press alone must not consume the arming — the
+        // user is allowed to reach for shift on the way to the second key.
+        let modifier_only = matches!(
+            event.logical_key,
+            Key::Named(
+                NamedKey::Shift | NamedKey::Control | NamedKey::Alt | NamedKey::Super
+                    | NamedKey::AltGraph | NamedKey::CapsLock
+            )
+        );
+        if !modifier_only {
+            if let Some(armed_at) = self.leader_armed {
+                self.leader_armed = None;
+                self.status = None;
+                self.status_expiry = None;
+                // An expired arm is treated as no arm at all: the key falls through to
+                // the pane, so a stray keystroke is never silently eaten.
+                if armed_at.elapsed() < crate::LEADER_TIMEOUT {
+                    // Any key ends the sequence, bound or not. Falling through to the
+                    // pane on a miss would leak a stray character into the shell after
+                    // a mistyped sequence.
+                    if let Some(action) = keymap.resolve_leader(&event.logical_key, mods) {
+                        self.run_action(action.clone(), config, event_loop);
+                    }
+                    self.window.request_redraw();
+                    return;
+                }
+            }
+            if keymap.is_leader(&event.logical_key, mods) {
+                self.leader_armed = Some(Instant::now());
+                // The toast doubles as the armed indicator, so it lasts exactly as
+                // long as the arming does.
+                self.toast("leader…", crate::LEADER_TIMEOUT.as_secs());
+                return;
+            }
+        }
+
         // The XF86 media transport keys drive the media backend directly, wherever the
         // focus is (no overlay needed). Volume media keys are left to the system.
         if let Key::Named(n) = &event.logical_key {
@@ -1177,7 +1213,7 @@ impl Gpu {
         let Some((_, r)) = self.visible_rects(area).into_iter().find(|(id, _)| *id == focus) else {
             return false;
         };
-        let strip_w = 46.0;
+        let strip_w = crate::MINIMAP_W;
         // A pane narrower than the strip has no minimap (it would escape the pane).
         if r.w <= strip_w {
             return false;
@@ -1835,6 +1871,14 @@ impl Gpu {
         // A status-bar toggle changes the content height, so reflow after.
         if self.status_bar != config.window.status_bar {
             self.status_bar = config.window.status_bar;
+            self.reflow_all();
+        }
+        // Same for the minimap: toggling it changes how much width the text grid may
+        // use, so every tab adopts the new setting before the reflow.
+        if self.tabs.iter().any(|t| t.minimap() != config.window.minimap) {
+            for tab in &mut self.tabs {
+                tab.set_minimap(config.window.minimap);
+            }
             self.reflow_all();
         }
         self.renderer.set_theme(config.theme.clone());
