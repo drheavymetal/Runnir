@@ -35,6 +35,36 @@ QUEUED after integration (touch grid/render, would conflict): Unicode/grapheme r
 Merge order suggestion: independent-file first (control.rs, themes.rs, selection.rs, layout.rs) then the grid.rs/app_input.rs-heavy (underlines, keyboard, osc52) resolving cumulatively.
 ## >>> END PENDING INTEGRATION <<<
 
+## 2026-07-19 — Minimap draws coloured text runs, not bars
+
+Pedro: "solo se ven cubos" — the strip showed one bar per line, width = `row_fill`
+(how far the line's last glyph reached). That only encodes line LENGTH, so it read
+as a stack of blocks with no structure.
+
+Now each sampled row is drawn as its runs of ink, in the text's own colour, so the
+strip is a shrunken picture of the screen: indentation, blank lines and coloured
+output are all recognisable. `Grid::row_runs_into(abs, &mut Vec<(col, len, Color)>)`
+groups adjacent non-blank cells sharing a foreground colour; a space OR a colour
+change breaks a run. Fills a caller-owned Vec instead of returning one — it runs
+once per sampled row on every frame the grid changes, and a per-row allocation would
+dominate. A spacer (right half of a wide glyph) extends a run rather than breaking it:
+it carries no glyph but it is ink.
+`app_draw` resolves each run's colour against the theme (Default → foreground,
+Indexed → `render::xterm256`, now `pub(crate)`) and emits one SolidRect per run at
+`x0 + col*cw`, `cw = strip_w / cols`. Sub-pixel runs still render — the quad covers
+part of a pixel, which reads as a lighter mark. `row_fill` deleted (last caller gone).
+
+Cost: decorations all join the single instanced draw call, so thousands of rects add
+instances, not draw calls. Measured under identical load (3x a 350-line colourful
+generator): 12 CPU ticks with the minimap OFF vs 9 with it ON — no regression outside
+noise.
+
+Verified by screenshot, since no headless path draws the minimap: real instance under
+a scratch `XDG_CONFIG_HOME`, floated and sized via `hyprctl`, fed colour through a
+script FILE (escape sequences do not survive the quoting layers of `@ send-text` —
+first attempt rendered a literal `33[36m`), then `dms screenshot window`. The strip
+shows green comment runs and per-line colour with indentation offsets.
+
 ## 2026-07-19 — Leader key + minimap column reserve (Hyprland fallout)
 
 Two bugs Pedro hit on his Hyprland setup.

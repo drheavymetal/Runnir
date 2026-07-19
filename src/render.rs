@@ -1507,7 +1507,7 @@ fn backdrop(_screen: (f32, f32), alpha: f32) -> Instance {
 
 /// The standard xterm 256-colour layout: 16 themeable ANSI colours, a 6x6x6 cube,
 /// then 24 greys. The cube and greys are fixed by the spec; only 0-15 are themed.
-fn xterm256(i: u8, ansi: &[crate::config::Rgb]) -> crate::config::Rgb {
+pub(crate) fn xterm256(i: u8, ansi: &[crate::config::Rgb]) -> crate::config::Rgb {
     match i {
         0..=15 if (i as usize) < ansi.len() => ansi[i as usize],
         16..=231 => {

@@ -302,20 +302,34 @@ impl Gpu {
                 // One screen pixel-row per map entry, sampling the scrollback.
                 let steps = rows_px.min(total.max(1));
                 let a = config.theme.accent;
+                // Each row is drawn as its runs of ink, in the colour the text
+                // actually has, so the strip reads as a shrunken picture of the
+                // screen: indentation, blank lines and coloured output are all
+                // recognisable. A run narrower than a pixel still renders — the quad
+                // just covers part of one, which reads as a lighter mark.
+                let cw = strip_w / grid.cols().max(1) as f32;
+                let h = (r.h / steps as f32).max(1.0);
+                let mut runs = Vec::new();
                 for s in 0..steps {
                     let abs = s * total / steps.max(1);
-                    let fill = grid.row_fill(abs);
-                    if fill <= 0.0 {
-                        continue;
-                    }
+                    grid.row_runs_into(abs, &mut runs);
                     let y = r.y + (s as f32 / steps as f32) * r.h;
-                    decorations.push(crate::render::SolidRect {
-                        x: x0,
-                        y,
-                        w: (strip_w * fill).max(1.0),
-                        h: (r.h / steps as f32).max(1.0),
-                        color: (0x4a, 0x4d, 0x55),
-                    });
+                    for &(col, len, colour) in &runs {
+                        let rgb = match colour {
+                            crate::grid::Color::Default => config.theme.foreground,
+                            crate::grid::Color::Rgb(cr, cg, cb) => crate::config::Rgb(cr, cg, cb),
+                            crate::grid::Color::Indexed(i) => {
+                                crate::render::xterm256(i, &config.theme.ansi)
+                            }
+                        };
+                        decorations.push(crate::render::SolidRect {
+                            x: x0 + col as f32 * cw,
+                            y,
+                            w: len as f32 * cw,
+                            h,
+                            color: (rgb.0, rgb.1, rgb.2),
+                        });
+                    }
                 }
                 // Highlight the visible window.
                 let top = grid.total_rows() - grid.rows() - grid.display_offset();

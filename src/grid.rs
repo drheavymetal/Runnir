@@ -624,21 +624,35 @@ impl Grid {
         self.dropped
     }
 
-    /// Fraction (0..1) of the absolute (local) row `abs` that holds non-blank cells,
-    /// for the minimap. Cheap: one pass over the row.
-    pub fn row_fill(&self, abs: usize) -> f32 {
-        if self.cols == 0 {
-            return 0.0;
+    /// Runs of adjacent non-blank cells sharing a foreground colour, for the
+    /// minimap. Appends `(start_col, len, colour)` to `out` rather than returning a
+    /// Vec: this is called once per sampled row on every frame the grid changes, and
+    /// a fresh allocation per row would dominate the cost of drawing the strip.
+    ///
+    /// Runs are what make the minimap read as text — a single bar per line (how it
+    /// worked before) only shows how long the line is, not its shape.
+    pub fn row_runs_into(&self, abs: usize, out: &mut Vec<(usize, usize, Color)>) {
+        out.clear();
+        let mut run: Option<(usize, usize, Color)> = None;
+        for col in 0..self.cols {
+            let cell = self.abs_cell(abs, col);
+            // A spacer carries no glyph of its own, but it is the right half of a
+            // wide character that IS ink, so it extends the run rather than breaking
+            // it.
+            let blank = cell.ch == ' ' || (cell.ch == SPACER && run.is_none());
+            if blank {
+                out.extend(run.take());
+                continue;
+            }
+            match &mut run {
+                Some((_, len, colour)) if *colour == cell.pen.fg => *len += 1,
+                _ => {
+                    out.extend(run.take());
+                    run = Some((col, 1, cell.pen.fg));
+                }
+            }
         }
-        let last = (0..self.cols)
-            .rev()
-            .find(|&c| {
-                let cell = self.abs_cell(abs, c);
-                !cell.is_spacer() && cell.ch != ' '
-            })
-            .map(|c| c + 1)
-            .unwrap_or(0);
-        last as f32 / self.cols as f32
+        out.extend(run);
     }
 
     /// Exit code of the most recently finished command, if OSC 133;D carried one.
@@ -1930,6 +1944,31 @@ mod tests {
 
     fn feed(grid: &mut Grid, bytes: &str) {
         vte::Parser::new().advance(grid, bytes.as_bytes());
+    }
+
+    #[test]
+    fn minimap_runs_split_on_gaps_and_on_colour_changes() {
+        let mut g = Grid::new(20, 3);
+        // Two words with a gap, the second in red (SGR 31) — three runs, because a
+        // colour change breaks a run just as a space does.
+        feed(&mut g, "ab  cd\x1b[31mef");
+        let mut runs = Vec::new();
+        g.row_runs_into(0, &mut runs);
+        assert_eq!(
+            runs,
+            vec![(0, 2, Color::Default), (4, 2, Color::Default), (6, 2, Color::Indexed(1))]
+        );
+
+        // A blank row contributes nothing, so blank lines stay visible as gaps in
+        // the strip rather than being drawn over.
+        g.row_runs_into(1, &mut runs);
+        assert!(runs.is_empty());
+
+        // Leading indentation is preserved as an offset: that is what makes the
+        // minimap read as code rather than as a stack of bars.
+        feed(&mut g, "\r\n    xy");
+        g.row_runs_into(1, &mut runs);
+        assert_eq!(runs, vec![(4, 2, Color::Indexed(1))]);
     }
 
     #[test]
