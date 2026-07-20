@@ -514,13 +514,22 @@ impl Chord {
     }
 }
 
-/// Default chord that arms the leader layer. Alt+Space is free on Hyprland and
-/// sway, and is not an editing key in the shell, unlike the alt+letter Meta
-/// bindings readline owns. It is *not* universally free — GNOME/GTK opens the
-/// window menu with it, KDE's krunner claims it by default, and launchers
-/// (rofi, wofi, albert) are often bound there — so it is a setting: `leader` in
-/// the config rebinds it, an empty string turns the layer off.
-pub const DEFAULT_LEADER: &str = "alt+space";
+/// Default chord that arms the leader layer, on the same alt+shift layer as the
+/// resize and clipboard binds.
+///
+/// Bare `alt+space` was the first choice and was wrong: it is the window menu in
+/// GNOME/GTK and on Windows, krunner's default on KDE, and PowerToys Run's on
+/// Windows — three of the four big desktops eat it before runnir sees it. Adding
+/// shift dodges all three (they are all unshifted), and readline owns no
+/// alt+shift binding. Not the super layer, ever: a compositor wins that race.
+///
+/// Residual risk, accepted: Windows and X11's `grp:alt_shift_toggle` switch
+/// keyboard layout on alt+shift. Both fire on *release with no other key*, so
+/// the space in between spares us — but a multi-layout user who still trips it
+/// has `leader` in the config to rebind, or `""` to turn the layer off.
+/// `ctrl+alt+space` is NOT the fallback to suggest: ctrl+alt is AltGr on the
+/// Spanish and most EU layouts, where AltGr+space types a non-breaking space.
+pub const DEFAULT_LEADER: &str = "alt+shift+space";
 
 /// Prefix marking a user binding as living on the leader layer: `"leader+v"`.
 const LEADER_PREFIX: &str = "leader+";
@@ -582,7 +591,7 @@ impl Keymap {
     ///
     /// The exact chord wins, so `"leader+ctrl+r"` still binds a modified key. On a
     /// miss the modifiers held to reach the leader are dropped and it tries again:
-    /// nobody lets go of alt between `alt+space` and `1`, and an exact-only match
+    /// nobody lets go of alt+shift between the leader and `1`, and an exact-only match
     /// would swallow that keystroke instead of switching tabs. Shift is dropped
     /// last so a shifted key still finds its unshifted binding (`leader+V` → `v`).
     pub fn resolve_leader(&self, key: &Key, mods: ModifiersState) -> Option<&Action> {
@@ -900,9 +909,9 @@ mod tests {
     fn user_can_bind_and_disable_the_leader_layer() {
         let mut user = HashMap::new();
         user.insert("leader+z".into(), "quit".into());
-        let map = Keymap::new(&user, "ctrl+alt+space");
+        let map = Keymap::new(&user, "alt+shift+j");
         assert_eq!(map.leader_bindings.get(&Chord::parse("z").unwrap()), Some(&Action::Quit));
-        assert_eq!(map.leader, Chord::parse("ctrl+alt+space"));
+        assert_eq!(map.leader, Chord::parse("alt+shift+j"));
         // The default leader entries survive a user addition.
         assert_eq!(map.leader_bindings.get(&Chord::parse("v").unwrap()), Some(&Action::ClipboardHistory));
 
@@ -915,8 +924,12 @@ mod tests {
     fn leader_layer_ignores_the_modifiers_still_held_from_the_leader() {
         let map = Keymap::new(&HashMap::new(), DEFAULT_LEADER);
         let one = Key::Character("1".into());
-        // Nobody lets go of alt between `alt+space` and `1`.
+        // Nobody lets go of alt+shift between the leader and `1`.
         assert_eq!(map.resolve_leader(&one, ModifiersState::ALT), Some(&Action::GoToTab(1)));
+        assert_eq!(
+            map.resolve_leader(&one, ModifiersState::ALT | ModifiersState::SHIFT),
+            Some(&Action::GoToTab(1))
+        );
         assert_eq!(map.resolve_leader(&one, ModifiersState::empty()), Some(&Action::GoToTab(1)));
         // A shifted letter falls back to its unshifted binding.
         let v = Key::Character("V".into());

@@ -847,6 +847,15 @@ impl ApplicationHandler<UserEvent> for App {
             }
         }
 
+        // An armed leader expires on a deadline nothing else wakes us for: on an idle
+        // terminal the status-bar chip would stay lit long after the layer was gone.
+        // Clear it here and repaint once; the wake itself is folded into `extra_wake`
+        // below rather than returning early, which would stall the animations.
+        if gpu.leader_armed.is_some_and(|t| t.elapsed() >= LEADER_TIMEOUT) {
+            gpu.leader_armed = None;
+            gpu.window.request_redraw();
+        }
+
         // Animate a scroll glide (smooth scroll-to-top/bottom / jump-to-prompt).
         if let Some((id, cur, target)) = gpu.scroll_glide {
             let next = cur + (target - cur) * 0.3;
@@ -901,11 +910,10 @@ impl ApplicationHandler<UserEvent> for App {
         // (above) and to animate the waveform even on an idle terminal.
         let media_wake = matches!(gpu.overlay, Some(Overlay::Media(_)))
             .then(|| Instant::now() + Duration::from_millis(250));
+        // And the armed leader, so the chip clears itself on an otherwise idle window.
+        let leader_wake = gpu.leader_armed.map(|t| t + LEADER_TIMEOUT);
         // Whichever background timer is soonest is the one to wake on.
-        let extra_wake = match (watch_wake, media_wake) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        };
+        let extra_wake = [watch_wake, media_wake, leader_wake].into_iter().flatten().min();
 
         // Drive cursor blink. A WaitUntil wake does not itself repaint, so redraw
         // only when the blink phase actually flips — that keeps an idle terminal

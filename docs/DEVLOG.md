@@ -404,8 +404,52 @@ stays in legacy mode, where Enter and Shift+Enter were both a bare `\r`. Fix in
 sequence Claude Code's own `/terminal-setup` installs for Alacritty and VS Code, so
 apps already understand it; the rest read it as Alt+Enter, which is harmless.
 
+## 2026-07-20 — Leader: status-bar indicator, and a default that actually reaches us
+
+Two changes to the leader layer, both from Pedro trying to use it.
+
+**The armed state is now a status-bar chip, not a toast.** `leader_armed` was
+signalled with `toast("leader…")`, which put it in the floating overlay in the
+middle of the screen — the wrong place for "runnir is holding your next
+keystroke". `build_status` now reads `leader_armed` directly and draws a reversed
+accent ` LEADER ` chip at the far left of the bottom bar, pushing cwd/branch
+right. The toast survives only as the fallback when `status_bar` is off — an
+invisible modal layer is how you eat a keystroke and leave the user wondering.
+Expiry: `about_to_wait` clears `leader_armed` past the deadline and folds it into
+`extra_wake` alongside the image-watch and media timers. Do NOT early-return there
+like the AI-spinner arm does; that stalls the scroll glide and bell flash for up
+to 3 s.
+
+**Default leader is `alt+shift+space`, was `alt+space`.** The old comment claimed
+alt+space was "not universally free"; the honest version is that it is taken by
+default on three of the four big desktops, so the layer simply never armed
+anywhere except the Hyprland box it was written on:
+
+| Desktop | owns bare `alt+space` |
+| --- | --- |
+| Windows | window system menu (since 3.x); PowerToys Run; clashes with the Win11 Copilot bind |
+| KDE | krunner (with `alt+F2`) |
+| GNOME/GTK | window menu (moved GTK → gnome-shell in 3.14, still bound) |
+| macOS | `option+space` types U+00A0 — we intercept it first, but muscle memory says NBSP |
+| Hyprland / sway / i3 | free (their defaults live on super) |
+
+Adding shift dodges all of them, since every one of those is unshifted, and
+readline owns no alt+shift chord. Residual risk accepted: Windows and X11's
+`grp:alt_shift_toggle` switch keyboard layout on alt+shift — both fire on
+*release with no other key*, so the space spares us, and a multi-layout user has
+`leader` in the config.
+
+Do not "improve" this to `ctrl+alt+space`: ctrl+alt IS AltGr on the Spanish and
+most EU layouts, and AltGr+space types a non-breaking space there. That is a
+worse bug than the one being fixed.
+
 ## Gotchas (do not re-learn)
 
+- Check a candidate default chord against Windows/KDE/GNOME/macOS BEFORE shipping
+  it, not after. `alt+space` shipped broken on 3 of 4 desktops. Also never
+  ctrl+alt (= AltGr on EU layouts) and never super (the compositor wins).
+- A modal keyboard layer needs a PERSISTENT indicator in fixed chrome, and a
+  self-scheduled wake to clear it, or an idle window draws it forever.
 - Font size is LOGICAL (`Gpu.font_px`); the atlas is always `font_px * scale`. Never
   pass a raw config size to `FontAtlas::new_with` — multiply by `self.scale`.
 - Any font/cell change MUST call `Tab::set_cell()` before `Tab::reflow()`, or the PTY

@@ -33,7 +33,7 @@ export const FEATURES = [
       { es: 'Ctrl+Shift+T (nueva)', en: 'Ctrl+Shift+T (new)' },
       { es: 'Ctrl+Shift+W (cerrar)', en: 'Ctrl+Shift+W (close)' },
       { es: 'Ctrl+PageUp / Ctrl+PageDown (anterior / siguiente)', en: 'Ctrl+PageUp / Ctrl+PageDown (prev / next)' },
-      { es: 'Leader 1..9 (ir a la pestaña N; leader = Alt+Space)', en: 'Leader 1..9 (jump to tab N; leader = Alt+Space)' },
+      { es: 'Leader 1..9 (ir a la pestaña N; leader = Alt+Shift+Space)', en: 'Leader 1..9 (jump to tab N; leader = Alt+Shift+Space)' },
       { es: 'Ctrl+Shift+R (renombrar)', en: 'Ctrl+Shift+R (rename)' },
       { es: 'Ctrl+Shift+Left / Right (mover en la barra)', en: 'Ctrl+Shift+Left / Right (move in the bar)' },
     ],
@@ -218,8 +218,8 @@ export const FEATURES = [
     key: 'keyboard-first', section: 'input', status: 'shipped',
     title: { es: 'Teclado primero', en: 'Keyboard first' },
     natural: {
-      es: 'Casi todo tiene atajo; lo que no, vive en la paleta. Los atajos propios usan Ctrl+Shift, Alt+Shift o la capa leader (Alt+Space y luego una tecla suelta), nunca Ctrl+letra a secas, que pertenece al programa del panel (Ctrl+C, Ctrl+D). Tampoco Super: el compositor se queda esa capa antes de que la tecla llegue a runnir. Así no se pisa ni lo que espera tu shell ni lo que espera tu escritorio.',
-      en: 'Almost everything has a bind; the rest lives in the palette. runnir’s binds use Ctrl+Shift, Alt+Shift or the leader layer (Alt+Space, then one plain key), never a bare Ctrl+letter — that belongs to the program in the pane (Ctrl+C, Ctrl+D). Never Super either: the compositor grabs that layer before the key reaches runnir. So runnir steps on neither what your shell expects nor what your desktop does.',
+      es: 'Casi todo tiene atajo; lo que no, vive en la paleta. Los atajos propios usan Ctrl+Shift, Alt+Shift o la capa leader (Alt+Shift+Space y luego una tecla suelta), nunca Ctrl+letra a secas, que pertenece al programa del panel (Ctrl+C, Ctrl+D). Tampoco Super: el compositor se queda esa capa antes de que la tecla llegue a runnir. Así no se pisa ni lo que espera tu shell ni lo que espera tu escritorio.',
+      en: 'Almost everything has a bind; the rest lives in the palette. runnir’s binds use Ctrl+Shift, Alt+Shift or the leader layer (Alt+Shift+Space, then one plain key), never a bare Ctrl+letter — that belongs to the program in the pane (Ctrl+C, Ctrl+D). Never Super either: the compositor grabs that layer before the key reaches runnir. So runnir steps on neither what your shell expects nor what your desktop does.',
     },
     keys: [
       { es: 'Ctrl+Shift+P (paleta, todo buscable)', en: 'Ctrl+Shift+P (palette, everything searchable)' },
@@ -891,7 +891,7 @@ export const FEATURES = [
       es: 'Reasigna cualquier acción a la combinación que prefieras desde el config; tus atajos se fusionan sobre los de fábrica. Los acordes se escriben "ctrl+shift+t", "alt+enter", "alt+shift+v"; el prefijo "leader+" ata la tecla a la capa leader ("leader+v"). Regla de oro: los atajos propios llevan Ctrl+Shift, Alt+Shift o leader, nunca Ctrl+letra a secas ni Super (esa capa la toma el compositor).',
       en: 'Rebind any action to the combo you like from the config; your binds merge over the defaults. Chords are written "ctrl+shift+t", "alt+enter", "alt+shift+v"; a "leader+" prefix binds the key on the leader layer ("leader+v"). Rule of thumb: your own binds use Ctrl+Shift, Alt+Shift or leader, never a bare Ctrl+letter and never Super (the compositor takes that layer).',
     },
-    example: '[keys]\n"ctrl+shift+t" = "new_tab"\n"alt+enter" = "toggle_zoom"\n"leader+t" = "new_tab"\n\nleader = "alt+space"   # "" turns the layer off',
+    example: '[keys]\n"ctrl+shift+t" = "new_tab"\n"alt+enter" = "toggle_zoom"\n"leader+t" = "new_tab"\n\nleader = "alt+shift+space"   # "" turns the layer off',
     note: { es: 'Cada acción tiene un id estable (ver la página de atajos). go_to_tab_1..9 saltan a la pestaña N.', en: 'Each action has a stable id (see the shortcuts page). go_to_tab_1..9 jump to tab N.' },
   },
 

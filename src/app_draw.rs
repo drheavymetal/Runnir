@@ -510,8 +510,27 @@ impl Gpu {
         let dim = Pen { fg: Color::Rgb(0x8a, 0x8d, 0x94), bg, ..Pen::default() };
         let accent = Pen { fg: Color::Rgb(a.0, a.1, a.2), bg, ..Pen::default() };
 
-        bar.write_str(0, 1, &cwd, dim);
-        let mut x = 1 + cwd.chars().count() + 2;
+        // Leader chip, leftmost so it lands where the eye already is when a modal
+        // layer swallows the keyboard. Reversed accent, not just coloured text: the
+        // point is "runnir is holding your next keystroke", which has to read at a
+        // glance. Expiry is checked here too — `about_to_wait` repaints on the
+        // deadline, but a repaint for any other reason must not draw a dead chip.
+        let armed = self.leader_armed.is_some_and(|t| t.elapsed() < crate::LEADER_TIMEOUT);
+        let mut x = 1;
+        if armed {
+            let chip = Pen {
+                fg: Color::Rgb(0x12, 0x13, 0x17),
+                bg: Color::Rgb(a.0, a.1, a.2),
+                flags: crate::grid::Flags::BOLD,
+                ..Pen::default()
+            };
+            let s = " LEADER ";
+            bar.write_str(0, x, s, chip);
+            x += s.chars().count() + 1;
+        }
+
+        bar.write_str(0, x, &cwd, dim);
+        x += cwd.chars().count() + 2;
         if let Some(b) = &branch {
             let s = format!("\u{e0a0} {b}"); //  branch glyph
             bar.write_str(0, x, &s, accent);

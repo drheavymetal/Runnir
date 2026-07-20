@@ -17,7 +17,7 @@ Compositors win every modifier race. Hyprland and GNOME both claim most of the
 Super layer for workspaces, and a key they grab never reaches runnir at all — an
 app cannot bind around that. So runnir keeps its own layer behind a leader key.
 
-Press Alt+Space, let go, then press one plain key. The sequence has three seconds
+Press Alt+Shift+Space, let go, then press one plain key. It has three seconds
 before it lapses; any unbound key just cancels it, and nothing leaks to the shell.
 
 @ Leader 1..9      jump to tab N

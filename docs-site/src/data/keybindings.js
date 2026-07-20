@@ -8,7 +8,7 @@ export const KEY_GROUPS = [
   {
     group: { es: 'Capa leader', en: 'Leader layer' },
     rows: [
-      { keys: ['Alt+Space'], id: 'leader', title: { es: 'Armar la capa leader; luego una tecla suelta (3 s). Se reasigna con el ajuste leader; "" la desactiva', en: 'Arm the leader layer, then one plain key (3 s). Rebind with the leader setting; "" turns it off' } },
+      { keys: ['Alt+Shift+Space'], id: 'leader', title: { es: 'Armar la capa leader; luego una tecla suelta (3 s). Se reasigna con el ajuste leader; "" la desactiva', en: 'Arm the leader layer, then one plain key (3 s). Rebind with the leader setting; "" turns it off' } },
       { keys: ['Leader 1 .. Leader 9'], id: 'go_to_tab_N', title: { es: 'Ir a la pestaña N', en: 'Go to tab N' } },
       { keys: ['Leader H J K L', { es: 'Leader flechas', en: 'Leader arrows' }], id: 'resize_*', title: { es: 'Redimensionar el panel enfocado', en: 'Resize the focused pane' } },
       { keys: ['Leader V'], id: 'clipboard_history', title: { es: 'Historial del portapapeles', en: 'Clipboard history' } },

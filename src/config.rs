@@ -29,7 +29,7 @@ pub struct Config {
     /// Extra keybindings, merged over the built-in ones. `"ctrl+shift+t" = "new_tab"`.
     /// A `"leader+v"` key binds on the leader layer instead of as a plain chord.
     pub keys: HashMap<String, String>,
-    /// Chord that arms the leader layer (`"alt+space"` by default). Set it to an
+    /// Chord that arms the leader layer (`"alt+shift+space"` by default). Set it to an
     /// empty string to turn the layer off. The leader exists because compositors
     /// win every modifier race — see `actions::default_leader_bindings`.
     #[serde(default = "default_leader")]

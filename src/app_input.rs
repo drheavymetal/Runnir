@@ -276,8 +276,6 @@ impl Gpu {
         if !modifier_only {
             if let Some(armed_at) = self.leader_armed {
                 self.leader_armed = None;
-                self.status = None;
-                self.status_expiry = None;
                 // An expired arm is treated as no arm at all: the key falls through to
                 // the pane, so a stray keystroke is never silently eaten.
                 if armed_at.elapsed() < crate::LEADER_TIMEOUT {
@@ -293,9 +291,15 @@ impl Gpu {
             }
             if keymap.is_leader(&event.logical_key, mods) {
                 self.leader_armed = Some(Instant::now());
-                // The toast doubles as the armed indicator, so it lasts exactly as
-                // long as the arming does.
-                self.toast("leader…", crate::LEADER_TIMEOUT.as_secs());
+                // The armed state shows as a chip in the status bar, which lives
+                // exactly as long as the arming (`build_status` reads `leader_armed`).
+                // With the bar hidden there is nowhere to put it, so fall back to a
+                // toast — an invisible modal layer is how you eat a keystroke and
+                // leave the user wondering.
+                if !self.status_bar {
+                    self.toast("leader…", crate::LEADER_TIMEOUT.as_secs());
+                }
+                self.window.request_redraw();
                 return;
             }
         }

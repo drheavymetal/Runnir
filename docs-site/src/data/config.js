@@ -9,7 +9,7 @@ export const CONFIG_GROUPS = [
   {
     group: 'raíz / top-level',
     rows: [
-      { k: 'leader', v: '"alt+space"', d: { es: 'Acorde que arma la capa leader: se pulsa, se suelta y luego una tecla suelta (Leader 1..9, hjkl, v, s, p, g). El armado caduca a los 3 s. Cadena vacía = capa desactivada.', en: 'Chord that arms the leader layer: press it, release, then one plain key (Leader 1..9, hjkl, v, s, p, g). The arming expires after 3 s. An empty string turns the layer off.' } },
+      { k: 'leader', v: '"alt+shift+space"', d: { es: 'Acorde que arma la capa leader: se pulsa, se suelta y luego una tecla suelta (Leader 1..9, hjkl, v, s, p, g). Mientras está armada la barra inferior muestra LEADER. Caduca a los 3 s. Cadena vacía = capa desactivada. Evita ctrl+alt+space al reasignarlo: ctrl+alt es AltGr en la distribución española.', en: 'Chord that arms the leader layer: press it, release, then one plain key (Leader 1..9, hjkl, v, s, p, g). While armed the status bar shows LEADER. It expires after 3 s. An empty string turns the layer off. Avoid ctrl+alt+space when rebinding: ctrl+alt is AltGr on the Spanish layout.' } },
     ],
   },
   {
