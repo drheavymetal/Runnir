@@ -108,7 +108,14 @@ fn main() {
         Some("--version" | "-v") => return println!("runnir {}", env!("CARGO_PKG_VERSION")),
         Some("--help" | "-h") => return print_help(),
         Some("--demo") => {
-            return demo_scene(args.get(2).map(String::as_str).unwrap_or("/tmp/runnir-demo.png"));
+            let path = args.get(2).map(String::as_str).unwrap_or("/tmp/runnir-demo.png");
+            // A third argument names the leader level to draw the which-key panel
+            // for: "" is the root, "t" the tabs group, and so on. Without it the
+            // scene is the plain multi-pane one with the palette open.
+            return match args.get(3).map(String::as_str) {
+                Some(level) => leader_scene(path, level),
+                None => demo_scene(path),
+            };
         }
         _ => {}
     }
@@ -229,6 +236,93 @@ fn demo_scene(path: &str) {
             .collect();
 
         (panes, Some(overlay_specs))
+    });
+}
+
+/// Renders the leader layer as the app draws it: a working terminal, the LEADER
+/// chip in the status bar and the which-key panel for `level`.
+///
+/// `level` is the leader path already pressed — `""` for the root, `"t"` for the
+/// tabs group. The entries come from `Keymap`, not from a hand-written list, so a
+/// screenshot cannot claim a binding the terminal does not have.
+fn leader_scene(path_out: &str, level: &str) {
+    use crate::render::Rect;
+    let keymap =
+        actions::Keymap::new(&std::collections::HashMap::new(), &Config::default().leader);
+    let steps: Vec<actions::Chord> =
+        level.split_whitespace().filter_map(actions::Chord::parse).collect();
+    let entries = keymap.leader_entries(&steps);
+    if entries.is_empty() {
+        eprintln!("runnir: no leader entries for {level:?}");
+        return;
+    }
+    let labels: Vec<String> = steps.iter().map(|c| c.label()).collect();
+
+    // The panel's height is data-dependent (the root level is far taller than a
+    // group), so size the canvas to it: measure the cell, lay the panel out, then
+    // add the tab bar, six rows of terminal and the status bar.
+    const WIDTH: f32 = 1000.0;
+    const TERM_ROWS: f32 = 6.0;
+    let (cw, ch) = {
+        let f = font::FontAtlas::new(16.0).expect("font");
+        (f.cell_w, f.cell_h)
+    };
+    let cols = (WIDTH / cw) as usize;
+    let panel_rows = whichkey_grid(&entries, &labels, cols).rows() as f32;
+    let height = ((panel_rows + TERM_ROWS + 2.0) * ch).ceil() as u32;
+
+    render::offscreen_scene(path_out, WIDTH as u32, height, 16.0, |r| {
+        let (cw, ch) = r.cell_size();
+        let cols = (WIDTH / cw) as usize;
+        let bar_h = ch;
+        let height = height as f32;
+
+        let panel = whichkey_grid(&entries, &labels, cols);
+        let panel_h = panel.rows() as f32 * ch;
+        // Terminal area is what the chrome leaves: tab bar on top, which-key panel
+        // and status bar at the bottom.
+        let term = Rect { x: 0.0, y: bar_h, w: WIDTH, h: height - bar_h - panel_h - ch };
+
+        let pen = Pen { fg: Color::Rgb(0xd4, 0xd6, 0xd9), ..Pen::default() };
+        let accent = Pen { fg: Color::Rgb(0x0d, 0xbc, 0x79), ..Pen::default() };
+        let mut g = Grid::new((term.w / cw) as usize, (term.h / ch).max(1.0) as usize);
+        g.write_str(0, 0, "~/projects/runnir ❯ cargo test", accent);
+        g.write_str(1, 0, "   Compiling runnir v0.1.0", pen);
+        g.write_str(2, 0, "    Finished in 2.41s", pen);
+        g.write_str(3, 0, "  running 148 tests ... ok", pen);
+        g.write_str(4, 0, "~/projects/runnir ❯ █", accent);
+
+        // Tab bar.
+        let mut bar = Grid::new(cols, 1);
+        bar.fill(Pen { bg: Color::Rgb(0x15, 0x16, 0x1a), ..Pen::default() });
+        bar.write_str(0, 1, " 1 runnir ", Pen {
+            fg: Color::Rgb(0x0d, 0x0d, 0x0f),
+            bg: Color::Rgb(0x4c, 0x9f, 0xd4),
+            ..Pen::default()
+        });
+        bar.write_str(0, 12, " 2 servers ", Pen { fg: Color::Rgb(0x9a, 0x9d, 0xa4), bg: Color::Rgb(0x15, 0x16, 0x1a), ..Pen::default() });
+
+        // Status bar with the armed LEADER chip, same shape as `build_status`.
+        let sbg = Color::Rgb(0x12, 0x13, 0x17);
+        let a = config::Theme::default().accent;
+        let mut status = Grid::new(cols, 1);
+        status.fill(Pen { bg: sbg, ..Pen::default() });
+        status.write_str(0, 1, " LEADER ", Pen {
+            fg: Color::Rgb(0x12, 0x13, 0x17),
+            bg: Color::Rgb(a.0, a.1, a.2),
+            flags: crate::grid::Flags::BOLD,
+            ..Pen::default()
+        });
+        status.write_str(0, 10, "~/projects/runnir", Pen { fg: Color::Rgb(0x8a, 0x8d, 0x94), bg: sbg, ..Pen::default() });
+        status.write_str(0, 29, "\u{e0a0} main", Pen { fg: Color::Rgb(a.0, a.1, a.2), bg: sbg, ..Pen::default() });
+
+        let panes = vec![
+            (bar, Rect { x: 0.0, y: 0.0, w: WIDTH, h: bar_h }, None, true),
+            (g, term, None, true),
+            (panel, Rect { x: 0.0, y: height - ch - panel_h, w: WIDTH, h: panel_h }, None, true),
+            (status, Rect { x: 0.0, y: height - ch, w: WIDTH, h: ch }, None, true),
+        ];
+        (panes, None)
     });
 }
 
@@ -457,16 +551,52 @@ impl App {
         let window = Arc::new(event_loop.create_window(attrs).unwrap());
         mark("create_window");
 
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
-        mark("Instance::new");
-        let surface = instance.create_surface(window.clone()).unwrap();
-        mark("create_surface");
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::LowPower,
-            compatible_surface: Some(&surface),
-            ..Default::default()
-        }))
-        .expect("no suitable GPU adapter");
+        // On a hybrid laptop the Vulkan loader enumerates every ICD, and touching the
+        // NVIDIA one resumes a runtime-suspended discrete GPU. That wake costs ~1.8s,
+        // which is why the first launch after an idle stretch feels slow while the
+        // next ones are instant. We ask for LowPower anyway, so hide the discrete ICD
+        // from the loader and only put it back if that leaves us with no adapter.
+        let hide_discrete = cfg!(target_os = "linux")
+            && std::env::var_os("VK_LOADER_DRIVERS_DISABLE").is_none()
+            && std::env::var_os("VK_LOADER_DRIVERS_SELECT").is_none();
+        let native = if cfg!(target_os = "macos") {
+            wgpu::Backends::METAL
+        } else if cfg!(target_os = "windows") {
+            wgpu::Backends::DX12
+        } else {
+            wgpu::Backends::VULKAN
+        };
+        let try_adapter = |hidden: bool, backends: wgpu::Backends| {
+            if cfg!(target_os = "linux") {
+                // Read by the loader inside vkCreateInstance below. Nothing else in
+                // the process reads these, so the racy-set_var hazard does not apply.
+                unsafe {
+                    if hidden {
+                        std::env::set_var("VK_LOADER_DRIVERS_DISABLE", "nvidia_icd.json");
+                    } else {
+                        std::env::remove_var("VK_LOADER_DRIVERS_DISABLE");
+                    }
+                }
+            }
+            let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+                backends,
+                ..wgpu::InstanceDescriptor::new_without_display_handle()
+            });
+            let surface = instance.create_surface(window.clone()).ok()?;
+            let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::LowPower,
+                compatible_surface: Some(&surface),
+                ..Default::default()
+            }))
+            .ok()?;
+            Some((instance, surface, adapter))
+        };
+        // Widen the search only if the cheap path came up empty: first the native
+        // backend without the discrete ICD, then with it, then everything else.
+        let (_instance, surface, adapter) = try_adapter(hide_discrete, native)
+            .or_else(|| hide_discrete.then(|| try_adapter(false, native)).flatten())
+            .or_else(|| try_adapter(false, wgpu::Backends::all()))
+            .expect("no suitable GPU adapter");
         mark("request_adapter");
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("runnir"),

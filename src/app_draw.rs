@@ -563,49 +563,12 @@ impl Gpu {
         }
         let (cw, ch) = self.renderer.cell_size();
         let cols = (screen.0 / cw).floor().max(20.0) as usize;
-
-        // Column width from the widest entry, so nothing is truncated at the root
-        // (the level with the most entries and the longest titles).
-        let widest = self.leader_entries.iter().map(|(k, t, _)| k.chars().count() + t.chars().count()).max().unwrap_or(10);
-        let colw = (widest + 6).min(cols.saturating_sub(2)).max(12);
-        let per_row = (cols.saturating_sub(2) / colw).max(1);
-        let rows = self.leader_entries.len().div_ceil(per_row);
-
-        let bg = Color::Rgb(0x1a, 0x1c, 0x22);
-        let mut grid = Grid::new(cols, rows + 2);
-        grid.fill(Pen { bg, ..Pen::default() });
-
-        let dim = Pen { fg: Color::Rgb(0x8a, 0x8d, 0x94), bg, ..Pen::default() };
-        let key = Pen { fg: Color::Rgb(0xf5, 0xd5, 0x43), bg, flags: crate::grid::Flags::BOLD, ..Pen::default() };
-        let text = Pen { fg: Color::Rgb(0xd4, 0xd6, 0xd9), bg, ..Pen::default() };
-        // Groups are told apart by colour, not by a suffix: a trailing arrow costs
-        // width in every column and this reads faster.
-        let grp = Pen { fg: Color::Rgb(0x6b, 0xb1, 0xff), bg, ..Pen::default() };
-
-        // Header names where you are: the keys pressed so far, or the root.
         let path: Vec<String> = self.leader_path.iter().map(|c| c.label()).collect();
-        let header = if path.is_empty() {
-            "LEADER  —  Esc cancels".to_string()
-        } else {
-            format!("LEADER {}  —  Esc cancels", path.join(" "))
-        };
-        grid.write_str(0, 1, &header, dim);
-
-        for (i, (k, title, is_group)) in self.leader_entries.iter().enumerate() {
-            let row = 1 + i / per_row;
-            let col = 1 + (i % per_row) * colw;
-            grid.write_str(row, col, k, key);
-            let tcol = col + k.chars().count() + 2;
-            if tcol + 1 < cols {
-                let room = (col + colw).min(cols).saturating_sub(tcol + 1);
-                let t: String = title.chars().take(room).collect();
-                grid.write_str(row, tcol, &t, if *is_group { grp } else { text });
-            }
-        }
+        let grid = whichkey_grid(&self.leader_entries, &path, cols);
 
         // Sits directly on top of the status bar when there is one.
         let bar = if self.status_bar { ch } else { 0.0 };
-        let y = screen.1 - bar - (rows + 2) as f32 * ch;
+        let y = screen.1 - bar - grid.rows() as f32 * ch;
         Some((grid, 0.0, y.max(0.0)))
     }
 
@@ -733,4 +696,53 @@ fn git_branch(dir: &std::path::Path) -> Option<String> {
         cur = d.parent();
     }
     None
+}
+
+/// Lays out the which-key panel for one level of the leader layer.
+///
+/// Free function rather than a `Gpu` method so the headless scene renderer
+/// (`runnir --demo leader`) draws the exact same panel the app draws — a
+/// screenshot of the layer can never drift from the layer itself.
+///
+/// `entries` is `(key, title, is_group)` as `Keymap::leader_entries` returns it,
+/// `path` the keys pressed since the leader was armed (empty at the root).
+fn whichkey_grid(entries: &[(String, String, bool)], path: &[String], cols: usize) -> Grid {
+    // Column width from the widest entry, so nothing is truncated at the root
+    // (the level with the most entries and the longest titles).
+    let widest = entries.iter().map(|(k, t, _)| k.chars().count() + t.chars().count()).max().unwrap_or(10);
+    let colw = (widest + 6).min(cols.saturating_sub(2)).max(12);
+    let per_row = (cols.saturating_sub(2) / colw).max(1);
+    let rows = entries.len().div_ceil(per_row);
+
+    let bg = Color::Rgb(0x1a, 0x1c, 0x22);
+    let mut grid = Grid::new(cols, rows + 2);
+    grid.fill(Pen { bg, ..Pen::default() });
+
+    let dim = Pen { fg: Color::Rgb(0x8a, 0x8d, 0x94), bg, ..Pen::default() };
+    let key = Pen { fg: Color::Rgb(0xf5, 0xd5, 0x43), bg, flags: crate::grid::Flags::BOLD, ..Pen::default() };
+    let text = Pen { fg: Color::Rgb(0xd4, 0xd6, 0xd9), bg, ..Pen::default() };
+    // Groups are told apart by colour, not by a suffix: a trailing arrow costs
+    // width in every column and this reads faster.
+    let grp = Pen { fg: Color::Rgb(0x6b, 0xb1, 0xff), bg, ..Pen::default() };
+
+    // Header names where you are: the keys pressed so far, or the root.
+    let header = if path.is_empty() {
+        "LEADER  —  Esc cancels".to_string()
+    } else {
+        format!("LEADER {}  —  Esc cancels", path.join(" "))
+    };
+    grid.write_str(0, 1, &header, dim);
+
+    for (i, (k, title, is_group)) in entries.iter().enumerate() {
+        let row = 1 + i / per_row;
+        let col = 1 + (i % per_row) * colw;
+        grid.write_str(row, col, k, key);
+        let tcol = col + k.chars().count() + 2;
+        if tcol + 1 < cols {
+            let room = (col + colw).min(cols).saturating_sub(tcol + 1);
+            let t: String = title.chars().take(room).collect();
+            grid.write_str(row, tcol, &t, if *is_group { grp } else { text });
+        }
+    }
+    grid
 }

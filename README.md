@@ -58,6 +58,33 @@ The same [`install.sh`](install.sh) drives all three flows — `install` (defaul
 piped), `update`, and `uninstall` — so `sh install.sh --help` from a checkout shows
 every option.
 
+## The leader key
+
+Compositors win every modifier race — Hyprland and GNOME claim most of the Super
+layer, and a key they grab never reaches an application at all. So runnir keeps its
+own keyboard layer behind a leader key.
+
+<p align="center">
+  <img src="docs-site/public/img/leader.png" alt="the which-key panel with the leader layer armed" width="800">
+</p>
+
+Press `Alt+Shift+Space` and let go. The status bar shows **LEADER** and a which-key
+panel lists what the next key does, so the layer teaches itself. The hot keys act at
+once (`1..9` tabs, `hjkl` pane focus, `HJKL` and the arrows resize); the rest open a
+group that takes one more key — `t` tabs, `p` panes, `c` clipboard, `f` find &
+scroll, `a` AI, `r` run & launch, `o` open, `s` session. Escape backs out, and
+modifiers you are still holding are ignored, so you can keep `Alt+Shift` down
+through the whole sequence.
+
+The layer is a strict superset of the chords: everything on `Ctrl+Shift` still
+works, but plenty of actions — tab switching, cycle layout, copy mode, project
+sessions, quit — are reachable only from here or the command palette.
+
+`leader` sets the arming chord (`""` turns the layer off), `leader_timeout` the
+seconds it waits per step (`0` waits as long as you do), and a `leader+` prefix in
+`[keys]` binds your own sequences: `leader+r c` is the leader, then `r`, then `c`.
+Press `F1` inside runnir for the full reference.
+
 ## Status
 
 Working: window, PTY, VT parser, GPU renderer, keyboard, scrollback, selection, fonts.

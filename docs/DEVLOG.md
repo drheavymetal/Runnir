@@ -488,6 +488,43 @@ only because `+` is the chord separator, so `"ctrl++"` cannot be written.
 Test `spelled_out_punctuation_matches_the_key_you_actually_press` compares a
 parsed spec against a synthesised keypress — the assertion that was missing.
 
+## 2026-07-20 — The 1.8s cold start was a sleeping discrete GPU
+
+Pedro: "runnir tarda mucho en abrir el primero, luego va más rápido, pero la
+primera vez tras X segundos o minutos sin abrir runnir abre más lento".
+
+The `[boot]` marks in `init_gpu` pinned it immediately: `Instance::new` took
+1.84s and everything after it ~100ms. The cause is hybrid graphics. This laptop
+has an Intel Iris Xe plus an RTX 4060 whose PCI device sits at
+`power/control=auto`, so the kernel runtime-suspends it after an idle stretch.
+Bringing it back up costs ~1.8s of blocking wait — exactly the "first launch
+after a while" pattern, and exactly why the second launch is instant (the dGPU
+is still `active` from the first one).
+
+Two separate things woke it, and fixing only one changed nothing:
+- the GL backend, which wgpu also initialises when `backends` is `all`. EGL via
+  GLVND loads the NVIDIA driver. `VK_LOADER_DRIVERS_DISABLE` does not touch EGL.
+- the Vulkan loader, which enumerates every ICD in `/usr/share/vulkan/icd.d/`
+  including `nvidia_icd.json`, regardless of the `LowPower` preference we pass
+  to `request_adapter` — the preference only picks among adapters already
+  enumerated, far too late to matter.
+
+Fix in `init_gpu`: ask for the native backend only (VULKAN on Linux, METAL on
+macOS, DX12 on Windows) AND set `VK_LOADER_DRIVERS_DISABLE=nvidia_icd.json`
+before `vkCreateInstance`. The env var is only set on Linux and only when the
+user has not set `VK_LOADER_DRIVERS_DISABLE`/`_SELECT` themselves. Fallback
+cascade if no adapter turns up: native without the discrete ICD → native with
+it → `Backends::all()`. NVIDIA-only machines still boot.
+
+Measured with the dGPU confirmed `suspended` beforehand
+(`/sys/bus/pci/devices/0000:01:00.0/power/runtime_status`):
+1.94s → 73ms to `renderer_new`, and the dGPU stays `suspended` afterwards, so
+runnir no longer costs battery either. Warm case ~100ms → ~73ms.
+
+Ruled out along the way: `fontdb::load_system_fonts()` is 10ms for 976 faces
+because fontdb 0.23 memory-maps rather than reads (676MB of fonts on this box
+are never touched); the 27MB binary and page-cache eviction are not the issue.
+
 ## Gotchas (do not re-learn)
 
 - A binding spec and a keypress must produce the SAME `ChordKey` variant.
@@ -513,6 +550,12 @@ parsed spec against a synthesised keypress — the assertion that was missing.
 - Claude Code does not probe for the kitty keyboard protocol. Terminal-side protocol
   support alone is not enough; the legacy encoding has to carry Shift+Enter as ESC-CR.
 
+- Never ask wgpu for `Backends::all()` on a hybrid laptop. Enumerating GL wakes a
+  runtime-suspended discrete GPU (~1.8s) even when you asked for `LowPower` —
+  that preference only ranks adapters that were already enumerated.
+- When a startup feels slow "only the first time", check
+  `/sys/bus/pci/devices/*/power/runtime_status` BEFORE blaming page cache. Time
+  it once from a confirmed `suspended` state, not from whatever state you left.
 - wgpu 30 API differs from all tutorials — read vendored source in ~/.cargo/registry/src/*/wgpu-30.0.0.
 - sRGB: shader must emit LINEAR (surface is *UnormSrgb). Use to_linear() on every colour.
 - Wayland: request_redraw from PTY thread does NOT wake Wait — use EventLoopProxy::send_event(Redraw).

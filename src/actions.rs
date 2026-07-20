@@ -1017,7 +1017,42 @@ pub fn default_hints() -> HashMap<String, String> {
         ("open_snippets", "Alt+Shift+S"),
         ("now_playing", "Alt+Shift+P"),
     ];
-    pretty.iter().map(|(a, k)| (a.to_string(), k.to_string())).collect()
+    let mut hints: HashMap<String, String> =
+        pretty.iter().map(|(a, k)| (a.to_string(), k.to_string())).collect();
+    // Actions with no chord of their own — roughly a third of them, and every one
+    // of the leader-only ones — would otherwise show a blank hint column, which
+    // reads as "no way to reach this but the palette". Fall back to the leader
+    // path, walked from the real bindings so the palette teaches the layer.
+    fn walk(level: &HashMap<Chord, LeaderNode>, path: &mut Vec<String>, out: &mut HashMap<String, String>) {
+        for (chord, node) in level {
+            // The label verbatim, not upper-cased: `h` is focus and `H` (shift+h)
+            // is resize, so folding the case would print a hint for the wrong one.
+            path.push(chord.label());
+            match node {
+                LeaderNode::Run(action) => {
+                    let hint = format!("Leader {}", path.join(" "));
+                    // Several keys can reach one action (H/L and the arrows both
+                    // move a tab). Keep the shortest, then the alphabetically
+                    // first, so the hint is stable across runs of the HashMap.
+                    out.entry(action.id().to_string())
+                        .and_modify(|prev| {
+                            if (hint.len(), &hint) < (prev.len(), prev) {
+                                *prev = hint.clone();
+                            }
+                        })
+                        .or_insert_with(|| hint.clone());
+                }
+                LeaderNode::Group { keys, .. } => walk(keys, path, out),
+            }
+            path.pop();
+        }
+    }
+    let mut leader = HashMap::new();
+    walk(&default_leader_bindings(), &mut Vec::new(), &mut leader);
+    for (id, hint) in leader {
+        hints.entry(id).or_insert(hint);
+    }
+    hints
 }
 
 fn named_id(named: NamedKey) -> Option<&'static str> {
@@ -1345,6 +1380,40 @@ mod tests {
         assert!(root.iter().any(|(k, _, group)| k == "l" && !*group));
         // A level that is an action, not a group, has nothing to list.
         assert!(map.leader_entries(&[Chord::parse("v").unwrap()]).is_empty());
+    }
+
+    #[test]
+    fn every_action_the_palette_lists_shows_a_way_to_reach_it() {
+        // A blank hint column reads as "the palette is the only way in", which was
+        // false for the ~19 leader-only actions. Each one falls back to its path.
+        let hints = default_hints();
+        let map = Keymap::new(&HashMap::new(), DEFAULT_LEADER);
+        // Every action the leader layer can reach shows how to reach it. (The
+        // media keys are deliberately palette-only — nothing binds them.)
+        fn reachable(level: &HashMap<Chord, LeaderNode>, out: &mut Vec<&'static str>) {
+            for node in level.values() {
+                match node {
+                    LeaderNode::Run(a) => out.push(a.id()),
+                    LeaderNode::Group { keys, .. } => reachable(keys, out),
+                }
+            }
+        }
+        let mut ids = Vec::new();
+        reachable(&default_leader_bindings(), &mut ids);
+        for id in ids {
+            let hint = hints.get(id).unwrap_or_else(|| panic!("{id} has no palette hint"));
+            assert!(!hint.is_empty(), "{id} has an empty palette hint");
+        }
+        // The leader-only ones name the layer, and name it correctly.
+        assert_eq!(hints.get("quit").map(String::as_str), Some("Leader s q"));
+        assert_eq!(hints.get("cycle_layout").map(String::as_str), Some("Leader p c"));
+        // An action with a chord keeps the chord: it is the shorter thing to type.
+        assert_eq!(hints.get("copy").map(String::as_str), Some("Ctrl+Shift+C"));
+        // Shifted steps keep their case: `J` is resize, `j` is focus, and a hint
+        // that folded them together would point at the wrong action.
+        assert_eq!(hints.get("resize_down").map(String::as_str), Some("Leader J"));
+        assert_eq!(hints.get("focus_down").map(String::as_str), Some("Leader j"));
+        let _ = &map;
     }
 
     #[test]

@@ -3,6 +3,15 @@
 // Real screenshots rendered headless with runnir --render / --demo.
 // Key = the feature's stable key (see features.js). Value = { src, cap:{es,en} }.
 export const MEDIA = {
+  // Varias capturas: el panel which-key cambia por completo entre el nivel raíz y
+  // un grupo, y una sola imagen no lo cuenta. Se generan con
+  // `runnir --demo OUT <nivel>`, que dibuja el panel con las mismas entradas que
+  // el Keymap real — una captura no puede prometer un atajo que no existe.
+  leader: [
+    { src: './img/leader.png', cap: { es: 'Captura real (runnir --demo): la capa recién armada. Chip LEADER en la barra y el panel which-key con todo el nivel raíz; en azul los grupos, en amarillo las teclas.', en: 'Real screenshot (runnir --demo): the layer just armed. The LEADER chip in the bar and the which-key panel with the whole root level; groups in blue, keys in yellow.' } },
+    { src: './img/leader-t.png', cap: { es: 'Captura real: tras pulsar T, el panel se reduce al grupo Pestañas y la cabecera muestra dónde estás (LEADER t).', en: 'Real screenshot: after pressing T the panel narrows to the Tabs group and the header names where you are (LEADER t).' } },
+    { src: './img/leader-f.png', cap: { es: 'Captura real: el grupo Buscar y scroll, con los alias (U/D y AvPág/RePág hacen lo mismo).', en: 'Real screenshot: the Find & scroll group, aliases included (U/D and PageUp/PageDown do the same).' } },
+  ],
   tabs: { src: './img/scene.png', cap: { es: 'Captura real (runnir --demo): dos pestañas, varios paneles y la paleta de comandos abierta.', en: 'Real screenshot (runnir --demo): two tabs, several panes and the command palette open.' } },
   splits: { src: './img/scene.png', cap: { es: 'Captura real (runnir --demo): una pestaña dividida en paneles independientes.', en: 'Real screenshot (runnir --demo): a tab split into independent panes.' } },
   'keyboard-first': { src: './img/scene.png', cap: { es: 'Captura real (runnir --demo): la paleta de comandos con cada acción y su atajo.', en: 'Real screenshot (runnir --demo): the command palette with each action and its keybind.' } },

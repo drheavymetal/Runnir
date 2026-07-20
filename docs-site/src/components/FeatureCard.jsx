@@ -5,7 +5,9 @@ import { useLang, UI } from '../i18n.jsx'
 
 export default function FeatureCard({ f }) {
   const { t } = useLang()
-  const media = MEDIA[f.key]
+  // Una feature puede traer una captura o varias (la capa leader necesita ver el
+  // nivel raíz y un grupo para entenderse). / One shot or several.
+  const media = [MEDIA[f.key]].flat().filter(Boolean)
   const demo = DEMOS[f.key]
   const hasTech = f.keys || f.palette || (f.config && f.config.length) || (f.escape && f.escape.length) || f.example
   return (
@@ -19,12 +21,12 @@ export default function FeatureCard({ f }) {
 
       <p className="natural">{t(f.natural)}</p>
 
-      {media && (
-        <figure className="shot">
-          <img src={media.src} alt={t(f.title)} loading="lazy" />
-          <figcaption>{t(media.cap)}</figcaption>
+      {media.map((m, i) => (
+        <figure className="shot" key={i}>
+          <img src={m.src} alt={t(f.title)} loading="lazy" />
+          <figcaption>{t(m.cap)}</figcaption>
         </figure>
-      )}
+      ))}
 
       {demo && <TerminalDemo kind={demo} />}
 

@@ -17,9 +17,9 @@ Compositors win every modifier race. Hyprland and GNOME both claim most of the
 Super layer for workspaces, and a key they grab never reaches runnir at all — an
 app cannot bind around that. So runnir keeps its own layer behind a leader key.
 
-Press Alt+Shift+Space and let go. The status bar shows LEADER and a panel lists
-what the next key does, so the layer teaches itself — you never have to remember
-a table. Then press a key: the hot ones act immediately, the rest open a group
+Press Alt+Shift+Space and let go. The status bar shows LEADER (a toast, if you
+turned the bar off with `window.status_bar`) and a panel lists what the next key
+does, so the layer teaches itself — you never have to remember a table. Then press a key: the hot ones act immediately, the rest open a group
 that takes one more key. Escape or any unbound key backs out, and nothing leaks
 to the shell. Modifiers you are still holding are ignored, so you can keep
 Alt+Shift down through the whole sequence. Ten seconds per step by default;
@@ -36,19 +36,22 @@ Straight away, no group — the things you do constantly:
 @ Leader HJKL      resize the focused pane (arrows do this too)
 @ Leader V         clipboard history
 @ Leader G         fix the last failed command
-@ Leader Z / Shift+Z  font bigger / smaller (+ and - work too)
+@ Leader Z / Shift+Z  font bigger / smaller (+, = and - work too; the letters
+@                        are the binding that survives a layout where = is shifted)
 @ Leader 0         reset the font size
 
 Then the groups. The letter is the noun:
 
 @ Leader T ...     tabs: T new, N/P next/prev, W close, R rename, U reopen,
-@                        H/L move the tab in the bar
+@                        H/L (or the arrows) move the tab in the bar
 @ Leader P ...     panes: D split left/right, E split up/down, X close, Z zoom,
-@                        C cycle layout, N focus next, B broadcast
+@                        C cycle layout, N focus next, B broadcast,
+@                        G add/remove this pane from the broadcast group
 @ Leader C ...     clipboard: C copy, V paste, H history, O last output,
 @                        M copy mode, P/S pipe output/scrollback
 @ Leader F ...     find & scroll: F search, H history search, I hint mode,
-@                        N/P jump between commands, T/B top/bottom, U/D page,
+@                        N/P jump between commands, T/B top/bottom,
+@                        U/D (or PageUp/PageDown) page,
 @                        E open scrollback in an editor, W watch, O fold
 @ Leader A ...     ai: A toggle, G fix last command, W why did this fail,
 @                        M run a described command, E explain, S summarise
@@ -58,8 +61,12 @@ Then the groups. The letter is the noun:
 @                        P the palette, I/W image watch
 @ Leader S ...     session: S save, R restore, C clear, Q quit
 
-Every one of these still has its old Ctrl+Shift chord too — the leader layer is a
-superset, not a replacement, so nothing you already learned stopped working.
+The layer is a strict superset: every chord that exists still works (some on
+Ctrl+Shift, a few on Alt+Shift), so nothing you already learned stopped working —
+but the reverse does not hold. Tab switching, cycle layout, focus next, broadcast
+groups, copy mode, piping output, history search, watch, fold, saved layouts,
+config, the theme picker, image watch, project sessions, clear and quit have no
+chord at all and are reachable only from here or the palette.
 
 Rebind the leader itself with the `leader` setting (an empty string turns the
 layer off), and bind your own sequences with a `leader+` prefix in [keys]: a
@@ -88,7 +95,7 @@ working directory of the pane you were in, so it opens where you already are.
 @ Ctrl+Shift+X     close the focused pane
 @ Ctrl+Shift+Z     zoom the focused pane to fill the tab (toggle)
 @ Ctrl+Shift+HJKL  move focus left / down / up / right (vim directions)
-@ Alt+Shift+arrows resize the focused pane (also Leader hjkl / arrows)
+@ Alt+Shift+arrows resize the focused pane (also Leader HJKL / arrows)
 
 A pane that rings the terminal bell (BEL) flashes briefly; if the window is not
 focused it also raises the compositor urgency hint, so a finished build in the
@@ -474,6 +481,13 @@ file is safe to keep in a dotfiles repo.
 @ behaviour.shell_integration  true auto-injects OSC 133/7 hooks into fish/zsh/bash (no rc edits)
 @ clipboard.capacity   how many recent copies the clipboard history keeps (default 50)
 @ clipboard.enabled    false stops recording copies into the history
+@ leader           the chord that arms the leader layer (default alt+shift+space;
+@                    an empty string turns the layer off entirely)
+@ leader_timeout   seconds the armed layer waits per step (default 10; 0 = it
+@                    waits as long as you do)
+@ [keys]           action id -> chord. A `leader+` prefix binds on the leader
+@                    layer, and a space separates the steps: `leader+r c` is the
+@                    leader, then R, then C
 
 Each tab shows an icon for its foreground app and a badge: an amber dot for a
 background tab with unseen output, a red cross if its last command failed. The tab

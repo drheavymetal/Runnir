@@ -61,7 +61,8 @@ export const FEATURES = [
       { es: 'Ctrl+Shift+E (dividir arriba/abajo)', en: 'Ctrl+Shift+E (split up/down)' },
       { es: 'Ctrl+Shift+X (cerrar panel)', en: 'Ctrl+Shift+X (close pane)' },
       { es: 'Ctrl+Shift+H/J/K/L (mover foco, direcciones vim)', en: 'Ctrl+Shift+H/J/K/L (move focus, vim directions)' },
-      { es: 'Alt+Shift+flechas, o Leader hjkl / flechas (redimensionar)', en: 'Alt+Shift+arrows, or Leader hjkl / arrows (resize)' },
+      { es: 'Leader h/j/k/l (mover foco, sin modificadores)', en: 'Leader h/j/k/l (move focus, no modifiers)' },
+      { es: 'Alt+Shift+flechas, o Leader H/J/K/L o flechas (redimensionar)', en: 'Alt+Shift+arrows, or Leader H/J/K/L or arrows (resize)' },
     ],
     palette: 'Split pane left/right / Split pane up/down / Close pane',
   },
@@ -215,11 +216,29 @@ export const FEATURES = [
 
   // ------------------------------------------------------- ENTRADA Y SELECCION
   {
+    key: 'leader', section: 'input', status: 'shipped',
+    title: { es: 'Capa leader', en: 'Leader layer' },
+    natural: {
+      es: 'El compositor gana toda carrera de modificadores: Hyprland y GNOME se quedan casi toda la capa Super, y una tecla que ellos capturan no llega nunca a runnir. Por eso runnir monta su propia capa detrás de una tecla leader. Pulsa Alt+Shift+Space y suelta: la barra inferior saca LEADER (o un aviso «leader…» si la ocultaste) y un panel lista qué hace la siguiente tecla, así que la capa se enseña sola. Las teclas calientes actúan al momento; el resto abren un grupo que pide una tecla más. Los modificadores que sigas apretando se ignoran, o sea que puedes no soltar Alt+Shift en toda la secuencia. Esc o cualquier tecla sin atar sale sin filtrar nada al shell. La capa es un superconjunto estricto: todo acorde que exista sigue funcionando, pero muchas acciones (cambiar de pestaña, ciclar layout, copy mode, sesiones de proyecto, salir) solo viven aquí o en la paleta.',
+      en: 'The compositor wins every modifier race: Hyprland and GNOME claim most of the Super layer, and a key they grab never reaches runnir. So runnir keeps its own layer behind a leader key. Press Alt+Shift+Space and let go: the bottom bar shows LEADER (or a “leader…” toast if you hid it) and a panel lists what the next key does, so the layer teaches itself. The hot keys act at once; the rest open a group that takes one more key. Modifiers you are still holding are ignored, so you can keep Alt+Shift down through the whole sequence. Esc or any unbound key backs out without leaking to the shell. The layer is a strict superset: every chord that exists still works, but plenty of actions (tab switching, cycle layout, copy mode, project sessions, quit) live only here or in the palette.',
+    },
+    keys: [
+      { es: 'Alt+Shift+Space (armar la capa)', en: 'Alt+Shift+Space (arm the layer)' },
+      { es: 'Leader 1..9 / hjkl / HJKL (pestaña, foco, redimensionar)', en: 'Leader 1..9 / hjkl / HJKL (tab, focus, resize)' },
+      { es: 'Leader t p c f a r o s (grupos)', en: 'Leader t p c f a r o s (groups)' },
+    ],
+    config: [
+      { k: 'leader', v: '"alt+shift+space"', d: { es: 'Acorde que arma la capa; "" la desactiva entera', en: 'Chord that arms the layer; "" turns it off entirely' } },
+      { k: 'leader_timeout', v: '10', d: { es: 'Segundos de espera por paso; 0 = espera lo que haga falta', en: 'Seconds it waits per step; 0 = waits as long as you do' } },
+    ],
+    note: { es: 'En [keys], el prefijo leader+ ata tus acciones a la capa y el espacio separa los pasos: "leader+r c". Ojo: atar leader+t sustituye el grupo Pestañas entero por esa acción.', en: 'In [keys], a leader+ prefix binds your actions on the layer and a space separates the steps: "leader+r c". Careful: binding leader+t replaces the whole Tabs group with that action.' },
+  },
+  {
     key: 'keyboard-first', section: 'input', status: 'shipped',
     title: { es: 'Teclado primero', en: 'Keyboard first' },
     natural: {
-      es: 'Casi todo tiene atajo; lo que no, vive en la paleta. Los atajos propios usan Ctrl+Shift, Alt+Shift o la capa leader (Alt+Shift+Space y luego una tecla suelta; mientras espera la segunda tecla, la barra inferior muestra LEADER), nunca Ctrl+letra a secas, que pertenece al programa del panel (Ctrl+C, Ctrl+D). Tampoco Super: el compositor se queda esa capa antes de que la tecla llegue a runnir. Y tampoco Alt+Space pelado: es el menú de ventana en Windows y GNOME, y krunner en KDE. Así no se pisa ni lo que espera tu shell ni lo que espera tu escritorio.',
-      en: 'Almost everything has a bind; the rest lives in the palette. runnir’s binds use Ctrl+Shift, Alt+Shift or the leader layer (Alt+Shift+Space, then one plain key; while it waits for that second key the bottom bar shows LEADER), never a bare Ctrl+letter — that belongs to the program in the pane (Ctrl+C, Ctrl+D). Never Super either: the compositor grabs that layer before the key reaches runnir. Nor bare Alt+Space: that is the window menu on Windows and GNOME, and krunner on KDE. So runnir steps on neither what your shell expects nor what your desktop does.',
+      es: 'Casi todo tiene atajo; lo que no, vive en la paleta. Los atajos propios usan Ctrl+Shift, Alt+Shift o la capa leader (Alt+Shift+Space y luego una tecla suelta; mientras espera la segunda tecla, la barra inferior muestra LEADER, o un aviso «leader…» si tienes la barra oculta), nunca Ctrl+letra a secas, que pertenece al programa del panel (Ctrl+C, Ctrl+D). Tampoco Super: el compositor se queda esa capa antes de que la tecla llegue a runnir. Y tampoco Alt+Space pelado: es el menú de ventana en Windows y GNOME, y krunner en KDE. Así no se pisa ni lo que espera tu shell ni lo que espera tu escritorio.',
+      en: 'Almost everything has a bind; the rest lives in the palette. runnir’s binds use Ctrl+Shift, Alt+Shift or the leader layer (Alt+Shift+Space, then one plain key; while it waits for that second key the bottom bar shows LEADER, or a “leader…” toast if you have the bar hidden), never a bare Ctrl+letter — that belongs to the program in the pane (Ctrl+C, Ctrl+D). Never Super either: the compositor grabs that layer before the key reaches runnir. Nor bare Alt+Space: that is the window menu on Windows and GNOME, and krunner on KDE. So runnir steps on neither what your shell expects nor what your desktop does.',
     },
     keys: [
       { es: 'Ctrl+Shift+P (paleta, todo buscable)', en: 'Ctrl+Shift+P (palette, everything searchable)' },
@@ -590,10 +609,10 @@ export const FEATURES = [
     key: 'snippets', section: 'distinctive', status: 'shipped',
     title: { es: 'Snippets de comandos', en: 'Command snippets' },
     natural: {
-      es: 'Guarda en el config los comandos que repites como snippets con nombre y recupéralos desde la paleta (Insert command snippet), con Alt+Shift+S o con Leader S. Tecleas para filtrar por nombre o descripción; al elegir uno, teclea su comando en el prompt para que lo revises y lo ejecutes tú — la misma regla de revisión previa que el escritor de comandos de la IA, nunca a tus espaldas. Un snippet con run_now = true se envía solo.',
-      en: 'Save the commands you run often as named snippets in the config and recall them from the palette (Insert command snippet), with Alt+Shift+S or Leader S. Type to filter on name or description; selecting one types its command at the prompt for you to check and run yourself — the same review-first rule as the AI command-writer, never behind your back. A snippet with run_now = true submits itself.',
+      es: 'Guarda en el config los comandos que repites como snippets con nombre y recupéralos desde la paleta (Insert command snippet), con Alt+Shift+S o con Leader O S. Tecleas para filtrar por nombre o descripción; al elegir uno, teclea su comando en el prompt para que lo revises y lo ejecutes tú — la misma regla de revisión previa que el escritor de comandos de la IA, nunca a tus espaldas. Un snippet con run_now = true se envía solo.',
+      en: 'Save the commands you run often as named snippets in the config and recall them from the palette (Insert command snippet), with Alt+Shift+S or Leader O S. Type to filter on name or description; selecting one types its command at the prompt for you to check and run yourself — the same review-first rule as the AI command-writer, never behind your back. A snippet with run_now = true submits itself.',
     },
-    keys: ['Alt+Shift+S', 'Leader S'],
+    keys: ['Alt+Shift+S', 'Leader O S'],
     palette: 'Insert command snippet',
     config: [{ k: '[[snippets]]', v: 'name + command + description + run_now', d: { es: 'description y run_now son opcionales; run_now por defecto false (se inserta, no se ejecuta).', en: 'description and run_now are optional; run_now defaults to false (inserted, not executed).' } }],
     example: '[[snippets]]\nname = "deploy"\ncommand = "git push && ssh server bin/deploy"\ndescription = "ship the current branch to prod"\n\n[[snippets]]\nname = "tail"\ncommand = "journalctl -fu runnir"\nrun_now = true',
@@ -602,11 +621,11 @@ export const FEATURES = [
     key: 'now-playing', section: 'distinctive', status: 'shipped',
     title: { es: 'Reproduciendo ahora (media)', en: 'Now playing (media)' },
     natural: {
-      es: 'Ve y controla lo que suena sin salir del terminal. Alt+Shift+P (o Leader P) abre un overlay con la carátula (medios bloques Unicode de color, así se ve en cualquier GPU), título, artista, álbum, el estado de reproducción y una forma de onda en vivo dibujada con barras Unicode (cava, en Linux). Las teclas multimedia XF86 del teclado (play/pausa, siguiente, anterior) funcionan en cualquier parte, y cada comando está en la paleta (Media: play / pause, etc.). Si no hay reproductor activo, un aviso breve lo dice.',
-      en: 'See and control whatever is playing without leaving the terminal. Alt+Shift+P (or Leader P) opens an overlay with the album art (coloured Unicode half-blocks, so it shows on any GPU), title, artist, album, the playback state and a live waveform drawn as Unicode bars (cava, on Linux). The XF86 media keys on your keyboard (play/pause, next, previous) work anywhere, and every command is in the palette (Media: play / pause, and so on). If no player is active, a brief toast says so.',
+      es: 'Ve y controla lo que suena sin salir del terminal. Alt+Shift+P (o Leader R M) abre un overlay con la carátula (medios bloques Unicode de color, así se ve en cualquier GPU), título, artista, álbum, el estado de reproducción y una forma de onda en vivo dibujada con barras Unicode (cava, en Linux). Las teclas multimedia XF86 del teclado (play/pausa, siguiente, anterior) funcionan en cualquier parte, y cada comando está en la paleta (Media: play / pause, etc.). Si no hay reproductor activo, un aviso breve lo dice.',
+      en: 'See and control whatever is playing without leaving the terminal. Alt+Shift+P (or Leader R M) opens an overlay with the album art (coloured Unicode half-blocks, so it shows on any GPU), title, artist, album, the playback state and a live waveform drawn as Unicode bars (cava, on Linux). The XF86 media keys on your keyboard (play/pause, next, previous) work anywhere, and every command is in the palette (Media: play / pause, and so on). If no player is active, a brief toast says so.',
     },
     keys: [
-      { es: 'Alt+Shift+P o Leader P (abrir el overlay)', en: 'Alt+Shift+P or Leader P (open the overlay)' },
+      { es: 'Alt+Shift+P o Leader R M (abrir el overlay)', en: 'Alt+Shift+P or Leader R M (open the overlay)' },
       { es: 'Espacio (play / pausa)', en: 'Space (play / pause)' },
       { es: 'n / p (siguiente / anterior)', en: 'n / p (next / previous)' },
       { es: '+ / - (subir / bajar volumen)', en: '+ / - (volume up / down)' },
@@ -888,10 +907,10 @@ export const FEATURES = [
     key: 'custom-keybinds', section: 'config', status: 'shipped',
     title: { es: 'Atajos personalizables', en: 'Custom keybindings' },
     natural: {
-      es: 'Reasigna cualquier acción a la combinación que prefieras desde el config; tus atajos se fusionan sobre los de fábrica. Los acordes se escriben "ctrl+shift+t", "alt+enter", "alt+shift+v"; el prefijo "leader+" ata la tecla a la capa leader ("leader+v"). Regla de oro: los atajos propios llevan Ctrl+Shift, Alt+Shift o leader, nunca Ctrl+letra a secas ni Super (esa capa la toma el compositor).',
-      en: 'Rebind any action to the combo you like from the config; your binds merge over the defaults. Chords are written "ctrl+shift+t", "alt+enter", "alt+shift+v"; a "leader+" prefix binds the key on the leader layer ("leader+v"). Rule of thumb: your own binds use Ctrl+Shift, Alt+Shift or leader, never a bare Ctrl+letter and never Super (the compositor takes that layer).',
+      es: 'Reasigna cualquier acción a la combinación que prefieras desde el config; tus atajos se fusionan sobre los de fábrica. Los acordes se escriben "ctrl+shift+t", "alt+enter", "alt+shift+v"; el prefijo "leader+" ata la tecla a la capa leader ("leader+v"), y los espacios separan los pasos de una secuencia ("leader+r c"). Ojo: atar una acción a una tecla de grupo ("leader+t") sustituye el grupo entero. Regla de oro: los atajos propios llevan Ctrl+Shift, Alt+Shift o leader, nunca Ctrl+letra a secas ni Super (esa capa la toma el compositor).',
+      en: 'Rebind any action to the combo you like from the config; your binds merge over the defaults. Chords are written "ctrl+shift+t", "alt+enter", "alt+shift+v"; a "leader+" prefix binds the key on the leader layer ("leader+v"), and spaces separate the steps of a sequence ("leader+r c"). Careful: binding an action to a group key ("leader+t") replaces the whole group. Rule of thumb: your own binds use Ctrl+Shift, Alt+Shift or leader, never a bare Ctrl+letter and never Super (the compositor takes that layer).',
     },
-    example: '[keys]\n"ctrl+shift+t" = "new_tab"\n"alt+enter" = "toggle_zoom"\n"leader+t" = "new_tab"\n\nleader = "alt+shift+space"   # "" turns the layer off',
+    example: '[keys]\n"ctrl+shift+t" = "new_tab"\n"alt+enter" = "toggle_zoom"\n"leader+n" = "new_tab"\n\nleader = "alt+shift+space"   # "" turns the layer off',
     note: { es: 'Cada acción tiene un id estable (ver la página de atajos). go_to_tab_1..9 saltan a la pestaña N.', en: 'Each action has a stable id (see the shortcuts page). go_to_tab_1..9 jump to tab N.' },
   },
 

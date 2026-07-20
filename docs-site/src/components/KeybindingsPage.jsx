@@ -25,7 +25,7 @@ export default function KeybindingsPage({ query }) {
   const groups = KEY_GROUPS.map((g) => ({
     ...g,
     rows: g.rows.filter(
-      (r) => !q || t(r.title).toLowerCase().includes(q) || r.id.toLowerCase().includes(q) || r.keys.map(t).join(' ').toLowerCase().includes(q)
+      (r) => !q || t(r.title).toLowerCase().includes(q) || (t(r.id) || '').toLowerCase().includes(q) || r.keys.map(t).join(' ').toLowerCase().includes(q)
     ),
   })).filter((g) => g.rows.length)
 
@@ -51,7 +51,7 @@ export default function KeybindingsPage({ query }) {
                 <tr key={i}>
                   <td>{r.keys.map((k, j) => <span key={j}>{j > 0 && <span className="plain" style={{ color: 'var(--fg-faint)' }}> / </span>}<Chord spec={t(k)} /></span>)}</td>
                   <td>{t(r.title)}</td>
-                  <td><span className="id">{r.id || '—'}</span></td>
+                  <td><span className="id">{t(r.id) || '—'}</span></td>
                 </tr>
               ))}
             </tbody>
