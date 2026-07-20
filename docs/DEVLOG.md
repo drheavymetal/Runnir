@@ -468,8 +468,31 @@ keyboard, and the entire point is that the next key reaches the leader resolver.
 It reads `Gpu.leader_entries`, a snapshot taken in the key handler, because the
 keymap lives in `App` and the draw path only sees `Gpu`.
 
+## 2026-07-20 — `ctrl+plus` never worked (and neither did `leader +`)
+
+Pedro: "el = sigo sin poder hacerlo con una unica tecla y el + y el - tambien".
+Sounded like a layout ergonomics complaint; it was a dead binding.
+
+`Chord::parse("plus")` went through `canonical_named` and produced
+`ChordKey::Named("plus")`. But `Chord::from_event` turns a real keypress into
+`ChordKey::Char('+')`, because winit delivers `Key::Character("+")` — `named_id`
+has no NamedKey for punctuation and never could. Named != Char, so the chord
+never matched anything. `ctrl+plus`, `ctrl+minus`, `ctrl+equal` and the leader
+aliases have all been inert since they were written; the font zoom that "worked"
+was `ctrl+shift+plus`-free coincidence — nobody had tested the bare chords.
+
+Fix: `parse` maps `plus`/`minus`/`equal` (+ `dash`, `equals`) straight to
+`ChordKey::Char`, and the entries come OUT of `canonical_named`. The names exist
+only because `+` is the chord separator, so `"ctrl++"` cannot be written.
+
+Test `spelled_out_punctuation_matches_the_key_you_actually_press` compares a
+parsed spec against a synthesised keypress — the assertion that was missing.
+
 ## Gotchas (do not re-learn)
 
+- A binding spec and a keypress must produce the SAME `ChordKey` variant.
+  Punctuation is always `Char`; only real NamedKeys (arrows, F-keys, pageup) are
+  `Named`. Test a new spec against `Chord::from_event`, never just against parse.
 - The leader layer is a TREE. Adding an action means adding it to a group in
   `default_leader_bindings` — the superset test fails otherwise, on purpose.
 - A hint that must not steal the keyboard is chrome (a grid appended in `draw`),

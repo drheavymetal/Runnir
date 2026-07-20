@@ -500,6 +500,14 @@ impl Chord {
                 "alt" | "opt" | "option" => alt = true,
                 "super" | "cmd" | "win" | "meta" => supr = true,
                 "" => return None,
+                // Spelled-out punctuation. These have to become the CHARACTER, not
+                // a named key: the keyboard delivers them as `Key::Character('+')`,
+                // so a `ChordKey::Named("plus")` could never match an event — which
+                // is exactly why `ctrl+plus` and `leader +` silently did nothing.
+                // The names exist because `+` is also the separator in a chord spec.
+                "plus" => key = Some(ChordKey::Char('+')),
+                "minus" | "dash" => key = Some(ChordKey::Char('-')),
+                "equal" | "equals" => key = Some(ChordKey::Char('=')),
                 other => {
                     let k = if other.chars().count() == 1 {
                         ChordKey::Char(other.chars().next().unwrap())
@@ -524,9 +532,6 @@ impl Chord {
             // "pagedown" is unreadable at a glance and eats the width the titles
             // need.
             ChordKey::Named(n) => match *n {
-                "equal" => "=".into(),
-                "plus" => "+".into(),
-                "minus" => "-".into(),
                 "left" => "←".into(),
                 "right" => "→".into(),
                 "up" => "↑".into(),
@@ -1065,9 +1070,6 @@ fn canonical_named(name: &str) -> Option<&'static str> {
         "end" => "end",
         "pageup" | "pgup" => "pageup",
         "pagedown" | "pgdn" => "pagedown",
-        "plus" => "plus",
-        "minus" => "minus",
-        "equal" | "equals" => "equal",
         "f1" => "f1",
         "f2" => "f2",
         "f3" => "f3",
@@ -1294,6 +1296,26 @@ mod tests {
         assert_eq!(Chord::parse("pageup").unwrap().label(), "PgUp");
         // A shifted letter shows as the capital you actually press.
         assert_eq!(Chord::parse("shift+z").unwrap().label(), "Z");
+    }
+
+    #[test]
+    fn spelled_out_punctuation_matches_the_key_you_actually_press() {
+        // The regression this guards: `plus` used to parse to a NAMED key, while
+        // the keyboard delivers `Key::Character('+')`. The two could never be equal,
+        // so ctrl+plus and leader + silently did nothing for as long as they existed.
+        for (spec, ch) in [("plus", '+'), ("minus", '-'), ("equal", '=')] {
+            let parsed = Chord::parse(spec).unwrap();
+            let pressed = Chord::from_event(&Key::Character(ch.to_string().into()), ModifiersState::empty()).unwrap();
+            assert_eq!(parsed, pressed, "{spec} does not match a real {ch} keypress");
+            // And the panel shows the glyph, since that is what the chord now holds.
+            assert_eq!(parsed.label(), ch.to_string());
+        }
+        // The same key with a modifier still parses as one chord: `+` is the
+        // separator, so the spelled-out name is the only way to write it.
+        assert_eq!(
+            Chord::parse("ctrl+plus"),
+            Chord::from_event(&Key::Character("+".into()), ModifiersState::CONTROL)
+        );
     }
 
     #[test]
