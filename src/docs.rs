@@ -17,8 +17,14 @@ Compositors win every modifier race. Hyprland and GNOME both claim most of the
 Super layer for workspaces, and a key they grab never reaches runnir at all — an
 app cannot bind around that. So runnir keeps its own layer behind a leader key.
 
-Press Alt+Shift+Space, let go, then press one plain key. It has three seconds
+Press Alt+Shift+Space, let go, then press one plain key. While runnir waits for
+that second key the status bar shows LEADER on the left. It has three seconds
 before it lapses; any unbound key just cancels it, and nothing leaks to the shell.
+Modifiers you are still holding are ignored, so you can keep Alt+Shift down.
+
+Bare Alt+Space is deliberately NOT the leader: it is the window menu on Windows
+and GNOME, krunner on KDE and PowerToys Run on Windows, so it would never reach
+runnir on most desktops.
 
 @ Leader 1..9      jump to tab N
 @ Leader hjkl      resize the focused pane (arrows work too)
