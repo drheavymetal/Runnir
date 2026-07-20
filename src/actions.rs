@@ -518,7 +518,27 @@ impl Chord {
     pub fn label(&self) -> String {
         let base = match &self.key {
             ChordKey::Char(c) => c.to_string(),
-            ChordKey::Named(n) => (*n).to_string(),
+            // Named keys are stored by their config spelling (`equal`, `pageup`),
+            // which is what you type in the config but not what is printed on the
+            // key. The panel shows the glyph — a column of words like "equal" and
+            // "pagedown" is unreadable at a glance and eats the width the titles
+            // need.
+            ChordKey::Named(n) => match *n {
+                "equal" => "=".into(),
+                "plus" => "+".into(),
+                "minus" => "-".into(),
+                "left" => "←".into(),
+                "right" => "→".into(),
+                "up" => "↑".into(),
+                "down" => "↓".into(),
+                "pageup" => "PgUp".into(),
+                "pagedown" => "PgDn".into(),
+                "enter" => "⏎".into(),
+                "space" => "␣".into(),
+                "tab" => "⇥".into(),
+                "escape" => "Esc".into(),
+                other => other.to_string(),
+            },
         };
         if self.shift { base.to_uppercase() } else { base }
     }
@@ -829,7 +849,11 @@ fn default_leader_bindings() -> HashMap<Chord, LeaderNode> {
     // letter is needed as a group.
     leaf(&mut m, "v", ClipboardHistory);
     leaf(&mut m, "g", FixLastCommand);
-    // Font size, where every terminal already puts it.
+    // Font size, where every terminal already puts it — but +, - and = are not all
+    // one keypress on every layout (on the Spanish one `=` is shift+0), so the
+    // letters are the binding that always works and the symbols are the alias.
+    leaf(&mut m, "z", FontBigger);
+    leaf(&mut m, "shift+z", FontSmaller);
     leaf(&mut m, "plus", FontBigger);
     leaf(&mut m, "equal", FontBigger);
     leaf(&mut m, "minus", FontSmaller);
@@ -1258,6 +1282,31 @@ mod tests {
             seq_events(&map, &[(v, ModifiersState::empty())]),
             Some(&Action::ClipboardHistory)
         );
+    }
+
+    #[test]
+    fn the_panel_labels_named_keys_with_their_glyph() {
+        // "equal"/"pagedown" is what you write in the config, not what the panel
+        // should print — a column of words eats the width the titles need.
+        assert_eq!(Chord::parse("equal").unwrap().label(), "=");
+        assert_eq!(Chord::parse("minus").unwrap().label(), "-");
+        assert_eq!(Chord::parse("down").unwrap().label(), "↓");
+        assert_eq!(Chord::parse("pageup").unwrap().label(), "PgUp");
+        // A shifted letter shows as the capital you actually press.
+        assert_eq!(Chord::parse("shift+z").unwrap().label(), "Z");
+    }
+
+    #[test]
+    fn font_zoom_has_a_layout_independent_binding() {
+        // +, - and = are not one keypress on every layout (on the Spanish one `=`
+        // is shift+0), so the letters have to work on their own.
+        let map = Keymap::new(&HashMap::new(), DEFAULT_LEADER);
+        assert_eq!(seq(&map, "z"), Some(&Action::FontBigger));
+        assert_eq!(seq(&map, "shift+z"), Some(&Action::FontSmaller));
+        assert_eq!(seq(&map, "0"), Some(&Action::FontReset));
+        // The symbols stay as aliases for the layouts where they are one key.
+        assert_eq!(seq(&map, "minus"), Some(&Action::FontSmaller));
+        assert_eq!(seq(&map, "plus"), Some(&Action::FontBigger));
     }
 
     #[test]

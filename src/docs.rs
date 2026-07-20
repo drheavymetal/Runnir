@@ -36,7 +36,9 @@ Straight away, no group — the things you do constantly:
 @ Leader HJKL      resize the focused pane (arrows do this too)
 @ Leader V         clipboard history
 @ Leader G         fix the last failed command
-@ Leader + - 0     font bigger / smaller / reset
+@ Leader Z / Shift+Z  font bigger / smaller. Also + and -, on the layouts
+@                        where those are one key (on the Spanish one, = is not)
+@ Leader 0         reset the font size
 
 Then the groups. The letter is the noun:
 
