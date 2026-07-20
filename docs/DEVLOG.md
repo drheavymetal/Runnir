@@ -443,8 +443,39 @@ Do not "improve" this to `ctrl+alt+space`: ctrl+alt IS AltGr on the Spanish and
 most EU layouts, and AltGr+space types a non-breaking space there. That is a
 worse bug than the one being fixed.
 
+## 2026-07-20 — The leader layer becomes two levels, with a which-key panel
+
+Pedro asked where Claude was on the leader layer, found it was not (only 17 of
+~40 actions were), and said all of them should be. Right instinct, but a flat
+layer cannot hold them: 26 letters, and `1..9` already belong to the tabs.
+
+So `leader_bindings` is now a tree — `LeaderNode::Run(Action) | Group { title,
+keys }` — walked by `Keymap::resolve_leader(&[Chord])`. `Gpu` tracks how deep it
+is in `leader_path`; a group re-arms the timeout (the panel is up, the user is
+reading) and anything else disarms. Escape backs out.
+
+Layout: direct keys for what you do constantly (`1..9`, `hjkl` focus, `HJKL` and
+arrows resize, `v`, `g`, font `+ - 0`), then groups whose letter is the noun —
+`t` tabs, `p` panes, `c` clipboard, `f` find/scroll, `a` ai, `r` run/launch,
+`o` open, `s` session. Launch is `r`, not `l`, because `l` is focus-right and the
+vim row outranks a nicer mnemonic. Every ctrl+shift chord survives as an alias;
+the layer is a superset, and a test enforces exactly that
+(`every_action_with_a_normal_binding_is_reachable_from_the_leader`) — it caught
+two real holes while being written, `scroll_page_up` and the `l` collision.
+
+The which-key panel is chrome, NOT an `Overlay`. An Overlay captures the
+keyboard, and the entire point is that the next key reaches the leader resolver.
+It reads `Gpu.leader_entries`, a snapshot taken in the key handler, because the
+keymap lives in `App` and the draw path only sees `Gpu`.
+
 ## Gotchas (do not re-learn)
 
+- The leader layer is a TREE. Adding an action means adding it to a group in
+  `default_leader_bindings` — the superset test fails otherwise, on purpose.
+- A hint that must not steal the keyboard is chrome (a grid appended in `draw`),
+  never an `Overlay`. Overlays capture input by design.
+- `Gpu` cannot see the `Keymap` (it lives in `App`). Anything the draw path needs
+  from it has to be snapshotted into a `Gpu` field when the input handler runs.
 - Check a candidate default chord against Windows/KDE/GNOME/macOS BEFORE shipping
   it, not after. `alt+space` shipped broken on 3 of 4 desktops. Also never
   ctrl+alt (= AltGr on EU layouts) and never super (the compositor wins).

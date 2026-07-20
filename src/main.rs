@@ -40,7 +40,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy}
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowId};
 
-use crate::actions::{Action, Keymap};
+use crate::actions::{Action, Chord, Keymap, LeaderNode};
 use crate::config::Config;
 use crate::grid::{Color, Grid, Pen};
 use crate::font::FontAtlas;
@@ -326,11 +326,20 @@ struct Gpu {
     hover_url: Option<HoverUrl>,
     /// Keyboard copy-mode state, or `None` when off (D12).
     copy_mode: Option<CopyMode>,
-    /// When the leader layer was armed: the next key resolves against the leader
-    /// bindings instead of reaching the pane. Disarmed by any key, or by
-    /// `LEADER_TIMEOUT` — an indefinitely armed leader would turn a keystroke typed
-    /// minutes later into an action the user never asked for.
+    /// When the leader layer was armed, or last stepped into a group: keys resolve
+    /// against the leader tree instead of reaching the pane. Disarmed by an action,
+    /// a miss, Escape, or `LEADER_TIMEOUT` — an indefinitely armed leader would turn
+    /// a keystroke typed minutes later into an action the user never asked for.
+    /// Entering a group restarts the clock; the panel is up, so the user is reading.
     leader_armed: Option<Instant>,
+    /// The keys pressed since the leader was armed, i.e. how deep into the tree we
+    /// are. Empty at the root — the which-key panel renders whatever level it names.
+    leader_path: Vec<Chord>,
+    /// What the which-key panel draws for the level `leader_path` names: `(key,
+    /// what it does, is it a group)`. Snapshotted when the layer is armed or steps
+    /// into a group, because the keymap lives in `App` and the draw code only ever
+    /// sees `Gpu`.
+    leader_entries: Vec<(String, String, bool)>,
     /// The armed image auto-preview watch, or `None` when not watching.
     image_watch: Option<ImageWatch>,
     /// The running now-playing waveform worker, or `None`. Dropping it (on overlay
@@ -563,6 +572,8 @@ impl App {
             hover_url: None,
             copy_mode: None,
             leader_armed: None,
+            leader_path: Vec::new(),
+            leader_entries: Vec::new(),
             image_watch: None,
             media_wave: None,
             media_last_refresh: None,

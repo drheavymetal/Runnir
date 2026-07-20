@@ -17,27 +17,54 @@ Compositors win every modifier race. Hyprland and GNOME both claim most of the
 Super layer for workspaces, and a key they grab never reaches runnir at all — an
 app cannot bind around that. So runnir keeps its own layer behind a leader key.
 
-Press Alt+Shift+Space, let go, then press one plain key. While runnir waits for
-that second key the status bar shows LEADER on the left. It has three seconds
-before it lapses; any unbound key just cancels it, and nothing leaks to the shell.
-Modifiers you are still holding are ignored, so you can keep Alt+Shift down.
+Press Alt+Shift+Space and let go. The status bar shows LEADER and a panel lists
+what the next key does, so the layer teaches itself — you never have to remember
+a table. Then press a key: the hot ones act immediately, the rest open a group
+that takes one more key. Three seconds per step; Escape or any unbound key backs
+out, and nothing leaks to the shell. Modifiers you are still holding are ignored,
+so you can keep Alt+Shift down through the whole sequence.
 
 Bare Alt+Space is deliberately NOT the leader: it is the window menu on Windows
 and GNOME, krunner on KDE and PowerToys Run on Windows, so it would never reach
 runnir on most desktops.
 
+Straight away, no group — the things you do constantly:
+
 @ Leader 1..9      jump to tab N
-@ Leader hjkl      resize the focused pane (arrows work too)
+@ Leader hjkl      focus the pane left/down/up/right
+@ Leader HJKL      resize the focused pane (arrows do this too)
 @ Leader V         clipboard history
-@ Leader S         command snippets
-@ Leader P         now playing
 @ Leader G         fix the last failed command
+@ Leader + - 0     font bigger / smaller / reset
+
+Then the groups. The letter is the noun:
+
+@ Leader T ...     tabs: T new, N/P next/prev, W close, R rename, U reopen,
+@                        H/L move the tab in the bar
+@ Leader P ...     panes: D split left/right, E split up/down, X close, Z zoom,
+@                        C cycle layout, N focus next, B broadcast
+@ Leader C ...     clipboard: C copy, V paste, H history, O last output,
+@                        M copy mode, P/S pipe output/scrollback
+@ Leader F ...     find & scroll: F search, H history search, I hint mode,
+@                        N/P jump between commands, T/B top/bottom, U/D page,
+@                        E open scrollback in an editor, W watch, O fold
+@ Leader A ...     ai: A toggle, G fix last command, W why did this fail,
+@                        M run a described command, E explain, S summarise
+@ Leader R ...     run & launch: C Claude, W whisper, S ssh, M now playing,
+@                        L a saved layout
+@ Leader O ...     open: C config, T theme, D these docs, S snippets,
+@                        P the palette, I/W image watch
+@ Leader S ...     session: S save, R restore, C clear, Q quit
+
+Every one of these still has its old Ctrl+Shift chord too — the leader layer is a
+superset, not a replacement, so nothing you already learned stopped working.
 
 Rebind the leader itself with the `leader` setting (an empty string turns the
-layer off), and bind your own sequences with a `leader+` prefix in [keys] — see
+layer off), and bind your own sequences with a `leader+` prefix in [keys]: a
+space separates the steps, so `leader+r c` is the leader, then R, then C. See
 the config section below.
 
-Everything on the leader layer is also in the command palette (Ctrl+Shift+P),
+Everything here is also in the command palette (Leader O P, or Ctrl+Shift+P),
 which stays the way to find a command you have not memorised.
 
 # Tabs

@@ -275,15 +275,38 @@ impl Gpu {
         );
         if !modifier_only {
             if let Some(armed_at) = self.leader_armed {
-                self.leader_armed = None;
                 // An expired arm is treated as no arm at all: the key falls through to
                 // the pane, so a stray keystroke is never silently eaten.
-                if armed_at.elapsed() < crate::LEADER_TIMEOUT {
-                    // Any key ends the sequence, bound or not. Falling through to the
-                    // pane on a miss would leak a stray character into the shell after
-                    // a mistyped sequence.
-                    if let Some(action) = keymap.resolve_leader(&event.logical_key, mods) {
-                        self.run_action(action.clone(), config, event_loop);
+                if armed_at.elapsed() >= crate::LEADER_TIMEOUT {
+                    self.cancel_leader();
+                } else {
+                    // Escape backs out of the whole layer, the way it leaves every
+                    // other modal thing in runnir.
+                    if matches!(event.logical_key, Key::Named(NamedKey::Escape)) {
+                        self.cancel_leader();
+                        self.window.request_redraw();
+                        return;
+                    }
+                    if let Some(chord) = Chord::from_event(&event.logical_key, mods) {
+                        self.leader_path.push(chord);
+                    }
+                    match keymap.resolve_leader(&self.leader_path) {
+                        // A group: stay armed, restart the clock (the panel is on
+                        // screen now, so the user is reading, not stalling) and let
+                        // the which-key panel show what this group holds.
+                        Some(LeaderNode::Group { .. }) => {
+                            self.leader_armed = Some(Instant::now());
+                            self.leader_entries = keymap.leader_entries(&self.leader_path);
+                        }
+                        Some(LeaderNode::Run(action)) => {
+                            let action = action.clone();
+                            self.cancel_leader();
+                            self.run_action(action, config, event_loop);
+                        }
+                        // A miss ends the sequence, bound or not. Falling through to
+                        // the pane would leak a stray character into the shell after
+                        // a mistyped sequence.
+                        None => self.cancel_leader(),
                     }
                     self.window.request_redraw();
                     return;
@@ -291,6 +314,8 @@ impl Gpu {
             }
             if keymap.is_leader(&event.logical_key, mods) {
                 self.leader_armed = Some(Instant::now());
+                self.leader_path.clear();
+                self.leader_entries = keymap.leader_entries(&[]);
                 // The armed state shows as a chip in the status bar, which lives
                 // exactly as long as the arming (`build_status` reads `leader_armed`).
                 // With the bar hidden there is nowhere to put it, so fall back to a
@@ -2279,6 +2304,14 @@ impl Gpu {
             pane.grid.lock().unwrap().place_image(decoded);
         }
         self.window.request_redraw();
+    }
+
+    /// Leaves the leader layer: disarms it and forgets the keys pressed so far, so
+    /// the next arming starts at the root instead of inside the last group.
+    fn cancel_leader(&mut self) {
+        self.leader_armed = None;
+        self.leader_path.clear();
+        self.leader_entries.clear();
     }
 
     /// Shows a transient toast for `secs` seconds. A small wrapper so the several

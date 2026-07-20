@@ -88,6 +88,7 @@ export const CONFIG_GROUPS = [
       { k: '"ctrl+shift+t"', v: '"new_tab"', d: { es: 'Ejemplo: reasignar un atajo. Se fusiona sobre los de fábrica.', en: 'Example: rebind a shortcut. Merges over the defaults.' } },
       { k: 'formato de acorde', v: '"ctrl+shift+X" / "alt+enter" / "alt+shift+v"', d: { es: 'Modificadores: ctrl, shift, alt (opt/option), super (cmd/win/meta). Evita super: el compositor se queda esa capa antes de que la tecla llegue a runnir.', en: 'Modifiers: ctrl, shift, alt (opt/option), super (cmd/win/meta). Avoid super: the compositor grabs that layer before the key reaches runnir.' } },
       { k: '"leader+v"', v: '"clipboard_history"', d: { es: 'El prefijo leader+ ata la tecla a la capa leader, donde va sin modificadores.', en: 'A leader+ prefix binds the key on the leader layer, where it needs no modifiers.' } },
+      { k: '"leader+r c"', v: '"launch_claude"', d: { es: 'Secuencia de dos teclas: el espacio separa los pasos. Si el primer paso no existe todavía, se crea como grupo nuevo.', en: 'A two-key sequence: the space separates the steps. If the first step does not exist yet it is created as a new group.' } },
     ],
   },
   {

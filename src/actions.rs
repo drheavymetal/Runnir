@@ -512,6 +512,66 @@ impl Chord {
         }
         Some(Chord { ctrl, shift, alt, supr, key: key? })
     }
+
+    /// Short label for the which-key panel: just the key, no modifiers, because
+    /// everything on the leader layer is already unmodified.
+    pub fn label(&self) -> String {
+        let base = match &self.key {
+            ChordKey::Char(c) => c.to_string(),
+            ChordKey::Named(n) => (*n).to_string(),
+        };
+        if self.shift { base.to_uppercase() } else { base }
+    }
+
+    /// Sort key for the panel: digits, then letters, then named keys, so a group
+    /// lists in an order the eye can scan instead of hash order.
+    fn sort_key(&self) -> (u8, String) {
+        match &self.key {
+            ChordKey::Char(c) if c.is_ascii_digit() => (0, c.to_string()),
+            ChordKey::Char(c) => (1, c.to_string()),
+            ChordKey::Named(n) => (2, (*n).to_string()),
+        }
+    }
+}
+
+/// One step on the leader layer: either an action to run, or a group that waits
+/// for one more key.
+///
+/// Two levels exist because a flat layer cannot hold the ~40 actions runnir has:
+/// there are 26 letters and `1..9` already belong to the tabs. Groups buy the
+/// room and, with the which-key panel, make the layer self-teaching — the reason
+/// tmux and every vim leader config land on the same shape.
+pub enum LeaderNode {
+    Run(Action),
+    Group { title: &'static str, keys: HashMap<Chord, LeaderNode> },
+}
+
+impl LeaderNode {
+    /// What the which-key panel writes next to the key.
+    pub fn title(&self) -> &str {
+        match self {
+            LeaderNode::Run(a) => a.title(),
+            LeaderNode::Group { title, .. } => title,
+        }
+    }
+
+    pub fn is_group(&self) -> bool {
+        matches!(self, LeaderNode::Group { .. })
+    }
+}
+
+/// Looks a chord up in one level of the layer, dropping the modifiers still held
+/// from the leader itself on a miss.
+///
+/// Nobody lets go of alt+shift between the leader and the next key, and an
+/// exact-only match would swallow that keystroke. The exact chord is still tried
+/// first, so `"leader+ctrl+r"` binds a genuinely modified key; shift is dropped
+/// last so a shifted key finds its unshifted binding (`V` → `v`) only after a
+/// real `shift+v` binding had its chance.
+fn lookup<'a>(map: &'a HashMap<Chord, LeaderNode>, chord: &Chord) -> Option<&'a LeaderNode> {
+    let relaxed = Chord { alt: false, supr: false, ctrl: false, ..chord.clone() };
+    let bare = Chord { shift: false, ..relaxed.clone() };
+    map.get(chord).or_else(|| map.get(&relaxed)).or_else(|| map.get(&bare))
 }
 
 /// Default chord that arms the leader layer, on the same alt+shift layer as the
@@ -539,10 +599,10 @@ pub struct Keymap {
     bindings: HashMap<Chord, Action>,
     /// The chord that arms the leader layer, if one is configured.
     leader: Option<Chord>,
-    /// Actions reached by pressing the leader, releasing it, then this chord.
-    /// Kept apart from `bindings` because these are *unmodified* keys — bare `v`
-    /// is an action here and a literal `v` everywhere else.
-    leader_bindings: HashMap<Chord, Action>,
+    /// The leader layer's root. Kept apart from `bindings` because these are
+    /// *unmodified* keys — bare `v` is an action here and a literal `v`
+    /// everywhere else — and because it is a tree, not a flat map.
+    leader_bindings: HashMap<Chord, LeaderNode>,
 }
 
 impl Keymap {
@@ -550,16 +610,27 @@ impl Keymap {
         let mut bindings = default_bindings();
         let mut leader_bindings = default_leader_bindings();
         for (chord_spec, action_id) in user {
-            let (spec, map) = match chord_spec.trim().strip_prefix(LEADER_PREFIX) {
-                Some(rest) => (rest, &mut leader_bindings),
-                None => (chord_spec.as_str(), &mut bindings),
+            let Some(action) = Action::parse(action_id) else {
+                eprintln!("runnir: unknown action {action_id:?}");
+                continue;
             };
-            match (Chord::parse(spec), Action::parse(action_id)) {
-                (Some(chord), Some(action)) => {
-                    map.insert(chord, action);
+            match chord_spec.trim().strip_prefix(LEADER_PREFIX) {
+                // A leader spec is a *sequence*: `"leader+t n"` is the leader, then
+                // `t`, then `n`. Spaces separate the steps because `+` already joins
+                // the modifiers inside one step.
+                Some(rest) => {
+                    let path: Option<Vec<Chord>> = rest.split_whitespace().map(Chord::parse).collect();
+                    match path {
+                        Some(p) if !p.is_empty() => insert_leader(&mut leader_bindings, &p, action),
+                        _ => eprintln!("runnir: unparseable leader sequence {chord_spec:?}"),
+                    }
                 }
-                (None, _) => eprintln!("runnir: unparseable key {chord_spec:?}"),
-                (_, None) => eprintln!("runnir: unknown action {action_id:?}"),
+                None => match Chord::parse(chord_spec) {
+                    Some(chord) => {
+                        bindings.insert(chord, action);
+                    }
+                    None => eprintln!("runnir: unparseable key {chord_spec:?}"),
+                },
             }
         }
         // An empty leader spec disables the layer rather than binding some fallback
@@ -587,21 +658,56 @@ impl Keymap {
         }
     }
 
-    /// Resolves a key pressed while the leader layer is armed.
-    ///
-    /// The exact chord wins, so `"leader+ctrl+r"` still binds a modified key. On a
-    /// miss the modifiers held to reach the leader are dropped and it tries again:
-    /// nobody lets go of alt+shift between the leader and `1`, and an exact-only match
-    /// would swallow that keystroke instead of switching tabs. Shift is dropped
-    /// last so a shifted key still finds its unshifted binding (`leader+V` → `v`).
-    pub fn resolve_leader(&self, key: &Key, mods: ModifiersState) -> Option<&Action> {
-        let chord = Chord::from_event(key, mods)?;
-        let relaxed = Chord { alt: false, supr: false, ctrl: false, ..chord.clone() };
-        let bare = Chord { shift: false, ..relaxed.clone() };
-        self.leader_bindings
-            .get(&chord)
-            .or_else(|| self.leader_bindings.get(&relaxed))
-            .or_else(|| self.leader_bindings.get(&bare))
+    /// Walks a sequence of keys pressed since the leader was armed. `None` means
+    /// the sequence is unbound and the layer should just cancel.
+    pub fn resolve_leader(&self, path: &[Chord]) -> Option<&LeaderNode> {
+        let mut level = &self.leader_bindings;
+        let mut node = None;
+        for chord in path {
+            node = lookup(level, chord);
+            match node {
+                Some(LeaderNode::Group { keys, .. }) => level = keys,
+                // An action mid-path, or a miss: either way there is nowhere
+                // further to walk.
+                _ => return node,
+            }
+        }
+        node
+    }
+
+    /// The which-key panel's contents for the group reached by `path` (the root
+    /// when it is empty): `(key label, what it does, is it a group)`, in scan order.
+    pub fn leader_entries(&self, path: &[Chord]) -> Vec<(String, String, bool)> {
+        let level = match self.resolve_leader(path) {
+            _ if path.is_empty() => &self.leader_bindings,
+            Some(LeaderNode::Group { keys, .. }) => keys,
+            _ => return Vec::new(),
+        };
+        let mut out: Vec<_> = level.iter().collect();
+        out.sort_by_key(|(c, _)| c.sort_key());
+        out.iter().map(|(c, n)| (c.label(), n.title().to_string(), n.is_group())).collect()
+    }
+}
+
+/// Inserts an action at a path, creating the groups it passes through. A user
+/// binding that lands on an existing action replaces it; one that tunnels
+/// *through* an action (`"leader+v x"` when `v` runs something) turns that step
+/// into a group, since the config asked for a sequence and a config that parses
+/// should do what it says.
+fn insert_leader(map: &mut HashMap<Chord, LeaderNode>, path: &[Chord], action: Action) {
+    let Some((first, rest)) = path.split_first() else { return };
+    if rest.is_empty() {
+        map.insert(first.clone(), LeaderNode::Run(action));
+        return;
+    }
+    let entry = map
+        .entry(first.clone())
+        .or_insert_with(|| LeaderNode::Group { title: "custom", keys: HashMap::new() });
+    if !entry.is_group() {
+        *entry = LeaderNode::Group { title: "custom", keys: HashMap::new() };
+    }
+    if let LeaderNode::Group { keys, .. } = entry {
+        insert_leader(keys, rest, action);
     }
 }
 
@@ -695,27 +801,150 @@ fn default_bindings() -> HashMap<Chord, Action> {
 /// GNOME both claim most of the super layer, and an app cannot bind around that.
 /// After the leader is armed the keys are unmodified, so the namespace is wide and
 /// nothing outside runnir can take it.
-fn default_leader_bindings() -> HashMap<Chord, Action> {
+fn default_leader_bindings() -> HashMap<Chord, LeaderNode> {
     use Action::*;
     let mut m = HashMap::new();
-    for n in 1..=9 {
-        bind(&mut m, &n.to_string(), GoToTab(n));
-    }
-    // Both the arrows and the vim row resize, matching ctrl+shift+hjkl for focus.
-    bind(&mut m, "left", ResizeLeft);
-    bind(&mut m, "right", ResizeRight);
-    bind(&mut m, "up", ResizeUp);
-    bind(&mut m, "down", ResizeDown);
-    bind(&mut m, "h", ResizeLeft);
-    bind(&mut m, "l", ResizeRight);
-    bind(&mut m, "k", ResizeUp);
-    bind(&mut m, "j", ResizeDown);
 
-    bind(&mut m, "v", ClipboardHistory);
-    bind(&mut m, "s", OpenSnippets);
-    bind(&mut m, "p", NowPlaying);
-    bind(&mut m, "g", FixLastCommand);
+    // --- Direct keys. These earn their place at the top level by frequency: you
+    // switch tab and move focus far more often than you do anything else, and a
+    // group would double the keystrokes for exactly the hottest paths.
+    for n in 1..=9 {
+        leaf(&mut m, &n.to_string(), GoToTab(n));
+    }
+    leaf(&mut m, "h", FocusLeft);
+    leaf(&mut m, "j", FocusDown);
+    leaf(&mut m, "k", FocusUp);
+    leaf(&mut m, "l", FocusRight);
+    // Resize is the shifted vim row and the arrows: same fingers as focus, one
+    // modifier apart, so the pair is learned as one thing.
+    leaf(&mut m, "shift+h", ResizeLeft);
+    leaf(&mut m, "shift+j", ResizeDown);
+    leaf(&mut m, "shift+k", ResizeUp);
+    leaf(&mut m, "shift+l", ResizeRight);
+    leaf(&mut m, "left", ResizeLeft);
+    leaf(&mut m, "down", ResizeDown);
+    leaf(&mut m, "up", ResizeUp);
+    leaf(&mut m, "right", ResizeRight);
+    // Kept from the flat layer: both were already muscle memory, and neither
+    // letter is needed as a group.
+    leaf(&mut m, "v", ClipboardHistory);
+    leaf(&mut m, "g", FixLastCommand);
+    // Font size, where every terminal already puts it.
+    leaf(&mut m, "plus", FontBigger);
+    leaf(&mut m, "equal", FontBigger);
+    leaf(&mut m, "minus", FontSmaller);
+    leaf(&mut m, "0", FontReset);
+
+    // --- Groups. The letter is the noun: t=tabs, p=panes, c=clipboard, f=find,
+    // a=ai, l=launch, o=open, s=session.
+    group(&mut m, "t", "Tabs", |g| {
+        leaf(g, "t", NewTab);
+        leaf(g, "n", NextTab);
+        leaf(g, "p", PrevTab);
+        leaf(g, "w", CloseTab);
+        leaf(g, "r", RenameTab);
+        leaf(g, "u", ReopenClosed);
+        leaf(g, "h", MoveTabLeft);
+        leaf(g, "l", MoveTabRight);
+        leaf(g, "left", MoveTabLeft);
+        leaf(g, "right", MoveTabRight);
+    });
+    group(&mut m, "p", "Panes", |g| {
+        leaf(g, "d", SplitHorizontal);
+        leaf(g, "e", SplitVertical);
+        leaf(g, "x", ClosePane);
+        leaf(g, "z", ToggleZoom);
+        leaf(g, "c", CycleLayout);
+        leaf(g, "n", FocusNext);
+        leaf(g, "b", ToggleBroadcast);
+        leaf(g, "g", ToggleBroadcastGroup);
+    });
+    group(&mut m, "c", "Clipboard", |g| {
+        leaf(g, "c", Copy);
+        leaf(g, "v", Paste);
+        leaf(g, "h", ClipboardHistory);
+        leaf(g, "o", CopyLastOutput);
+        leaf(g, "m", CopyMode);
+        leaf(g, "p", PipeLastOutput);
+        leaf(g, "s", PipeScrollback);
+    });
+    group(&mut m, "f", "Find & scroll", |g| {
+        leaf(g, "f", SearchScrollback);
+        leaf(g, "h", HistorySearch);
+        leaf(g, "i", HintMode);
+        leaf(g, "e", OpenScrollbackInEditor);
+        leaf(g, "w", WatchKeyword);
+        leaf(g, "o", FoldOutput);
+        leaf(g, "n", JumpNextPrompt);
+        leaf(g, "p", JumpPrevPrompt);
+        leaf(g, "t", ScrollToTop);
+        leaf(g, "b", ScrollToBottom);
+        // Page scroll, on the vim half-page letters and on the page keys.
+        leaf(g, "u", ScrollPageUp);
+        leaf(g, "d", ScrollPageDown);
+        leaf(g, "pageup", ScrollPageUp);
+        leaf(g, "pagedown", ScrollPageDown);
+    });
+    group(&mut m, "a", "AI", |g| {
+        leaf(g, "a", ToggleAi);
+        leaf(g, "g", FixLastCommand);
+        leaf(g, "w", AskAiAboutError);
+        leaf(g, "m", AiCommand);
+        leaf(g, "e", AiExplain);
+        leaf(g, "s", SummarizeSession);
+    });
+    // `r` for run, not `l` for launch: `l` is focus-right on the vim row and that
+    // is not negotiable — the letter that is free wins over the nicer mnemonic.
+    group(&mut m, "r", "Run & launch", |g| {
+        leaf(g, "c", LaunchClaude);
+        leaf(g, "w", Whisper);
+        leaf(g, "s", QuickConnect);
+        leaf(g, "m", NowPlaying);
+        leaf(g, "l", LaunchLayout);
+    });
+    group(&mut m, "o", "Open", |g| {
+        leaf(g, "c", OpenConfig);
+        leaf(g, "t", OpenThemePicker);
+        leaf(g, "d", ShowDocs);
+        leaf(g, "s", OpenSnippets);
+        leaf(g, "p", CommandPalette);
+        leaf(g, "i", ToggleImageWatch);
+        leaf(g, "w", SetImageWatchDir);
+    });
+    group(&mut m, "s", "Session", |g| {
+        leaf(g, "s", SaveProjectSession);
+        leaf(g, "r", RestoreProjectSession);
+        leaf(g, "c", ClearSelectionOrScrollback);
+        leaf(g, "q", Quit);
+    });
     m
+}
+
+/// Binds one action at this level.
+fn leaf(map: &mut HashMap<Chord, LeaderNode>, spec: &str, action: Action) {
+    match Chord::parse(spec) {
+        Some(chord) => {
+            map.insert(chord, LeaderNode::Run(action));
+        }
+        None => debug_assert!(false, "built-in leader chord {spec:?} does not parse"),
+    }
+}
+
+/// Opens a group at this level and fills it.
+fn group(
+    map: &mut HashMap<Chord, LeaderNode>,
+    spec: &str,
+    title: &'static str,
+    fill: impl FnOnce(&mut HashMap<Chord, LeaderNode>),
+) {
+    let mut keys = HashMap::new();
+    fill(&mut keys);
+    match Chord::parse(spec) {
+        Some(chord) => {
+            map.insert(chord, LeaderNode::Group { title, keys });
+        }
+        None => debug_assert!(false, "built-in leader group {spec:?} does not parse"),
+    }
 }
 
 /// Action id -> a readable chord, for the palette's right-hand hints. Uses the
@@ -895,29 +1124,70 @@ mod tests {
         }
     }
 
-    #[test]
-    fn leader_layer_binds_plain_keys_without_touching_the_normal_map() {
-        let map = Keymap::new(&HashMap::new(), DEFAULT_LEADER);
-        let v = Chord::parse("v").unwrap();
-        assert_eq!(map.leader_bindings.get(&v), Some(&Action::ClipboardHistory));
-        // A bare `v` must stay a literal `v` outside the leader layer.
-        assert_eq!(map.bindings.get(&v), None);
-        assert_eq!(map.leader_bindings.get(&Chord::parse("3").unwrap()), Some(&Action::GoToTab(3)));
+    /// Walks a written sequence (`"t n"`) the way the key handler would, and
+    /// returns the action it lands on — `None` for a miss or a bare group.
+    fn seq<'a>(map: &'a Keymap, spec: &str) -> Option<&'a Action> {
+        let path: Vec<Chord> = spec.split_whitespace().map(|s| Chord::parse(s).unwrap()).collect();
+        match map.resolve_leader(&path) {
+            Some(LeaderNode::Run(a)) => Some(a),
+            _ => None,
+        }
+    }
+
+    /// The same, but from real key events, so the modifier relaxation is exercised.
+    fn seq_events<'a>(map: &'a Keymap, keys: &[(Key, ModifiersState)]) -> Option<&'a Action> {
+        let path: Vec<Chord> =
+            keys.iter().map(|(k, m)| Chord::from_event(k, *m).unwrap()).collect();
+        match map.resolve_leader(&path) {
+            Some(LeaderNode::Run(a)) => Some(a),
+            _ => None,
+        }
     }
 
     #[test]
-    fn user_can_bind_and_disable_the_leader_layer() {
-        let mut user = HashMap::new();
-        user.insert("leader+z".into(), "quit".into());
-        let map = Keymap::new(&user, "alt+shift+j");
-        assert_eq!(map.leader_bindings.get(&Chord::parse("z").unwrap()), Some(&Action::Quit));
-        assert_eq!(map.leader, Chord::parse("alt+shift+j"));
-        // The default leader entries survive a user addition.
-        assert_eq!(map.leader_bindings.get(&Chord::parse("v").unwrap()), Some(&Action::ClipboardHistory));
+    fn leader_layer_binds_plain_keys_without_touching_the_normal_map() {
+        let map = Keymap::new(&HashMap::new(), DEFAULT_LEADER);
+        assert_eq!(seq(&map, "v"), Some(&Action::ClipboardHistory));
+        assert_eq!(seq(&map, "3"), Some(&Action::GoToTab(3)));
+        // A bare `v` must stay a literal `v` outside the leader layer.
+        assert_eq!(map.bindings.get(&Chord::parse("v").unwrap()), None);
+    }
 
-        // An empty spec turns the layer off rather than falling back to a chord the
-        // user did not ask for.
-        assert_eq!(Keymap::new(&HashMap::new(), "").leader, None);
+    #[test]
+    fn leader_groups_take_a_second_key() {
+        let map = Keymap::new(&HashMap::new(), DEFAULT_LEADER);
+        assert_eq!(seq(&map, "r c"), Some(&Action::LaunchClaude));
+        assert_eq!(seq(&map, "t t"), Some(&Action::NewTab));
+        assert_eq!(seq(&map, "c v"), Some(&Action::Paste));
+        // A group on its own runs nothing — it waits.
+        assert!(matches!(map.resolve_leader(&[Chord::parse("r").unwrap()]), Some(LeaderNode::Group { .. })));
+        assert_eq!(seq(&map, "r"), None);
+        // And a miss inside a group is a miss, not a fall back to the root.
+        assert_eq!(seq(&map, "r 1"), None);
+    }
+
+    #[test]
+    fn every_action_with_a_normal_binding_is_reachable_from_the_leader() {
+        // The layer is meant to be a superset: anything on ctrl+shift must also
+        // have a leader path, or "everything is under the leader" is a lie.
+        let map = Keymap::new(&HashMap::new(), DEFAULT_LEADER);
+        let mut reachable = Vec::new();
+        fn walk(level: &HashMap<Chord, LeaderNode>, out: &mut Vec<String>) {
+            for node in level.values() {
+                match node {
+                    LeaderNode::Run(a) => out.push(a.id().to_string()),
+                    LeaderNode::Group { keys, .. } => walk(keys, out),
+                }
+            }
+        }
+        walk(&map.leader_bindings, &mut reachable);
+        for action in default_bindings().values() {
+            assert!(
+                reachable.iter().any(|id| id == action.id()),
+                "{} has a chord but no leader path",
+                action.id()
+            );
+        }
     }
 
     #[test]
@@ -925,20 +1195,56 @@ mod tests {
         let map = Keymap::new(&HashMap::new(), DEFAULT_LEADER);
         let one = Key::Character("1".into());
         // Nobody lets go of alt+shift between the leader and `1`.
-        assert_eq!(map.resolve_leader(&one, ModifiersState::ALT), Some(&Action::GoToTab(1)));
+        assert_eq!(seq_events(&map, &[(one.clone(), ModifiersState::ALT)]), Some(&Action::GoToTab(1)));
         assert_eq!(
-            map.resolve_leader(&one, ModifiersState::ALT | ModifiersState::SHIFT),
+            seq_events(&map, &[(one.clone(), ModifiersState::ALT | ModifiersState::SHIFT)]),
             Some(&Action::GoToTab(1))
         );
-        assert_eq!(map.resolve_leader(&one, ModifiersState::empty()), Some(&Action::GoToTab(1)));
-        // A shifted letter falls back to its unshifted binding.
-        let v = Key::Character("V".into());
+        assert_eq!(seq_events(&map, &[(one, ModifiersState::empty())]), Some(&Action::GoToTab(1)));
+        // Held modifiers are dropped at every level, not just the first.
         assert_eq!(
-            map.resolve_leader(&v, ModifiersState::ALT | ModifiersState::SHIFT),
-            Some(&Action::ClipboardHistory)
+            seq_events(
+                &map,
+                &[
+                    (Key::Character("r".into()), ModifiersState::ALT),
+                    (Key::Character("c".into()), ModifiersState::ALT),
+                ]
+            ),
+            Some(&Action::LaunchClaude)
         );
         // An unbound key is still unbound, however it is modified.
-        assert_eq!(map.resolve_leader(&Key::Character("q".into()), ModifiersState::ALT), None);
+        assert_eq!(seq_events(&map, &[(Key::Character("ñ".into()), ModifiersState::ALT)]), None);
+    }
+
+    #[test]
+    fn a_shifted_key_binds_apart_from_its_unshifted_one() {
+        // Focus is hjkl, resize is HJKL: the exact chord has to win, or the shifted
+        // row would relax straight back into focus.
+        let map = Keymap::new(&HashMap::new(), DEFAULT_LEADER);
+        let h = Key::Character("h".into());
+        assert_eq!(seq_events(&map, &[(h.clone(), ModifiersState::empty())]), Some(&Action::FocusLeft));
+        assert_eq!(seq_events(&map, &[(h, ModifiersState::SHIFT)]), Some(&Action::ResizeLeft));
+    }
+
+    #[test]
+    fn user_can_bind_and_disable_the_leader_layer() {
+        let mut user = HashMap::new();
+        user.insert("leader+z".into(), "quit".into());
+        // A sequence binds into a group, creating it if it does not exist.
+        user.insert("leader+t x".into(), "close_tab".into());
+        user.insert("leader+w a b".into(), "new_tab".into());
+        let map = Keymap::new(&user, "alt+shift+j");
+        assert_eq!(seq(&map, "z"), Some(&Action::Quit));
+        assert_eq!(seq(&map, "t x"), Some(&Action::CloseTab));
+        assert_eq!(seq(&map, "w a b"), Some(&Action::NewTab));
+        assert_eq!(map.leader, Chord::parse("alt+shift+j"));
+        // The defaults survive a user addition, in the same group and elsewhere.
+        assert_eq!(seq(&map, "t t"), Some(&Action::NewTab));
+        assert_eq!(seq(&map, "v"), Some(&Action::ClipboardHistory));
+
+        // An empty spec turns the layer off rather than falling back to a chord the
+        // user did not ask for.
+        assert_eq!(Keymap::new(&HashMap::new(), "").leader, None);
     }
 
     #[test]
@@ -947,8 +1253,27 @@ mod tests {
         user.insert("leader+ctrl+v".into(), "quit".into());
         let map = Keymap::new(&user, DEFAULT_LEADER);
         let v = Key::Character("v".into());
-        assert_eq!(map.resolve_leader(&v, ModifiersState::CONTROL), Some(&Action::Quit));
-        assert_eq!(map.resolve_leader(&v, ModifiersState::empty()), Some(&Action::ClipboardHistory));
+        assert_eq!(seq_events(&map, &[(v.clone(), ModifiersState::CONTROL)]), Some(&Action::Quit));
+        assert_eq!(
+            seq_events(&map, &[(v, ModifiersState::empty())]),
+            Some(&Action::ClipboardHistory)
+        );
+    }
+
+    #[test]
+    fn the_which_key_panel_lists_a_level_in_scan_order() {
+        let map = Keymap::new(&HashMap::new(), DEFAULT_LEADER);
+        let root = map.leader_entries(&[]);
+        // Digits first, then letters: hash order would make the panel unreadable.
+        assert_eq!(root.first().map(|(k, ..)| k.as_str()), Some("0"));
+        let launch = map.leader_entries(&[Chord::parse("r").unwrap()]);
+        assert!(launch.iter().any(|(k, t, group)| k == "c" && t.contains("Claude") && !group));
+        // Groups are flagged so the panel can colour them apart from actions.
+        assert!(root.iter().any(|(k, _, group)| k == "r" && *group));
+        // ...and hjkl stay actions at the root, not groups.
+        assert!(root.iter().any(|(k, _, group)| k == "l" && !*group));
+        // A level that is an action, not a group, has nothing to list.
+        assert!(map.leader_entries(&[Chord::parse("v").unwrap()]).is_empty());
     }
 
     #[test]
