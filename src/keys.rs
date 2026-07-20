@@ -307,6 +307,14 @@ fn named_key(key: NamedKey, mods: ModifiersState, mode: KeyMode) -> Option<Vec<u
     };
 
     match key {
+        // Plain Enter is CR. Shift+Enter has no legacy encoding of its own — the
+        // kitty protocol spells it CSI 13;2u, but an app only gets that if it
+        // enabled the protocol first, and several (Claude Code among them) never
+        // send the CSI ? u query. ESC-CR is the de-facto fallback those apps
+        // already understand: it is exactly the sequence Claude Code's
+        // /terminal-setup installs for Alacritty and VS Code. Apps that ignore it
+        // see Alt+Enter, which is harmless.
+        NamedKey::Enter if mods.shift_key() => b("\x1b\r"),
         NamedKey::Enter => b("\r"),
         NamedKey::Backspace => {
             // Plain Backspace: DEL, not BS. Every Unix terminal has done this since
@@ -402,6 +410,18 @@ mod tests {
         let tab = kit(&Key::Named(NamedKey::Tab), Some("\t"), m(false, false, false, false), DISAMB)
             .unwrap();
         assert_eq!(tab, b"\t");
+    }
+
+    #[test]
+    fn legacy_shift_enter_sends_esc_cr() {
+        let mode = KeyMode::default();
+        // Unmodified Enter stays a bare CR.
+        assert_eq!(named_key(NamedKey::Enter, m(false, false, false, false), mode).unwrap(), b"\r");
+        // Shift+Enter gets the ESC-CR fallback so apps can tell it from Enter
+        // without the kitty protocol.
+        assert_eq!(named_key(NamedKey::Enter, m(true, false, false, false), mode).unwrap(), b"\x1b\r");
+        // Ctrl+Enter is not the shortcut we are encoding — it keeps plain CR.
+        assert_eq!(named_key(NamedKey::Enter, m(false, true, false, false), mode).unwrap(), b"\r");
     }
 
     #[test]

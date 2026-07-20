@@ -244,6 +244,12 @@ impl Pane {
         self.pty.resize(cols as u16, rows as u16);
     }
 
+    /// Adopts a new cell size after a font zoom or a display-scale change. The grid
+    /// keeps it to size inline images in cells.
+    pub fn set_cell_px(&mut self, cell: (f32, f32)) {
+        self.grid.lock().unwrap().set_cell_px(cell.0, cell.1);
+    }
+
     pub fn scroll(&mut self, lines: isize) -> bool {
         self.grid.lock().unwrap().scroll_display(lines)
     }

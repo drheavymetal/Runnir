@@ -363,7 +363,57 @@ bumps next_pane_seed). Startup restore in `init_gpu` takes precedence over `rest
 Caveat: macOS cwd is OSC-7-only (`platform::cwd` returns None) — no shell integration ⇒
 no cwd to key/restore; rely on `behaviour.shell_integration` (default on).
 
+## 2026-07-20 — HiDPI / per-monitor scale, and Shift+Enter
+
+Pedro: "en la pantalla central se ve muy pequeño" + "shift+enter no hace salto de línea".
+Setup: `eDP-2` 1920x1080 scale 1.0, `DP-6` 1920x1080 scale 1.0, `DP-9` 3840x2160
+**scale 1.5**. Only the 4K was wrong — `hyprctl monitors -j` is how you confirm this
+in one command; do that FIRST before reading any code.
+
+**Scale.** runnir had *no* DPI handling at all: `init_gpu` built the atlas at
+`config.font.size` in raw physical px, and `WindowEvent::ScaleFactorChanged` fell
+into the catch-all arm. winit binds `wp_fractional_scale_v1` for us — the scale
+arrives at the app boundary and was thrown away. Fix: `font_px` is now the *logical*
+size (zoom steps and the 6..72 clamp stay logical, so a size means the same thing on
+every monitor) and a new `Gpu.scale` multiplies it wherever the atlas is built —
+`init_gpu`, `set_font_px`, the config hot-reload. New `set_scale()` handles the event;
+it is separate from `set_font_px` because the logical size does NOT change there and
+`set_font_px`'s `< 0.5` early-return would swallow the rebuild.
+
+**The real bug behind "las líneas se salen por abajo".** `Tab` caches the cell size
+in `self.cell` (tab.rs) at construction and `reflow` divides pane rects by it —
+**nothing ever reassigned it**. So after any font change the PTY got sized with the
+OLD cell: on DP-9 the renderer drew 63 rows while `stty size` inside the pane said
+92, and everything below row 63 was invisible. This was ALREADY broken for the
+`Ctrl +/-` font zoom; the scale work only made it obvious. Fix: `Tab::set_cell()`
+(also pushes to each pane's grid via `Pane::set_cell_px`, for inline-image sizing),
+called from both reflow sites — `reflow_all()` and `Gpu::resize()`.
+
+Debug technique worth repeating: compare what the renderer thinks against what the
+child actually got, from OUTSIDE the terminal —
+`for c in $(pgrep -P $(pgrep -n runnir)); do stty size < /proc/$c/fd/0; done`.
+A mismatch there is the whole bug class. Temporary `RUNNIR_SCALE_DEBUG` eprintln in
+`resize`/`set_scale` (surface, cell, derived cols/rows) pinpointed it; removed after.
+
+**Shift+Enter.** The kitty keyboard protocol was already fully implemented (`CSI ? u`
+query answered, Shift+Enter → `CSI 13;2u`). The problem is Claude Code **never sends
+the query**: its binary contains the reply parser `/^\x1b\[\?(\d+)u$/` but the string
+`[?u` appears nowhere, and `TERM` is `xterm-256color` with no `TERM_PROGRAM`. So it
+stays in legacy mode, where Enter and Shift+Enter were both a bare `\r`. Fix in
+`keys.rs::named_key`: legacy Shift+Enter now sends `\x1b\r` (ESC-CR) — exactly the
+sequence Claude Code's own `/terminal-setup` installs for Alacritty and VS Code, so
+apps already understand it; the rest read it as Alt+Enter, which is harmless.
+
 ## Gotchas (do not re-learn)
+
+- Font size is LOGICAL (`Gpu.font_px`); the atlas is always `font_px * scale`. Never
+  pass a raw config size to `FontAtlas::new_with` — multiply by `self.scale`.
+- Any font/cell change MUST call `Tab::set_cell()` before `Tab::reflow()`, or the PTY
+  is sized with a stale cell and output runs off the bottom of the window.
+- `ScaleFactorChanged` arrives BEFORE `Resized` on Wayland; reflowing in it uses the
+  old surface size. Harmless because the `Resized` reflow follows — don't "fix" it.
+- Claude Code does not probe for the kitty keyboard protocol. Terminal-side protocol
+  support alone is not enough; the legacy encoding has to carry Shift+Enter as ESC-CR.
 
 - wgpu 30 API differs from all tutorials — read vendored source in ~/.cargo/registry/src/*/wgpu-30.0.0.
 - sRGB: shader must emit LINEAR (surface is *UnormSrgb). Use to_linear() on every colour.

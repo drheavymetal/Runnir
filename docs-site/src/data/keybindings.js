@@ -6,13 +6,26 @@
 // (identical chords) with { es, en } pairs when the "key" is a descriptive word.
 export const KEY_GROUPS = [
   {
+    group: { es: 'Capa leader', en: 'Leader layer' },
+    rows: [
+      { keys: ['Alt+Space'], id: 'leader', title: { es: 'Armar la capa leader; luego una tecla suelta (3 s). Se reasigna con el ajuste leader; "" la desactiva', en: 'Arm the leader layer, then one plain key (3 s). Rebind with the leader setting; "" turns it off' } },
+      { keys: ['Leader 1 .. Leader 9'], id: 'go_to_tab_N', title: { es: 'Ir a la pestaña N', en: 'Go to tab N' } },
+      { keys: ['Leader H J K L', { es: 'Leader flechas', en: 'Leader arrows' }], id: 'resize_*', title: { es: 'Redimensionar el panel enfocado', en: 'Resize the focused pane' } },
+      { keys: ['Leader V'], id: 'clipboard_history', title: { es: 'Historial del portapapeles', en: 'Clipboard history' } },
+      { keys: ['Leader S'], id: 'open_snippets', title: { es: 'Insertar un snippet de comando', en: 'Insert command snippet' } },
+      { keys: ['Leader P'], id: 'now_playing', title: { es: 'Overlay de reproducción (media)', en: 'Now-playing overlay (media)' } },
+      { keys: ['Leader G'], id: 'fix_last_command', title: { es: 'IA: arreglar el último comando fallido', en: 'AI: fix the last failed command' } },
+      { keys: [{ es: 'leader+<tecla>', en: 'leader+<key>' }], id: '[keys]', title: { es: 'Prefijo para atar tus propias acciones a la capa desde el config', en: 'Prefix that binds your own actions on the layer from the config' } },
+    ],
+  },
+  {
     group: { es: 'Pestañas', en: 'Tabs' },
     rows: [
       { keys: ['Ctrl+Shift+T'], id: 'new_tab', title: { es: 'Nueva pestaña', en: 'New tab' } },
       { keys: ['Ctrl+Shift+W'], id: 'close_tab', title: { es: 'Cerrar pestaña', en: 'Close tab' } },
       { keys: ['Ctrl+Tab', 'Ctrl+PageDown'], id: 'next_tab', title: { es: 'Pestaña siguiente', en: 'Next tab' } },
       { keys: ['Ctrl+Shift+Tab', 'Ctrl+PageUp'], id: 'prev_tab', title: { es: 'Pestaña anterior', en: 'Previous tab' } },
-      { keys: ['Super+1 .. Super+9'], id: 'go_to_tab_N', title: { es: 'Ir a la pestaña N', en: 'Go to tab N' } },
+      { keys: ['Leader 1 .. Leader 9'], id: 'go_to_tab_N', title: { es: 'Ir a la pestaña N', en: 'Go to tab N' } },
       { keys: ['Ctrl+Shift+R'], id: 'rename_tab', title: { es: 'Renombrar pestaña', en: 'Rename tab' } },
       { keys: ['Ctrl+Shift+U'], id: 'reopen_closed', title: { es: 'Reabrir pestaña cerrada', en: 'Reopen closed tab' } },
       { keys: ['Ctrl+Shift+Left'], id: 'move_tab_left', title: { es: 'Mover pestaña a la izquierda', en: 'Move tab left' } },
@@ -29,10 +42,10 @@ export const KEY_GROUPS = [
       { keys: ['Ctrl+Shift+J'], id: 'focus_down', title: { es: 'Foco al panel de abajo', en: 'Focus down pane' } },
       { keys: ['Ctrl+Shift+K'], id: 'focus_up', title: { es: 'Foco al panel de arriba', en: 'Focus up pane' } },
       { keys: ['Ctrl+Shift+L'], id: 'focus_right', title: { es: 'Foco al panel de la derecha', en: 'Focus right pane' } },
-      { keys: ['Super+Left'], id: 'resize_left', title: { es: 'Encoger panel', en: 'Shrink pane' } },
-      { keys: ['Super+Right'], id: 'resize_right', title: { es: 'Agrandar panel', en: 'Grow pane' } },
-      { keys: ['Super+Up'], id: 'resize_up', title: { es: 'Agrandar panel hacia arriba', en: 'Grow pane upward' } },
-      { keys: ['Super+Down'], id: 'resize_down', title: { es: 'Agrandar panel hacia abajo', en: 'Grow pane downward' } },
+      { keys: ['Alt+Shift+Left', 'Leader H'], id: 'resize_left', title: { es: 'Encoger panel', en: 'Shrink pane' } },
+      { keys: ['Alt+Shift+Right', 'Leader L'], id: 'resize_right', title: { es: 'Agrandar panel', en: 'Grow pane' } },
+      { keys: ['Alt+Shift+Up', 'Leader K'], id: 'resize_up', title: { es: 'Agrandar panel hacia arriba', en: 'Grow pane upward' } },
+      { keys: ['Alt+Shift+Down', 'Leader J'], id: 'resize_down', title: { es: 'Agrandar panel hacia abajo', en: 'Grow pane downward' } },
       { keys: ['Ctrl+Shift+Z'], id: 'toggle_zoom', title: { es: 'Zoom / des-zoom del panel enfocado', en: 'Zoom / unzoom focused pane' } },
     ],
   },
@@ -41,7 +54,7 @@ export const KEY_GROUPS = [
     rows: [
       { keys: ['Ctrl+Shift+C'], id: 'copy', title: { es: 'Copiar selección', en: 'Copy selection' } },
       { keys: ['Ctrl+Shift+V'], id: 'paste', title: { es: 'Pegar', en: 'Paste' } },
-      { keys: ['Super+V'], id: 'clipboard_history', title: { es: 'Historial del portapapeles', en: 'Clipboard history' } },
+      { keys: ['Alt+Shift+V', 'Leader V'], id: 'clipboard_history', title: { es: 'Historial del portapapeles', en: 'Clipboard history' } },
       { keys: [{ es: 'Clic central', en: 'Middle click' }], id: '(primaria)', title: { es: 'Pegar la selección primaria', en: 'Paste the primary selection' } },
       { keys: ['Ctrl+Shift+O'], id: 'copy_last_output', title: { es: 'Copiar la salida del último comando', en: 'Copy last command output' } },
       { keys: ['Ctrl+Shift+F'], id: 'search', title: { es: 'Buscar en el historial', en: 'Search the scrollback' } },
@@ -67,7 +80,7 @@ export const KEY_GROUPS = [
     rows: [
       { keys: ['Ctrl+Shift+A'], id: 'toggle_ai', title: { es: 'Abrir/cerrar el asistente IA', en: 'Toggle the AI assistant' } },
       { keys: ['Ctrl+Shift+G'], id: 'ask_ai_about_error', title: { es: 'IA: por qué ha fallado esto', en: 'AI: why did this fail' } },
-      { keys: ['Super+Shift+G'], id: 'fix_last_command', title: { es: 'IA: arreglar el último comando fallido', en: 'AI: fix the last failed command' } },
+      { keys: ['Alt+Shift+G', 'Leader G'], id: 'fix_last_command', title: { es: 'IA: arreglar el último comando fallido', en: 'AI: fix the last failed command' } },
       { keys: ['Ctrl+Shift+M'], id: 'ai_command', title: { es: 'IA: lenguaje natural a comando', en: 'AI: natural language to command' } },
       { keys: ['Ctrl+Shift+Y'], id: 'ai_explain', title: { es: 'IA: explicar la selección', en: 'AI: explain the selection' } },
       { keys: ['Ctrl+Shift+I'], id: 'summarize_session', title: { es: 'IA: resumir la sesión', en: 'AI: summarize the session' } },
@@ -83,8 +96,8 @@ export const KEY_GROUPS = [
       { keys: ['Ctrl+Shift+Space'], id: 'hint_mode', title: { es: 'Hint mode (abrir/copiar en pantalla)', en: 'Hint mode (open/copy on screen)' } },
       { keys: ['Ctrl+Shift+S'], id: 'quick_connect', title: { es: 'SSH: conexión rápida', en: 'SSH: quick connect' } },
       { keys: ['Ctrl+Shift+B'], id: 'toggle_broadcast', title: { es: 'Activar/desactivar broadcast', en: 'Toggle broadcast' } },
-      { keys: ['Super+S'], id: 'open_snippets', title: { es: 'Insertar un snippet de comando', en: 'Insert command snippet' } },
-      { keys: ['Super+P'], id: 'now_playing', title: { es: 'Overlay de reproducción (media)', en: 'Now-playing overlay (media)' } },
+      { keys: ['Alt+Shift+S', 'Leader S'], id: 'open_snippets', title: { es: 'Insertar un snippet de comando', en: 'Insert command snippet' } },
+      { keys: ['Alt+Shift+P', 'Leader P'], id: 'now_playing', title: { es: 'Overlay de reproducción (media)', en: 'Now-playing overlay (media)' } },
     ],
   },
   {

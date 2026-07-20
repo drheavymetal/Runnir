@@ -338,6 +338,18 @@ impl Tab {
 
     /// Reapplies the layout to every pane after the tree or the window changed, so
     /// each child PTY learns its true size.
+    /// Adopts a new cell size — the font zoom changed, or the window moved to a
+    /// display with a different scale. Without this the cached `cell` stays at the
+    /// size captured when the tab was built, and `reflow` then divides the pane
+    /// rects by a cell size that is no longer being drawn: the PTY is told it has
+    /// more rows than actually fit, and output runs off the bottom of the window.
+    pub fn set_cell(&mut self, cell: (f32, f32)) {
+        self.cell = cell;
+        for pane in self.panes.values_mut() {
+            pane.set_cell_px(cell);
+        }
+    }
+
     pub fn reflow(&mut self, area: Rect) {
         for (id, rect) in self.layout(area) {
             let (cols, rows) = cells_in(rect, self.cell, self.minimap);

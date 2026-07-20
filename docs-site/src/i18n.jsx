@@ -139,8 +139,8 @@ export const UI = {
   // Keybindings page
   kbTitle: { es: 'Atajos de teclado', en: 'Keybindings' },
   kbLede: {
-    es: 'Atajos por defecto, sacados de src/actions.rs y src/docs.rs. La columna id es el nombre de la acción para reasignarla en [keys]. Los atajos propios usan siempre Ctrl+Shift o Super, nunca Ctrl+letra a secas: eso pertenece al programa del panel.',
-    en: 'Default keybinds, from src/actions.rs and src/docs.rs. The id column is the action name you rebind under [keys]. runnir’s own binds always use Ctrl+Shift or Super, never a bare Ctrl+letter — that belongs to the program in the pane.',
+    es: 'Atajos por defecto, sacados de src/actions.rs y src/docs.rs. La columna id es el nombre de la acción para reasignarla en [keys]. Los atajos propios usan siempre Ctrl+Shift, Alt+Shift o la capa leader, nunca Ctrl+letra a secas: eso pertenece al programa del panel. Tampoco Super: el compositor se queda esa capa antes de que runnir vea la tecla.',
+    en: 'Default keybinds, from src/actions.rs and src/docs.rs. The id column is the action name you rebind under [keys]. runnir’s own binds always use Ctrl+Shift, Alt+Shift or the leader layer, never a bare Ctrl+letter — that belongs to the program in the pane. Never Super either: the compositor grabs that layer before runnir sees the key.',
   },
   kbColKeys: { es: 'Teclas', en: 'Keys' },
   kbColAction: { es: 'Acción', en: 'Action' },

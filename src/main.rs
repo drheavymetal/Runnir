@@ -351,7 +351,15 @@ struct Gpu {
     /// The focused pane id and its cursor cell rect last frame, to detect a jump for
     /// the trail — keyed to the pane so a focus/tab change is not read as a move.
     last_cursor_rect: Option<(u64, f32, f32, f32, f32)>,
+    /// The font size in *logical* pixels — what the config asks for and what the
+    /// zoom actions step. The atlas is always rasterised at `font_px * scale`, so
+    /// this stays display-independent and a zoom means the same thing on every
+    /// monitor.
     font_px: f32,
+    /// The current display scale factor (1.0 on a normal monitor, 1.5/2.0 on HiDPI
+    /// or under fractional scaling). Everything else in the renderer works in
+    /// physical pixels; this is the one place logical becomes physical.
+    scale: f32,
     /// The (family, size, ligatures) the config last asked for, so hot-reload can
     /// tell an actual font change from an unrelated edit — and so a color-only reload
     /// does not snap a runtime font-zoom back to the configured size.
@@ -415,6 +423,8 @@ fn wake_fn(proxy: EventLoopProxy<UserEvent>) -> impl Fn() + Send + Clone + 'stat
 
 impl App {
     fn init_gpu(&mut self, event_loop: &ActiveEventLoop) -> Gpu {
+        let t0 = Instant::now();
+        let mark = |what: &str| eprintln!("[boot] {what}: {:?}", t0.elapsed());
         let mut attrs = Window::default_attributes()
             .with_title("runnir")
             .with_decorations(self.config.window.decorations && !self.quake)
@@ -428,20 +438,25 @@ impl App {
             attrs = attrs.with_name(app_id, app_id);
         }
         let window = Arc::new(event_loop.create_window(attrs).unwrap());
+        mark("create_window");
 
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        mark("Instance::new");
         let surface = instance.create_surface(window.clone()).unwrap();
+        mark("create_surface");
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::LowPower,
             compatible_surface: Some(&surface),
             ..Default::default()
         }))
         .expect("no suitable GPU adapter");
+        mark("request_adapter");
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("runnir"),
             ..Default::default()
         }))
         .expect("failed to create device");
+        mark("request_device");
 
         let size = window.inner_size();
         let mut surface_config = surface
@@ -459,13 +474,17 @@ impl App {
             }
         }
         surface.configure(&device, &surface_config);
+        mark("surface_configure");
         println!("runnir: {} ({:?})", adapter.get_info().name, adapter.get_info().backend);
 
         let font_px = self.config.font.size;
-        let mut font =
-            FontAtlas::new_with(&self.config.font.family, font_px).unwrap_or_else(|e| panic!("font: {e}"));
+        let scale = window.scale_factor() as f32;
+        let mut font = FontAtlas::new_with(&self.config.font.family, font_px * scale)
+            .unwrap_or_else(|e| panic!("font: {e}"));
         font.ligatures = self.config.font.ligatures;
+        mark("font_atlas");
         let mut renderer = Renderer::new(&device, surface_config.format, font);
+        mark("renderer_new");
         renderer.set_theme(self.config.theme.clone());
         // Apply opacity when the compositor can show through (translucent) OR a
         // background image is set (the image is drawn in-pass, behind the translucent
@@ -552,6 +571,7 @@ impl App {
             cursor_trail: Vec::new(),
             last_cursor_rect: None,
             font_px,
+            scale,
             applied_font: (
                 self.config.font.family.clone(),
                 self.config.font.size,
@@ -757,6 +777,14 @@ impl ApplicationHandler<UserEvent> for App {
                 event_loop.exit();
             }
             WindowEvent::Resized(size) => gpu.resize(size.width, size.height, &self.config),
+            // Dragging the window to a monitor with a different scale (or a
+            // fractional-scale change under Wayland) keeps the same logical font
+            // size but must re-rasterise the atlas at the new density — otherwise
+            // the glyphs stay at the old monitor's pixel size and look tiny on a
+            // HiDPI screen. winit sends a Resized right after this, which reflows.
+            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                gpu.set_scale(scale_factor as f32, &self.config)
+            }
             WindowEvent::RedrawRequested => gpu.render(&self.config),
             WindowEvent::ModifiersChanged(m) => self.mods = m.state(),
             WindowEvent::MouseWheel { delta, .. } => gpu.on_wheel(delta, &self.config, self.mods),
@@ -969,7 +997,9 @@ impl Gpu {
         self.surface_config.height = h.max(1);
         self.surface.configure(&self.device, &self.surface_config);
         let area = self.active_area();
+        let cell = self.renderer.cell_size();
         for tab in &mut self.tabs {
+            tab.set_cell(cell);
             tab.reflow(area);
         }
         self.reapply_zoom();

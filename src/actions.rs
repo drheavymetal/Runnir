@@ -514,9 +514,12 @@ impl Chord {
     }
 }
 
-/// Default chord that arms the leader layer. Alt+Space is free in every tiling
-/// compositor checked (Hyprland, sway, GNOME) and is not an editing key in the
-/// shell, unlike the alt+letter Meta bindings readline owns.
+/// Default chord that arms the leader layer. Alt+Space is free on Hyprland and
+/// sway, and is not an editing key in the shell, unlike the alt+letter Meta
+/// bindings readline owns. It is *not* universally free — GNOME/GTK opens the
+/// window menu with it, KDE's krunner claims it by default, and launchers
+/// (rofi, wofi, albert) are often bound there — so it is a setting: `leader` in
+/// the config rebinds it, an empty string turns the layer off.
 pub const DEFAULT_LEADER: &str = "alt+space";
 
 /// Prefix marking a user binding as living on the leader layer: `"leader+v"`.
@@ -576,8 +579,20 @@ impl Keymap {
     }
 
     /// Resolves a key pressed while the leader layer is armed.
+    ///
+    /// The exact chord wins, so `"leader+ctrl+r"` still binds a modified key. On a
+    /// miss the modifiers held to reach the leader are dropped and it tries again:
+    /// nobody lets go of alt between `alt+space` and `1`, and an exact-only match
+    /// would swallow that keystroke instead of switching tabs. Shift is dropped
+    /// last so a shifted key still finds its unshifted binding (`leader+V` → `v`).
     pub fn resolve_leader(&self, key: &Key, mods: ModifiersState) -> Option<&Action> {
-        Chord::from_event(key, mods).and_then(|c| self.leader_bindings.get(&c))
+        let chord = Chord::from_event(key, mods)?;
+        let relaxed = Chord { alt: false, supr: false, ctrl: false, ..chord.clone() };
+        let bare = Chord { shift: false, ..relaxed.clone() };
+        self.leader_bindings
+            .get(&chord)
+            .or_else(|| self.leader_bindings.get(&relaxed))
+            .or_else(|| self.leader_bindings.get(&bare))
     }
 }
 
@@ -894,6 +909,33 @@ mod tests {
         // An empty spec turns the layer off rather than falling back to a chord the
         // user did not ask for.
         assert_eq!(Keymap::new(&HashMap::new(), "").leader, None);
+    }
+
+    #[test]
+    fn leader_layer_ignores_the_modifiers_still_held_from_the_leader() {
+        let map = Keymap::new(&HashMap::new(), DEFAULT_LEADER);
+        let one = Key::Character("1".into());
+        // Nobody lets go of alt between `alt+space` and `1`.
+        assert_eq!(map.resolve_leader(&one, ModifiersState::ALT), Some(&Action::GoToTab(1)));
+        assert_eq!(map.resolve_leader(&one, ModifiersState::empty()), Some(&Action::GoToTab(1)));
+        // A shifted letter falls back to its unshifted binding.
+        let v = Key::Character("V".into());
+        assert_eq!(
+            map.resolve_leader(&v, ModifiersState::ALT | ModifiersState::SHIFT),
+            Some(&Action::ClipboardHistory)
+        );
+        // An unbound key is still unbound, however it is modified.
+        assert_eq!(map.resolve_leader(&Key::Character("q".into()), ModifiersState::ALT), None);
+    }
+
+    #[test]
+    fn exact_leader_chord_wins_over_the_relaxed_match() {
+        let mut user = HashMap::new();
+        user.insert("leader+ctrl+v".into(), "quit".into());
+        let map = Keymap::new(&user, DEFAULT_LEADER);
+        let v = Key::Character("v".into());
+        assert_eq!(map.resolve_leader(&v, ModifiersState::CONTROL), Some(&Action::Quit));
+        assert_eq!(map.resolve_leader(&v, ModifiersState::empty()), Some(&Action::ClipboardHistory));
     }
 
     #[test]

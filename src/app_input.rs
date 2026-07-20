@@ -1389,7 +1389,9 @@ impl Gpu {
 
     fn reflow_all(&mut self) {
         let area = self.active_area();
+        let cell = self.renderer.cell_size();
         for tab in &mut self.tabs {
+            tab.set_cell(cell);
             tab.reflow(area);
         }
         self.reapply_zoom();
@@ -1901,7 +1903,7 @@ impl Gpu {
         // family/ligature change (same size) is applied.
         let want = (config.font.family.clone(), config.font.size, config.font.ligatures);
         if want != self.applied_font {
-            match FontAtlas::new_with(&config.font.family, config.font.size) {
+            match FontAtlas::new_with(&config.font.family, config.font.size * self.scale) {
                 Ok(mut font) => {
                     font.ligatures = config.font.ligatures;
                     self.renderer.replace_font(&self.device, font);
@@ -1920,15 +1922,32 @@ impl Gpu {
         self.window.request_redraw();
     }
 
+    /// Sets the font size in *logical* pixels; the atlas is rasterised at
+    /// `px * scale` so a given size looks the same on every monitor.
     fn set_font_px(&mut self, px: f32, config: &Config) {
         let px = px.clamp(6.0, 72.0);
         if (px - self.font_px).abs() < 0.5 {
             return;
         }
-        if let Ok(mut font) = FontAtlas::new_with(&config.font.family, px) {
+        if let Ok(mut font) = FontAtlas::new_with(&config.font.family, px * self.scale) {
             font.ligatures = config.font.ligatures;
             self.renderer.replace_font(&self.device, font);
             self.font_px = px;
+            self.reflow_all();
+        }
+    }
+
+    /// Adopts a new display scale factor, re-rasterising the atlas at the same
+    /// logical font size. Separate from `set_font_px` because the logical size is
+    /// unchanged here — its early-return would swallow the rebuild.
+    fn set_scale(&mut self, scale: f32, config: &Config) {
+        if !scale.is_finite() || scale <= 0.0 || (scale - self.scale).abs() < 0.01 {
+            return;
+        }
+        self.scale = scale;
+        if let Ok(mut font) = FontAtlas::new_with(&config.font.family, self.font_px * scale) {
+            font.ligatures = config.font.ligatures;
+            self.renderer.replace_font(&self.device, font);
             self.reflow_all();
         }
     }

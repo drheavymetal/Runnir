@@ -7,6 +7,12 @@
 // d (description) is an { es, en } pair.
 export const CONFIG_GROUPS = [
   {
+    group: 'raíz / top-level',
+    rows: [
+      { k: 'leader', v: '"alt+space"', d: { es: 'Acorde que arma la capa leader: se pulsa, se suelta y luego una tecla suelta (Leader 1..9, hjkl, v, s, p, g). El armado caduca a los 3 s. Cadena vacía = capa desactivada.', en: 'Chord that arms the leader layer: press it, release, then one plain key (Leader 1..9, hjkl, v, s, p, g). The arming expires after 3 s. An empty string turns the layer off.' } },
+    ],
+  },
+  {
     group: '[font]',
     rows: [
       { k: 'family', v: '"JetBrainsMono Nerd Font Mono"', d: { es: 'Familia de fuente monoespaciada. Se sobrescribe con la variable RUNNIR_FONT.', en: 'Monospace font family. Overridden by the RUNNIR_FONT variable.' } },
@@ -80,7 +86,8 @@ export const CONFIG_GROUPS = [
     group: '[keys]',
     rows: [
       { k: '"ctrl+shift+t"', v: '"new_tab"', d: { es: 'Ejemplo: reasignar un atajo. Se fusiona sobre los de fábrica.', en: 'Example: rebind a shortcut. Merges over the defaults.' } },
-      { k: 'formato de acorde', v: '"ctrl+shift+X" / "alt+enter" / "super+1"', d: { es: 'Modificadores: ctrl, shift, alt (opt/option), super (cmd/win/meta).', en: 'Modifiers: ctrl, shift, alt (opt/option), super (cmd/win/meta).' } },
+      { k: 'formato de acorde', v: '"ctrl+shift+X" / "alt+enter" / "alt+shift+v"', d: { es: 'Modificadores: ctrl, shift, alt (opt/option), super (cmd/win/meta). Evita super: el compositor se queda esa capa antes de que la tecla llegue a runnir.', en: 'Modifiers: ctrl, shift, alt (opt/option), super (cmd/win/meta). Avoid super: the compositor grabs that layer before the key reaches runnir.' } },
+      { k: '"leader+v"', v: '"clipboard_history"', d: { es: 'El prefijo leader+ ata la tecla a la capa leader, donde va sin modificadores.', en: 'A leader+ prefix binds the key on the leader layer, where it needs no modifiers.' } },
     ],
   },
   {
