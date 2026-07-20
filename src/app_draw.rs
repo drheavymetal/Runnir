@@ -519,7 +519,7 @@ impl Gpu {
         // point is "runnir is holding your next keystroke", which has to read at a
         // glance. Expiry is checked here too — `about_to_wait` repaints on the
         // deadline, but a repaint for any other reason must not draw a dead chip.
-        let armed = self.leader_armed.is_some_and(|t| t.elapsed() < crate::LEADER_TIMEOUT);
+        let armed = self.leader_armed.is_some_and(|t| self.leader_timeout.is_none_or(|d| t.elapsed() < d));
         let mut x = 1;
         if armed {
             let chip = Pen {

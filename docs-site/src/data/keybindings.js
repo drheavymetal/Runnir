@@ -8,7 +8,7 @@ export const KEY_GROUPS = [
   {
     group: { es: 'Capa leader', en: 'Leader layer' },
     rows: [
-      { keys: ['Alt+Shift+Space'], id: 'leader', title: { es: 'Armar la capa leader. Sale LEADER en la barra inferior y un panel con lo que hace la siguiente tecla; las teclas frecuentes actúan ya, el resto abren un grupo que pide una tecla más. 3 s por paso; Esc sale. Se reasigna con el ajuste leader; "" la desactiva', en: 'Arm the leader layer. The bottom bar shows LEADER and a panel lists what the next key does; the frequent keys act at once, the rest open a group that takes one more key. 3 s per step; Esc leaves. Rebind with the leader setting; "" turns it off' } },
+      { keys: ['Alt+Shift+Space'], id: 'leader', title: { es: 'Armar la capa leader. Sale LEADER en la barra inferior y un panel con lo que hace la siguiente tecla; las teclas frecuentes actúan ya, el resto abren un grupo que pide una tecla más. 10 s por paso (leader_timeout; 0 = sin caducidad); Esc sale. Se reasigna con el ajuste leader; "" la desactiva', en: 'Arm the leader layer. The bottom bar shows LEADER and a panel lists what the next key does; the frequent keys act at once, the rest open a group that takes one more key. 10 s per step (leader_timeout; 0 = never lapses); Esc leaves. Rebind with the leader setting; "" turns it off' } },
       { keys: ['Leader 1 .. Leader 9'], id: 'go_to_tab_N', title: { es: 'Ir a la pestaña N', en: 'Go to tab N' } },
       { keys: ['Leader h j k l'], id: 'focus_*', title: { es: 'Mover el foco de panel', en: 'Move pane focus' } },
       { keys: ['Leader H J K L', { es: 'Leader flechas', en: 'Leader arrows' }], id: 'resize_*', title: { es: 'Redimensionar el panel enfocado', en: 'Resize the focused pane' } },

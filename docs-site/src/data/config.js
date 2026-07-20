@@ -9,7 +9,8 @@ export const CONFIG_GROUPS = [
   {
     group: 'raíz / top-level',
     rows: [
-      { k: 'leader', v: '"alt+shift+space"', d: { es: 'Acorde que arma la capa leader: se pulsa, se suelta y luego una tecla suelta (Leader 1..9, hjkl, v, s, p, g). Mientras está armada la barra inferior muestra LEADER. Caduca a los 3 s. Cadena vacía = capa desactivada. Evita ctrl+alt+space al reasignarlo: ctrl+alt es AltGr en la distribución española.', en: 'Chord that arms the leader layer: press it, release, then one plain key (Leader 1..9, hjkl, v, s, p, g). While armed the status bar shows LEADER. It expires after 3 s. An empty string turns the layer off. Avoid ctrl+alt+space when rebinding: ctrl+alt is AltGr on the Spanish layout.' } },
+      { k: 'leader', v: '"alt+shift+space"', d: { es: 'Acorde que arma la capa leader: se pulsa, se suelta y luego una tecla suelta (1..9, hjkl, v, g) o una de grupo (t, p, c, f, a, r, o, s) que pide una segunda. Mientras está armada la barra inferior muestra LEADER y un panel lista las opciones. Cadena vacía = capa desactivada. Evita ctrl+alt+space al reasignarlo: ctrl+alt es AltGr en la distribución española.', en: 'Chord that arms the leader layer: press it, release, then one plain key (1..9, hjkl, v, g) or a group key (t, p, c, f, a, r, o, s) that takes a second one. While armed the status bar shows LEADER and a panel lists the options. An empty string turns the layer off. Avoid ctrl+alt+space when rebinding: ctrl+alt is AltGr on the Spanish layout.' } },
+      { k: 'leader_timeout', v: '10', d: { es: 'Segundos que espera cada paso de la capa leader antes de caducar. 0 = no caduca nunca (estilo prefijo de tmux): entonces solo se sale con una acción, una tecla no ligada o Esc.', en: 'Seconds each leader step waits before lapsing. 0 = it never lapses (tmux-prefix style): the layer then leaves only on an action, an unbound key, or Esc.' } },
     ],
   },
   {

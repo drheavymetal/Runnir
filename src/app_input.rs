@@ -277,7 +277,7 @@ impl Gpu {
             if let Some(armed_at) = self.leader_armed {
                 // An expired arm is treated as no arm at all: the key falls through to
                 // the pane, so a stray keystroke is never silently eaten.
-                if armed_at.elapsed() >= crate::LEADER_TIMEOUT {
+                if self.leader_timeout.is_some_and(|d| armed_at.elapsed() >= d) {
                     self.cancel_leader();
                 } else {
                     // Escape backs out of the whole layer, the way it leaves every
@@ -322,7 +322,7 @@ impl Gpu {
                 // toast — an invisible modal layer is how you eat a keystroke and
                 // leave the user wondering.
                 if !self.status_bar {
-                    self.toast("leader…", crate::LEADER_TIMEOUT.as_secs());
+                    self.toast("leader…", self.leader_timeout.map_or(30, |d| d.as_secs()));
                 }
                 self.window.request_redraw();
                 return;
@@ -1899,6 +1899,7 @@ impl Gpu {
     /// Applies a freshly-loaded config live (hot-reload): theme, opacity and font.
     /// Key bindings are rebuilt by the caller (they live on `App`, not `Gpu`).
     fn apply_config(&mut self, config: &Config) {
+        self.leader_timeout = crate::leader_timeout(config);
         // A status-bar toggle changes the content height, so reflow after.
         if self.status_bar != config.window.status_bar {
             self.status_bar = config.window.status_bar;

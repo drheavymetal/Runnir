@@ -20,9 +20,10 @@ app cannot bind around that. So runnir keeps its own layer behind a leader key.
 Press Alt+Shift+Space and let go. The status bar shows LEADER and a panel lists
 what the next key does, so the layer teaches itself — you never have to remember
 a table. Then press a key: the hot ones act immediately, the rest open a group
-that takes one more key. Three seconds per step; Escape or any unbound key backs
-out, and nothing leaks to the shell. Modifiers you are still holding are ignored,
-so you can keep Alt+Shift down through the whole sequence.
+that takes one more key. Escape or any unbound key backs out, and nothing leaks
+to the shell. Modifiers you are still holding are ignored, so you can keep
+Alt+Shift down through the whole sequence. Ten seconds per step by default;
+`leader_timeout` changes it, and 0 means it waits as long as you do.
 
 Bare Alt+Space is deliberately NOT the leader: it is the window menu on Windows
 and GNOME, krunner on KDE and PowerToys Run on Windows, so it would never reach

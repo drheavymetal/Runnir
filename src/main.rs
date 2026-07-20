@@ -54,8 +54,12 @@ use crate::tab::Tab;
 /// Height of the tab bar, in cells. Shown only when more than one tab exists.
 const TABBAR_ROWS: f32 = 1.0;
 
-/// How long the leader layer stays armed waiting for its second key.
-pub const LEADER_TIMEOUT: Duration = Duration::from_secs(3);
+/// How long each leader step waits for the next key, from the config. `None` when
+/// `leader_timeout = 0`: the layer then stays armed until an action, a miss or
+/// Escape, the way a tmux prefix does.
+pub fn leader_timeout(config: &Config) -> Option<Duration> {
+    (config.leader_timeout > 0).then(|| Duration::from_secs(config.leader_timeout))
+}
 
 /// Width of the minimap strip, in pixels. Like the tab bar, this is chrome that
 /// overlaps the pane, so the text grid must reserve it — see `tab::cells_in`.
@@ -335,6 +339,10 @@ struct Gpu {
     /// The keys pressed since the leader was armed, i.e. how deep into the tree we
     /// are. Empty at the root — the which-key panel renders whatever level it names.
     leader_path: Vec<Chord>,
+    /// How long each leader step waits, from `leader_timeout` in the config.
+    /// `None` means it never lapses. Cached on `Gpu` because the expiry is read
+    /// from the draw path and the event loop, neither of which holds the config.
+    leader_timeout: Option<Duration>,
     /// What the which-key panel draws for the level `leader_path` names: `(key,
     /// what it does, is it a group)`. Snapshotted when the layer is armed or steps
     /// into a group, because the keymap lives in `App` and the draw code only ever
@@ -574,6 +582,7 @@ impl App {
             leader_armed: None,
             leader_path: Vec::new(),
             leader_entries: Vec::new(),
+            leader_timeout: leader_timeout(&self.config),
             image_watch: None,
             media_wave: None,
             media_last_refresh: None,
@@ -862,9 +871,13 @@ impl ApplicationHandler<UserEvent> for App {
         // terminal the status-bar chip would stay lit long after the layer was gone.
         // Clear it here and repaint once; the wake itself is folded into `extra_wake`
         // below rather than returning early, which would stall the animations.
-        if gpu.leader_armed.is_some_and(|t| t.elapsed() >= LEADER_TIMEOUT) {
-            gpu.leader_armed = None;
-            gpu.window.request_redraw();
+        if let Some(limit) = gpu.leader_timeout {
+            if gpu.leader_armed.is_some_and(|t| t.elapsed() >= limit) {
+                gpu.leader_armed = None;
+                gpu.leader_path.clear();
+                gpu.leader_entries.clear();
+                gpu.window.request_redraw();
+            }
         }
 
         // Animate a scroll glide (smooth scroll-to-top/bottom / jump-to-prompt).
@@ -922,7 +935,8 @@ impl ApplicationHandler<UserEvent> for App {
         let media_wake = matches!(gpu.overlay, Some(Overlay::Media(_)))
             .then(|| Instant::now() + Duration::from_millis(250));
         // And the armed leader, so the chip clears itself on an otherwise idle window.
-        let leader_wake = gpu.leader_armed.map(|t| t + LEADER_TIMEOUT);
+        // Nothing to wake for when the layer never lapses.
+        let leader_wake = gpu.leader_timeout.and_then(|d| gpu.leader_armed.map(|t| t + d));
         // Whichever background timer is soonest is the one to wake on.
         let extra_wake = [watch_wake, media_wake, leader_wake].into_iter().flatten().min();
 

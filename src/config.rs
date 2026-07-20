@@ -34,6 +34,12 @@ pub struct Config {
     /// win every modifier race — see `actions::default_leader_bindings`.
     #[serde(default = "default_leader")]
     pub leader: String,
+    /// Seconds the leader layer stays armed waiting for the next key, per step.
+    /// `0` means it never lapses, tmux-style: it then leaves only on an action, a
+    /// miss, or Escape. The default is generous because the which-key panel is on
+    /// screen the whole time — you are reading it, not stalling.
+    #[serde(default = "default_leader_timeout")]
+    pub leader_timeout: u64,
     /// Named workspace layouts. Each opens a fresh tab split into one pane per
     /// command. Launch from the palette (Launch layout) — e.g. a `servers` layout
     /// that ssh's into .3/.7/.9/.188 at once.
@@ -85,6 +91,7 @@ impl Default for Config {
             media: Media::default(),
             keys: HashMap::new(),
             leader: default_leader(),
+            leader_timeout: default_leader_timeout(),
             layouts: Vec::new(),
             snippets: Vec::new(),
         }
@@ -138,6 +145,10 @@ fn default_bg_dim() -> f32 {
 
 fn default_leader() -> String {
     crate::actions::DEFAULT_LEADER.to_string()
+}
+
+fn default_leader_timeout() -> u64 {
+    10
 }
 
 impl Default for WindowCfg {
@@ -659,6 +670,16 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn leader_timeout_zero_means_the_layer_never_lapses() {
+        let mut cfg = Config::default();
+        assert_eq!(crate::leader_timeout(&cfg), Some(std::time::Duration::from_secs(10)));
+        cfg.leader_timeout = 0;
+        assert_eq!(crate::leader_timeout(&cfg), None);
+        cfg.leader_timeout = 45;
+        assert_eq!(crate::leader_timeout(&cfg), Some(std::time::Duration::from_secs(45)));
+    }
 
     #[test]
     fn defaults_round_trip_through_toml() {
