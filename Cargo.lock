@@ -2620,6 +2620,7 @@ dependencies = [
  "unicode-width",
  "ureq",
  "vte",
+ "wayland-client",
  "wgpu",
  "winit",
 ]

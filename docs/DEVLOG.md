@@ -525,6 +525,37 @@ Ruled out along the way: `fontdb::load_system_fonts()` is 10ms for 976 faces
 because fontdb 0.23 memory-maps rather than reads (676MB of fonts on this box
 are never touched); the 27MB binary and page-cache eviction are not the issue.
 
+## 2026-07-21 — Drag-and-drop of files, spoken to Wayland directly
+
+Dropping a file on runnir did nothing on Hyprland: **winit 0.30's Wayland backend
+implements no drag-and-drop at all**. `WindowEvent::DroppedFile` exists and is raised
+on X11, macOS and Windows only — which is every platform except the one runnir
+actually runs on.
+
+`src/dnd.rs` (new) speaks `wl_data_device` itself. It attaches to the connection winit
+already opened (`Backend::from_foreign_display` on the raw display handle from
+`RawDisplayHandle::Wayland`) and opens its OWN event queue on it. That is legal and
+cheap: a Wayland queue only receives events for proxies created from it, so our
+registry, seat and data device are entirely ours and winit never sees them. Binding a
+second `wl_seat` does not disturb the first — seats are compositor state, not a
+client-side claim. It runs on its own thread blocking in `blocking_dispatch`, and
+reports drops through the same `EventLoopProxy` the PTY and AI workers use
+(`UserEvent::FilesDropped`). `start_wayland_dnd` is a no-op on an X11 display, or the
+path would be typed twice.
+
+MIME is `text/uri-list` (RFC 2483: one URI per line, CRLF, `#` comments). The drop
+event carries no position, so the last `motion` is stashed in an `AtomicU64` with both
+f32s packed into one word — a two-field version could hand the reader an x from one
+motion and a y from the next.
+
+`on_files_dropped` focuses the pane under the drop (Wayland gives surface-LOGICAL
+coordinates; multiply by `gpu.scale` before the hit test) and TYPES the paths — no
+newline, ever. Each is wrapped by `shell_quote` in single quotes, where every byte is
+literal; a `'` closes, escapes and reopens. A file named `; rm -rf ~` has to arrive as
+a filename, not a command. Tested for spaces, globs, `$`, apostrophes and a newline in
+the name. winit's own `DroppedFile` (X11/macOS/Windows) is one event per file and
+carries no coordinates, so it passes `None` and lands in the focused pane.
+
 ## Gotchas (do not re-learn)
 
 - A binding spec and a keypress must produce the SAME `ChordKey` variant.

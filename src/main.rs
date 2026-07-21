@@ -4,6 +4,7 @@ mod boxdraw;
 mod clipboard;
 mod config;
 mod control;
+mod dnd;
 mod docs;
 mod font;
 mod graphics;
@@ -30,6 +31,7 @@ mod themes;
 mod watch;
 mod whisper;
 
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -78,6 +80,10 @@ pub enum UserEvent {
     /// replies; the socket thread waits (bounded) on the other end. This is the only
     /// safe cross-thread path to the terminal state — same reasoning as `Redraw`.
     Control(control::ControlRequest, std::sync::mpsc::Sender<control::ControlResponse>),
+    /// Files dropped onto the window under Wayland, with the surface-logical
+    /// coordinates of the drop. Comes from the `dnd` thread, which is the only
+    /// place Wayland drag-and-drop exists — winit has none.
+    FilesDropped(Vec<std::path::PathBuf>, f64, f64),
     /// A now-playing update from a media worker: fetched metadata or a waveform frame.
     /// Delivered off the UI thread via the proxy, same wake pattern as `Ai`, so the
     /// playerctl / cava subprocess never blocks rendering.
@@ -551,6 +557,12 @@ impl App {
         let window = Arc::new(event_loop.create_window(attrs).unwrap());
         mark("create_window");
 
+        // Wayland drag-and-drop, which winit does not implement. Started here
+        // because it needs the surface, and skipped entirely on X11/macOS, where
+        // winit's own `DroppedFile` covers it.
+        #[cfg(all(unix, not(target_os = "macos")))]
+        start_wayland_dnd(&window, self.proxy.clone());
+
         // On a hybrid laptop the Vulkan loader enumerates every ICD, and touching the
         // NVIDIA one resumes a runtime-suspended discrete GPU. That wake costs ~1.8s,
         // which is why the first launch after an idle stretch feels slow while the
@@ -916,6 +928,13 @@ impl ApplicationHandler<UserEvent> for App {
                 let _ = reply.send(resp);
             }
             UserEvent::Media(msg) => gpu.on_media_msg(msg, &self.config),
+            // Wayland reports the drop in surface-logical coordinates; the pane hit
+            // test works in physical pixels, so scale before asking where it landed.
+            UserEvent::FilesDropped(paths, x, y) => {
+                let scale = gpu.scale as f64;
+                let at = PhysicalPosition::new(x * scale, y * scale);
+                gpu.on_files_dropped(&paths, Some(at));
+            }
         }
     }
 
@@ -936,6 +955,14 @@ impl ApplicationHandler<UserEvent> for App {
                 gpu.set_scale(scale_factor as f32, &self.config)
             }
             WindowEvent::RedrawRequested => gpu.render(&self.config),
+            // One event per file, so a multi-file drag arrives as a run of these
+            // and each path appends its own argument. winit gives no drop
+            // coordinates here, hence `None` — see `on_files_dropped`.
+            //
+            // NOTE: winit 0.30 only raises this on X11, macOS and Windows; its
+            // Wayland backend has no drag-and-drop at all. Under a Wayland session
+            // the drop is picked up by `dnd`, which speaks wl_data_device directly.
+            WindowEvent::DroppedFile(path) => gpu.on_files_dropped(&[path], None),
             WindowEvent::ModifiersChanged(m) => self.mods = m.state(),
             WindowEvent::MouseWheel { delta, .. } => gpu.on_wheel(delta, &self.config, self.mods),
             WindowEvent::CursorMoved { position, .. } => gpu.on_cursor(position, self.mods),
@@ -1297,3 +1324,19 @@ impl Gpu {
 include!("app_input.rs");
 include!("app_ai.rs");
 include!("app_draw.rs");
+
+/// Hands the `dnd` listener the raw Wayland handles for this window.
+///
+/// A no-op on an X11 display: the handles are then X11 handles, winit already
+/// delivers `DroppedFile` there, and running both would type the path twice.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn start_wayland_dnd(window: &Window, proxy: EventLoopProxy<UserEvent>) {
+    use winit::raw_window_handle::{
+        HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle,
+    };
+    let (Ok(dh), Ok(wh)) = (window.display_handle(), window.window_handle()) else { return };
+    if let (RawDisplayHandle::Wayland(d), RawWindowHandle::Wayland(w)) = (dh.as_raw(), wh.as_raw())
+    {
+        dnd::start(d.display.as_ptr(), w.surface.as_ptr(), proxy);
+    }
+}

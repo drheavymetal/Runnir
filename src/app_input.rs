@@ -1896,6 +1896,35 @@ impl Gpu {
         }
     }
 
+    /// A file dropped onto the window types its full path at the prompt.
+    ///
+    /// `at` is where it landed, when the platform tells us; winit's X11 drop
+    /// carries no coordinates, so `None` means the focused pane — the predictable
+    /// answer, and the only honest one when we do not know where the pointer was.
+    ///
+    /// The path is typed, never run: no newline is ever sent, so what happens to
+    /// it is the shell's business (or vim's, or whatever holds the pane).
+    fn on_files_dropped(&mut self, paths: &[PathBuf], at: Option<PhysicalPosition<f64>>) {
+        if paths.is_empty() {
+            return;
+        }
+        if let Some(pos) = at {
+            let area = self.active_area();
+            if let Some((id, _)) = self.pane_at(pos, area) {
+                self.tabs[self.active].focus = id;
+            }
+        }
+        // Trailing space so a second drop lands as a second argument and you can
+        // keep typing without one.
+        let mut text = String::new();
+        for p in paths {
+            text.push_str(&shell_quote(&p.to_string_lossy()));
+            text.push(' ');
+        }
+        self.paste_text(text);
+        self.window.request_redraw();
+    }
+
     /// Applies a freshly-loaded config live (hot-reload): theme, opacity and font.
     /// Key bindings are rebuilt by the caller (they live on `App`, not `Gpu`).
     fn apply_config(&mut self, config: &Config) {
@@ -2666,6 +2695,61 @@ fn ssh_hosts() -> Vec<String> {
     hosts.sort();
     hosts.dedup();
     hosts
+}
+
+/// Wraps a string so a POSIX shell reads it back as exactly one word.
+///
+/// Single quotes, because inside them every byte is literal — spaces, `$`, `*`,
+/// backslashes and even a newline. The one character that cannot appear is `'`
+/// itself, which is closed, escaped and reopened (`it's` -> `'it'\''s'`). Dropped
+/// paths go through this: a file called `my report (final).txt` must arrive as one
+/// argument, and one called `; rm -rf ~` must arrive as a filename.
+fn shell_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for c in s.chars() {
+        if c == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(c);
+        }
+    }
+    out.push('\'');
+    out
+}
+
+#[cfg(test)]
+mod shell_quote_tests {
+    use super::shell_quote;
+
+    #[test]
+    fn a_plain_path_is_just_quoted() {
+        assert_eq!(shell_quote("/home/pedro/notes.md"), "'/home/pedro/notes.md'");
+    }
+
+    #[test]
+    fn spaces_and_globs_stay_one_word() {
+        assert_eq!(shell_quote("/tmp/my report (final).txt"), "'/tmp/my report (final).txt'");
+        assert_eq!(shell_quote("/tmp/*.rs"), "'/tmp/*.rs'");
+        assert_eq!(shell_quote("/tmp/$HOME"), "'/tmp/$HOME'");
+    }
+
+    #[test]
+    fn an_apostrophe_closes_escapes_and_reopens() {
+        assert_eq!(shell_quote("/tmp/it's here"), r"'/tmp/it'\''s here'");
+    }
+
+    #[test]
+    fn a_hostile_filename_stays_a_filename() {
+        // The whole point: a file named like a command must not become one. The
+        // quoting leaves nothing outside the quotes for the shell to act on.
+        let q = shell_quote("/tmp/; rm -rf ~");
+        assert_eq!(q, "'/tmp/; rm -rf ~'");
+        assert!(!q[1..q.len() - 1].contains('\''), "no quote escapes the wrapper");
+        // A newline in a name is legal on Unix; quoted, it is data, not a new line
+        // of input to run.
+        assert_eq!(shell_quote("/tmp/a\nb"), "'/tmp/a\nb'");
+    }
 }
 
 #[cfg(test)]

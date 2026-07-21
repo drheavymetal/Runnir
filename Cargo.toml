@@ -28,6 +28,12 @@ winit = "0.30.13"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# Wayland drag-and-drop. winit 0.30 has none on Wayland, so `dnd` talks to
+# wl_data_device on winit's own connection. Version-matched to what winit already
+# pulls in, so there is one wayland-client in the tree, not two.
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+wayland-client = "0.31.14"
+
 # macOS process introspection (cwd + foreground name), the /proc equivalent.
 [target.'cfg(target_os = "macos")'.dependencies]
 libproc = "0.14"
