@@ -26,6 +26,9 @@ pub struct Config {
     /// Now-playing media overlay (album art, transport, waveform).
     #[serde(default)]
     pub media: Media,
+    /// The file explorer sidebar.
+    #[serde(default)]
+    pub explorer: Explorer,
     /// Extra keybindings, merged over the built-in ones. `"ctrl+shift+t" = "new_tab"`.
     /// A `"leader+v"` key binds on the leader layer instead of as a plain chord.
     pub keys: HashMap<String, String>,
@@ -89,6 +92,7 @@ impl Default for Config {
             ai: Ai::default(),
             watch: Watch::default(),
             media: Media::default(),
+            explorer: Explorer::default(),
             keys: HashMap::new(),
             leader: default_leader(),
             leader_timeout: default_leader_timeout(),
@@ -350,6 +354,35 @@ pub struct Media {
 impl Default for Media {
     fn default() -> Self {
         Self { waveform: true, bars: 24, art_cells: 18 }
+    }
+}
+
+// ---- explorer -------------------------------------------------------------
+
+/// The file explorer sidebar (leader e). Chrome beside the panes, not an overlay.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Explorer {
+    /// Which edge it sits on: `"left"` (the default, where every editor puts it) or
+    /// `"right"`.
+    pub side: String,
+    /// Width in COLUMNS, not a fraction of the window: a fraction on an ultrawide
+    /// gives a 90-column tree. Clamped against the window when it is drawn.
+    pub width: usize,
+    /// Show dotfiles. Off by default; `.` toggles it live.
+    pub show_hidden: bool,
+    /// Open the sidebar on start, in every tab.
+    pub open_on_start: bool,
+}
+
+impl Default for Explorer {
+    fn default() -> Self {
+        Self {
+            side: "left".to_string(),
+            width: 30,
+            show_hidden: false,
+            open_on_start: false,
+        }
     }
 }
 

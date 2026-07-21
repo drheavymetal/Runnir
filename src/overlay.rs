@@ -1528,7 +1528,7 @@ fn first_line(s: &str) -> String {
 
 /// Clips to `width` columns, marking the cut, so a truncated path is never mistaken
 /// for a shorter one.
-fn elide(s: &str, width: usize) -> String {
+pub fn elide(s: &str, width: usize) -> String {
     if width == 0 {
         return String::new();
     }

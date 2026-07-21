@@ -61,6 +61,8 @@ pub enum Action {
     CopyMode,
     FoldOutput,
     ToggleImageWatch,
+    /// Show/hide the file explorer sidebar, and put the keyboard in it.
+    ToggleExplorer,
     SetImageWatchDir,
     SaveProjectSession,
     RestoreProjectSession,
@@ -151,6 +153,7 @@ impl Action {
             CopyMode => "copy_mode",
             FoldOutput => "fold_output",
             ToggleImageWatch => "toggle_image_watch",
+            ToggleExplorer => "toggle_explorer",
             SetImageWatchDir => "set_image_watch_dir",
             SaveProjectSession => "save_project_session",
             RestoreProjectSession => "restore_project_session",
@@ -235,6 +238,7 @@ impl Action {
             CopyMode => "Copy mode (keyboard select)",
             FoldOutput => "Fold / unfold all command output",
             ToggleImageWatch => "Auto-preview images: toggle on this pane's dir",
+            ToggleExplorer => "File explorer sidebar (tree of the project)",
             SetImageWatchDir => "Auto-preview images: set / clear watched dir",
             SaveProjectSession => "Save session for this project",
             RestoreProjectSession => "Restore session for this project",
@@ -322,6 +326,7 @@ impl Action {
             "copy_mode" => CopyMode,
             "fold_output" => FoldOutput,
             "toggle_image_watch" => ToggleImageWatch,
+            "toggle_explorer" => ToggleExplorer,
             "set_image_watch_dir" => SetImageWatchDir,
             "save_project_session" => SaveProjectSession,
             "restore_project_session" => RestoreProjectSession,
@@ -419,6 +424,7 @@ impl Action {
             CopyMode,
             FoldOutput,
             ToggleImageWatch,
+            ToggleExplorer,
             SetImageWatchDir,
             SaveProjectSession,
             RestoreProjectSession,
@@ -871,6 +877,9 @@ fn default_leader_bindings() -> HashMap<Chord, LeaderNode> {
     // letter is needed as a group.
     leaf(&mut m, "v", ClipboardHistory);
     leaf(&mut m, "g", GitPanel);
+    // `e` for the explorer, beside `g` for git: both are a whole surface, both are
+    // one key. It is also the letter LazyVim uses for the same sidebar.
+    leaf(&mut m, "e", ToggleExplorer);
     // Font size, where every terminal already puts it — but +, - and = are not all
     // one keypress on every layout (on the Spanish one `=` is shift+0), so the
     // letters are the binding that always works and the symbols are the alias.

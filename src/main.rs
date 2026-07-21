@@ -6,6 +6,7 @@ mod config;
 mod control;
 mod dnd;
 mod docs;
+mod explorer;
 mod font;
 mod git;
 mod graphics;
@@ -96,6 +97,10 @@ pub enum UserEvent {
     /// Data or a command result for the git panel, tagged with the request sequence
     /// so a stale preview never paints over a newer one.
     GitPanel(u64, git::PanelMsg),
+    /// One directory the explorer sidebar asked for: the tab it belongs to, the
+    /// tree generation that asked, the directory, and its entries. Off the UI
+    /// thread because `read_dir` of a huge or networked directory drops frames.
+    Explorer(usize, u64, PathBuf, Vec<explorer::Entry>),
 }
 
 fn main() {
@@ -623,6 +628,9 @@ struct Gpu {
     resizing: Option<crate::layout::DividerHit>,
     /// A git panel column separator being dragged (0 = list/files, 1 = files/diff).
     git_drag: Option<usize>,
+    /// The explorer sidebar's edge is being dragged. The panes are reflowed when it
+    /// is released, not while it moves.
+    explorer_resizing: bool,
     /// Whether the pointer is currently over one, so the resize cursor is set once
     /// on the way in and once on the way out rather than on every motion event.
     git_over_split: bool,
@@ -879,6 +887,7 @@ impl App {
             mouse_down: None,
             resizing: None,
             git_drag: None,
+            explorer_resizing: false,
             git_over_split: false,
             zoomed: None,
             bell_flash: None,
@@ -1056,6 +1065,9 @@ impl ApplicationHandler<UserEvent> for App {
             }
             UserEvent::Media(msg) => gpu.on_media_msg(msg, &self.config),
             UserEvent::GitPanel(seq, msg) => gpu.on_git_panel_msg(seq, msg, &self.config),
+            UserEvent::Explorer(tab, seq, dir, entries) => {
+                gpu.on_explorer_read(tab, seq, dir, entries)
+            }
             UserEvent::Git(root, state) => {
                 gpu.git_pending.remove(&root);
                 match state {
@@ -1276,7 +1288,23 @@ impl ApplicationHandler<UserEvent> for App {
 }
 
 impl Gpu {
+    /// The area the PANES get: the window minus the chrome, minus the explorer
+    /// sidebar's columns when the active tab has one open.
+    ///
+    /// Reserving here is what keeps the sidebar out of the layout tree: everything
+    /// downstream — `Tab::layout`, `reflow`, the hit tests, the divider drags — asks
+    /// this one question and never learns there is a sidebar at all.
     fn active_area(&self) -> Rect {
+        let full = self.window_area();
+        match self.tabs.get(self.active).and_then(|t| t.explorer.as_ref()) {
+            Some(e) => e.reserve(full, self.renderer.cell_size()),
+            None => full,
+        }
+    }
+
+    /// The whole content area, sidebar included — what the sidebar itself is placed
+    /// against.
+    fn window_area(&self) -> Rect {
         content_area(&self.surface_config, self.renderer.cell_size(), self.tabs.len(), self.status_bar)
     }
 
@@ -1426,6 +1454,10 @@ impl Gpu {
         // Poll the image auto-preview watch (no-op unless armed). Runs on the periodic
         // wake driven from about_to_wait; never blocks (one read_dir at most).
         self.poll_image_watch(config);
+
+        // Follow the focused shell into another REPOSITORY (not into every
+        // directory) with the explorer's root. Cheap: a cwd read and a compare.
+        self.explorer_sync_root();
 
         // Refresh the now-playing overlay's metadata on a slow timer while it is open,
         // so a track change shows without reopening. Non-blocking: the fetch runs on a

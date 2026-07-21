@@ -486,6 +486,32 @@ application global hotkeys, so the toggle is the compositor's job. For Hyprland:
   bind = , F12, togglespecialworkspace, runnir
   exec-once = runnir --quake
 
+# File explorer sidebar
+
+Leader E opens a tree of the project beside the panes, and puts the keyboard in it.
+It is chrome, not a modal layer: it stays up while you work in the pane next to it,
+and it takes keys only while it has focus (Escape gives them back).
+
+  j k / arrows      move            l or Enter   unfold a directory
+  h                 fold, or go to the parent    g G   top, bottom
+  .                 hidden files    r  reread the tree
+  y                 copy the path   Esc or q     back to the pane
+
+The root is the git repository of the focused pane's directory, or that directory
+when it is not a repo. It follows the shell into another REPOSITORY, not into every
+cd: re-anchoring on each directory would collapse the tree while you navigate.
+
+Click a row to select it, click it again to open it, and drag the sidebar's edge to
+resize it — the panes are only resized when you let go, because a PTY resized on
+every frame of a drag is one full-screen program redrawing itself into a corner.
+
+With the tree focused, the leader key opens a menu of file verbs, the same which-key
+the git panel uses. It offers only what the row under the cursor can do.
+
+Config: explorer.side (left/right), explorer.width in COLUMNS (not a fraction: a
+fraction on an ultrawide gives a 90-column tree), explorer.show_hidden. All three
+are in the settings panel too.
+
 # Remote control
 
 A running runnir listens on a per-user socket and exports its path to the panes as

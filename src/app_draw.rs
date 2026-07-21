@@ -40,6 +40,8 @@ impl Gpu {
         let chrome = self.build_chrome(config, screen);
         let status_holder = self.build_status(config, screen);
         let whichkey_holder = self.build_whichkey(screen);
+        let explorer_holder = self.build_explorer(config);
+        let explorer_keys = self.build_explorer_whichkey(screen);
 
         // Clear dirty flags so the next output marks a fresh redraw. (After chrome, so
         // the activity badge still reflects this frame's unseen output.)
@@ -94,6 +96,12 @@ impl Gpu {
             panes.push(PaneDraw { grid, selection: None, origin: (*ox, *oy), tint: None, focused: true, cursor: None, search: Default::default(), transparent: false });
         }
         if let Some((grid, ox, oy)) = &whichkey_holder {
+            panes.push(PaneDraw { grid, selection: None, origin: (*ox, *oy), tint: None, focused: true, cursor: None, search: Default::default(), transparent: false });
+        }
+        if let Some((grid, ox, oy)) = &explorer_holder {
+            panes.push(PaneDraw { grid, selection: None, origin: (*ox, *oy), tint: None, focused: true, cursor: None, search: Default::default(), transparent: false });
+        }
+        if let Some((grid, ox, oy)) = &explorer_keys {
             panes.push(PaneDraw { grid, selection: None, origin: (*ox, *oy), tint: None, focused: true, cursor: None, search: Default::default(), transparent: false });
         }
 
@@ -563,6 +571,125 @@ impl Gpu {
             bar.write_str(0, right, &s, dim);
         }
         Some((bar, 0.0, y))
+    }
+
+    /// The file explorer sidebar, as a chrome grid beside the panes.
+    ///
+    /// Chrome and not an `Overlay` on purpose: an overlay captures the keyboard and
+    /// dims what it covers, and this has to stay readable while you work in the pane
+    /// next to it. The keyboard goes to it only while `focused`, which the border
+    /// colour says out loud.
+    fn build_explorer(&self, config: &Config) -> Option<(Grid, f32, f32)> {
+        let tab = self.tabs.get(self.active)?;
+        let e = tab.explorer.as_ref().filter(|e| e.open)?;
+        let cell = self.renderer.cell_size();
+        let rect = e.rect(self.window_area(), cell);
+        let cols = (rect.w / cell.0).floor().max(1.0) as usize;
+        let rows = (rect.h / cell.1).floor().max(1.0) as usize;
+
+        let bg = Color::Rgb(0x16, 0x17, 0x1c);
+        let fg = Color::Rgb(0xc8, 0xcb, 0xd2);
+        let dim = Color::Rgb(0x7d, 0x81, 0x8a);
+        let accent = config.theme.accent;
+        let accent = Color::Rgb(accent.0, accent.1, accent.2);
+        let mut g = Grid::new(cols, rows);
+        g.fill(Pen { bg, ..Pen::default() });
+
+        // Header: the root's name, and the marker that says where the keyboard is.
+        let name = e.root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| e.root.display().to_string());
+        let head = crate::overlay::field_view(&name, cols.saturating_sub(3));
+        g.write_str(
+            0,
+            1,
+            &head,
+            Pen { fg: if e.focused { accent } else { dim }, bg, flags: crate::grid::Flags::BOLD, ..Pen::default() },
+        );
+
+        let body = rows.saturating_sub(2);
+        for line in 0..body {
+            let Some(row) = e.rows.get(e.scroll + line) else { break };
+            let y = 1 + line;
+            let selected = e.scroll + line == e.cursor;
+            // The selection stays visible with the keyboard elsewhere, just quieter:
+            // it is what a key would act on the moment focus comes back.
+            if selected {
+                let pen = if e.focused {
+                    Pen { fg: Color::Rgb(0x0d, 0x0d, 0x0f), bg: accent, ..Pen::default() }
+                } else {
+                    Pen { fg, bg: Color::Rgb(0x2c, 0x2f, 0x38), ..Pen::default() }
+                };
+                g.write_str(y, 0, &" ".repeat(cols), pen);
+            }
+            let sel_pen = |c: Color| {
+                if selected && e.focused {
+                    Pen { fg: Color::Rgb(0x0d, 0x0d, 0x0f), bg: accent, ..Pen::default() }
+                } else if selected {
+                    Pen { fg: c, bg: Color::Rgb(0x2c, 0x2f, 0x38), ..Pen::default() }
+                } else {
+                    Pen { fg: c, bg, ..Pen::default() }
+                }
+            };
+            let indent = 1 + row.depth * 2;
+            let mark = if row.more.is_some() {
+                " "
+            } else if row.entry.dir {
+                if row.open { "\u{25be}" } else { "\u{25b8}" }
+            } else {
+                " "
+            };
+            g.write_str(y, indent.min(cols), mark, sel_pen(dim));
+            let x = (indent + 2).min(cols);
+            let room = cols.saturating_sub(x + 1);
+            let colour = if row.more.is_some() {
+                dim
+            } else if row.entry.dir {
+                Color::Rgb(0x6b, 0xb1, 0xff)
+            } else if row.entry.exec {
+                Color::Rgb(0x7a, 0xc0, 0x7a)
+            } else {
+                fg
+            };
+            // Clip a long name from the LEFT of its tail: the end of a filename is
+            // the part that tells you which file it is.
+            let name = crate::overlay::field_view(&row.entry.name, room);
+            g.write_str(y, x, &name, sel_pen(colour));
+            if row.entry.link {
+                let at = cols.saturating_sub(1);
+                g.write_str(y, at, "\u{2192}", sel_pen(dim));
+            }
+        }
+
+        // Footer: what a key does here, or the last thing that happened.
+        let foot = match &e.message {
+            Some(m) => m.clone(),
+            None if e.focused => "enter open \u{b7} h l fold \u{b7} . hidden \u{b7} esc pane".to_string(),
+            None => format!("{} items \u{b7} leader e", e.rows.len()),
+        };
+        g.write_str(
+            rows.saturating_sub(1),
+            1,
+            &crate::overlay::elide(&foot, cols.saturating_sub(2)),
+            Pen { fg: dim, bg, ..Pen::default() },
+        );
+        Some((g, rect.x, rect.y))
+    }
+
+    /// The sidebar's leader menu, drawn along the bottom of the WINDOW rather than
+    /// inside the sidebar: the tree is 30 columns wide and a which-key in it would
+    /// be one entry per line. Same grid the global layer uses.
+    fn build_explorer_whichkey(&self, screen: (f32, f32)) -> Option<(Grid, f32, f32)> {
+        let e = self.tabs.get(self.active)?.explorer.as_ref()?;
+        e.leader.as_ref()?;
+        let entries = e.leader_entries();
+        if entries.is_empty() {
+            return None;
+        }
+        let (cw, ch) = self.renderer.cell_size();
+        let cols = (screen.0 / cw).floor().max(20.0) as usize;
+        let grid = whichkey_grid(&entries, &e.leader_path(), cols);
+        let bar = if self.status_bar { ch } else { 0.0 };
+        let y = screen.1 - bar - grid.rows() as f32 * ch;
+        Some((grid, 0.0, y.max(0.0)))
     }
 
     /// The which-key panel: what the armed leader layer will accept next, in

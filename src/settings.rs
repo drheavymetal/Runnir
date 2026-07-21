@@ -30,6 +30,9 @@ pub enum SettingId {
     RestoreSession,
     CommandGuardian,
     SmoothScroll,
+    ExplorerSide,
+    ExplorerWidth,
+    ExplorerHidden,
 }
 
 /// How a setting is edited, which drives the key handling and the value hint.
@@ -81,6 +84,9 @@ pub fn rows() -> Vec<Row> {
         row!("Behaviour", "Restore session", RestoreSession, Bool),
         row!("Behaviour", "Command guardian", CommandGuardian, Bool),
         row!("Behaviour", "Smooth scroll", SmoothScroll, Bool),
+        row!("Explorer", "Side", ExplorerSide, Enum),
+        row!("Explorer", "Width (columns)", ExplorerWidth, Int),
+        row!("Explorer", "Show hidden files", ExplorerHidden, Bool),
     ]
 }
 
@@ -115,6 +121,9 @@ pub fn value(cfg: &Config, id: SettingId) -> String {
         RestoreSession => onoff(cfg.behaviour.restore_session),
         CommandGuardian => onoff(cfg.behaviour.command_guardian),
         SmoothScroll => onoff(cfg.behaviour.smooth_scroll),
+        ExplorerSide => cfg.explorer.side.clone(),
+        ExplorerWidth => cfg.explorer.width.to_string(),
+        ExplorerHidden => onoff(cfg.explorer.show_hidden),
     }
 }
 
@@ -168,6 +177,18 @@ pub fn adjust(cfg: &mut Config, id: SettingId, dir: i32) {
         RestoreSession => cfg.behaviour.restore_session = up,
         CommandGuardian => cfg.behaviour.command_guardian = up,
         SmoothScroll => cfg.behaviour.smooth_scroll = up,
+        // The sidebar is stored in columns, so it steps in columns. Clamped to the
+        // same floor the sidebar itself enforces, or the panel could set a width
+        // the draw path silently refuses.
+        ExplorerSide => {
+            let side = crate::explorer::Side::parse(&cfg.explorer.side).unwrap_or_default();
+            cfg.explorer.side = side.flip().label().to_string();
+        }
+        ExplorerWidth => {
+            let w = cfg.explorer.width as i32 + dir * 2;
+            cfg.explorer.width = w.clamp(crate::explorer::MIN_WIDTH as i32, 120) as usize;
+        }
+        ExplorerHidden => cfg.explorer.show_hidden = up,
         FontFamily | Background => {} // text; edited inline
     }
 }

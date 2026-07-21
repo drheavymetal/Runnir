@@ -134,6 +134,11 @@ impl Gpu {
             self.window.request_redraw();
             return;
         }
+        // The explorer's edge being dragged, for as long as the button is held.
+        if self.explorer_resizing {
+            self.explorer_drag(position);
+            return;
+        }
         // A git panel column separator being dragged, for as long as the button is
         // held — the same contract the pane dividers have.
         if self.git_drag.is_some() {
@@ -190,6 +195,15 @@ impl Gpu {
         if state == ElementState::Released && button == MouseButton::Left {
             self.resizing = None;
             self.git_drag = None;
+            if self.explorer_resizing {
+                // The panes learn their new size once, here: a PTY resized on every
+                // frame of a drag is how a full-screen program ends up redrawing
+                // itself into a corner.
+                self.explorer_resizing = false;
+                let area = self.active_area();
+                self.tabs[self.active].reflow(area);
+                self.window.request_redraw();
+            }
         }
         // The git panel takes the mouse: it is a list and a diff, and both are
         // things people point at. Every other overlay still swallows clicks.
@@ -210,6 +224,34 @@ impl Gpu {
         // A left press in the focused pane's minimap strip jumps to that position.
         if state == ElementState::Pressed && button == MouseButton::Left && config.window.minimap {
             if self.minimap_jump(self.cursor_px) {
+                return;
+            }
+        }
+
+        // The explorer sidebar: its edge starts a resize, a row selects, and a click
+        // anywhere in it moves the keyboard there. Checked before the panes, since
+        // the sidebar sits outside their area and they would never see it anyway.
+        if state == ElementState::Pressed && button == MouseButton::Left && self.overlay.is_none() {
+            if self.explorer_edge_at(self.cursor_px) {
+                self.explorer_resizing = true;
+                return;
+            }
+            if let Some(row) = self.explorer_row_at(self.cursor_px) {
+                let body = self.explorer_body_rows();
+                let mut open = false;
+                if let Some(e) = self.tabs[self.active].explorer.as_mut() {
+                    e.focused = true;
+                    if let Some(i) = row {
+                        // Clicking the row that is already selected opens it, the way
+                        // the git panel and every file manager work.
+                        open = e.cursor == i;
+                        e.set_cursor(i, body);
+                    }
+                }
+                if open {
+                    self.explorer_key(&Key::Named(NamedKey::Enter), config);
+                }
+                self.window.request_redraw();
                 return;
             }
         }
@@ -386,8 +428,22 @@ impl Gpu {
             return;
         }
 
+        // With the tree focused its own leader answers first: the same chord, a tree
+        // of file verbs instead of the window's.
+        if self.explorer_leader_key(&event.logical_key, mods, config) {
+            return;
+        }
         if self.leader_key(&event.logical_key, mods, config, keymap, event_loop) {
             return;
+        }
+
+        // The sidebar takes the keyboard only while it has focus, and only after the
+        // leader layer and the bound chords: a tree that swallowed ctrl+shift+t would
+        // be a mode, and this is chrome.
+        if self.explorer_focused() && !mods.control_key() && !mods.alt_key() && !mods.super_key() {
+            if self.explorer_key(&event.logical_key, config) {
+                return;
+            }
         }
 
         // The XF86 media transport keys drive the media backend directly, wherever the
@@ -633,6 +689,7 @@ impl Gpu {
             Action::CopyMode => self.enter_copy_mode(),
             Action::FoldOutput => self.tab().focused().toggle_fold_all(),
             Action::ToggleImageWatch => self.toggle_image_watch(config),
+            Action::ToggleExplorer => self.toggle_explorer(config),
             Action::SetImageWatchDir => self.set_image_watch_dir(),
             Action::SaveProjectSession => self.save_project_session_cmd(),
             Action::RestoreProjectSession => self.restore_project_session_cmd(config),
@@ -676,6 +733,369 @@ impl Gpu {
             _ => {}
         }
         self.window.request_redraw();
+    }
+
+    // ------------------------------------------------------------------
+    // File explorer sidebar (explorer.rs). Chrome beside the panes: it takes the
+    // keyboard only while focused, and gives it back with Escape.
+    // ------------------------------------------------------------------
+
+    /// Opens the sidebar and puts the keyboard in it; closes it when it already has
+    /// the keyboard. Open-but-unfocused is a state you reach by clicking a pane, and
+    /// the same key then focuses the tree again rather than hiding it — hiding what
+    /// you just asked to look at is not a toggle anyone wants.
+    fn toggle_explorer(&mut self, config: &Config) {
+        let root = self
+            .tab()
+            .focused_ref()
+            .cwd()
+            .map(|d| crate::explorer::root_for(&d))
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+        let side = crate::explorer::Side::parse(&config.explorer.side).unwrap_or_default();
+        let width = config.explorer.width;
+        let show_hidden = config.explorer.show_hidden;
+        let tab = &mut self.tabs[self.active];
+        match &mut tab.explorer {
+            Some(e) if e.open && e.focused => {
+                e.open = false;
+                e.focused = false;
+            }
+            Some(e) => {
+                e.open = true;
+                e.focused = true;
+                e.set_root(root);
+            }
+            None => {
+                let mut e = crate::explorer::Explorer::new(root, width, side);
+                e.show_hidden = show_hidden;
+                tab.explorer = Some(e);
+            }
+        }
+        self.explorer_read_pending();
+        // The panes just lost (or gained) columns: their PTYs have to be told.
+        let area = self.active_area();
+        self.tabs[self.active].reflow(area);
+        self.window.request_redraw();
+    }
+
+    /// The tree row under a pointer position, if it is over the sidebar at all.
+    /// `Some(None)` means the sidebar but not a row (its header or footer).
+    fn explorer_row_at(&self, pos: PhysicalPosition<f64>) -> Option<Option<usize>> {
+        let e = self.tabs.get(self.active)?.explorer.as_ref().filter(|e| e.open)?;
+        let cell = self.renderer.cell_size();
+        let rect = e.rect(self.window_area(), cell);
+        let (x, y) = (pos.x as f32, pos.y as f32);
+        if x < rect.x || x >= rect.x + rect.w || y < rect.y || y >= rect.y + rect.h {
+            return None;
+        }
+        let line = ((y - rect.y) / cell.1).floor() as usize;
+        // Row 0 is the header and the last row is the footer.
+        let body = (rect.h / cell.1).floor().max(1.0) as usize;
+        if line == 0 || line + 1 >= body {
+            return Some(None);
+        }
+        let i = e.scroll + line - 1;
+        Some((i < e.rows.len()).then_some(i))
+    }
+
+    /// Whether a pointer is on the edge between the sidebar and the panes, where a
+    /// drag resizes it. Two cells wide, like every other divider here: a one-cell
+    /// target is a target you miss.
+    fn explorer_edge_at(&self, pos: PhysicalPosition<f64>) -> bool {
+        let Some(e) = self.tabs.get(self.active).and_then(|t| t.explorer.as_ref()) else {
+            return false;
+        };
+        if !e.open {
+            return false;
+        }
+        let cell = self.renderer.cell_size();
+        let rect = e.rect(self.window_area(), cell);
+        let edge = match e.side {
+            crate::explorer::Side::Left => rect.x + rect.w,
+            crate::explorer::Side::Right => rect.x,
+        };
+        let (x, y) = (pos.x as f32, pos.y as f32);
+        y >= rect.y && y < rect.y + rect.h && (x - edge).abs() <= cell.0
+    }
+
+    /// Drags the sidebar's edge. The width follows the pointer live (the tree
+    /// redraws), but the PANES are only reflowed on release: a reflow per frame
+    /// resizes every PTY per frame, and full-screen programs do not survive it.
+    fn explorer_drag(&mut self, pos: PhysicalPosition<f64>) {
+        let cell = self.renderer.cell_size();
+        let area = self.window_area();
+        let Some(e) = self.tabs[self.active].explorer.as_mut() else { return };
+        let cols = match e.side {
+            crate::explorer::Side::Left => (pos.x as f32 - area.x) / cell.0,
+            crate::explorer::Side::Right => (area.x + area.w - pos.x as f32) / cell.0,
+        };
+        e.width = cols.round().max(crate::explorer::MIN_WIDTH as f32) as usize;
+        self.window.request_redraw();
+    }
+
+    /// Whether the keyboard is in the sidebar.
+    fn explorer_focused(&self) -> bool {
+        self.tabs
+            .get(self.active)
+            .and_then(|t| t.explorer.as_ref())
+            .is_some_and(|e| e.open && e.focused)
+    }
+
+    /// How many rows of tree the sidebar is drawing, for the scrolling maths.
+    fn explorer_body_rows(&self) -> usize {
+        let (_, ch) = self.renderer.cell_size();
+        let h = self.window_area().h;
+        ((h / ch).floor().max(1.0) as usize).saturating_sub(2)
+    }
+
+    /// Starts a worker for every directory the tree has open and has not read.
+    ///
+    /// One thread per directory, tagged with the explorer's `seq`: a `read_dir` of
+    /// `node_modules` or of a network mount takes long enough to drop frames, and
+    /// the answer to a read the tree has moved past has to be droppable.
+    fn explorer_read_pending(&mut self) {
+        let tab_index = self.active;
+        let Some(e) = self.tabs[self.active].explorer.as_mut() else { return };
+        let (seq, hidden) = (e.seq, e.show_hidden);
+        let want: Vec<std::path::PathBuf> =
+            e.open_dirs().into_iter().filter(|d| e.needs_read(d)).collect();
+        for dir in &want {
+            e.loading.insert(dir.clone());
+        }
+        for dir in want {
+            let proxy = self.proxy.clone();
+            std::thread::spawn(move || {
+                let entries = crate::explorer::read_dir(&dir, hidden);
+                let _ = proxy.send_event(UserEvent::Explorer(tab_index, seq, dir, entries));
+            });
+        }
+    }
+
+    /// A finished directory read. Dropped when it belongs to a tree that has since
+    /// been re-rooted (`seq`) or to a tab that is gone.
+    fn on_explorer_read(
+        &mut self,
+        tab_index: usize,
+        seq: u64,
+        dir: std::path::PathBuf,
+        entries: Vec<crate::explorer::Entry>,
+    ) {
+        let Some(tab) = self.tabs.get_mut(tab_index) else { return };
+        let Some(e) = tab.explorer.as_mut() else { return };
+        if e.seq != seq || !dir.starts_with(&e.root) {
+            return;
+        }
+        e.insert_children(dir, entries);
+        self.window.request_redraw();
+    }
+
+    /// Re-reads everything the tree has open, keeping what is folded folded.
+    fn explorer_refresh(&mut self) {
+        if let Some(e) = self.tabs[self.active].explorer.as_mut() {
+            e.children.clear();
+            e.loading.clear();
+            e.seq += 1;
+        }
+        self.explorer_read_pending();
+    }
+
+    /// The sidebar's leader layer. Returns whether it consumed the key.
+    ///
+    /// Same deal as the git panel's: the panel that has the keyboard gets its own
+    /// tree, because with the tree focused the global "new tab" under the same
+    /// letter is not what the hand means.
+    fn explorer_leader_key(&mut self, key: &Key, mods: ModifiersState, config: &Config) -> bool {
+        if !self.explorer_focused() {
+            return false;
+        }
+        let is_leader = match (
+            crate::actions::leader_chord(&config.leader),
+            Chord::from_event(key, mods),
+        ) {
+            (Some(l), Some(c)) => l == c,
+            _ => false,
+        };
+        let armed = self
+            .tabs
+            .get(self.active)
+            .and_then(|t| t.explorer.as_ref())
+            .is_some_and(|e| e.leader.is_some());
+        if is_leader {
+            if let Some(e) = self.tabs[self.active].explorer.as_mut() {
+                if armed {
+                    e.cancel_leader();
+                } else {
+                    e.arm_leader();
+                }
+            }
+            self.window.request_redraw();
+            return true;
+        }
+        if !armed {
+            return false;
+        }
+        // A character with ctrl/alt/super is a shortcut attempt, not a choice here.
+        if matches!(key, Key::Character(_))
+            && (mods.control_key() || mods.alt_key() || mods.super_key())
+        {
+            return false;
+        }
+        let press = {
+            let Some(e) = self.tabs[self.active].explorer.as_mut() else { return false };
+            match key {
+                Key::Named(NamedKey::Escape) => {
+                    e.cancel_leader();
+                    None
+                }
+                Key::Character(c) => c.chars().next().and_then(|c| e.leader_key(c)),
+                _ => None,
+            }
+        };
+        if let Some(k) = press {
+            let key = match k {
+                crate::explorer::FileKey::Ch(c) => {
+                    Key::Character(winit::keyboard::SmolStr::new(c.to_string()))
+                }
+                crate::explorer::FileKey::Enter => Key::Named(NamedKey::Enter),
+            };
+            self.explorer_key(&key, config);
+        }
+        self.window.request_redraw();
+        true
+    }
+
+    /// Keys while the sidebar has the keyboard. Returns whether it consumed one.
+    fn explorer_key(&mut self, key: &Key, config: &Config) -> bool {
+        if !self.explorer_focused() {
+            return false;
+        }
+        let body = self.explorer_body_rows();
+        let mut read = false;
+        let mut refresh = false;
+        let mut copy: Option<String> = None;
+        let mut unfocus = false;
+        {
+            let Some(e) = self.tabs[self.active].explorer.as_mut() else { return false };
+            e.message = None;
+            let selected = e.selected().cloned();
+            match key {
+                Key::Named(NamedKey::Escape) => unfocus = true,
+                Key::Named(NamedKey::ArrowDown) => e.move_cursor(1, body),
+                Key::Named(NamedKey::ArrowUp) => e.move_cursor(-1, body),
+                Key::Named(NamedKey::PageDown) => e.move_cursor(body as i32 / 2, body),
+                Key::Named(NamedKey::PageUp) => e.move_cursor(-(body as i32) / 2, body),
+                Key::Named(NamedKey::Home) => e.set_cursor(0, body),
+                Key::Named(NamedKey::End) => e.set_cursor(usize::MAX, body),
+                Key::Named(NamedKey::Enter) | Key::Named(NamedKey::ArrowRight) => {
+                    if let Some(row) = selected {
+                        if row.more.is_some() {
+                            // The cap row is a statement, not a place to go.
+                        } else if row.entry.dir {
+                            if row.entry.link && !row.open {
+                                // Following a symlinked directory is how a tree
+                                // walks into a cycle; say so instead.
+                                e.message = Some("symlinked directory - not followed".into());
+                            } else {
+                                read = e.toggle(&row.entry.path);
+                            }
+                        } else {
+                            e.message = Some("viewer comes next; y copies the path".into());
+                        }
+                    }
+                }
+                Key::Named(NamedKey::ArrowLeft) => {
+                    if let Some(row) = selected {
+                        // Left on an open directory folds it; on anything else it
+                        // goes to the parent, which is what a tree's left means.
+                        if row.entry.dir && row.open {
+                            e.toggle(&row.entry.path);
+                        } else if let Some(i) =
+                            e.rows.iter().position(|r| Some(r.entry.path.as_path()) == row.entry.path.parent())
+                        {
+                            e.set_cursor(i, body);
+                        }
+                    }
+                }
+                Key::Character(c) => match c.as_str() {
+                    "j" => e.move_cursor(1, body),
+                    "k" => e.move_cursor(-1, body),
+                    "g" => e.set_cursor(0, body),
+                    "G" => e.set_cursor(usize::MAX, body),
+                    "l" => {
+                        if let Some(row) = selected.filter(|r| r.entry.dir && !r.open) {
+                            read = e.toggle(&row.entry.path);
+                        }
+                    }
+                    "h" => {
+                        if let Some(row) = selected {
+                            if row.entry.dir && row.open {
+                                e.toggle(&row.entry.path);
+                            } else if let Some(i) = e
+                                .rows
+                                .iter()
+                                .position(|r| Some(r.entry.path.as_path()) == row.entry.path.parent())
+                            {
+                                e.set_cursor(i, body);
+                            }
+                        }
+                    }
+                    "." => {
+                        e.show_hidden = !e.show_hidden;
+                        refresh = true;
+                    }
+                    "r" => refresh = true,
+                    "y" => copy = selected.map(|r| r.entry.path.display().to_string()),
+                    "q" => unfocus = true,
+                    _ => {}
+                },
+                _ => {}
+            }
+        }
+        if unfocus {
+            if let Some(e) = self.tabs[self.active].explorer.as_mut() {
+                e.focused = false;
+            }
+        }
+        if refresh {
+            self.explorer_refresh();
+        } else if read {
+            self.explorer_read_pending();
+        }
+        if let Some(text) = copy {
+            self.set_clipboard(text);
+            if let Some(e) = self.tabs[self.active].explorer.as_mut() {
+                e.message = Some("path copied".into());
+            }
+        }
+        let _ = config;
+        self.window.request_redraw();
+        true
+    }
+
+    /// Re-anchors the tree when the focused pane moves to another REPOSITORY.
+    ///
+    /// Only on a change of root, never on every `cd`: re-anchoring per directory
+    /// collapses the tree while you are navigating inside one project, which is
+    /// precisely when you are using it.
+    fn explorer_sync_root(&mut self) {
+        if self.tabs[self.active].explorer.as_ref().is_none_or(|e| !e.open) {
+            return;
+        }
+        let Some(cwd) = self.tab().focused_ref().cwd() else { return };
+        let root = crate::explorer::root_for(&cwd);
+        let changed = {
+            let Some(e) = self.tabs[self.active].explorer.as_mut() else { return };
+            if e.root == root {
+                return;
+            }
+            e.seq += 1;
+            e.set_root(root);
+            true
+        };
+        if changed {
+            self.explorer_read_pending();
+            self.window.request_redraw();
+        }
     }
 
     /// The leader layer, for one key. Returns whether it consumed it.
@@ -776,12 +1196,22 @@ impl Gpu {
             self.overlay_key(key, mods, config);
             return;
         }
+        if self.explorer_leader_key(key, mods, config) {
+            return;
+        }
         if self.leader_key(key, mods, config, keymap, event_loop) {
             return;
         }
         if let Some(action) = keymap.resolve(key, mods) {
             let action = action.clone();
             self.run_action(action, config, event_loop);
+            return;
+        }
+        // Same order as `on_key`: the sidebar takes what the leader and the bound
+        // chords did not. Leaving this out is what made a scripted `j` do nothing
+        // while the same key worked from the keyboard.
+        if !mods.control_key() && !mods.alt_key() && !mods.super_key() {
+            self.explorer_key(key, config);
         }
     }
 
@@ -810,6 +1240,21 @@ impl Gpu {
             "rows": rows,
             "leader_armed": self.leader_armed.is_some(),
         });
+        if let Some(e) = self.tabs.get(self.active).and_then(|t| t.explorer.as_ref()) {
+            out["explorer"] = json!({
+                "open": e.open,
+                "focused": e.focused,
+                "root": e.root.display().to_string(),
+                "width": e.width_in(self.window_area(), self.renderer.cell_size()),
+                "side": e.side.label(),
+                "cursor": e.cursor,
+                "rows": e.rows.len(),
+                "selected": e.selected().map(|r| r.entry.path.display().to_string()),
+                "open_dirs": e.expanded.len(),
+                "hidden": e.show_hidden,
+                "message": e.message,
+            });
+        }
         if let Some(Overlay::Git(p)) = &self.overlay {
             let l = p.layout(cols, rows);
             out["git"] = json!({
@@ -1258,6 +1703,7 @@ impl Gpu {
             Action::CopyMode => self.enter_copy_mode(),
             Action::FoldOutput => self.tab().focused().toggle_fold_all(),
             Action::ToggleImageWatch => self.toggle_image_watch(config),
+            Action::ToggleExplorer => self.toggle_explorer(config),
             Action::SetImageWatchDir => self.set_image_watch_dir(),
             Action::SaveProjectSession => self.save_project_session_cmd(),
             Action::RestoreProjectSession => self.restore_project_session_cmd(config),

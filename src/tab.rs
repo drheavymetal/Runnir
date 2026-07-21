@@ -35,6 +35,9 @@ pub struct Tab {
     /// Kept on the tab (not read from `Config` at use) because `reflow` and
     /// `resize_one` are called from paths that do not carry the config.
     minimap: bool,
+    /// The file explorer sidebar, per tab. `None` until it is first opened; kept
+    /// (closed) afterwards so reopening does not collapse the tree it had.
+    pub explorer: Option<crate::explorer::Explorer>,
 }
 
 /// Default master share for Tall/Fat: a touch over half, so the master reads as
@@ -71,6 +74,7 @@ impl Tab {
             gap: config.window.padding.max(6.0),
             padding,
             minimap: config.window.minimap,
+            explorer: None,
         })
     }
 
@@ -542,6 +546,7 @@ impl Tab {
             gap,
             padding,
             minimap: config.window.minimap,
+            explorer: None,
         })
     }
 
@@ -598,6 +603,7 @@ mod tests {
             cell: (10.0, 20.0),
             gap: 6.0,
             padding: 0.0,
+            explorer: None,
             minimap: false,
         }
     }

@@ -992,6 +992,44 @@ which renders the real `GitPanel` over the real repository through the same
 `overlay.render` the app uses — a three-column layout cannot be checked from a unit
 test, and this cannot drift from what the app draws.
 
+## 2026-07-21 - File explorer: the sidebar and its tree (step 1 of the design below)
+
+The first two build steps of the design entry below, minus the viewer: the sidebar
+itself, the tree, focus, the mouse and a leader layer of its own. The design section
+stays until the whole thing is built; this is what exists now.
+
+**It reserves columns, and that is the whole trick.** `Gpu::active_area()` returns
+the window minus the sidebar; `window_area()` is the undivided one, for the sidebar
+itself. Everything downstream — `Tab::layout`, `reflow`, the pane hit tests, the
+divider drags — asks `active_area()` and never learns a sidebar exists. No `Overlay`
+(it would capture the keyboard and dim the pane), no `Pane` (it owns a non-optional
+PTY).
+
+**Every read is on a worker**, keyed by the tree's `seq` and by the tab index, and
+the answer is dropped if either moved on. `read_dir` of `node_modules` or of an NFS
+mount is not something the frame can wait for.
+
+**The cursor follows the PATH across a rebuild**, not the index: a directory
+finishing its read inserts rows above the selection, and on the slow filesystems
+where the reads are slow, a selection that jumps every time one lands is unusable.
+
+**Its own leader tree** (`FILE_LEADER`), same contract as the git panel's: every leaf
+presses a key the sidebar already binds, and `OnFile`/`OnDir` leaves are hidden when
+the row under the cursor is the other kind. It draws along the bottom of the window
+rather than inside the sidebar — 30 columns of which-key is one entry per line.
+
+Two bugs the remote control caught immediately, both invisible to the tests:
+- `press_key` (the scripted path) skipped the sidebar entirely, so a scripted `j`
+  did nothing while the same key worked by hand. The scripted path has to mirror
+  `on_key`'s ORDER, not just its handlers.
+- `toggle()` marked the directory as loading and `explorer_read_pending()` then
+  skipped it as already in flight: a directory opened and never loaded. Reporting
+  "this needs a read" and marking it in flight are two jobs, and the one that spawns
+  the thread owns the second.
+
+Still to come, in the design's order: the viewer, `$EDITOR`, properties and
+operations, git badges and mtime sort, real images.
+
 ## DESIGN, NOT YET BUILT — the file explorer sidebar (decided 2026-07-21)
 
 Four sessions of design with Pedro, written down before any code so it is not
@@ -1148,6 +1186,8 @@ leader and descend into a group — each step asserted on the JSON that came bac
 
 ## Gotchas (do not re-learn)
 
+- A scripted input path must mirror the real one's ORDER, not only its handlers.
+  `press_key` had every handler and the wrong order, and a whole panel was unreachable.
 - Handlers that take a `winit::event::KeyEvent` cannot be called by anything but
   winit. Take `(&Key, ModifiersState)` and they stay scriptable and testable.
 - Any coordinate a remote API hands out has to be in the space the caller will aim
