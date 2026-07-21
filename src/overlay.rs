@@ -4081,6 +4081,10 @@ pub enum DockerRow {
     Image(usize),
     Volume(usize),
     Network(usize),
+    /// A Docker Hub repository, and one of its tags. Hub has no kinds and no
+    /// compose projects: it is repos, and inside a repo, tags.
+    Repo(usize),
+    Tag(usize),
 }
 
 pub struct DockerPanel {
@@ -4103,6 +4107,18 @@ pub struct DockerPanel {
     /// What the detail column is describing, so an answer that arrives after the
     /// cursor moved can be dropped instead of drawn under the wrong row.
     pub detail_for: Option<String>,
+    /// Docker Hub: the repositories, the one drilled into, and its tags.
+    pub repos: Vec<crate::docker::HubRepo>,
+    pub open_repo: Option<String>,
+    pub tags: Vec<crate::docker::HubTag>,
+    /// The images of the last DAEMON read, kept so the hub column can compare a
+    /// published tag against what this machine holds. Hub's own snapshot is empty,
+    /// and the comparison is the whole reason the hub column exists.
+    pub local_images: Vec<crate::docker::Image>,
+    /// Where the repository list came from, said out loud: an org token cannot read
+    /// Hub's API, and a list quietly built from local images would read as the
+    /// account's whole catalogue.
+    pub repos_note: String,
     pub message: Result<String, String>,
     pub busy: bool,
     /// A read is in flight for the selected host.
@@ -4127,6 +4143,11 @@ impl DockerPanel {
             detail_lines: Vec::new(),
             detail_scroll: 0,
             detail_for: None,
+            repos: Vec::new(),
+            open_repo: None,
+            tags: Vec::new(),
+            local_images: Vec::new(),
+            repos_note: String::new(),
             message: Ok(String::new()),
             busy: false,
             loading: false,
@@ -4193,6 +4214,14 @@ impl DockerPanel {
             DockerRow::Image(i) => self.snap.images.get(*i).map(|m| m.id.clone()),
             DockerRow::Volume(i) => self.snap.volumes.get(*i).map(|v| v.name.clone()),
             DockerRow::Network(i) => self.snap.networks.get(*i).map(|n| n.id.clone()),
+            DockerRow::Repo(i) => self.repos.get(*i).map(|r| r.name.clone()),
+            // A tag is identified by the repository it is in: two repositories both
+            // have a `latest`, and a detail keyed on the bare name would answer for
+            // whichever one asked last.
+            DockerRow::Tag(i) => {
+                let repo = self.open_repo.clone()?;
+                self.tags.get(*i).map(|t| format!("{repo}:{}", t.name))
+            }
             DockerRow::Project { .. } => None,
         }
     }
@@ -4204,6 +4233,8 @@ impl DockerPanel {
             DockerRow::Image(i) => self.snap.images.get(*i).map(|m| m.label()),
             DockerRow::Volume(i) => self.snap.volumes.get(*i).map(|v| v.name.clone()),
             DockerRow::Network(i) => self.snap.networks.get(*i).map(|n| n.name.clone()),
+            DockerRow::Repo(i) => self.repos.get(*i).map(|r| r.name.clone()),
+            DockerRow::Tag(i) => self.tags.get(*i).map(|t| t.name.clone()),
             DockerRow::Project { name, .. } => {
                 Some(name.clone().unwrap_or_else(|| "(no project)".into()))
             }
@@ -4243,6 +4274,26 @@ impl DockerPanel {
 
     fn rebuild_keeping(&mut self, keep: Option<String>) {
         let mut rows = Vec::new();
+        // Hub has no kinds: it is repositories, and inside one, its tags.
+        if self.on_hub() {
+            if self.open_repo.is_some() {
+                rows.extend((0..self.tags.len()).map(DockerRow::Tag));
+            } else {
+                rows.extend((0..self.repos.len()).map(DockerRow::Repo));
+            }
+            self.rows = rows;
+            if let Some(id) = keep {
+                if let Some(i) = (0..self.rows.len())
+                    .find(|i| self.id_of(&self.rows[*i]).as_deref() == Some(id.as_str()))
+                {
+                    self.cursors[self.kind_index()] = i;
+                    return;
+                }
+            }
+            let i = self.kind_index();
+            self.cursors[i] = self.cursors[i].min(self.rows.len().saturating_sub(1));
+            return;
+        }
         match self.kind {
             crate::docker::Kind::Containers => {
                 for project in crate::docker::projects(&self.snap.containers) {
@@ -4304,6 +4355,8 @@ impl DockerPanel {
             DockerRow::Image(i) => self.snap.images.get(*i).map(|m| m.id.clone()),
             DockerRow::Volume(i) => self.snap.volumes.get(*i).map(|v| v.name.clone()),
             DockerRow::Network(i) => self.snap.networks.get(*i).map(|n| n.id.clone()),
+            DockerRow::Repo(i) => self.repos.get(*i).map(|r| r.name.clone()),
+            DockerRow::Tag(i) => self.tags.get(*i).map(|t| t.name.clone()),
             DockerRow::Project { name, .. } => name.clone(),
         }
     }
@@ -4477,6 +4530,53 @@ impl DockerPanel {
                 });
                 out
             }
+            Some(DockerRow::Repo(i)) => {
+                let Some(r) = self.repos.get(*i) else { return Vec::new() };
+                let mut out = vec![format!("repo     {}", r.name)];
+                if r.private {
+                    out.push("access   private".to_string());
+                }
+                if !r.last_updated.is_empty() {
+                    out.push(format!("updated  {}", r.last_updated));
+                }
+                let local: Vec<&str> = self
+                    .local_images
+                    .iter()
+                    .flat_map(|i| i.tags.iter())
+                    .filter_map(|t| t.strip_prefix(&format!("{}:", r.name)))
+                    .collect();
+                out.push(if local.is_empty() {
+                    "local    nothing from this repo".to_string()
+                } else {
+                    format!("local    {}", local.join(", "))
+                });
+                out.push(String::new());
+                out.push("enter    read its tags".to_string());
+                out
+            }
+            Some(DockerRow::Tag(i)) => {
+                let Some(t) = self.tags.get(*i) else { return Vec::new() };
+                let repo = self.open_repo.clone().unwrap_or_default();
+                let d = crate::docker::drift(&self.local_images, &repo, &t.name, t.digest.as_deref());
+                let mut out = vec![format!("tag      {repo}:{}", t.name)];
+                out.push(match &t.digest {
+                    Some(d) => format!("digest   {d}"),
+                    None => "digest   reading\u{2026}".to_string(),
+                });
+                let local = self
+                    .local_images
+                    .iter()
+                    .find(|i| i.tags.iter().any(|x| *x == format!("{repo}:{}", t.name)))
+                    .and_then(|i| i.digest_for(&repo).map(str::to_string));
+                out.push(match local {
+                    Some(l) => format!("local    {l}"),
+                    None => "local    not pulled here".to_string(),
+                });
+                if !d.label().is_empty() {
+                    out.push(format!("state    {}", d.label()));
+                }
+                out
+            }
             Some(DockerRow::Project { name, total, up, .. }) => {
                 let label = name.clone().unwrap_or_else(|| "(no compose project)".into());
                 let mut out =
@@ -4545,6 +4645,36 @@ impl DockerPanel {
                 let Some(v) = self.snap.volumes.get(*vi) else { return (String::new(), dim()) };
                 (elide(&v.name, width), normal())
             }
+            DockerRow::Repo(ri) => {
+                let Some(r) = self.repos.get(*ri) else { return (String::new(), dim()) };
+                let right = if r.private { "private".to_string() } else { String::new() };
+                let pad =
+                    width.saturating_sub(r.name.chars().count() + right.chars().count() + 1).max(1);
+                (elide(&format!("{}{}{right}", r.name, " ".repeat(pad)), width), normal())
+            }
+            DockerRow::Tag(ti) => {
+                let Some(t) = self.tags.get(*ti) else { return (String::new(), dim()) };
+                let repo = self.open_repo.clone().unwrap_or_default();
+                let drift = crate::docker::drift(
+                    &self.local_images,
+                    &repo,
+                    &t.name,
+                    t.digest.as_deref(),
+                );
+                // The drift is the point of this column: a row that says whether what
+                // runs here is what is published there.
+                let right = drift.label().to_string();
+                let pad =
+                    width.saturating_sub(t.name.chars().count() + right.chars().count() + 1).max(1);
+                let pen = match drift {
+                    crate::docker::Drift::Same => Pen { fg: Color::Rgb(0x7a, 0xc0, 0x7a), ..normal() },
+                    crate::docker::Drift::Differs => {
+                        Pen { fg: Color::Rgb(0xe0, 0xaf, 0x68), ..normal() }
+                    }
+                    _ => normal(),
+                };
+                (elide(&format!("{}{}{right}", t.name, " ".repeat(pad)), width), pen)
+            }
             DockerRow::Network(ni) => {
                 let Some(n) = self.snap.networks.get(*ni) else { return (String::new(), dim()) };
                 let right = n.driver.clone();
@@ -4564,7 +4694,18 @@ impl DockerPanel {
 
         // Header: the kind strip, then the host and what it answered.
         let mut x = 2;
-        if !self.on_hub() {
+        if self.on_hub() {
+            // No kind strip on hub: it has none, and a strip that switched to
+            // something that does not exist there would be a lie in one keystroke.
+            // The note in its place says where the repository list came from.
+            let head = match &self.open_repo {
+                Some(repo) => format!("{repo} \u{b7} tags"),
+                None => self.repos_note.clone(),
+            };
+            let head = elide(&head, w.saturating_sub(28));
+            write(&mut g, 0, x, &head, dim());
+            x += head.chars().count();
+        } else {
             for k in crate::docker::Kind::ALL {
                 let label = format!(" {} ", k.letter());
                 let pen = if k == self.kind { selected() } else { dim() };
@@ -4896,6 +5037,7 @@ pub static DOCKER_LEADER: &[DockerEntry] = &[
             dleaf('u', "up -d", OnProject(DCh('U'))),
             dleaf('w', "down (asks)", OnProject(DCh('W'))),
             dleaf('p', "pull", OnProject(DCh('P'))),
+            dleaf('t', "deploy it (pull, then up -d)", OnProject(DCh('T'))),
             dleaf('o', "fold / unfold", DKey(DEnter)),
         ]),
     },
@@ -4908,6 +5050,7 @@ pub static DOCKER_LEADER: &[DockerEntry] = &[
             dleaf('v', "volumes", DKey(DCh('V'))),
             dleaf('n', "networks", DKey(DCh('N'))),
             dleaf('r', "reread this host", DKey(DCh('r'))),
+            dleaf('p', "publish this image (push)", DKey(DCh('>'))),
             dleaf('z', "zoom the detail", DKey(DCh('z'))),
         ]),
     },

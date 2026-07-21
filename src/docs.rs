@@ -579,6 +579,8 @@ thing.
   e                a shell inside it, in a pane
   w                open its published port in the browser
   U W P            compose up -d, compose down (asks), compose pull
+  T                deploy the project: compose pull, then up -d (asks)
+  >                publish the image or tag: docker push (asks)
   y z r            copy the id, zoom the detail, reread this host
   leader           the panel's own menu of verbs   esc or q   close it
 
@@ -591,6 +593,14 @@ Everything is read over the daemon's own socket, on a worker thread, and a remot
 context is reached through the tunnel the CLI uses (ssh <host> docker system
 dial-stdio). A host that cannot be reached is drawn as down and never stalls the
 window. A host is only READ when you choose it, so moving over one costs nothing.
+
+Docker Hub is the last host in the column. It lists the repositories your login
+can see; when the stored credential is an ORGANISATION token, Hub's web API
+refuses it (the registry does not), so the list falls back to the repositories your
+local images name - and the header says which of the two you are looking at.
+Enter reads a repository's tags, and each tag says how it compares with what is
+here: the same image, a different one, not pulled here, or built here and never
+pushed. Compared by DIGEST, never by id - a local id says nothing about a registry.
 
 Short operations run on the socket and answer in the footer. Anything that takes
 minutes or prints progress - a shell, compose up, compose pull - goes to a real

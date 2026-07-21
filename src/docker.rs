@@ -895,6 +895,88 @@ mod tests {
         assert_eq!(Kind::default(), Kind::Containers);
     }
 
+
+    #[test]
+    fn credentials_come_from_the_file_the_cli_already_wrote() {
+        // base64("go2chaindev:secret")
+        let auth = decode_basic("Z28yY2hhaW5kZXY6c2VjcmV0").expect("decoded");
+        assert_eq!(auth.username, "go2chaindev");
+        assert_eq!(auth.secret, "secret");
+        // Anything that is not `user:secret` is not credentials, and half of one
+        // would authenticate as nobody with a confusing error.
+        assert!(decode_basic("bm90aGluZw==").is_none());
+        assert!(decode_basic("!!!!").is_none());
+    }
+
+    #[test]
+    fn a_tag_is_compared_by_digest_and_never_by_id() {
+        let published = "sha256:aaa";
+        let local = vec![Image {
+            id: "sha256:localid".into(),
+            tags: vec!["go2chaindev/api:1.0".into(), "go2chaindev/api:old".into()],
+            digests: vec!["go2chaindev/api@sha256:aaa".into()],
+            ..Image::default()
+        }];
+        assert_eq!(drift(&local, "go2chaindev/api", "1.0", Some(published)), Drift::Same);
+        assert_eq!(drift(&local, "go2chaindev/api", "1.0", Some("sha256:bbb")), Drift::Differs);
+        assert_eq!(drift(&local, "go2chaindev/api", "2.0", Some(published)), Drift::NotLocal);
+        // Still coming: not a verdict.
+        assert_eq!(drift(&local, "go2chaindev/api", "1.0", None), Drift::Unknown);
+
+        // Built here under the name and never pushed: it looks published on any
+        // list that goes by tag, and it is the case a deploy gets wrong.
+        let built = vec![Image {
+            id: "sha256:x".into(),
+            tags: vec!["go2chaindev/api:1.0".into()],
+            digests: vec!["someone/else@sha256:ccc".into()],
+            ..Image::default()
+        }];
+        assert_eq!(drift(&built, "go2chaindev/api", "1.0", Some(published)), Drift::NoDigest);
+    }
+
+    #[test]
+    fn the_repo_list_falls_back_to_what_the_local_images_name() {
+        let images = vec![
+            Image { tags: vec!["go2chaindev/api:1.0".into(), "go2chaindev/api:2.0".into()], ..Image::default() },
+            Image { tags: vec!["postgres:16".into()], ..Image::default() },
+            Image { tags: vec!["cromowin-html2image:dev".into()], ..Image::default() },
+            Image { tags: vec!["go2chaindev/web:1.0".into()], ..Image::default() },
+        ];
+        let repos: Vec<String> = repos_from_images(&images).into_iter().map(|r| r.name).collect();
+        // One row per repository, not per tag; and only what a registry could hold:
+        // `postgres:16` is a library image and `cromowin-html2image:dev` is a local
+        // build nobody published.
+        assert_eq!(repos, ["go2chaindev/api", "go2chaindev/web"]);
+    }
+
+    #[test]
+    fn hub_answers_are_parsed_or_explained() {
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"count":2,"results":[{"name":"api","is_private":true,"last_updated":"2026-07-01T10:00:00Z"},
+                                      {"name":"web","is_private":false,"last_updated":""}]}"#,
+        )
+        .unwrap();
+        let repos = parse_hub_repos(&v, "go2chaindev").unwrap();
+        assert_eq!(repos[0].name, "go2chaindev/api");
+        assert!(repos[0].private);
+
+        // Hub's own words survive a refusal, which is the only useful part of its
+        // errors — and an organisation token being refused is the NORMAL case here.
+        let err: serde_json::Value =
+            serde_json::from_str(r#"{"message":"token issued from organization access token is not allowed"}"#)
+                .unwrap();
+        assert_eq!(
+            parse_hub_repos(&err, "go2chaindev").unwrap_err(),
+            "token issued from organization access token is not allowed"
+        );
+
+        let tags: serde_json::Value =
+            serde_json::from_str(r#"{"name":"go2chaindev/api","tags":["2.0","1.0"]}"#).unwrap();
+        let parsed = parse_tag_list(&tags);
+        assert_eq!(parsed.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(), ["1.0", "2.0"]);
+        assert!(parsed[0].digest.is_none(), "a digest is one request per tag, asked for on demand");
+    }
+
     /// Talks to the daemon on this machine. Ignored by default — a test suite that
     /// needs a running docker is a suite that fails on the machine without one.
     #[test]
@@ -943,6 +1025,13 @@ pub enum PanelMsg {
     Detail(String, Result<String, String>),
     /// An operation finished.
     Done(Result<String, String>),
+    /// The repositories on Docker Hub, and how they were found: the web API, or
+    /// the local images when the API refused the credentials.
+    Repos(Result<Vec<HubRepo>, String>, String),
+    /// One repository's tags.
+    Tags(String, Result<Vec<HubTag>, String>),
+    /// One tag's manifest digest, which is what the local one is compared against.
+    Digest(String, String, Result<String, String>),
 }
 
 /// Asks every host for its version, in parallel, so one unreachable machine does
@@ -1064,6 +1153,44 @@ pub fn compose_command(host: &Host, project: &str, files: &[String], verb: &[&st
     cmd
 }
 
+/// The command line that publishes one image tag.
+///
+/// A push is the one docker verb with consequences outside this machine: it is
+/// what `go2chaindev/*` on Hub becomes, so it asks first and it goes to a pane —
+/// it is minutes of progress bars and it can be Ctrl-C'd.
+pub fn push_command(host: &Host, tag: &str) -> Vec<String> {
+    let mut cmd = cli_prefix(host);
+    cmd.push("push".into());
+    cmd.push(tag.to_string());
+    cmd
+}
+
+/// The deploy, as ONE command line: pull what was published, then bring the
+/// project up on it.
+///
+/// Chained with `&&` rather than run as two: if the pull fails there is nothing
+/// new to bring up, and an `up` after a failed pull silently restarts the project
+/// on the image it was already running — the deploy that looks like it worked.
+pub fn deploy_command(host: &Host, project: &str, files: &[String]) -> Vec<String> {
+    let pull = compose_command(host, project, files, &["pull"]);
+    let up = compose_command(host, project, files, &["up", "-d"]);
+    vec![shell_join(&pull), "&&".into(), shell_join(&up)]
+}
+
+/// Joins one command into a single shell word-safe string, for chaining.
+fn shell_join(cmd: &[String]) -> String {
+    cmd.iter()
+        .map(|a| {
+            if a.chars().all(|c| c.is_ascii_alphanumeric() || "-_./:=".contains(c)) {
+                a.clone()
+            } else {
+                format!("'{}'", a.replace('\'', "'\\''"))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// The command line for a shell inside a container.
 ///
 /// `bash` if it is there and `sh` if it is not, decided INSIDE the container:
@@ -1096,4 +1223,326 @@ pub fn image_users<'a>(containers: &'a [Container], image: &Image) -> Vec<&'a st
         .filter(|c| image.tags.iter().any(|t| *t == c.image) || c.image.contains(&short))
         .map(|c| c.name.as_str())
         .collect()
+}
+
+// ---- Docker Hub ------------------------------------------------------------
+//
+// Not a daemon: a registry (`registry-1.docker.io`, the v2 protocol) with a web API
+// beside it (`hub.docker.com`). Both are needed, and they authenticate DIFFERENTLY,
+// which is the whole shape of this section.
+//
+// The credentials are read from `~/.docker/config.json` and its credential helper
+// FIRST: if `docker login` already happened there is nothing for runnir to store,
+// and a terminal asking again for a token the machine already has is a terminal
+// inventing a secret to look after.
+
+/// A username and a secret for Docker Hub, as `docker login` left them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HubAuth {
+    pub username: String,
+    pub secret: String,
+}
+
+/// The server key `docker login` files Hub credentials under. It is not
+/// `hub.docker.com`, and looking there finds nothing.
+const HUB_SERVER: &str = "https://index.docker.io/v1/";
+
+/// Reads the credentials `docker login` stored, from the helper or from the file.
+pub fn hub_credentials() -> Option<HubAuth> {
+    let path = dirs::home_dir()?.join(".docker/config.json");
+    let text = std::fs::read_to_string(path).ok()?;
+    let cfg: Value = serde_json::from_str(&text).ok()?;
+    // A helper wins over the file: when one is configured the file's `auths` entry
+    // is an empty placeholder, which parses fine and authenticates as nobody.
+    let helper = cfg
+        .get("credHelpers")
+        .and_then(|h| h.get(HUB_SERVER))
+        .or_else(|| cfg.get("credsStore"))
+        .and_then(|s| s.as_str());
+    if let Some(helper) = helper {
+        if let Some(auth) = credential_helper(helper) {
+            return Some(auth);
+        }
+    }
+    let encoded = cfg.get("auths")?.get(HUB_SERVER)?.get("auth")?.as_str()?;
+    decode_basic(encoded)
+}
+
+/// Asks `docker-credential-<helper>` for one server's credentials, the way the CLI
+/// does: the server URL on stdin, a JSON object back.
+fn credential_helper(helper: &str) -> Option<HubAuth> {
+    use std::io::Write;
+    let mut child = std::process::Command::new(format!("docker-credential-{helper}"))
+        .arg("get")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    child.stdin.as_mut()?.write_all(HUB_SERVER.as_bytes()).ok()?;
+    let out = child.wait_with_output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let v: Value = serde_json::from_slice(&out.stdout).ok()?;
+    let username = v.get("Username")?.as_str()?.to_string();
+    let secret = v.get("Secret")?.as_str()?.to_string();
+    (!username.is_empty() && !secret.is_empty()).then_some(HubAuth { username, secret })
+}
+
+/// `base64(user:secret)`, which is what the file holds when there is no helper.
+pub fn decode_basic(encoded: &str) -> Option<HubAuth> {
+    use base64::Engine;
+    let raw = base64::engine::general_purpose::STANDARD.decode(encoded).ok()?;
+    let text = String::from_utf8(raw).ok()?;
+    let (username, secret) = text.split_once(':')?;
+    (!username.is_empty() && !secret.is_empty())
+        .then(|| HubAuth { username: username.into(), secret: secret.into() })
+}
+
+/// One repository on Hub, as the panel lists it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HubRepo {
+    /// `namespace/name`, which is also what a local tag is prefixed with.
+    pub name: String,
+    pub private: bool,
+    pub last_updated: String,
+}
+
+/// One tag of one repository.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HubTag {
+    pub name: String,
+    /// The manifest digest, which is what a local `RepoDigest` can be compared with.
+    /// `None` until it has been asked for: one request per tag, so they are fetched
+    /// for what is on screen and not for the whole list.
+    pub digest: Option<String>,
+}
+
+/// How a local image compares with the tag of the same name on Hub.
+///
+/// This is the thing lazydocker cannot do and the reason the hub column exists: a
+/// row that says whether what is running here is what is published there.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Drift {
+    /// The local image is the published one, digest for digest.
+    Same,
+    /// Both exist and they are different images.
+    Differs,
+    /// Nothing local carries this tag.
+    NotLocal,
+    /// The image is here but carries no digest for THIS repository — it was built
+    /// locally under the name and never pushed or pulled under it. Worth saying:
+    /// it looks like the published one on every list that goes by tag, and it is
+    /// the case a deploy gets wrong.
+    NoDigest,
+    /// Not asked yet.
+    Unknown,
+}
+
+impl Drift {
+    pub fn label(self) -> &'static str {
+        match self {
+            Drift::Same => "same as local",
+            Drift::Differs => "differs from local",
+            Drift::NotLocal => "not pulled here",
+            Drift::NoDigest => "local, never pushed",
+            Drift::Unknown => "",
+        }
+    }
+}
+
+/// Compares one repository tag against the local images.
+///
+/// By DIGEST, never by id: the local id is a content hash of the image as this
+/// machine stored it and says nothing about what a registry holds. The digest is
+/// per repository, which is why the repo has to be passed in.
+pub fn drift(images: &[Image], repo: &str, tag: &str, remote: Option<&str>) -> Drift {
+    let full = format!("{repo}:{tag}");
+    let Some(local) = images.iter().find(|i| i.tags.iter().any(|t| *t == full)) else {
+        return Drift::NotLocal;
+    };
+    let Some(remote) = remote else { return Drift::Unknown };
+    let Some(local_digest) = local.digest_for(repo) else { return Drift::NoDigest };
+    if local_digest == remote { Drift::Same } else { Drift::Differs }
+}
+
+/// The repositories a namespace holds, from the Hub web API.
+///
+/// This one needs a bearer minted from the PAT (`/v2/auth/token`); an
+/// ORGANISATION access token is refused by that API even though the registry
+/// accepts it, so the caller has a fallback and this returning `Err` is normal.
+pub fn hub_repos(auth: &HubAuth, namespace: &str) -> Result<Vec<HubRepo>, String> {
+    let token = hub_bearer(auth)?;
+    let url =
+        format!("https://hub.docker.com/v2/repositories/{namespace}/?page_size=100&ordering=name");
+    let mut resp = ureq::get(&url)
+        .config()
+        .timeout_global(Some(std::time::Duration::from_secs(20)))
+        .build()
+        .header("Authorization", &format!("Bearer {token}"))
+        .call()
+        .map_err(|e| format!("hub: {e}"))?;
+    let v: Value = resp.body_mut().read_json().map_err(|e| format!("hub: {e}"))?;
+    parse_hub_repos(&v, namespace)
+}
+
+/// Exchanges a personal (or organisation) access token for a Hub API bearer.
+fn hub_bearer(auth: &HubAuth) -> Result<String, String> {
+    let body = serde_json::json!({ "identifier": auth.username, "secret": auth.secret });
+    let mut resp = ureq::post("https://hub.docker.com/v2/auth/token")
+        .config()
+        .timeout_global(Some(std::time::Duration::from_secs(20)))
+        .build()
+        .header("Content-Type", "application/json")
+        .send_json(&body)
+        .map_err(|e| format!("hub login: {e}"))?;
+    let v: Value = resp.body_mut().read_json().map_err(|e| format!("hub login: {e}"))?;
+    v.get("access_token")
+        .and_then(|t| t.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| hub_message(&v))
+}
+
+/// Hub's own words for a failure, which are the only useful part of its errors.
+fn hub_message(v: &Value) -> String {
+    v.get("message")
+        .or_else(|| v.get("detail"))
+        .and_then(|m| m.as_str())
+        .unwrap_or("hub refused the token")
+        .to_string()
+}
+
+pub fn parse_hub_repos(v: &Value, namespace: &str) -> Result<Vec<HubRepo>, String> {
+    let Some(results) = v.get("results").and_then(|r| r.as_array()) else {
+        return Err(hub_message(v));
+    };
+    Ok(results
+        .iter()
+        .map(|r| HubRepo {
+            name: format!("{namespace}/{}", str_of(r, "name")),
+            private: r.get("is_private").and_then(|p| p.as_bool()).unwrap_or(false),
+            last_updated: str_of(r, "last_updated"),
+        })
+        .collect())
+}
+
+/// The repositories the LOCAL images name, as the fallback for a namespace whose
+/// list cannot be read.
+///
+/// It is a smaller answer than Hub's, and for the question this panel asks — is
+/// what runs here what is published there — it is the RIGHT answer: a repository
+/// with nothing local is a repository with nothing to compare.
+pub fn repos_from_images(images: &[Image]) -> Vec<HubRepo> {
+    let mut out: Vec<HubRepo> = Vec::new();
+    for image in images {
+        for tag in &image.tags {
+            let Some((repo, _)) = tag.rsplit_once(':') else { continue };
+            // Only what a registry could hold: an unqualified `postgres:16` is a
+            // library image and `foo-api:dev` is a local build nobody published.
+            if !repo.contains('/') || out.iter().any(|r| r.name == repo) {
+                continue;
+            }
+            out.push(HubRepo { name: repo.to_string(), private: false, last_updated: String::new() });
+        }
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
+/// A registry bearer for one repository, from the token service the registry
+/// points at. This is the path an ORGANISATION token can take, which is why the
+/// tags come from the registry and not from the web API.
+fn registry_token(auth: Option<&HubAuth>, repo: &str, scope: &str) -> Result<String, String> {
+    let url = format!(
+        "https://auth.docker.io/token?service=registry.docker.io&scope=repository:{repo}:{scope}"
+    );
+    let req = ureq::get(&url)
+        .config()
+        .timeout_global(Some(std::time::Duration::from_secs(20)))
+        .build();
+    let req = match auth {
+        Some(a) => {
+            use base64::Engine;
+            let basic = base64::engine::general_purpose::STANDARD
+                .encode(format!("{}:{}", a.username, a.secret));
+            req.header("Authorization", &format!("Basic {basic}"))
+        }
+        None => req,
+    };
+    let mut resp = req.call().map_err(|e| format!("registry auth: {e}"))?;
+    let v: Value = resp.body_mut().read_json().map_err(|e| format!("registry auth: {e}"))?;
+    v.get("token")
+        .and_then(|t| t.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| "registry refused the credentials".to_string())
+}
+
+/// The tags of one repository, from the registry.
+pub fn hub_tags(auth: Option<&HubAuth>, repo: &str) -> Result<Vec<HubTag>, String> {
+    let token = registry_token(auth, repo, "pull")?;
+    let url = format!("https://registry-1.docker.io/v2/{repo}/tags/list?n=200");
+    let mut resp = ureq::get(&url)
+        .config()
+        .timeout_global(Some(std::time::Duration::from_secs(20)))
+        .build()
+        .header("Authorization", &format!("Bearer {token}"))
+        .call()
+        .map_err(|e| registry_error(e, repo))?;
+    let v: Value = resp.body_mut().read_json().map_err(|e| format!("registry: {e}"))?;
+    Ok(parse_tag_list(&v))
+}
+
+pub fn parse_tag_list(v: &Value) -> Vec<HubTag> {
+    let mut out: Vec<HubTag> = strings(v.get("tags"))
+        .into_iter()
+        .map(|name| HubTag { name, digest: None })
+        .collect();
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
+/// What a registry failure MEANS, in the words of the thing that failed.
+///
+/// A 404 here is the common and interesting case: a locally built image tagged
+/// `org/thing` that was never pushed. "http status: 404" makes that read like a
+/// bug in runnir; it is the answer to the question.
+fn registry_error(e: ureq::Error, repo: &str) -> String {
+    match e {
+        ureq::Error::StatusCode(404) => format!("{repo} is not on the registry"),
+        ureq::Error::StatusCode(401 | 403) => {
+            format!("{repo}: the stored docker login cannot read it")
+        }
+        other => format!("registry: {other}"),
+    }
+}
+
+/// The manifest digest of one tag — the number the local `RepoDigest` is compared
+/// against.
+///
+/// The `Accept` headers matter: without them the registry converts a modern
+/// multi-architecture image into an old single-arch manifest and answers with the
+/// digest of the CONVERSION, which never matches anything local.
+pub fn hub_digest(auth: Option<&HubAuth>, repo: &str, tag: &str) -> Result<String, String> {
+    let token = registry_token(auth, repo, "pull")?;
+    let url = format!("https://registry-1.docker.io/v2/{repo}/manifests/{tag}");
+    let resp = ureq::get(&url)
+        .config()
+        .timeout_global(Some(std::time::Duration::from_secs(20)))
+        .build()
+        .header("Authorization", &format!("Bearer {token}"))
+        .header(
+            "Accept",
+            "application/vnd.oci.image.index.v1+json, \
+             application/vnd.oci.image.manifest.v1+json, \
+             application/vnd.docker.distribution.manifest.list.v2+json, \
+             application/vnd.docker.distribution.manifest.v2+json",
+        )
+        .call()
+        .map_err(|e| registry_error(e, repo))?;
+    resp.headers()
+        .get("docker-content-digest")
+        .and_then(|h| h.to_str().ok())
+        .map(str::to_string)
+        .ok_or_else(|| "the registry sent no digest".to_string())
 }

@@ -1399,7 +1399,53 @@ context drawn as down with its reason, images/volumes/networks, logs (500 lines,
 unwrapped from the daemon's 8-byte stream framing), inspect, then stop / start /
 remove of a throwaway container including the confirm and its "no".
 
-## DESIGN, NOT YET BUILT — the Docker / Docker Hub panel (decided 2026-07-21)
+## 2026-07-21 - The docker panel, step 2: Docker Hub, the drift, and the deploy
+
+**Hub is a host in the same column, and it authenticates twice.** The registry
+(`registry-1.docker.io`, the v2 protocol) and the web API (`hub.docker.com`) are
+two services with two token schemes, and the credentials come from
+`~/.docker/config.json` and its credential helper FIRST — if `docker login` already
+happened there is nothing for runnir to store, and a terminal asking again for a
+token the machine already has is a terminal inventing a secret to look after.
+
+**An organisation access token is refused by Hub's web API and accepted by the
+registry.** That is this account's normal case, so the repository list falls back to
+the repositories the LOCAL images name — and the header says which of the two you
+are looking at, because a fallback list passed off as the account's catalogue is
+worse than no list. The tags come from the registry either way, which is what makes
+the fallback work at all.
+
+**The drift is the point.** Each tag says how it compares with what is here: the
+same image, a different one, not pulled here, or — the case that matters —
+`local, never pushed`: built here under the name, so it looks published on every
+list that goes by tag, and it is the one a deploy gets wrong. Compared by DIGEST,
+never by id: a local id is a content hash of how this machine stored the image and
+says nothing about what a registry holds. The `Accept` headers on the manifest
+request are load-bearing — without them the registry converts a multi-architecture
+image to an old single-arch manifest and answers with the digest of the CONVERSION,
+which matches nothing local. One digest request per tag, on the tag under the
+cursor: Hub rate-limits, and fetching a list of two hundred would spend the limit
+on rows nobody looked at.
+
+**The deploy is one command line**: `compose pull && compose up -d` on whichever
+host the panel is pointed at, in a pane, after a confirm that names the host. The
+`&&` is not decoration: an `up` after a failed pull silently restarts the project on
+the image it was already running, which is the deploy that looks like it worked.
+`>` publishes an image the same way — a push is the one verb here with consequences
+outside this machine.
+
+**A generation counter is for the thing it guards.** The first version bumped the
+panel's `seq` in every worker, including the detail and digest reads, so opening a
+host and then moving the cursor dropped the host's own answer and the panel sat on
+`reading…` forever. Only a RELOAD is a new generation now; a detail is keyed by the
+object it is for and a digest by its repo and tag.
+
+**Still not built** from the design below: the `/events` stream (so a refresh is
+pushed rather than asked for), `/stats` for the selection, logs through the hint
+layer, a container's death in the status bar, browsing a volume with the explorer,
+and `system df` / prune.
+
+## DESIGN, PARTLY BUILT — the Docker / Docker Hub panel (decided 2026-07-21)
 
 Discussed with Pedro on 2026-07-21, before a line of code. Nothing here is built. The
 prose version, in Spanish, is in the qlaios personal wiki under `runnir`.

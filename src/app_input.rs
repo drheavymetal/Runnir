@@ -1632,12 +1632,37 @@ impl Gpu {
         let Some(host) = p.host().cloned() else { return };
         p.loading = true;
         if matches!(host.endpoint, crate::docker::Endpoint::Hub) {
-            // Hub is not a daemon and has no snapshot to read. Saying so beats a
-            // spinner that never stops.
-            p.loading = false;
-            p.snap = crate::docker::Snapshot::default();
-            p.rebuild();
-            p.message = Ok("docker hub: not built yet".into());
+            // Hub is not a daemon: no snapshot, a repository list instead. The local
+            // images go with the request so the answer can be compared against them
+            // without a second round trip.
+            p.open_repo = None;
+            p.tags.clear();
+            let images = p.local_images.clone();
+            let proxy = self.proxy.clone();
+            std::thread::spawn(move || {
+                let auth = crate::docker::hub_credentials();
+                let (repos, note) = match &auth {
+                    Some(a) => match crate::docker::hub_repos(a, &a.username) {
+                        Ok(list) => (Ok(list), format!("hub \u{b7} {}", a.username)),
+                        // An ORGANISATION access token is refused by Hub's web API
+                        // even though the registry accepts it, which is the normal
+                        // case here. The repositories the local images name are the
+                        // ones with something to compare anyway — but the panel says
+                        // where the list came from rather than passing it off as the
+                        // account's whole catalogue.
+                        Err(e) => (
+                            Ok(crate::docker::repos_from_images(&images)),
+                            format!("from local images \u{b7} {e}"),
+                        ),
+                    },
+                    None => (
+                        Ok(crate::docker::repos_from_images(&images)),
+                        "from local images \u{b7} no docker login found".to_string(),
+                    ),
+                };
+                let _ = proxy
+                    .send_event(UserEvent::Docker(seq, crate::docker::PanelMsg::Repos(repos, note)));
+            });
             return;
         }
         let ep = host.endpoint.clone();
@@ -1653,7 +1678,8 @@ impl Gpu {
     /// daemon knows. The summary needs no worker at all — it is built from the
     /// snapshot the panel already has.
     fn docker_detail_load(&mut self) {
-        self.docker_gen += 1;
+        // NOT a new generation: a detail read is keyed by the object it is for, and
+        // bumping the counter here would drop the snapshot that is still in flight.
         let seq = self.docker_gen;
         let Some(Overlay::Docker(p)) = &mut self.overlay else { return };
         if p.detail == overlay::DockerDetail::Summary {
@@ -1664,6 +1690,15 @@ impl Gpu {
         // A compose heading is not an object the daemon knows: it has no logs and
         // nothing to inspect. Falling back to the summary says what it DOES have —
         // leaving the column on "logs" would spin on "reading…" forever.
+        // On hub there is no daemon to ask: the detail IS the summary, plus the
+        // digest, which is fetched on its own.
+        if p.on_hub() {
+            p.detail = overlay::DockerDetail::Summary;
+            p.detail_lines.clear();
+            p.detail_for = None;
+            self.docker_tag_digest();
+            return;
+        }
         let (Some(id), Some(host)) = (p.selected_id(), p.host().cloned()) else {
             p.detail = overlay::DockerDetail::Summary;
             p.detail_lines.clear();
@@ -1689,6 +1724,49 @@ impl Gpu {
         });
     }
 
+    /// Drills into a Hub repository: its tags, read from the registry.
+    ///
+    /// The registry and not Hub's web API, because an organisation access token is
+    /// refused by the API and accepted by the registry — and the tags are what the
+    /// comparison needs.
+    fn docker_open_repo(&mut self, repo: String) {
+        let seq = self.docker_gen;
+        let Some(Overlay::Docker(p)) = &mut self.overlay else { return };
+        p.open_repo = Some(repo.clone());
+        p.tags.clear();
+        p.loading = true;
+        p.rebuild();
+        let proxy = self.proxy.clone();
+        std::thread::spawn(move || {
+            let auth = crate::docker::hub_credentials();
+            let tags = crate::docker::hub_tags(auth.as_ref(), &repo);
+            let _ = proxy.send_event(UserEvent::Docker(seq, crate::docker::PanelMsg::Tags(repo, tags)));
+        });
+    }
+
+    /// Reads the manifest digest of the selected tag, which is what the local
+    /// `RepoDigest` is compared against. One request per tag, so it is asked for
+    /// what is selected and not for the whole list: Hub rate-limits.
+    fn docker_tag_digest(&mut self) {
+        // Keyed by repo and tag, so it needs no generation of its own either.
+        let seq = self.docker_gen;
+        let Some(Overlay::Docker(p)) = &self.overlay else { return };
+        let Some(repo) = p.open_repo.clone() else { return };
+        let Some(overlay::DockerRow::Tag(i)) = p.selected() else { return };
+        let Some(tag) = p.tags.get(*i) else { return };
+        if tag.digest.is_some() {
+            return;
+        }
+        let tag = tag.name.clone();
+        let proxy = self.proxy.clone();
+        std::thread::spawn(move || {
+            let auth = crate::docker::hub_credentials();
+            let digest = crate::docker::hub_digest(auth.as_ref(), &repo, &tag);
+            let _ = proxy
+                .send_event(UserEvent::Docker(seq, crate::docker::PanelMsg::Digest(repo, tag, digest)));
+        });
+    }
+
     /// A docker worker answered. Anything tagged with an older generation is
     /// dropped: hosts get switched faster than a slow daemon answers, and a
     /// snapshot landing under another host would be a lie about that host.
@@ -1709,6 +1787,9 @@ impl Gpu {
                 p.loading = false;
                 match snap {
                     Ok(s) => {
+                        // Kept for the hub column, which has no images of its own
+                        // and exists to compare against these.
+                        p.local_images = s.images.clone();
                         p.apply_snapshot(s);
                         // Only an ERROR is cleared by a good read. The message is
                         // usually what the operation that triggered this reload just
@@ -1737,6 +1818,54 @@ impl Gpu {
                         p.detail_lines = vec![e.clone()];
                         p.message = Err(e);
                     }
+                }
+            }
+            crate::docker::PanelMsg::Repos(repos, note) => {
+                if seq != self.docker_gen {
+                    return;
+                }
+                p.loading = false;
+                match repos {
+                    Ok(list) => {
+                        p.repos = list;
+                        p.repos_note = note;
+                        p.rebuild();
+                    }
+                    Err(e) => {
+                        p.repos.clear();
+                        p.rebuild();
+                        p.message = Err(e);
+                    }
+                }
+            }
+            crate::docker::PanelMsg::Tags(repo, tags) => {
+                if p.open_repo.as_deref() != Some(repo.as_str()) {
+                    return;
+                }
+                p.loading = false;
+                match tags {
+                    Ok(list) => {
+                        p.tags = list;
+                        p.rebuild();
+                    }
+                    Err(e) => {
+                        p.tags.clear();
+                        p.rebuild();
+                        p.message = Err(e);
+                    }
+                }
+            }
+            crate::docker::PanelMsg::Digest(repo, tag, digest) => {
+                if p.open_repo.as_deref() != Some(repo.as_str()) {
+                    return;
+                }
+                match digest {
+                    Ok(d) => {
+                        if let Some(t) = p.tags.iter_mut().find(|t| t.name == tag) {
+                            t.digest = Some(d);
+                        }
+                    }
+                    Err(e) => p.message = Err(e),
                 }
             }
             crate::docker::PanelMsg::Done(result) => {
@@ -1883,15 +2012,23 @@ impl Gpu {
         let mut exec = false;
         let mut browse = false;
         let mut compose: Option<Vec<&str>> = None;
+        let mut open_repo: Option<String> = None;
+        let mut publish = false;
+        let mut deploy = false;
         {
             let Some(Overlay::Docker(p)) = &mut self.overlay else { return };
             let focus = p.focus;
             match key {
                 Key::Named(NamedKey::Escape) => {
-                    // Zoom first, then the panel: Escape backs out one thing at a
-                    // time, the way it does everywhere else here.
+                    // Zoom first, then an open repository, then the panel: Escape
+                    // backs out one thing at a time, the way it does everywhere
+                    // else here.
                     if p.zoom {
                         p.zoom = false;
+                    } else if p.open_repo.is_some() {
+                        p.open_repo = None;
+                        p.tags.clear();
+                        p.rebuild();
                     } else {
                         self.overlay = None;
                         self.window.request_redraw();
@@ -1921,8 +2058,17 @@ impl Gpu {
                         reload = true;
                     }
                     overlay::DockerFocus::Objects => {
-                        if !p.toggle_project() {
-                            detail = true;
+                        match p.selected() {
+                            // On hub, Enter drills into a repository's tags, the
+                            // way the git panel drills into a commit's files.
+                            Some(overlay::DockerRow::Repo(i)) => {
+                                open_repo = p.repos.get(*i).map(|r| r.name.clone());
+                            }
+                            _ => {
+                                if !p.toggle_project() {
+                                    detail = true;
+                                }
+                            }
                         }
                     }
                     overlay::DockerFocus::Detail => {}
@@ -2010,6 +2156,8 @@ impl Gpu {
                     "d" => remove = true,
                     "e" => exec = true,
                     "w" => browse = true,
+                    ">" => publish = true,
+                    "T" => deploy = true,
                     "U" => compose = Some(vec!["up", "-d"]),
                     "W" => compose = Some(vec!["down"]),
                     "P" => compose = Some(vec!["pull"]),
@@ -2044,6 +2192,20 @@ impl Gpu {
         }
         if let Some(verb) = compose {
             self.docker_compose(&verb, config);
+        }
+        if let Some(repo) = open_repo {
+            self.docker_open_repo(repo);
+        }
+        if publish {
+            self.docker_publish();
+        }
+        if deploy {
+            self.docker_deploy();
+        }
+        // A tag's digest is fetched when it comes under the cursor, not when the
+        // list arrives: one request per tag, and Hub rate-limits.
+        if matches!(&self.overlay, Some(Overlay::Docker(p)) if p.on_hub()) {
+            self.docker_tag_digest();
         }
         self.window.request_redraw();
     }
@@ -2129,8 +2291,11 @@ impl Gpu {
                 )
             }
             // A project heading has no single thing to remove: `compose down` is
-            // the verb for that, and it has its own key.
-            overlay::DockerRow::Project { .. } => return,
+            // the verb for that, and it has its own key. A hub row is not this
+            // machine's to delete from here either.
+            overlay::DockerRow::Project { .. }
+            | overlay::DockerRow::Repo(_)
+            | overlay::DockerRow::Tag(_) => return,
         };
         let host = p.host().map(|h| h.name.clone()).unwrap_or_default();
         self.pending_docker = Some(op);
@@ -2257,6 +2422,78 @@ impl Gpu {
             return;
         }
         self.docker_to_pane(cmd, config);
+    }
+
+    /// Publishes the selected image: `docker push repo:tag`, in a pane, after a
+    /// confirm that names what would be published and where.
+    ///
+    /// The one verb here with consequences outside this machine — it is what
+    /// `go2chaindev/*` on Hub becomes — so it asks, like everything else that
+    /// reaches off the box.
+    fn docker_publish(&mut self) {
+        let Some(Overlay::Docker(p)) = &self.overlay else { return };
+        let Some(host) = p.host().cloned() else { return };
+        // From an image row, or from the tag of a hub repository — both name one
+        // `repo:tag`, which is all a push needs.
+        let tag = match p.selected() {
+            Some(overlay::DockerRow::Image(i)) => p.snap.images.get(*i).and_then(|m| {
+                m.tags.iter().find(|t| t.contains('/') && *t != "<none>:<none>").cloned()
+            }),
+            Some(overlay::DockerRow::Tag(i)) => p
+                .open_repo
+                .as_ref()
+                .zip(p.tags.get(*i))
+                .map(|(repo, t)| format!("{repo}:{}", t.name)),
+            _ => None,
+        };
+        let Some(tag) = tag else {
+            if let Some(Overlay::Docker(p)) = &mut self.overlay {
+                p.message = Err("nothing here carries a repository tag to push".into());
+            }
+            return;
+        };
+        let cmd = crate::docker::push_command(&host, &tag);
+        self.docker_confirm_command(cmd, format!("Push {tag} to the registry?"), tag);
+    }
+
+    /// The deploy, as one action: pull what was published, then bring the project
+    /// up on it — on whichever host the panel is pointed at.
+    fn docker_deploy(&mut self) {
+        let Some(Overlay::Docker(p)) = &self.overlay else { return };
+        let (Some(project), Some(host)) = (p.selected_project(), p.host().cloned()) else {
+            if let Some(Overlay::Docker(p)) = &mut self.overlay {
+                p.message = Err("a deploy is a compose project: pick one".into());
+            }
+            return;
+        };
+        let files = p
+            .snap
+            .containers
+            .iter()
+            .find(|c| c.project.as_deref() == Some(project.as_str()))
+            .map(|c| c.config_files.clone())
+            .unwrap_or_default();
+        let cmd = crate::docker::deploy_command(&host, &project, &files);
+        let label = format!("Deploy {project} on {}? compose pull, then up -d", host.name);
+        self.docker_confirm_command(cmd, label, host.endpoint.label());
+    }
+
+    /// Parks the panel behind a confirm for a command that will run in a pane.
+    fn docker_confirm_command(&mut self, cmd: Vec<String>, label: String, detail: String) {
+        self.pending_docker_cmd = Some(cmd);
+        self.docker_stash = match self.overlay.take() {
+            Some(Overlay::Docker(p)) => Some(p),
+            other => {
+                self.overlay = other;
+                return;
+            }
+        };
+        self.overlay = Some(Overlay::Prompt(Prompt::new(
+            PromptKind::DockerRemote,
+            &label,
+            vec![detail],
+        )));
+        self.window.request_redraw();
     }
 
     /// Opens the selected container's first published port in the browser.
@@ -2549,6 +2786,17 @@ impl Gpu {
                     }
                     crate::overlay::DockerRow::Network(i) => {
                         json!({"kind": "network", "name": p.snap.networks[*i].name})
+                    }
+                    crate::overlay::DockerRow::Repo(i) => {
+                        json!({"kind": "repo", "name": p.repos[*i].name,
+                               "private": p.repos[*i].private})
+                    }
+                    crate::overlay::DockerRow::Tag(i) => {
+                        let t = &p.tags[*i];
+                        let repo = p.open_repo.clone().unwrap_or_default();
+                        json!({"kind": "tag", "name": t.name, "digest": t.digest,
+                               "drift": crate::docker::drift(&p.local_images, &repo, &t.name,
+                                                             t.digest.as_deref()).label()})
                     }
                 }).collect::<Vec<_>>(),
             });
