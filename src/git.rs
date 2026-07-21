@@ -37,6 +37,10 @@ pub struct RepoState {
     pub ahead: usize,
     pub behind: usize,
     pub upstream: bool,
+    /// An operation left half-finished in this repository — a rebase, a merge, a
+    /// cherry-pick. The bar has to say so: every command behaves differently in the
+    /// middle of one, and the branch name alone hides it completely.
+    pub operation: Option<&'static str>,
     /// Local branch names, so hint mode can tell a branch from any other word on
     /// the screen. Read from the refs, never guessed: a token is a branch only if
     /// this repository actually has a branch by that name.
@@ -60,6 +64,7 @@ impl RepoState {
 pub fn repo_root(dir: &Path) -> Option<PathBuf> {
     let mut cur = Some(dir);
     while let Some(d) = cur {
+        // `.exists()`, not `.is_dir()`: in a worktree or submodule `.git` is a file.
         if d.join(".git").exists() {
             return Some(d.to_path_buf());
         }
@@ -68,12 +73,40 @@ pub fn repo_root(dir: &Path) -> Option<PathBuf> {
     None
 }
 
-/// The current branch for `dir`, read straight out of `.git/HEAD`. No git process is
+/// The git directory for a working tree.
+///
+/// Usually `<root>/.git`, but in a WORKTREE (and in a submodule) `.git` is a FILE
+/// holding `gitdir: <path>`. Reading `<root>/.git/HEAD` there fails outright, which
+/// is how a worktree ended up with no branch anywhere in the UI.
+pub fn git_dir(root: &Path) -> Option<PathBuf> {
+    let dot = root.join(".git");
+    if dot.is_dir() {
+        return Some(dot);
+    }
+    let text = std::fs::read_to_string(&dot).ok()?;
+    let path = text.strip_prefix("gitdir:")?.trim();
+    let path = Path::new(path);
+    Some(if path.is_absolute() { path.to_path_buf() } else { root.join(path) })
+}
+
+/// Where the refs live for this working tree. A worktree's own git dir holds its
+/// HEAD and index, but `refs/heads` and `packed-refs` belong to the main one, named
+/// by the `commondir` file. Branch lists must come from there or a worktree lists
+/// nothing.
+pub fn common_dir(git_dir: &Path) -> PathBuf {
+    let Ok(text) = std::fs::read_to_string(git_dir.join("commondir")) else {
+        return git_dir.to_path_buf();
+    };
+    let p = Path::new(text.trim());
+    if p.is_absolute() { p.to_path_buf() } else { git_dir.join(p) }
+}
+
+/// The current branch for `dir`, read straight out of HEAD. No git process is
 /// spawned, so this is safe to call from the draw path. A detached head yields the
 /// short commit id.
 pub fn head_branch(dir: &Path) -> Option<String> {
     let root = repo_root(dir)?;
-    let content = std::fs::read_to_string(root.join(".git/HEAD")).ok()?;
+    let content = std::fs::read_to_string(git_dir(&root)?.join("HEAD")).ok()?;
     let content = content.trim();
     Some(match content.strip_prefix("ref: refs/heads/") {
         Some(name) => name.chars().take(24).collect(),
@@ -91,9 +124,10 @@ pub fn head_branch(dir: &Path) -> Option<String> {
 pub fn local_branches(root: &Path) -> Vec<String> {
     const CAP: usize = 512;
     let mut out = Vec::new();
-    let heads = root.join(".git/refs/heads");
+    let Some(common) = git_dir(root).map(|g| common_dir(&g)) else { return out };
+    let heads = common.join("refs/heads");
     walk_refs(&heads, &heads, &mut out, CAP);
-    if let Ok(packed) = std::fs::read_to_string(root.join(".git/packed-refs")) {
+    if let Ok(packed) = std::fs::read_to_string(common.join("packed-refs")) {
         for line in packed.lines() {
             if line.starts_with('#') || line.starts_with('^') {
                 continue;
@@ -148,8 +182,28 @@ pub fn read_state(dir: &Path) -> Option<RepoState> {
     // the UI thread here.
     if let Some(root) = repo_root(dir) {
         state.branches = local_branches(&root);
+        state.operation = git_dir(&root).and_then(|g| in_progress(&g));
     }
     Some(state)
+}
+
+/// The operation this repository is in the middle of, by the marker files git
+/// leaves in its git dir. Named the way git names them in its own messages.
+pub fn in_progress(git_dir: &Path) -> Option<&'static str> {
+    let has = |p: &str| git_dir.join(p).exists();
+    if has("rebase-merge") || has("rebase-apply") {
+        Some("REBASE")
+    } else if has("MERGE_HEAD") {
+        Some("MERGE")
+    } else if has("CHERRY_PICK_HEAD") {
+        Some("CHERRY-PICK")
+    } else if has("REVERT_HEAD") {
+        Some("REVERT")
+    } else if has("BISECT_LOG") {
+        Some("BISECT")
+    } else {
+        None
+    }
 }
 
 /// Parses `git status --porcelain=v2 --branch`. Kept pure and separate from the
@@ -412,6 +466,13 @@ pub fn run(root: &Path, args: &[String]) -> Result<String, String> {
 /// until there is something to say.
 pub fn status_text(s: &RepoState) -> String {
     let mut out = String::new();
+    // First, because it changes what every other number means: 2 commits "ahead"
+    // in the middle of a rebase is not the same fact as 2 commits ahead on a
+    // finished branch.
+    if let Some(op) = s.operation {
+        out.push_str(op);
+        out.push(' ');
+    }
     if s.detached {
         out.push_str("detached ");
     }
@@ -486,6 +547,13 @@ mod tests {
         assert!(s.detached);
         assert_eq!(s.branch, "12345678");
         assert!(!s.has_upstream(), "a detached head has no upstream to be ahead of");
+    }
+
+    #[test]
+    fn an_unfinished_operation_leads_the_status_text() {
+        let mut st = parse_porcelain_v2("# branch.head main\n# branch.ab +2 -0\n");
+        st.operation = Some("REBASE");
+        assert_eq!(status_text(&st), "REBASE main \u{2191}2");
     }
 
     #[test]

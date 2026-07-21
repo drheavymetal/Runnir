@@ -743,6 +743,25 @@ not by reading the code.
 The leader root `g` now opens the panel. It was FixLastCommand, which also lives at
 `leader a g`, so nothing lost a binding and git gets the letter everyone reaches for.
 
+## 2026-07-21 - Worktrees had no branch at all, and the bar hid an unfinished rebase
+
+Two blind spots, both found by asking "what is still missing" rather than by a test.
+
+**In a worktree (and a submodule) `.git` is a FILE**, holding `gitdir: <path>`.
+`head_branch` read `<root>/.git/HEAD`, which cannot work there, so every worktree
+showed no branch in the status bar, no branches in hint mode, and no HEAD in the
+panel. This repo keeps its agent worktrees under `.claude/worktrees/`, so it was
+broken in the place it is used most. `git_dir()` now resolves the pointer file.
+
+Refs need a second hop: a worktree's own git dir holds HEAD and the index, but
+`refs/heads` and `packed-refs` live in the MAIN one, named by its `commondir` file.
+`common_dir()` follows that, or a worktree lists zero branches while sitting on one.
+
+**An unfinished operation is now the first thing the bar says**: REBASE, MERGE,
+CHERRY-PICK, REVERT, BISECT, from the marker files in the git dir. It leads the
+line because it changes what the rest of it means - "2 ahead" mid-rebase is not the
+same fact as 2 ahead on a finished branch.
+
 ## Gotchas (do not re-learn)
 
 - A binding spec and a keypress must produce the SAME `ChordKey` variant.
@@ -768,6 +787,9 @@ The leader root `g` now opens the panel. It was FixLastCommand, which also lives
 - Claude Code does not probe for the kitty keyboard protocol. Terminal-side protocol
   support alone is not enough; the legacy encoding has to carry Shift+Enter as ESC-CR.
 
+- `.git` is not always a directory: in a worktree and in a submodule it is a file
+  holding `gitdir: <path>`, and the refs then live in the `commondir` it points at.
+  Never join `.git/<thing>` onto a repo root - go through `git::git_dir()`.
 - winit delivers space as `Key::Named(NamedKey::Space)`, never as
   `Key::Character(" ")`. An overlay binding it on the character compiles, runs, and
   does nothing.
