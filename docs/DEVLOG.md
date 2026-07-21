@@ -1258,6 +1258,96 @@ With it, the whole feature above was driven from a shell: open the panel, switch
 the log, Enter a commit, walk its files, zoom, escape, drag both separators, arm the
 leader and descend into a group — each step asserted on the JSON that came back.
 
+## DESIGN, NOT YET BUILT — the Docker / Docker Hub panel (decided 2026-07-21)
+
+Discussed with Pedro on 2026-07-21, before a line of code. Nothing here is built. The
+prose version, in Spanish, is in the qlaios personal wiki under `runnir`.
+
+**What it is.** Native management of Docker from the terminal, seen graphically:
+local containers/images/volumes/networks, containers on remote daemons over SSH, and
+the private repos on Docker Hub. Read AND act: start/stop, build, push, pull, deploy.
+
+**Shape: the git panel's contract, three columns.** Resizable, zoomable, with a
+leader of its own (`DOCKER_LEADER`). Not a sidebar, not a modal layer.
+
+```
+┌ hosts ───────┬ objects ────────────┬ detail ───────────┐
+│ ● local      │ [C] [I] [V] [N]     │ logs / inspect    │
+│   cloudmax   │ ▾ qlaios (compose)  │ stats             │
+│   demo       │    ● api    up 3d   │ ports, mounts     │
+│ ── hub ──    │    ● db     up 3d   │ env               │
+│   go2chaindev│    ○ web    exited  │ layers / history  │
+└──────────────┴─────────────────────┴───────────────────┘
+```
+
+- Column 1 is hosts (docker contexts) plus Docker Hub as a PSEUDO-HOST. A host that
+  is down is marked as down; it never stalls the frame.
+- Column 2 carries a strip for the object kind, and inside it the compose project is
+  a LEVEL of the tree, grouped by the `com.docker.compose.project` label — because
+  the real workflow here (qlaios, cromowin) is compose, not loose containers. On the
+  hub pseudo-host the strip disappears: repos → tags.
+- Column 3 is the detail of what is selected.
+
+**Three transports behind one layer.** The daemon socket is the primary one
+(`/var/run/docker.sock`, HTTP), because `/events` and `/stats` are streams and
+parsing CLI output for those is a losing game. But the socket does NOT reach the
+other two: Docker Hub is the registry v2 + Hub HTTP API and needs its own client,
+and a remote host needs the tunnel the CLI itself uses
+(`ssh … docker system dial-stdio`). One common layer, three transports.
+
+**Refresh is pushed, not polled.** `/events` announces starts, deaths and pulls;
+`stats` is streamed only for the SELECTED container — every container at once is
+expensive locally and impossible over SSH.
+
+**Long output goes to a real pane; short output stays inline.** `logs`, `stats` and
+`inspect` render in column 3. `build`, `push`, `pull` and `exec` open a pane and run
+there: progress bars, colour, Ctrl-C and scrollback come free, and they are minutes
+long. Same call as the git credentials prompt.
+
+**Operations, by object:**
+- Container: start, stop, restart, pause, kill, rm; `exec` shell → pane; live logs
+  with a filter; inspect; copy id; open a published port in the browser. Healthcheck
+  state is its own marker, not folded into up/exited.
+- Compose project: up, down, restart, pull, show the yaml. `down -v` confirms
+  separately, counting volumes.
+- Image: rm, tag, push, pull, layer history, which containers use it; build from the
+  current repo's Dockerfile → pane.
+- Volume: rm confirmed by counting users; and browsing its contents with the explorer
+  sidebar that already exists (via an ephemeral container when it is remote).
+- Network: subnet, connected containers, rm.
+- Docker Hub: the account/org repos, public and private; per repo the tags, digest,
+  size, last push, architectures; pull a tag, delete a tag, search.
+- Across all of it: a live event feed, and `system df` broken down into what a prune
+  WOULD free, shown before it runs.
+
+**The four things lazydocker does not do**, which are the reason to build this at all:
+1. **Local ↔ Hub diff.** Compare the local `RepoDigest` against the remote tag's
+   digest, so a row says whether local is behind, or whether what runs on cloudmax is
+   not what is published.
+2. **Deploy as one action**: build → push → (ssh) pull + up, steps visible, each
+   cancellable. It is what the `desplegar-*` skills do, inside the panel.
+3. **Logs through runnir's hint layer** — paths, URLs and hashes clickable in a log,
+   exactly as in the terminal.
+4. **A container that dies says so in the status bar**, like the per-tab dirty marker.
+
+**Credentials.** Read `~/.docker/config.json` and its credential helpers FIRST: if
+`docker login` already happened there is nothing to store. Only if there is nothing,
+offer a login and keep the PAT OUT of `config.toml` — a separate 0600 file or the
+system keyring — with the settings panel showing `••••` and a date, never the value.
+A Docker Hub PAT with read/write scope can publish to `go2chaindev/*`.
+
+**Traps identified up front:**
+- `stats` for the selection only. All of them at once is unsustainable over SSH.
+- One persistent multiplexed connection per SSH host, read on a thread with a
+  sequence number, like the git panel. A slow host must not block a frame.
+- `prune`, `rm -v` and `down -v` destroy data: they belong to the guardian, and they
+  count before they ask.
+- `exec` on a host that is not local confirms with the HOST NAMED.
+- Compare by `RepoDigests`, never by `Id` — the local Id says nothing about a remote.
+- Docker Hub rate-limits: cache tags, do not repoll them.
+- The settings rule from the explorer still holds: an option lives in the config, in
+  the settings panel AND in the code that reads it — all three or none.
+
 ## Gotchas (do not re-learn)
 
 - Half-block art is square per CELL, not on screen. Any image fit needs the cell
