@@ -1417,6 +1417,22 @@ impl Gpu {
                     self.git_exec(vec!["checkout".into(), "-b".into(), value.trim().to_string()]);
                 }
             }
+            // The filter is remembered on the panel, so reopening it keeps the view
+            // you were looking at; an empty prompt clears it.
+            PromptKind::GitLogFilter => {
+                self.open_git_panel(config);
+                if let Some(Overlay::Git(p)) = &mut self.overlay {
+                    p.log_filter = value.trim().to_string();
+                    p.set_view(crate::overlay::GitView::Log);
+                }
+                self.git_reload(config);
+            }
+            PromptKind::GitTag => {
+                if !value.trim().is_empty() {
+                    self.open_git_panel(config);
+                    self.git_exec(vec!["tag".into(), value.trim().to_string()]);
+                }
+            }
             PromptKind::ImageWatchDir => {
                 if value.trim().is_empty() {
                     self.image_watch = None;
@@ -1782,20 +1798,33 @@ impl Gpu {
     fn git_reload(&mut self, config: &Config) {
         let Some(Overlay::Git(p)) = &self.overlay else { return };
         let root = p.root.clone();
+        let filter = p.log_filter.clone();
         self.git_gen += 1;
         let seq = self.git_gen;
         let proxy = self.proxy.clone();
         std::thread::spawn(move || {
+            // Sent one at a time, cheapest first: the status view is what opens, so
+            // it paints while the log of a big repository is still being read.
             let files = crate::git::status_files(&root);
             let _ = proxy.send_event(UserEvent::GitPanel(seq, crate::git::PanelMsg::Files(files)));
-            let log = crate::git::log(&root, 200);
-            let _ = proxy.send_event(UserEvent::GitPanel(seq, crate::git::PanelMsg::Log(log)));
             let branches = crate::git::local_branches(&root);
+            let remotes = crate::git::remote_branches(&root);
             let current = crate::git::head_branch(&root).unwrap_or_default();
-            let _ = proxy
-                .send_event(UserEvent::GitPanel(seq, crate::git::PanelMsg::Branches(branches, current)));
+            let _ = proxy.send_event(UserEvent::GitPanel(
+                seq,
+                crate::git::PanelMsg::Branches(branches, remotes, current),
+            ));
+            let log = crate::git::log_filtered(&root, 200, &filter);
+            let _ = proxy.send_event(UserEvent::GitPanel(seq, crate::git::PanelMsg::Log(log)));
             let stashes = crate::git::stashes(&root);
             let _ = proxy.send_event(UserEvent::GitPanel(seq, crate::git::PanelMsg::Stashes(stashes)));
+            let tags = crate::git::tags(&root);
+            let _ = proxy.send_event(UserEvent::GitPanel(seq, crate::git::PanelMsg::Tags(tags)));
+            let reflog = crate::git::reflog(&root, 200);
+            let _ = proxy.send_event(UserEvent::GitPanel(seq, crate::git::PanelMsg::Reflog(reflog)));
+            let worktrees = crate::git::worktrees(&root);
+            let _ = proxy
+                .send_event(UserEvent::GitPanel(seq, crate::git::PanelMsg::Worktrees(worktrees)));
         });
         let _ = config;
     }
@@ -1806,24 +1835,51 @@ impl Gpu {
         let Some(Overlay::Git(p)) = &self.overlay else { return };
         let root = p.root.clone();
         let job = match p.view {
-            overlay::GitView::Status => p.selected_file().map(|f| {
-                (f.path.clone(), f.is_staged() && !f.is_unstaged(), f.untracked())
-            }).map(|(path, staged, untracked)| {
-                Box::new(move |root: &std::path::Path| crate::git::diff_file(root, &path, staged, untracked))
-                    as Box<dyn FnOnce(&std::path::Path) -> String + Send>
-            }),
+            overlay::GitView::Status => p
+                .selected_file()
+                .map(|f| {
+                    // A file can be staged AND modified; `t` toggles which of the
+                    // two diffs the preview shows.
+                    let staged = p.show_staged || (f.is_staged() && !f.is_unstaged());
+                    (f.path.clone(), staged, f.untracked())
+                })
+                .map(|(path, staged, untracked)| {
+                    Box::new(move |root: &std::path::Path| {
+                        crate::git::diff_file(root, &path, staged, untracked)
+                    }) as Box<dyn FnOnce(&std::path::Path) -> String + Send>
+                }),
             overlay::GitView::Log => p.selected_commit().map(|c| c.sha.clone()).map(|sha| {
                 Box::new(move |root: &std::path::Path| crate::git::show(root, &sha))
                     as Box<dyn FnOnce(&std::path::Path) -> String + Send>
             }),
-            overlay::GitView::Branches => p.selected_branch().cloned().map(|b| {
+            overlay::GitView::Branches => p.selected_branch().map(|(b, _)| b.clone()).map(|b| {
                 Box::new(move |root: &std::path::Path| crate::git::branch_log(root, &b))
                     as Box<dyn FnOnce(&std::path::Path) -> String + Send>
             }),
-            overlay::GitView::Stashes => p.selected_stash().cloned().map(|s| {
-                let name = s.split(':').next().unwrap_or("stash@{0}").to_string();
+            overlay::GitView::Stashes => p.selected_stash().cloned().map(|st| {
+                let name = st.split(':').next().unwrap_or("stash@{0}").to_string();
                 Box::new(move |root: &std::path::Path| crate::git::stash_show(root, &name))
                     as Box<dyn FnOnce(&std::path::Path) -> String + Send>
+            }),
+            overlay::GitView::Tags => p.selected_tag().cloned().map(|t| {
+                let name = t.split_whitespace().next().unwrap_or("").to_string();
+                Box::new(move |root: &std::path::Path| crate::git::show(root, &name))
+                    as Box<dyn FnOnce(&std::path::Path) -> String + Send>
+            }),
+            overlay::GitView::Reflog => p.selected_reflog().map(|c| c.sha.clone()).map(|sha| {
+                Box::new(move |root: &std::path::Path| crate::git::show(root, &sha))
+                    as Box<dyn FnOnce(&std::path::Path) -> String + Send>
+            }),
+            overlay::GitView::Worktrees => p.selected_worktree().cloned().map(|w| {
+                let path = crate::git::worktree_path(&w).to_string();
+                Box::new(move |_root: &std::path::Path| {
+                    let dir = std::path::PathBuf::from(&path);
+                    crate::git::log(&dir, 30)
+                        .iter()
+                        .map(|c| format!("{} {}", c.sha, c.subject))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                }) as Box<dyn FnOnce(&std::path::Path) -> String + Send>
             }),
         };
         let Some(job) = job else { return };
@@ -1856,6 +1912,21 @@ impl Gpu {
             let _ = proxy.send_event(UserEvent::GitPanel(seq, crate::git::PanelMsg::Ran(args, out)));
         });
         self.window.request_redraw();
+    }
+
+    /// Opens a new tab with its shell started in `dir`. Used to visit a worktree:
+    /// the panel lists them, and a terminal's answer to "show me that one" is a
+    /// shell already sitting in it.
+    fn new_tab_in(&mut self, config: &Config, dir: std::path::PathBuf) {
+        let area = self.active_area();
+        let id = self.new_pane_id();
+        let wake = wake_fn(self.proxy.clone());
+        let spawn = Spawn { cwd: Some(dir), ..Default::default() };
+        if let Ok(tab) = Tab::new(area, self.renderer.cell_size(), config, id, &spawn, wake) {
+            self.tabs.push(tab);
+            self.active = self.tabs.len() - 1;
+            self.reflow_all();
+        }
     }
 
     /// Stages or unstages one hunk, by feeding a rebuilt patch to `git apply
@@ -1894,10 +1965,14 @@ impl Gpu {
                     preview = true;
                 }
                 crate::git::PanelMsg::Log(l) => p.log = l,
-                crate::git::PanelMsg::Branches(b, cur) => {
+                crate::git::PanelMsg::Branches(b, r, cur) => {
                     p.branches = b;
+                    p.remotes = r;
                     p.current_branch = cur;
                 }
+                crate::git::PanelMsg::Tags(t) => p.tags = t,
+                crate::git::PanelMsg::Reflog(r) => p.reflog = r,
+                crate::git::PanelMsg::Worktrees(w) => p.worktrees = w,
                 crate::git::PanelMsg::Stashes(s) => p.stashes = s,
                 crate::git::PanelMsg::Preview(text) => {
                     // Only the newest request may paint: a fast j/k run would
@@ -1950,6 +2025,7 @@ impl Gpu {
         let mut prompt: Option<(PromptKind, &str)> = None;
         let mut close = false;
         let mut reload = false;
+        let mut open_dir: Option<String> = None;
         // A hunk patch to stage (or, reversed, unstage).
         let mut patch: Option<(String, bool)> = None;
 
@@ -1984,14 +2060,46 @@ impl Gpu {
             Key::Named(NamedKey::PageUp) => p.scroll_preview(-10),
             Key::Named(NamedKey::Enter) => match view {
                 GitView::Branches => {
-                    if let Some(b) = p.selected_branch() {
-                        exec = Some(vec![s("checkout"), b.clone()]);
+                    if let Some((b, remote)) = p.selected_branch() {
+                        // A remote-tracking ref is checked out with --track, which
+                        // creates the local branch that follows it; plain checkout
+                        // of one lands you on a detached HEAD.
+                        exec = Some(if remote {
+                            vec![s("switch"), s("--track"), b.clone()]
+                        } else {
+                            vec![s("checkout"), b.clone()]
+                        });
                     }
                 }
                 GitView::Stashes => {
                     if let Some(st) = p.selected_stash() {
                         let name = st.split(':').next().unwrap_or("stash@{0}").to_string();
                         exec = Some(vec![s("stash"), s("pop"), name]);
+                    }
+                }
+                GitView::Log => {
+                    if let Some(c) = p.selected_commit() {
+                        exec = Some(vec![s("checkout"), c.sha.clone()]);
+                    }
+                }
+                GitView::Tags => {
+                    if let Some(t) = p.selected_tag() {
+                        let name = t.split_whitespace().next().unwrap_or("").to_string();
+                        exec = Some(vec![s("checkout"), name]);
+                    }
+                }
+                // The reflog exists to get back to a position. Checking one out is
+                // the whole point of showing it.
+                GitView::Reflog => {
+                    if let Some(c) = p.selected_reflog() {
+                        exec = Some(vec![s("checkout"), c.sha.clone()]);
+                    }
+                }
+                // A worktree is a directory: opening it is a new tab there, which is
+                // what a terminal can do that a git client cannot.
+                GitView::Worktrees => {
+                    if let Some(w) = p.selected_worktree() {
+                        open_dir = Some(crate::git::worktree_path(w).to_string());
                     }
                 }
                 _ => {}
@@ -2035,7 +2143,95 @@ impl Gpu {
                     p.set_view(GitView::Stashes);
                     moved = true;
                 }
+                "5" => {
+                    p.set_view(GitView::Tags);
+                    moved = true;
+                }
+                "6" => {
+                    p.set_view(GitView::Reflog);
+                    moved = true;
+                }
+                "7" => {
+                    p.set_view(GitView::Worktrees);
+                    moved = true;
+                }
+                // A file can be staged and modified at once; show the other diff.
+                "t" if view == GitView::Status => {
+                    p.show_staged = !p.show_staged;
+                    moved = true;
+                }
+                // Amend keeps the message and folds the staged set into the last
+                // commit. Recoverable from the reflog, which is view 6.
+                "A" if view == GitView::Status => {
+                    exec = Some(vec![s("commit"), s("--amend"), s("--no-edit")])
+                }
+                // A commit message with a body needs a real editor, so this hands
+                // the whole commit to a pane: git opens $EDITOR there, hooks and
+                // all, exactly as it would at the prompt.
+                "C" if view == GitView::Status => {
+                    split = Some(vec![s("git"), s("commit")]);
+                }
+                // Conflict resolution. Guarded on the file actually being unmerged,
+                // so a side can never be picked for a file that has no conflict.
+                "O" | "T" if view == GitView::Status => {
+                    if let Some(f) = p.selected_file() {
+                        if crate::git::is_conflicted(&p.files, &f.path) {
+                            let side = if c.as_str() == "O" { s("--ours") } else { s("--theirs") };
+                            exec = Some(vec![s("checkout"), side, s("--"), f.path.clone()]);
+                        } else {
+                            p.message = Err("not a conflicted file".into());
+                        }
+                    }
+                }
+                // Open the file under the cursor: how you resolve a conflict by hand.
+                "e" if view == GitView::Status => {
+                    if let Some(f) = p.selected_file() {
+                        split = Some(vec![editor_cmd(), f.path.clone()]);
+                    }
+                }
+                // History of just this file, in a split, so the log view stays where
+                // it was.
+                "L" if view == GitView::Status => {
+                    if let Some(f) = p.selected_file() {
+                        split = Some(vec![
+                            s("git"),
+                            s("log"),
+                            s("--follow"),
+                            s("--patch"),
+                            s("--"),
+                            f.path.clone(),
+                        ]);
+                    }
+                }
+                // Blame, likewise: a pager in a pane beats reimplementing one.
+                "b" if view == GitView::Status => {
+                    if let Some(f) = p.selected_file() {
+                        split = Some(vec![s("git"), s("blame"), s("--date=short"), s("-w"), s("--"), f.path.clone()]);
+                    }
+                }
+                "m" if view == GitView::Branches => {
+                    if let Some((b, _)) = p.selected_branch() {
+                        exec = Some(vec![s("merge"), s("--no-edit"), b.clone()]);
+                    }
+                }
+                "R" if view == GitView::Branches => {
+                    if let Some((b, _)) = p.selected_branch() {
+                        exec = Some(vec![s("rebase"), b.clone()]);
+                    }
+                }
+                "c" if view == GitView::Log => {
+                    if let Some(cm) = p.selected_commit() {
+                        exec = Some(vec![s("cherry-pick"), cm.sha.clone()]);
+                    }
+                }
+                "n" if view == GitView::Tags => prompt = Some((PromptKind::GitTag, "New tag")),
+                "P" if view == GitView::Tags => {
+                    exec = Some(vec![s("push"), s("--tags")]);
+                }
                 "r" => reload = true,
+                "/" if view == GitView::Log => {
+                    prompt = Some((PromptKind::GitLogFilter, "Filter log by message"))
+                }
                 "a" if view == GitView::Status => exec = Some(vec![s("add"), s("-A")]),
                 "c" if view == GitView::Status => {
                     prompt = Some((PromptKind::GitCommit, "Commit message"))
@@ -2048,8 +2244,13 @@ impl Gpu {
                     copy = match view {
                         GitView::Log => p.selected_commit().map(|c| c.sha.clone()),
                         GitView::Status => p.selected_file().map(|f| f.path.clone()),
-                        GitView::Branches => p.selected_branch().cloned(),
+                        GitView::Branches => p.selected_branch().map(|(b, _)| b.clone()),
                         GitView::Stashes => p.selected_stash().cloned(),
+                        GitView::Tags => p.selected_tag().cloned(),
+                        GitView::Reflog => p.selected_reflog().map(|c| c.sha.clone()),
+                        GitView::Worktrees => {
+                            p.selected_worktree().map(|w| crate::git::worktree_path(w).to_string())
+                        }
                     }
                 }
                 "o" if view == GitView::Log => {
@@ -2057,7 +2258,10 @@ impl Gpu {
                         vec![s("git"), s("show"), s("--stat"), s("--patch"), c.sha.clone()]
                     })
                 }
-                "P" => exec = Some(vec![s("push")]),
+                // The first push of a branch has no upstream to push to; push_args
+                // adds `-u origin HEAD` exactly then, so a new branch works without
+                // the user having to know.
+                "P" => exec = Some(crate::git::push_args(&p.root)),
                 "p" => exec = Some(vec![s("pull"), s("--ff-only")]),
                 "f" => exec = Some(vec![s("fetch"), s("--all"), s("--prune")]),
                 _ => {}
@@ -2079,6 +2283,10 @@ impl Gpu {
         if let Some(cmd) = split {
             self.split_running(config, cmd);
             self.overlay = None;
+        }
+        if let Some(dir) = open_dir {
+            self.overlay = None;
+            self.new_tab_in(config, std::path::PathBuf::from(dir));
         }
         if let Some((text, reverse)) = patch {
             self.git_apply(text, reverse);
@@ -2968,6 +3176,13 @@ impl Gpu {
             Err(e) => ControlResponse::error(format!("could not spawn: {e}")),
         }
     }
+}
+
+/// The user's editor, for the panel's "open this file" keys.
+fn editor_cmd() -> String {
+    std::env::var("VISUAL")
+        .or_else(|_| std::env::var("EDITOR"))
+        .unwrap_or_else(|_| "vi".to_string())
 }
 
 fn wheel_lines(delta: MouseScrollDelta, wheel_lines: f32, cell_h: f32) -> f32 {

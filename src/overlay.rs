@@ -119,6 +119,11 @@ pub enum GitView {
     Log,
     Branches,
     Stashes,
+    Tags,
+    /// Every position HEAD has held — the undo history for everything the panel
+    /// deliberately refuses to bind.
+    Reflog,
+    Worktrees,
 }
 
 impl GitView {
@@ -128,6 +133,9 @@ impl GitView {
             GitView::Log => "log",
             GitView::Branches => "branches",
             GitView::Stashes => "stashes",
+            GitView::Tags => "tags",
+            GitView::Reflog => "reflog",
+            GitView::Worktrees => "worktrees",
         }
     }
 
@@ -136,7 +144,10 @@ impl GitView {
             GitView::Status => GitView::Log,
             GitView::Log => GitView::Branches,
             GitView::Branches => GitView::Stashes,
-            GitView::Stashes => GitView::Status,
+            GitView::Stashes => GitView::Tags,
+            GitView::Tags => GitView::Reflog,
+            GitView::Reflog => GitView::Worktrees,
+            GitView::Worktrees => GitView::Status,
         }
     }
 }
@@ -152,10 +163,23 @@ pub struct GitPanel {
     pub files: Vec<crate::git::FileEntry>,
     pub log: Vec<crate::git::Commit>,
     pub branches: Vec<String>,
+    /// Remote-tracking branches, listed after the local ones in the same view: they
+    /// are the same kind of thing, and splitting them into two views would mean
+    /// switching views to answer "is my branch on the remote".
+    pub remotes: Vec<String>,
     pub stashes: Vec<String>,
+    pub tags: Vec<String>,
+    pub reflog: Vec<crate::git::Commit>,
+    pub worktrees: Vec<String>,
     pub current_branch: String,
     /// Selection per view, kept apart so switching back lands where you left off.
-    cursors: [usize; 4],
+    cursors: [usize; 7],
+    /// In the status view, whether the preview shows the STAGED diff. A file can be
+    /// both staged and modified, and those are two different diffs of one path.
+    pub show_staged: bool,
+    /// Message filter for the log view, shown in the header so a narrowed list can
+    /// never be mistaken for the whole history.
+    pub log_filter: String,
     pub preview: String,
     /// The preview, parsed into numbered diff rows. Kept beside the text so the
     /// draw path never re-parses on every frame.
@@ -179,9 +203,15 @@ impl GitPanel {
             files: Vec::new(),
             log: Vec::new(),
             branches: Vec::new(),
+            remotes: Vec::new(),
             stashes: Vec::new(),
+            tags: Vec::new(),
+            reflog: Vec::new(),
+            worktrees: Vec::new(),
             current_branch: String::new(),
-            cursors: [0; 4],
+            cursors: [0; 7],
+            show_staged: false,
+            log_filter: String::new(),
             preview: String::new(),
             preview_rows: Vec::new(),
             preview_scroll: 0,
@@ -197,6 +227,9 @@ impl GitPanel {
             GitView::Log => 1,
             GitView::Branches => 2,
             GitView::Stashes => 3,
+            GitView::Tags => 4,
+            GitView::Reflog => 5,
+            GitView::Worktrees => 6,
         }
     }
 
@@ -204,8 +237,11 @@ impl GitPanel {
         match self.view {
             GitView::Status => self.files.len(),
             GitView::Log => self.log.len(),
-            GitView::Branches => self.branches.len(),
+            GitView::Branches => self.branches.len() + self.remotes.len(),
             GitView::Stashes => self.stashes.len(),
+            GitView::Tags => self.tags.len(),
+            GitView::Reflog => self.reflog.len(),
+            GitView::Worktrees => self.worktrees.len(),
         }
     }
 
@@ -249,8 +285,31 @@ impl GitPanel {
         matches!(self.view, GitView::Log).then(|| self.log.get(self.cursor()))?
     }
 
-    pub fn selected_branch(&self) -> Option<&String> {
-        matches!(self.view, GitView::Branches).then(|| self.branches.get(self.cursor()))?
+    /// The selected branch, and whether it is a remote-tracking one — which decides
+    /// whether switching to it needs `--track`.
+    pub fn selected_branch(&self) -> Option<(&String, bool)> {
+        if !matches!(self.view, GitView::Branches) {
+            return None;
+        }
+        let i = self.cursor();
+        match self.branches.get(i) {
+            Some(b) => Some((b, false)),
+            None => self.remotes.get(i - self.branches.len()).map(|r| (r, true)),
+        }
+    }
+
+    pub fn selected_tag(&self) -> Option<&String> {
+        matches!(self.view, GitView::Tags)
+            .then(|| self.tags.get(self.cursor()))?
+            .map(|t| t)
+    }
+
+    pub fn selected_reflog(&self) -> Option<&crate::git::Commit> {
+        matches!(self.view, GitView::Reflog).then(|| self.reflog.get(self.cursor()))?
+    }
+
+    pub fn selected_worktree(&self) -> Option<&String> {
+        matches!(self.view, GitView::Worktrees).then(|| self.worktrees.get(self.cursor()))?
     }
 
     pub fn selected_stash(&self) -> Option<&String> {
@@ -342,6 +401,30 @@ impl GitPanel {
                     let pen = if here { accent() } else { normal() };
                     (format!("{} {}", if here { "*" } else { " " }, elide(b, width - 2)), pen)
                 }
+                // Past the local ones come the remote-tracking refs, dimmed: they
+                // are somewhere else's branches.
+                None => match self.remotes.get(i - self.branches.len()) {
+                    Some(r) => (format!("  {}", elide(r, width - 2)), dim()),
+                    None => (String::new(), normal()),
+                },
+            },
+            GitView::Tags => match self.tags.get(i) {
+                Some(t) => (elide(t, width), normal()),
+                None => (String::new(), normal()),
+            },
+            GitView::Reflog => match self.reflog.get(i) {
+                Some(c) => {
+                    // %gd (the HEAD@{n} selector) rides in `when`, and the action in
+                    // `subject`: "HEAD@{2} reset: moving to HEAD~1".
+                    (
+                        format!("{} {} {}", c.sha, c.when, elide(&c.subject, width.saturating_sub(20))),
+                        normal(),
+                    )
+                }
+                None => (String::new(), normal()),
+            },
+            GitView::Worktrees => match self.worktrees.get(i) {
+                Some(w) => (elide(w, width), normal()),
                 None => (String::new(), normal()),
             },
             GitView::Stashes => match self.stashes.get(i) {
@@ -359,9 +442,12 @@ impl GitPanel {
             GitView::Status => {
                 "space stage · a all · ]/[ hunk · s/u stage hunk · c commit · P push · p pull · S stash"
             }
-            GitView::Log => "y copy sha · o open in split · P push · p pull · f fetch",
-            GitView::Branches => "enter switch · n new · P push · f fetch",
+            GitView::Log => "enter checkout · c cherry-pick · / filter · o split · y sha · P push",
+            GitView::Branches => "enter switch · n new · m merge into HEAD · R rebase onto · f fetch",
             GitView::Stashes => "enter pop · S stash push",
+            GitView::Tags => "enter checkout · n new tag · P push tags",
+            GitView::Reflog => "enter checkout this position · y copy sha (nothing here rewrites)",
+            GitView::Worktrees => "enter open it in a new tab · y copy path",
         }
     }
 
@@ -373,17 +459,28 @@ impl GitPanel {
 
         // Header: the four views, the active one reversed, then the branch.
         let mut x = 2;
-        for v in [GitView::Status, GitView::Log, GitView::Branches, GitView::Stashes] {
+        for v in [
+            GitView::Status,
+            GitView::Log,
+            GitView::Branches,
+            GitView::Stashes,
+            GitView::Tags,
+            GitView::Reflog,
+            GitView::Worktrees,
+        ] {
             let label = format!(" {} ", v.title());
             let pen = if v == self.view { selected() } else { dim() };
             write(&mut g, 0, x, &label, pen);
             x += label.chars().count() + 1;
         }
-        let head = if self.current_branch.is_empty() {
+        let mut head = if self.current_branch.is_empty() {
             String::new()
         } else {
             format!("\u{e0a0} {}", self.current_branch)
         };
+        if matches!(self.view, GitView::Log) && !self.log_filter.is_empty() {
+            head = format!("/{}  {head}", self.log_filter);
+        }
         let head_w = head.chars().count();
         if head_w > 0 && w > x + head_w + 2 {
             write(&mut g, 0, w - head_w - 2, &head, accent());
@@ -1339,6 +1436,10 @@ pub enum PromptKind {
     GitCommit,
     /// A new branch name, typed in the git panel; confirming creates and switches.
     GitBranch,
+    /// A new tag name, typed in the git panel.
+    GitTag,
+    /// Text to narrow the panel's log to, matched against commit messages.
+    GitLogFilter,
 }
 
 impl Prompt {

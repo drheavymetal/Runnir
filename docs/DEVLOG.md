@@ -789,6 +789,46 @@ only when there is more than one hunk), `s` stages it, `u` unstages it.
 Verified against the real repo: staged one hunk of `src/git.rs` and `git diff
 --cached --stat` showed 38 insertions while 196 stayed unstaged in the same file.
 
+## 2026-07-21 - Git: the rest of the operation set
+
+Seven views now (1-7 or Tab): status, log, branches, stashes, tags, reflog,
+worktrees. What each one added:
+
+- **branches** also lists remote-tracking refs, dimmed, after the local ones -
+  splitting them into two views would mean switching views to answer "is my branch
+  on the remote". Enter on a remote uses `switch --track`, since a plain checkout of
+  one lands you on a detached HEAD. `m` merges into HEAD, `R` rebases onto it.
+- **tags**: `--sort=-creatordate`, because alphabetical puts v10 before v9. `n`
+  creates, `P` pushes them.
+- **reflog**: the undo history for everything the panel refuses to bind. Enter
+  checks a position out. Showing it is worth more than binding the operations that
+  make you need it.
+- **worktrees**: Enter opens one in a NEW TAB with the shell already there - the
+  thing a terminal can do that a git client cannot. This repo keeps agent branches
+  in worktrees, so it is the view that earns its place here.
+- **status** gained `t` (a file can be staged AND modified - two different diffs of
+  one path), `A` amend, `C` (hands the whole commit to a pane so $EDITOR opens for a
+  message with a body), `e` open the file, `L` its history, `b` blame, and `O`/`T`
+  for ours/theirs - guarded on the file actually being unmerged.
+- **log** gained `/` (a `--grep` filter, shown in the header so a narrowed list is
+  never mistaken for the whole history), `c` cherry-pick, Enter checkout.
+
+`P` now goes through `push_args`, which adds `-u origin HEAD` exactly when the
+branch has no upstream. Without it the first push of a new branch fails with "has
+no upstream branch", which is a thing to know rather than a thing to be told.
+
+**The bar refreshes on changes made elsewhere.** The OSC 133 counter only sees what
+ran in that pane; an editor writing a file, a git in another pane, a rebase in a
+second window were all invisible until something ran. `state_stamp` xors the mtimes
+of `index` and `HEAD` - two stats per tick - and a change in either triggers the
+same refresh. Walking the working tree would not be worth it; those two files cover
+staging, commits, switches and every step of a rebase.
+
+Verification note, learned the hard way: pick the scratch instance by
+`/proc/<pid>/exe`, never by excluding known pids. A stale exclusion list sent
+keystrokes into PEDRO'S terminal and floated his window onto another monitor.
+`scratchpad/shot.py` now resolves the window by binary path.
+
 ## Gotchas (do not re-learn)
 
 - A binding spec and a keypress must produce the SAME `ChordKey` variant.
@@ -814,6 +854,8 @@ Verified against the real repo: staged one hunk of `src/git.rs` and `git diff
 - Claude Code does not probe for the kitty keyboard protocol. Terminal-side protocol
   support alone is not enough; the legacy encoding has to carry Shift+Enter as ESC-CR.
 
+- Target a test instance by `/proc/<pid>/exe`, never by "not these pids". Pedro
+  opens runnir windows too, and keys sent to the wrong one land in his session.
 - `.git` is not always a directory: in a worktree and in a submodule it is a file
   holding `gitdir: <path>`, and the refs then live in the `commondir` it points at.
   Never join `.git/<thing>` onto a repo root - go through `git::git_dir()`.

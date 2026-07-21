@@ -310,12 +310,23 @@ const SEP: char = '\u{1f}';
 
 /// Reads history. Blocking — worker only.
 pub fn log(root: &Path, limit: usize) -> Vec<Commit> {
+    log_filtered(root, limit, "")
+}
+
+/// History, optionally narrowed to commits whose message matches `grep`. Empty
+/// filter means the plain log — the panel passes whatever was typed, and an empty
+/// prompt is how you clear it.
+pub fn log_filtered(root: &Path, limit: usize, grep: &str) -> Vec<Commit> {
     let fmt = format!("--pretty=format:%h{SEP}%s{SEP}%an{SEP}%ar{SEP}%D");
-    let out = std::process::Command::new("git")
-        .arg("--no-optional-locks")
+    let mut cmd = std::process::Command::new("git");
+    cmd.arg("--no-optional-locks")
         .args(["log", "--no-color"])
         .arg(format!("-{limit}"))
-        .arg(fmt)
+        .arg(fmt);
+    if !grep.trim().is_empty() {
+        cmd.arg("--regexp-ignore-case").arg(format!("--grep={}", grep.trim()));
+    }
+    let out = cmd
         .current_dir(root)
         .env("GIT_OPTIONAL_LOCKS", "0")
         .stderr(std::process::Stdio::null())
@@ -508,6 +519,30 @@ fn kill(pid: u32) {
     let _ = pid;
 }
 
+/// A cheap fingerprint of the repository's own state: the modification times of
+/// the index and of HEAD.
+///
+/// The status bar refreshes when a command finishes in the pane, which misses every
+/// change made from somewhere else — an editor writing a file, a git run in another
+/// pane, a rebase in a second window. Two `stat` calls per tick is a price worth
+/// paying to notice those; walking the working tree would not be.
+pub fn state_stamp(root: &Path) -> u64 {
+    let Some(dir) = git_dir(root) else { return 0 };
+    let mtime = |p: PathBuf| -> u64 {
+        std::fs::metadata(p)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    };
+    // The index covers staging and checkouts; HEAD covers commits, switches and
+    // every step of a rebase. A working-tree edit shows up through the index only
+    // once it is staged, which is why the counters can still lag a bare edit — the
+    // status bar says "dirty", and dirty it stays.
+    mtime(dir.join("index")) ^ mtime(dir.join("HEAD")).rotate_left(1)
+}
+
 /// Whether this failure means "there was nobody to ask for a credential".
 ///
 /// A push to a repo behind HTTPS, an ssh key with a passphrase, an unknown host
@@ -665,6 +700,109 @@ pub fn apply_patch(root: &Path, patch: &str, reverse: bool) -> Result<String, St
     }
 }
 
+// ---- the rest of the operation set ----------------------------------------
+
+/// Remote-tracking branches, from the refs — same two sources as the local ones,
+/// and the same reason (a fresh clone keeps them packed).
+pub fn remote_branches(root: &Path) -> Vec<String> {
+    const CAP: usize = 512;
+    let mut out = Vec::new();
+    let Some(common) = git_dir(root).map(|g| common_dir(&g)) else { return out };
+    let base = common.join("refs/remotes");
+    walk_refs(&base, &base, &mut out, CAP);
+    if let Ok(packed) = std::fs::read_to_string(common.join("packed-refs")) {
+        for line in packed.lines() {
+            if line.starts_with('#') || line.starts_with('^') {
+                continue;
+            }
+            if let Some(name) =
+                line.split_whitespace().nth(1).and_then(|r| r.strip_prefix("refs/remotes/"))
+            {
+                if out.len() >= CAP {
+                    break;
+                }
+                out.push(name.to_string());
+            }
+        }
+    }
+    // `origin/HEAD` is a symbolic pointer, not a branch anyone checks out.
+    out.retain(|b| !b.ends_with("/HEAD"));
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Tags, newest first: a tag list in creation order is far more useful than in
+/// alphabetical order, where v10 sorts before v9.
+pub fn tags(root: &Path) -> Vec<String> {
+    read_text(root, &["tag", "--sort=-creatordate", "--format=%(refname:short) %(subject)"])
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// The reflog: every position HEAD has held. This is the undo history for
+/// everything the panel refuses to bind — a bad reset, a lost branch, a dropped
+/// commit are all recoverable from here, so showing it is worth more than binding
+/// the operations that make you need it.
+pub fn reflog(root: &Path, limit: usize) -> Vec<Commit> {
+    let fmt = format!("--pretty=format:%h{SEP}%gs{SEP}%an{SEP}%gd{SEP}%s");
+    let out = std::process::Command::new("git")
+        .arg("--no-optional-locks")
+        .args(["reflog", "--no-color"])
+        .arg(format!("-{limit}"))
+        .arg(fmt)
+        .current_dir(root)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .stderr(std::process::Stdio::null())
+        .output();
+    match out {
+        Ok(o) if o.status.success() => parse_log(&String::from_utf8_lossy(&o.stdout)),
+        _ => Vec::new(),
+    }
+}
+
+/// The worktrees of this repository, one per line as `git worktree list` prints
+/// them: path, commit, and the branch checked out there. Relevant here because
+/// agent branches live in worktrees, and a terminal is how you visit one.
+pub fn worktrees(root: &Path) -> Vec<String> {
+    read_text(root, &["worktree", "list"])
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// The path column of a `git worktree list` line, so opening one is a real cd.
+pub fn worktree_path(line: &str) -> &str {
+    line.split_whitespace().next().unwrap_or(line)
+}
+
+/// Whether a path is unmerged right now. Checked before binding a resolution key to
+/// it, so `ours`/`theirs` cannot be aimed at a file that has no conflict.
+pub fn is_conflicted(files: &[FileEntry], path: &str) -> bool {
+    files.iter().any(|f| f.path == path && f.index == 'U')
+}
+
+/// The upstream branch for HEAD, or `None` when the branch has never been pushed.
+/// A push then needs `-u`, which is the difference between working and a fatal.
+pub fn upstream_of_head(root: &Path) -> Option<String> {
+    let out = read_text(root, &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"]);
+    let out = out.trim();
+    (!out.is_empty() && !out.contains("fatal") && !out.contains("no upstream")).then(|| out.to_string())
+}
+
+/// The argv for pushing this branch: plain when it already tracks something, and
+/// `-u origin HEAD` the first time, which is what makes a brand-new branch push at
+/// all instead of failing with "has no upstream branch".
+pub fn push_args(root: &Path) -> Vec<String> {
+    match upstream_of_head(root) {
+        Some(_) => vec!["push".into()],
+        None => vec!["push".into(), "-u".into(), "origin".into(), "HEAD".into()],
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -717,6 +855,23 @@ mod tests {
         assert!(s.detached);
         assert_eq!(s.branch, "12345678");
         assert!(!s.has_upstream(), "a detached head has no upstream to be ahead of");
+    }
+
+    #[test]
+    fn a_worktree_line_yields_its_path() {
+        let line = "/home/pedro/projects/runnir/.claude/worktrees/agent-a03  8f6876d [worktree-agent-a03]";
+        assert_eq!(worktree_path(line), "/home/pedro/projects/runnir/.claude/worktrees/agent-a03");
+    }
+
+    #[test]
+    fn a_conflict_is_recognised_by_its_status_letter() {
+        let files = parse_status_files(
+            "1 .M N... 100644 100644 100644 aaa bbb src/ok.rs\n\
+             u UU N... 100644 100644 100644 100644 aa bb cc src/bad.rs\n",
+        );
+        assert!(is_conflicted(&files, "src/bad.rs"));
+        assert!(!is_conflicted(&files, "src/ok.rs"), "a modified file is not a conflict");
+        assert!(!is_conflicted(&files, "src/absent.rs"));
     }
 
     #[test]
@@ -887,8 +1042,11 @@ index aaa..bbb 100644
 pub enum PanelMsg {
     Files(Vec<FileEntry>),
     Log(Vec<Commit>),
-    /// Branch list plus the branch currently checked out.
-    Branches(Vec<String>, String),
+    /// Local branches, remote-tracking branches, and the branch checked out now.
+    Branches(Vec<String>, Vec<String>, String),
+    Tags(Vec<String>),
+    Reflog(Vec<Commit>),
+    Worktrees(Vec<String>),
     Stashes(Vec<String>),
     Preview(String),
     /// A command finished: what it was, and its output or its error. The argv comes

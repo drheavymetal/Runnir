@@ -473,6 +473,9 @@ struct Gpu {
     /// Sequence for git-panel requests: a reply older than the current one is only
     /// allowed to update lists, never the preview.
     git_gen: u64,
+    /// Last seen `git::state_stamp` per repo root, so a change made outside this
+    /// pane — another pane, an editor, a second window — still refreshes the bar.
+    git_stamp: std::collections::HashMap<PathBuf, u64>,
     /// The pane command counter each root was last refreshed at, keyed by root. The
     /// refresh trigger is "a command finished in a pane sitting in this repo", not a
     /// timer: nothing else the user does can change the repository, and a poll would
@@ -754,6 +757,7 @@ impl App {
             git_pending: std::collections::HashSet::new(),
             git_seen: std::collections::HashMap::new(),
             git_gen: 0,
+            git_stamp: std::collections::HashMap::new(),
             scroll_glide: None,
             pending_config: None,
             cursor_trail: Vec::new(),
@@ -1263,10 +1267,19 @@ impl Gpu {
         if self.git_pending.contains(&root) {
             return;
         }
-        let fresh = self.git_seen.get(&root) == Some(&seq) && self.git_state.contains_key(&root);
+        // Two triggers, because a repository changes in two ways: something ran in
+        // this pane (the command counter), or something changed the repo from
+        // outside it (the index/HEAD stamp — an editor, another pane, a rebase in a
+        // second window). Neither alone is enough.
+        let stamp = crate::git::state_stamp(&root);
+        let same_stamp = self.git_stamp.get(&root) == Some(&stamp);
+        let fresh = self.git_seen.get(&root) == Some(&seq)
+            && same_stamp
+            && self.git_state.contains_key(&root);
         if fresh {
             return;
         }
+        self.git_stamp.insert(root.clone(), stamp);
         self.git_seen.insert(root.clone(), seq);
         self.git_pending.insert(root.clone());
         let proxy = self.proxy.clone();
