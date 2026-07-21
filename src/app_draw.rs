@@ -509,7 +509,18 @@ impl Gpu {
 
         let pane = self.tabs[self.active].focused_ref();
         let cwd = pane.cwd().map(|p| abbreviate_home(&p)).unwrap_or_default();
-        let branch = pane.cwd().and_then(|p| git_branch(&p));
+        // Two sources on purpose. The branch comes from `.git/HEAD`, one file read,
+        // so it is correct the instant a checkout finishes. The counts come from the
+        // worker's cache and lag by however long `git status` took — which is why
+        // they are never the thing that names the branch.
+        let repo = pane
+            .cwd()
+            .and_then(|p| crate::git::repo_root(&p))
+            .and_then(|root| self.git_state.get(&root));
+        let branch = pane.cwd().and_then(|p| crate::git::head_branch(&p)).map(|head| match repo {
+            Some(state) => crate::git::status_text(&crate::git::RepoState { branch: head, ..state.clone() }),
+            None => head,
+        });
         let a = config.theme.accent;
         let dim = Pen { fg: Color::Rgb(0x8a, 0x8d, 0x94), bg, ..Pen::default() };
         let accent = Pen { fg: Color::Rgb(a.0, a.1, a.2), bg, ..Pen::default() };
@@ -674,28 +685,6 @@ fn abbreviate_home(p: &std::path::Path) -> String {
         }
     }
     s.into_owned()
-}
-
-/// The current git branch for `dir`, by reading `.git/HEAD` walking up to the repo
-/// root. `None` outside a repo. No git process spawned.
-fn git_branch(dir: &std::path::Path) -> Option<String> {
-    let mut cur = Some(dir);
-    while let Some(d) = cur {
-        let head = d.join(".git/HEAD");
-        if let Ok(content) = std::fs::read_to_string(&head) {
-            let content = content.trim();
-            return Some(
-                content
-                    .strip_prefix("ref: refs/heads/")
-                    .unwrap_or(content)
-                    .chars()
-                    .take(24)
-                    .collect(),
-            );
-        }
-        cur = d.parent();
-    }
-    None
 }
 
 /// Lays out the which-key panel for one level of the leader layer.

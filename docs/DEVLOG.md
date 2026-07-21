@@ -637,6 +637,41 @@ One trap: `danger` lowercases the line, and `-D` versus `-d` is the ENTIRE diffe
 between force-deleting a branch and being refused. The branch rule reads a
 case-preserving copy of the tail; a test asserts both halves.
 
+## 2026-07-21 — Git step 2 (T1): the status bar knows the repo, without polling
+
+`src/git.rs` (new). The bar was showing a branch and nothing else; it now shows
+` main ↓1 ↑2 +2 ●4 !1` — behind, ahead, staged, dirty, conflicts — and only the
+parts that are non-zero, so a clean repo still reads as just its branch.
+
+**Two sources, deliberately.** `head_branch` reads `.git/HEAD` (one file read, safe
+from the draw path, correct the instant a checkout finishes). The counts come from
+`read_state`, which shells out and can take seconds in a big repo, so it runs on a
+worker and answers via `UserEvent::Git(root, Option<RepoState>)`. The branch is
+never taken from the slow path — a stale count is a cosmetic lag, a stale branch is
+a lie.
+
+**`--no-optional-locks` is load-bearing.** A plain `git status` refreshes the index
+and takes `index.lock`. A status poll doing that in the background can make the
+user's OWN git command in that pane fail with "another git process seems to be
+running". The flag plus `GIT_OPTIONAL_LOCKS=0` (for any git it invokes itself) is
+the whole reason this is safe to run behind the user's back.
+
+**The refresh trigger is the OSC 133 command counter, not a timer.** `refresh_git`
+runs on the periodic wake but only spawns when `pane.command_seq()` moved past what
+that repo root was last seen at. Nothing but a command can change a repository, and
+`cd` is a command, so entering a repo triggers it too. An idle terminal sitting in a
+repository spawns no git at all — the trail-at-60Hz lesson, applied before it bit.
+
+Cache is keyed by REPO ROOT, not pane: two panes in one repo share one entry and one
+process. `git_pending` holds one in-flight per root, so a repository slow enough to
+still be running cannot accumulate a process per wake.
+
+Parsing is `--porcelain=v2 --branch`, split into a pure `parse_porcelain_v2` with 7
+tests, so the format is covered without needing a repository in the test run. Note
+`XY`: X is staged, Y is worktree, `.` is unchanged — an `MM` file counts as BOTH,
+which is what it is. Conflicts (`u`) are counted apart from dirt: they need
+resolving, not committing.
+
 ## Gotchas (do not re-learn)
 
 - A binding spec and a keypress must produce the SAME `ChordKey` variant.

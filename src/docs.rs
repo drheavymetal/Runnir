@@ -268,6 +268,17 @@ Only a bare Enter at
 the live prompt is guarded, so editing history and full-screen apps are untouched.
 Turn it off with behaviour.command_guardian = false.
 
+# Repository state in the status bar
+
+In a git repository the status bar shows the branch, then only what is not clean:
+down/up arrows for commits behind and ahead of the upstream, + for staged files,
+a dot for files with unstaged or untracked changes, ! for conflicts. A clean tree
+level with its upstream shows just the branch.
+
+The branch is read from .git/HEAD, so it is right the moment a checkout finishes.
+The counts come from git status run on a worker, refreshed when a command finishes
+in that pane - nothing polls, so an idle terminal never runs git.
+
 # Named layouts (workspaces)
 
 Define layouts in the config and launch one from the palette (Launch layout): it

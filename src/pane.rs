@@ -140,6 +140,12 @@ impl Pane {
         self.grid.lock().unwrap().last_exit()
     }
 
+    /// How many commands have finished in this pane (OSC 133 D). The git status
+    /// refresh keys off it: a repository can only change because something ran.
+    pub fn command_seq(&self) -> u64 {
+        self.grid.lock().unwrap().command_seq()
+    }
+
     pub fn pty_pid(&self) -> Option<i32> {
         self.pty.pid()
     }

@@ -7,6 +7,7 @@ mod control;
 mod dnd;
 mod docs;
 mod font;
+mod git;
 mod graphics;
 mod grid;
 mod guardian;
@@ -88,6 +89,10 @@ pub enum UserEvent {
     /// Delivered off the UI thread via the proxy, same wake pattern as `Ai`, so the
     /// playerctl / cava subprocess never blocks rendering.
     Media(media::MediaMsg),
+    /// Repository state for a repo root, from a `git status` worker. `None` when the
+    /// command failed or the directory stopped being a repository. Never computed on
+    /// the UI thread: in a large repository `git status` takes seconds.
+    Git(PathBuf, Option<git::RepoState>),
 }
 
 fn main() {
@@ -456,6 +461,17 @@ struct Gpu {
     /// When the now-playing overlay last had its metadata refreshed, so a track change
     /// shows while it stays open without re-fetching on every wake. `None` when closed.
     media_last_refresh: Option<Instant>,
+    /// Repository state per repo ROOT, not per pane: two panes in the same repository
+    /// share one entry and one `git status`.
+    git_state: std::collections::HashMap<PathBuf, git::RepoState>,
+    /// Roots with a `git status` worker in flight, so a slow repository cannot
+    /// accumulate one process per wake.
+    git_pending: std::collections::HashSet<PathBuf>,
+    /// The pane command counter each root was last refreshed at, keyed by root. The
+    /// refresh trigger is "a command finished in a pane sitting in this repo", not a
+    /// timer: nothing else the user does can change the repository, and a poll would
+    /// run git forever on an idle terminal.
+    git_seen: std::collections::HashMap<PathBuf, u64>,
     /// An in-flight eased scroll: (pane id, current offset, target offset) in
     /// scrollback lines. Drives smooth glide on scroll-to-top/bottom and jumps.
     scroll_glide: Option<(u64, f32, f32)>,
@@ -728,6 +744,9 @@ impl App {
             image_watch: None,
             media_wave: None,
             media_last_refresh: None,
+            git_state: std::collections::HashMap::new(),
+            git_pending: std::collections::HashSet::new(),
+            git_seen: std::collections::HashMap::new(),
             scroll_glide: None,
             pending_config: None,
             cursor_trail: Vec::new(),
@@ -928,6 +947,20 @@ impl ApplicationHandler<UserEvent> for App {
                 let _ = reply.send(resp);
             }
             UserEvent::Media(msg) => gpu.on_media_msg(msg, &self.config),
+            UserEvent::Git(root, state) => {
+                gpu.git_pending.remove(&root);
+                match state {
+                    Some(s) => {
+                        gpu.git_state.insert(root, s);
+                    }
+                    // Not a repository any more (or git failed): forget it rather
+                    // than leaving the bar showing a state that no longer exists.
+                    None => {
+                        gpu.git_state.remove(&root);
+                    }
+                }
+                gpu.window.request_redraw();
+            }
             // Wayland reports the drop in surface-logical coordinates; the pane hit
             // test works in physical pixels, so scale before asking where it landed.
             UserEvent::FilesDropped(paths, x, y) => {
@@ -1201,6 +1234,42 @@ impl Gpu {
 
     /// Refreshes context tints/titles periodically, autosaves the session, and
     /// checks for long-running commands that finished while unfocused.
+    /// Asks a worker for the focused pane's repository state, when it can have
+    /// changed. "Can have changed" means a command finished in that pane since the
+    /// last look, or the pane moved into a repository we have nothing for — a `cd`
+    /// is itself a command, so both cases are covered by the OSC 133 counter.
+    ///
+    /// Nothing here polls. An idle terminal sitting in a repository never spawns a
+    /// git process, which is the whole reason this is not on the 500ms tick.
+    fn refresh_git(&mut self) {
+        // The status bar is the only consumer today; with it off, this is free.
+        if !self.status_bar {
+            return;
+        }
+        let pane = self.tabs[self.active].focused_ref();
+        let Some(cwd) = pane.cwd() else { return };
+        let Some(root) = git::repo_root(&cwd) else { return };
+        let seq = pane.command_seq();
+        // One in flight per root. A repository slow enough to still be running is a
+        // repository we must not queue a second process against.
+        if self.git_pending.contains(&root) {
+            return;
+        }
+        let fresh = self.git_seen.get(&root) == Some(&seq) && self.git_state.contains_key(&root);
+        if fresh {
+            return;
+        }
+        self.git_seen.insert(root.clone(), seq);
+        self.git_pending.insert(root.clone());
+        let proxy = self.proxy.clone();
+        // Detached: if git hangs on a network filesystem, this thread hangs, not the
+        // UI, and the `git_pending` guard keeps it to one.
+        std::thread::spawn(move || {
+            let state = git::read_state(&root);
+            let _ = proxy.send_event(UserEvent::Git(root, state));
+        });
+    }
+
     fn periodic(&mut self, config: &Config) {
         // Bells are checked here (not only in render) so an occluded or minimized
         // window — the case where the urgency hint matters most — still raises it;
@@ -1246,6 +1315,9 @@ impl Gpu {
                 }
             }
         }
+
+        // Repository state for the focused pane's repo, if it moved on.
+        self.refresh_git();
 
         // Refresh the status-bar clock roughly every 20s (formatting local time
         // without a chrono dependency; `date` handles the timezone).
