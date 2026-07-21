@@ -1399,6 +1399,49 @@ context drawn as down with its reason, images/volumes/networks, logs (500 lines,
 unwrapped from the daemon's 8-byte stream framing), inspect, then stop / start /
 remove of a throwaway container including the confirm and its "no".
 
+## 2026-07-21 - The panel leaders reach git's level, and the site catches up
+
+Two things the day was missing: the new panels' leader layers were thinner than the
+git panel's, and the website did not know any of this existed.
+
+**The docker panel's leader is now the git panel's, in shape.** What made git's
+better was not size: a leaf there can `In(view, key)` — go somewhere and then act —
+so `leader c p` cherry-picks whatever view you were in. The docker leader had only
+"press a key here". It now has `Switch(kind)` and `InKind(kind, key)`, so
+`leader i p` publishes an image from a container row, switching the column on the
+way. Eight groups: container, compose project, images, objects, hosts, Docker Hub,
+detail, view, plus zoom and close. Gating grew with it — `OnHub` for the verbs that
+only exist there, and the kind strip is not offered on hub at all, because there is
+no strip to switch.
+
+Three keys existed only in the menu's imagination and are now bound: `K` kill,
+`H` the hosts column, `B` jump to Docker Hub. A leaf that presses a key nothing
+answers is a menu entry that does nothing.
+
+**A second audit round** (two more finders, on the fixes and on the whole of the new
+code) turned up eleven more, all fixed here. The ones with teeth: `G` in the detail
+column added `i32::MAX` to a scroll position that was already past zero — an
+overflow panic in the debug profile, a jump to the top in release; a rebuild that
+could not hold the cursor left the previous object's logs under the new row's name;
+a confirmed delete was swallowed when an operation was still in flight, because the
+confirm did not check `busy` and `docker_run_op` refuses on it; a deploy with no
+compose file recorded ran `compose up` with no `-f`, which brings up whatever
+`compose.yaml` sits in the shell's directory under that project's name; and the
+drift verdict was computed against the last host READ, so "same as local" could mean
+"same as cloudmax". `local_images` is now filled only from a local daemon.
+
+The ssh transport got a real deadline: `ConnectTimeout` and keepalives only notice a
+transport that DIED, and the case that hangs is a healthy tunnel to a daemon that
+accepted and went quiet. A watchdog thread kills the child at the timeout, and the
+read returns. It is called off before the stream drops, so it can never kill a pid
+the OS has handed to someone else.
+
+**The website** (`docs-site`) gained the file explorer, the file/image viewer, the
+docker panel and Docker Hub as features, the `[explorer]` config block, two new
+keybinding groups (the sidebar's keys and the panel's), and four screenshots of a
+REAL window — these panels talk to git and to a live docker daemon, so a synthetic
+headless scene could not show what they show.
+
 ## 2026-07-21 - Bug audit of everything above (four Fable finders, Opus fixed)
 
 Four read-only agents audited the day's four commits — the explorer's git badges,
