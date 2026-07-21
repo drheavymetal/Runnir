@@ -991,7 +991,13 @@ impl ApplicationHandler<UserEvent> for App {
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         let Some(gpu) = self.gpu.as_mut() else { return };
         match event {
+            // The window manager's close button, and the compositor keybinding that
+            // does the same. It is one keystroke away from everything else, so it
+            // asks before it kills whatever is still running in the window.
             WindowEvent::CloseRequested => {
+                if !gpu.request_close(&self.config) {
+                    return;
+                }
                 gpu.save_session(&self.config);
                 event_loop.exit();
             }

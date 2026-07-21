@@ -1831,6 +1831,19 @@ pub enum PromptKind {
     GitTag,
     /// Text to narrow the panel's log to, matched against commit messages.
     GitLogFilter,
+    /// Closing the window (or the last pane) while something is still running.
+    /// Answered with y/n, never with typing: the question is whether to kill work,
+    /// and a text field would invite Enter — the one key most likely to be pressed
+    /// by reflex.
+    ConfirmQuit,
+}
+
+impl PromptKind {
+    /// Whether this prompt is a yes/no question rather than a field to type in.
+    /// A confirm draws no input line and takes no characters.
+    pub fn is_confirm(self) -> bool {
+        matches!(self, PromptKind::ConfirmQuit)
+    }
 }
 
 impl Prompt {
@@ -1889,20 +1902,34 @@ impl Prompt {
         let mut g = panel_grid(w, h, theme);
 
         write(&mut g, 0, 2, &field_view(&self.label, w.saturating_sub(4)), accent());
-        // Room for "> ", the caret cell and a right margin.
-        let field = w.saturating_sub(6);
-        let shown = field_view(&self.input, field);
-        let line = format!("> {shown}");
-        write(&mut g, 1, 2, &line, normal());
-        write(&mut g, 1, 2 + line.chars().count(), " ", selected());
-
-        for (i, s) in visible.iter().take(list).enumerate() {
-            let row = 3 + i;
-            let pen = if i == self.cursor { selected() } else { normal() };
-            if i == self.cursor {
-                write(&mut g, row, 0, &" ".repeat(w), selected());
+        if self.kind.is_confirm() {
+            // A confirm has no field and no highlighted row: nothing here is being
+            // picked, and a selection bar would read as "this one is about to
+            // happen". The answer keys go where the field would have been.
+            write(&mut g, 1, 2, "y", accent());
+            write(&mut g, 1, 4, "close it", normal());
+            write(&mut g, 1, 15, "\u{b7}", dim());
+            write(&mut g, 1, 17, "n", accent());
+            write(&mut g, 1, 19, "stay here (esc)", normal());
+            for (i, s) in visible.iter().take(list).enumerate() {
+                write(&mut g, 3 + i, 2, &elide(s, w.saturating_sub(4)), dim());
             }
-            write(&mut g, row, 2, s, pen);
+        } else {
+            // Room for "> ", the caret cell and a right margin.
+            let field = w.saturating_sub(6);
+            let shown = field_view(&self.input, field);
+            let line = format!("> {shown}");
+            write(&mut g, 1, 2, &line, normal());
+            write(&mut g, 1, 2 + line.chars().count(), " ", selected());
+
+            for (i, s) in visible.iter().take(list).enumerate() {
+                let row = 3 + i;
+                let pen = if i == self.cursor { selected() } else { normal() };
+                if i == self.cursor {
+                    write(&mut g, row, 0, &" ".repeat(w), selected());
+                }
+                write(&mut g, row, 2, s, pen);
+            }
         }
 
         let col = (cols.saturating_sub(w)) / 2;
@@ -2205,6 +2232,28 @@ mod tests {
             .collect();
         assert!(row.contains('\u{2026}'), "a clipped field must say so: {row:?}");
         assert!(row.trim_end().ends_with('a'), "the end of the input must be visible: {row:?}");
+    }
+
+    #[test]
+    fn a_confirm_prompt_shows_the_answers_and_no_field() {
+        let p = Prompt::new(
+            PromptKind::ConfirmQuit,
+            "Close runnir? 2 commands are still running",
+            vec!["tab 1: claude".into(), "tab 2: cargo build".into()],
+        );
+        let panels = p.render(120, 40, &Theme::default());
+        let g = &panels[0].grid;
+        let row = |r: usize| -> String { (0..g.cols()).map(|c| g.abs_cell(r, c).ch).collect() };
+
+        assert!(row(0).contains("2 commands are still running"));
+        // The answer keys, where a typing prompt would have put its field. A `>`
+        // there would invite Enter, which this prompt must never accept.
+        let answers = row(1);
+        assert!(answers.contains('y') && answers.contains('n'), "{answers:?}");
+        assert!(!answers.contains('>'), "a confirm has no input field: {answers:?}");
+        // What closing would kill, listed and never highlighted as a choice.
+        assert!(row(3).contains("claude"), "{:?}", row(3));
+        assert!(row(4).contains("cargo build"), "{:?}", row(4));
     }
 
     #[test]

@@ -268,6 +268,17 @@ Only a bare Enter at
 the live prompt is guarded, so editing history and full-screen apps are untouched.
 Turn it off with behaviour.command_guardian = false.
 
+# Closing with work still running
+
+Closing the window while a command is still running asks first, and lists what is
+running in each tab. Press y to close anyway, n or Escape to stay. Enter is not an
+answer here on purpose: this exists to survive a reflex keystroke.
+
+A pane sitting at its shell prompt is not work, so an idle window closes at once
+without asking. The same question guards the last tab and the last pane, since
+closing either of those closes the window. Turn it off with
+behaviour.confirm_close = false.
+
 # Git panel
 
 Leader G opens a git panel over the terminal: seven lists, and the selection's diff

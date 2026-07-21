@@ -2,6 +2,62 @@
 // it shares the imports there.
 
 impl Gpu {
+    /// What is running in the window right now, one entry per pane, as `tab n: cmd`.
+    ///
+    /// A pane sitting at its shell prompt reports the shell itself as the foreground
+    /// process; that is not work, so shells are filtered out. What is left is what
+    /// closing the window would kill.
+    pub fn running_commands(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for (i, tab) in self.tabs.iter().enumerate() {
+            for pane in tab.panes.values() {
+                let Some(fg) = pane.pty.foreground() else { continue };
+                if is_shell(&fg.name) {
+                    continue;
+                }
+                // The whole command line, not just the name: `claude` and `cargo
+                // build` are both "a process", but only the argv says which one you
+                // are about to kill.
+                let line = if fg.argv.is_empty() { fg.name.clone() } else { fg.argv.join(" ") };
+                out.push(format!("tab {}: {}", i + 1, line));
+            }
+        }
+        out
+    }
+
+    /// Whether the window may close now.
+    ///
+    /// With `behaviour.confirm_close` on and something still running, the question
+    /// goes on screen and this answers `false` — the caller must not exit. Nothing
+    /// running (or the setting off) closes straight away: a confirm that fires on an
+    /// idle shell is a confirm people learn to dismiss without reading.
+    pub fn request_close(&mut self, config: &Config) -> bool {
+        if !config.behaviour.confirm_close {
+            return true;
+        }
+        // Already asking: a second click on the window's close button must not
+        // stack another prompt, and must not be taken as an answer either.
+        if matches!(&self.overlay, Some(Overlay::Prompt(p)) if p.kind == PromptKind::ConfirmQuit) {
+            return false;
+        }
+        let running = self.running_commands();
+        if running.is_empty() {
+            return true;
+        }
+        let label = if running.len() == 1 {
+            "Close runnir? 1 command is still running".to_string()
+        } else {
+            format!("Close runnir? {} commands are still running", running.len())
+        };
+        self.overlay = Some(Overlay::Prompt(Prompt::new(
+            PromptKind::ConfirmQuit,
+            &label,
+            running.into_iter().take(6).collect(),
+        )));
+        self.window.request_redraw();
+        false
+    }
+
     fn on_wheel(&mut self, delta: MouseScrollDelta, config: &Config, mods: ModifiersState) {
         let cell_h = self.renderer.cell_size().1;
         // While an overlay owns input, the wheel scrolls it, not the terminal. Use
@@ -447,6 +503,9 @@ impl Gpu {
         let wake = wake_fn(self.proxy.clone());
         match action {
             Action::Quit => {
+                if !self.request_close(config) {
+                    return;
+                }
                 self.save_session(config);
                 event_loop.exit();
             }
@@ -467,6 +526,11 @@ impl Gpu {
                     self.active = self.active.min(self.tabs.len() - 1);
                     self.reflow_all();
                 } else {
+                    // Closing the last tab IS closing the window; it asks the same
+                    // question, or a habit of ctrl+w would still kill running work.
+                    if !self.request_close(config) {
+                        return;
+                    }
                     self.save_session(config);
                     event_loop.exit();
                 }
@@ -502,6 +566,9 @@ impl Gpu {
                     self.active = self.active.min(self.tabs.len() - 1);
                     self.reflow_all();
                 } else if self.tabs.len() == 1 && self.tab().tree.len() == 1 {
+                    if !self.request_close(config) {
+                        return;
+                    }
                     self.save_session(config);
                     event_loop.exit();
                 }
@@ -817,6 +884,24 @@ impl Gpu {
                 },
                 _ => {}
             },
+            // A yes/no confirm answers to y and n only. Enter is deliberately NOT a
+            // yes: this prompt exists because a reflex keystroke closed a window
+            // with work in it, and Enter is the reflex.
+            Overlay::Prompt(p) if p.kind.is_confirm() => {
+                let kind = p.kind;
+                match key {
+                    Key::Named(NamedKey::Escape) => self.overlay = None,
+                    Key::Character(s) => match s.to_lowercase().as_str() {
+                        "y" => {
+                            self.overlay = None;
+                            self.confirm_prompt(kind, String::new(), config);
+                        }
+                        "n" | "q" => self.overlay = None,
+                        _ => {}
+                    },
+                    _ => {}
+                }
+            }
             Overlay::Prompt(p) => match key {
                 Key::Named(NamedKey::Escape) => self.overlay = None,
                 Key::Named(NamedKey::ArrowUp) => p.up(),
@@ -959,6 +1044,9 @@ impl Gpu {
         // process here — but must save the session first, exactly like the keyboard
         // and window-close paths, or picking "Quit" from the palette would lose it.
         if action == Action::Quit {
+            if !self.request_close(config) {
+                return;
+            }
             self.save_session(config);
             std::process::exit(0);
         }
@@ -1387,6 +1475,13 @@ impl Gpu {
                 if !value.is_empty() {
                     self.send_whisper(value, config);
                 }
+            }
+            // Confirmed the close. Exits here rather than through the event loop
+            // (which this path cannot reach) — the same save-then-exit the palette's
+            // Quit does, so a confirmed close never loses the session.
+            PromptKind::ConfirmQuit => {
+                self.save_session(config);
+                std::process::exit(0);
             }
             PromptKind::GuardedCommand => {
                 // Confirmed: submit the command that was held back. The line is
@@ -3513,6 +3608,17 @@ fn editor_cmd() -> String {
     std::env::var("VISUAL")
         .or_else(|_| std::env::var("EDITOR"))
         .unwrap_or_else(|_| "vi".to_string())
+}
+
+/// Whether a foreground process name is just the pane's shell sitting at its
+/// prompt. Login shells arrive as `-fish`, so the leading dash is stripped first.
+fn is_shell(name: &str) -> bool {
+    let name = name.trim_start_matches('-');
+    matches!(
+        name,
+        "sh" | "bash" | "zsh" | "fish" | "dash" | "ksh" | "csh" | "tcsh" | "nu" | "elvish"
+            | "xonsh" | "ash" | "busybox"
+    )
 }
 
 fn wheel_lines(delta: MouseScrollDelta, wheel_lines: f32, cell_h: f32) -> f32 {

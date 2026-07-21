@@ -924,8 +924,41 @@ to `cp <our file>` makes the copy the edit. `GIT_EDITOR=true` keeps reword/squas
 from blocking on a terminal. The plan is newest-first (as the log shows it) and
 reversed when written, since git replays oldest-first.
 
+## 2026-07-21 - The window closed on running work without asking
+
+Pedro closed the window by reflex with Claude working in it. Nothing asked, nothing
+came back. The cause was not a missing feature: `behaviour.confirm_close` had been
+in `config.rs` (default `true`) and in the settings panel since the beginning, and
+**no code ever read it**. A dead setting is worse than no setting — it says the
+window is guarded when it is not.
+
+Four paths exited the app and all four now go through `Gpu::request_close`:
+`WindowEvent::CloseRequested`, `Action::Quit`, closing the LAST tab, and closing the
+last pane. The palette's Quit too (it exits the process directly, having no event
+loop).
+
+What counts as "running" is the foreground process of each pane with shells filtered
+out (`is_shell`, dash-stripped for login shells like `-fish`): a pane idling at its
+prompt reports the shell itself, and a confirm that fires on an idle window is one
+people learn to dismiss without reading. Nothing running still closes instantly.
+
+The prompt is a `PromptKind::ConfirmQuit`, which `PromptKind::is_confirm` marks as a
+question rather than a field: no input line, no selected row, and the running command
+lines listed under it dimmed. **Enter is not a yes.** This prompt exists because a
+reflex keystroke killed work, and Enter is the reflex — only `y` closes, `n`/Esc/`q`
+stay. Verified on a real instance on DP-6: `SHELL=/usr/bin/cat` (a non-shell
+foreground) + `hyprctl dispatch closewindow` leaves the window up with the prompt;
+with a normal shell idle, the same dispatch closes it at once.
+
 ## Gotchas (do not re-learn)
 
+- A setting that exists in `config.rs` and in the settings panel is NOT a feature.
+  `confirm_close` was both, and read by nobody, for months. Grep for every field of
+  `Behaviour` before trusting one.
+- `cargo test` fails `shell_integration::fish_prepends_xdg_data_dirs` when run from a
+  shell that runnir itself launched: the injected `XDG_DATA_DIRS` is already
+  prepended, so `apply` skips and the test finds no env. Run it as
+  `env -u XDG_DATA_DIRS cargo test`. Not a regression.
 - A binding spec and a keypress must produce the SAME `ChordKey` variant.
   Punctuation is always `Char`; only real NamedKeys (arrows, F-keys, pageup) are
   `Named`. Test a new spec against `Chord::from_event`, never just against parse.
