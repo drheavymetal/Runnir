@@ -1347,6 +1347,58 @@ With it, the whole feature above was driven from a shell: open the panel, switch
 the log, Enter a commit, walk its files, zoom, escape, drag both separators, arm the
 leader and descend into a group — each step asserted on the JSON that came back.
 
+## 2026-07-21 - The docker panel, step 1: the daemon, the objects, the verbs
+
+The design below, built as far as the local and remote DAEMONS go. Hub is a row in
+the hosts column that says it is not built yet, and the deploy action is not here.
+
+**The daemon is spoken to over its socket, not by parsing `docker`.** Two of the
+things this panel exists for — `/events` and `/stats` — are streams, and scraping a
+CLI for a stream is a losing game; going to the socket for the lists too means one
+transport and one set of field names. `docker.rs` is a tiny HTTP/1.1 client over a
+`UnixStream`, `Connection: close` per request, with the chunked decoding the daemon
+uses for anything it streams. A remote context opens `ssh <host> docker system
+dial-stdio` and speaks the same HTTP down its stdio — the tunnel the CLI itself
+uses, so it inherits the user's keys and config. The `Stream` is killed and reaped
+on drop: an ssh child that outlives its request is one leaked per refresh.
+
+**One place still uses the CLI, and it has to**: compose. Compose is a client that
+reads yaml and talks to the daemon; the daemon has never heard of a project. The
+files come off the containers' own `com.docker.compose.project.config_files` label,
+which is how compose finds them again too.
+
+**Containers are grouped by compose project**, because that is the unit the work is
+done in — nobody deploys a container. Health is parsed out of the status line into
+its own mark: `Up 3 days (healthy)` is two facts, and the one that matters is the
+one folding them into a green dot would hide.
+
+**Long output goes to a pane, short output stays inline.** `logs`, `inspect` and the
+summary render in column 3; a shell, `compose up`, `compose pull` open a pane and
+run there. Same call the git panel makes for a command that needs a terminal.
+
+**Every delete confirms, naming what goes with it**: the container's named volumes
+(which do NOT go with it, and saying so is the difference between a delete and a
+lost database), the containers still using an image, the containers still using a
+volume. `compose down` names what it would stop. Anything on a host that is not
+this machine names the host. The panel is parked while the confirm is up and put
+back on either answer, so "no" leaves the screen as it was.
+
+Two bugs the wiring itself produced, both worth remembering:
+
+- **A row holds an INDEX into the container list**, so reading "what is selected"
+  AFTER replacing the snapshot reads a different container. `apply_snapshot` takes
+  the id first and then rebuilds; a test kills the container above the cursor and
+  asserts the cursor stayed on the same NAME.
+- **A good read used to clear the footer**, which meant the message from the
+  operation that triggered the read never survived long enough to be read. Only an
+  error is cleared now.
+
+Verified against the real daemon on this machine, driven by remote control: seven
+containers in four compose projects with their health marks, the `desktop-linux`
+context drawn as down with its reason, images/volumes/networks, logs (500 lines,
+unwrapped from the daemon's 8-byte stream framing), inspect, then stop / start /
+remove of a throwaway container including the confirm and its "no".
+
 ## DESIGN, NOT YET BUILT — the Docker / Docker Hub panel (decided 2026-07-21)
 
 Discussed with Pedro on 2026-07-21, before a line of code. Nothing here is built. The

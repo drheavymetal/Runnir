@@ -1,0 +1,1099 @@
+//! Docker: the data layer behind the panel.
+//!
+//! Everything here BLOCKS and belongs on a worker thread, exactly like `git.rs`:
+//! a daemon on the other end of an ssh hop answers when it feels like it, and a
+//! frame cannot wait for it.
+//!
+//! The daemon is spoken to over its HTTP socket rather than by parsing `docker`
+//! output. Two of the things this panel exists for — `/events` and `/stats` — are
+//! streams, and scraping a CLI for a stream is a losing game; going to the socket
+//! for the lists too means one transport, one set of field names, and no second
+//! format to keep up with.
+//!
+//! Three transports sit behind one request function, because the socket does not
+//! reach everywhere: a local daemon is a unix socket, a remote one is the tunnel
+//! the CLI itself uses (`ssh <host> docker system dial-stdio`), and Docker Hub is
+//! an HTTP API somewhere else entirely (see `hub.rs`-shaped functions below).
+
+use std::io::{Read, Write};
+use std::path::PathBuf;
+
+use serde_json::Value;
+
+/// The API version asked for. 1.41 is Docker 20.10, which is old enough that every
+/// server this will meet speaks it and new enough to have everything used here.
+/// Pinning it means a newer daemon cannot rename a field under us.
+const API: &str = "/v1.41";
+
+/// How long a local request may take before it is given up on. A hung daemon is a
+/// thing that happens (a full disk, a stuck storage driver), and the worker thread
+/// it hangs is one this process never gets back.
+const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Where a daemon lives.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Endpoint {
+    /// A unix socket on this machine.
+    Unix(PathBuf),
+    /// A daemon reached by ssh, through the same stdio tunnel the CLI opens. Not a
+    /// TCP port: the tunnel is what `docker context` gives us and what already has
+    /// the user's keys and config behind it.
+    Ssh(String),
+    /// Docker Hub, which is not a daemon at all. Kept in the same enum because the
+    /// panel treats it as a host in the same column, and a caller that forgets it is
+    /// different gets an error rather than a wrong answer.
+    Hub,
+}
+
+impl Endpoint {
+    /// Parses what `docker context ls` prints in its endpoint column.
+    pub fn parse(endpoint: &str) -> Option<Endpoint> {
+        let e = endpoint.trim();
+        if let Some(path) = e.strip_prefix("unix://") {
+            return Some(Endpoint::Unix(PathBuf::from(path)));
+        }
+        if let Some(rest) = e.strip_prefix("ssh://") {
+            return Some(Endpoint::Ssh(rest.to_string()));
+        }
+        None
+    }
+
+    pub fn label(&self) -> String {
+        match self {
+            Endpoint::Unix(p) => p.display().to_string(),
+            Endpoint::Ssh(h) => format!("ssh://{h}"),
+            Endpoint::Hub => "hub.docker.com".to_string(),
+        }
+    }
+
+    pub fn is_local(&self) -> bool {
+        matches!(self, Endpoint::Unix(_))
+    }
+}
+
+/// One entry of the hosts column: a docker context, or Docker Hub.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Host {
+    pub name: String,
+    pub endpoint: Endpoint,
+    /// What the daemon said its version was, once asked. `None` until then.
+    pub version: Option<String>,
+    /// Why it could not be reached. A host that is down is DRAWN as down and never
+    /// stalls anything: the request already ran on a worker.
+    pub error: Option<String>,
+    pub current: bool,
+}
+
+impl Host {
+    pub fn hub() -> Host {
+        Host {
+            name: "docker hub".into(),
+            endpoint: Endpoint::Hub,
+            version: None,
+            error: None,
+            current: false,
+        }
+    }
+}
+
+/// The hosts to show: every docker context, plus Hub.
+///
+/// The contexts come from the CLI rather than from `~/.docker/contexts`, because
+/// the store's layout is an implementation detail of the CLI and the CLI is the
+/// thing that has to agree with us about what a context is.
+pub fn hosts() -> Vec<Host> {
+    let mut out = parse_contexts(&context_ls());
+    if out.is_empty() {
+        // No CLI, or no contexts: the default socket is still worth offering, since
+        // a daemon on it is the common case and the panel would otherwise be empty.
+        out.push(Host {
+            name: "default".into(),
+            endpoint: Endpoint::Unix(PathBuf::from("/var/run/docker.sock")),
+            version: None,
+            error: None,
+            current: true,
+        });
+    }
+    out.push(Host::hub());
+    out
+}
+
+fn context_ls() -> String {
+    let out = std::process::Command::new("docker")
+        .args(["context", "ls", "--format", "{{.Name}}\t{{.DockerEndpoint}}\t{{.Current}}"])
+        .stderr(std::process::Stdio::null())
+        .output();
+    match out {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
+        _ => String::new(),
+    }
+}
+
+/// Parses the tab-separated context list. Pure, so the format is testable.
+pub fn parse_contexts(text: &str) -> Vec<Host> {
+    text.lines()
+        .filter_map(|line| {
+            let mut it = line.split('\t');
+            let name = it.next()?.trim().to_string();
+            let endpoint = Endpoint::parse(it.next().unwrap_or(""))?;
+            let current = it.next().unwrap_or("false").trim() == "true";
+            (!name.is_empty()).then_some(Host { name, endpoint, version: None, error: None, current })
+        })
+        .collect()
+}
+
+// ---- the transport ---------------------------------------------------------
+
+/// A duplex stream to a daemon: a socket, or an ssh child's stdio.
+enum Stream {
+    Unix(std::os::unix::net::UnixStream),
+    Child(std::process::Child),
+}
+
+impl Stream {
+    fn open(ep: &Endpoint) -> Result<Stream, String> {
+        match ep {
+            Endpoint::Unix(path) => {
+                let s = std::os::unix::net::UnixStream::connect(path)
+                    .map_err(|e| format!("{}: {e}", path.display()))?;
+                let _ = s.set_read_timeout(Some(TIMEOUT));
+                let _ = s.set_write_timeout(Some(TIMEOUT));
+                Ok(Stream::Unix(s))
+            }
+            Endpoint::Ssh(host) => {
+                // The same tunnel the CLI opens. `-T` because there is no terminal
+                // here and ssh would otherwise try to allocate one; BatchMode so a
+                // host that wants a password fails instead of hanging on a prompt
+                // nobody can see.
+                let child = std::process::Command::new("ssh")
+                    .args(["-T", "-o", "BatchMode=yes", host, "docker", "system", "dial-stdio"])
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .map_err(|e| format!("ssh {host}: {e}"))?;
+                Ok(Stream::Child(child))
+            }
+            Endpoint::Hub => Err("docker hub is not a daemon".into()),
+        }
+    }
+
+    fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
+        match self {
+            Stream::Unix(s) => s.write_all(buf),
+            Stream::Child(c) => c.stdin.as_mut().expect("piped").write_all(buf),
+        }
+    }
+}
+
+impl Read for Stream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Stream::Unix(s) => s.read(buf),
+            Stream::Child(c) => c.stdout.as_mut().expect("piped").read(buf),
+        }
+    }
+}
+
+impl Drop for Stream {
+    fn drop(&mut self) {
+        // An ssh child outlives its request otherwise: the tunnel stays open, the
+        // process stays alive, and a panel that refreshes leaks one per refresh.
+        if let Stream::Child(c) = self {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+    }
+}
+
+/// One request, one connection, closed after the answer.
+///
+/// `Connection: close` on purpose: keeping a pool per host would mean owning
+/// reconnection, and the expensive part of a docker request is the daemon's work,
+/// not the socket. The streams that DO stay open (`/events`, `/stats`, logs) are
+/// their own function, because their lifetime is the panel's, not a call's.
+pub fn request(ep: &Endpoint, method: &str, path: &str, body: Option<&str>) -> Result<Vec<u8>, String> {
+    let mut stream = Stream::open(ep)?;
+    let mut req = format!(
+        "{method} {API}{path} HTTP/1.1\r\nHost: docker\r\nAccept: application/json\r\nConnection: close\r\n"
+    );
+    match body {
+        Some(b) => {
+            req.push_str(&format!(
+                "Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{b}",
+                b.len()
+            ));
+        }
+        None => req.push_str("\r\n"),
+    }
+    stream.write_all(req.as_bytes()).map_err(|e| e.to_string())?;
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).map_err(|e| e.to_string())?;
+    let (status, body) = split_response(&raw)?;
+    if !(200..300).contains(&status) {
+        return Err(error_message(&body, status));
+    }
+    Ok(body)
+}
+
+/// Splits an HTTP/1.1 response into its status and its decoded body.
+///
+/// Chunked has to be handled here and not wished away: the daemon uses it for
+/// anything it streams, and a body read as-is then carries the chunk lengths in the
+/// middle of the JSON.
+pub fn split_response(raw: &[u8]) -> Result<(u16, Vec<u8>), String> {
+    let split = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .ok_or("no HTTP header in the answer")?;
+    let head = String::from_utf8_lossy(&raw[..split]);
+    let mut lines = head.lines();
+    let status: u16 = lines
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|s| s.parse().ok())
+        .ok_or("unparseable HTTP status")?;
+    let chunked = lines.any(|l| {
+        let l = l.to_ascii_lowercase();
+        l.starts_with("transfer-encoding:") && l.contains("chunked")
+    });
+    let body = &raw[split + 4..];
+    Ok((status, if chunked { dechunk(body) } else { body.to_vec() }))
+}
+
+/// Reassembles a chunked body. A malformed length ends the body rather than
+/// panicking: this is data off a socket, not something we produced.
+pub fn dechunk(body: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(body.len());
+    let mut rest = body;
+    loop {
+        let Some(eol) = rest.windows(2).position(|w| w == b"\r\n") else { break };
+        let size_line = String::from_utf8_lossy(&rest[..eol]);
+        let size = usize::from_str_radix(size_line.split(';').next().unwrap_or("").trim(), 16);
+        let Ok(size) = size else { break };
+        if size == 0 {
+            break;
+        }
+        let start = eol + 2;
+        let end = (start + size).min(rest.len());
+        out.extend_from_slice(&rest[start..end]);
+        if end + 2 > rest.len() {
+            break;
+        }
+        rest = &rest[end + 2..];
+    }
+    out
+}
+
+/// The daemon's own error text, which is a JSON object with a `message`. Falling
+/// back to the status code alone would turn "no such container" into "404".
+fn error_message(body: &[u8], status: u16) -> String {
+    serde_json::from_slice::<Value>(body)
+        .ok()
+        .and_then(|v| v.get("message").and_then(|m| m.as_str().map(str::to_string)))
+        .unwrap_or_else(|| format!("docker answered {status}"))
+}
+
+fn get_json(ep: &Endpoint, path: &str) -> Result<Value, String> {
+    let body = request(ep, "GET", path, None)?;
+    serde_json::from_slice(&body).map_err(|e| e.to_string())
+}
+
+// ---- what the panel shows --------------------------------------------------
+
+/// A container as the list endpoint describes it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Container {
+    pub id: String,
+    /// Without the leading `/` the API puts on it.
+    pub name: String,
+    pub image: String,
+    /// `running`, `exited`, `created`, `paused`…
+    pub state: String,
+    /// The human line: `Up 3 days (healthy)`.
+    pub status: String,
+    /// Health, split OUT of the status line. A healthcheck failing is not the same
+    /// fact as a container being up, and folding them into one word hides the case
+    /// that matters: up and unhealthy.
+    pub health: Option<Health>,
+    pub project: Option<String>,
+    pub service: Option<String>,
+    /// Published ports as `(host, container, proto)`. Only the published ones: an
+    /// unpublished port is not something you can open.
+    pub ports: Vec<(u16, u16, String)>,
+    /// Named volumes this container mounts. Anonymous ones are left out: they have
+    /// no row of their own, and a delete confirm can only name what has one.
+    pub volumes: Vec<String>,
+    /// The compose files this project was brought up from, off its labels — which
+    /// is how compose itself finds them again, and the only way to run a compose
+    /// verb on a project the panel did not start.
+    pub config_files: Vec<String>,
+    pub created: i64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Health {
+    Healthy,
+    Unhealthy,
+    Starting,
+}
+
+impl Health {
+    pub fn mark(self) -> char {
+        match self {
+            Health::Healthy => '\u{2713}',
+            Health::Unhealthy => '\u{2717}',
+            Health::Starting => '\u{25cc}',
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Health::Healthy => "healthy",
+            Health::Unhealthy => "unhealthy",
+            Health::Starting => "starting",
+        }
+    }
+}
+
+impl Container {
+    pub fn running(&self) -> bool {
+        self.state == "running"
+    }
+
+    /// What a row shows on the right: the status, shortened. `Up 3 days` is what
+    /// people read; the rest of the line is the health, which has its own mark.
+    pub fn short_status(&self) -> String {
+        let s = self.status.split(" (").next().unwrap_or(&self.status);
+        s.to_string()
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Image {
+    pub id: String,
+    pub tags: Vec<String>,
+    /// `repo@sha256:…`, which is the ONLY thing that can be compared with a
+    /// registry. The local `Id` says nothing about what a remote holds.
+    pub digests: Vec<String>,
+    pub size: u64,
+    pub created: i64,
+}
+
+impl Image {
+    /// The name a row shows: its first tag, or a short id for an untagged layer.
+    pub fn label(&self) -> String {
+        match self.tags.iter().find(|t| *t != "<none>:<none>") {
+            Some(t) => t.clone(),
+            None => format!("<none> {}", short_id(&self.id)),
+        }
+    }
+
+    /// The digest for one repository, if this image carries one.
+    pub fn digest_for(&self, repo: &str) -> Option<&str> {
+        self.digests.iter().find_map(|d| {
+            let (r, sha) = d.split_once('@')?;
+            (r == repo).then_some(sha)
+        })
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Volume {
+    pub name: String,
+    pub driver: String,
+    pub mountpoint: String,
+    pub project: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Network {
+    pub id: String,
+    pub name: String,
+    pub driver: String,
+    pub subnet: Option<String>,
+}
+
+/// Everything one host holds, as one snapshot. Read together so the panel never
+/// draws a container list from one moment beside an image list from another.
+#[derive(Clone, Debug, Default)]
+pub struct Snapshot {
+    pub containers: Vec<Container>,
+    pub images: Vec<Image>,
+    pub volumes: Vec<Volume>,
+    pub networks: Vec<Network>,
+    pub version: Option<String>,
+}
+
+/// Reads a whole host. Blocking: worker only.
+pub fn snapshot(ep: &Endpoint) -> Result<Snapshot, String> {
+    // The version doubles as the ping: if this fails the host is down, and the
+    // three lists after it would each fail the same way, slowly.
+    let version = get_json(ep, "/version")?
+        .get("Version")
+        .and_then(|v| v.as_str().map(str::to_string));
+    Ok(Snapshot {
+        containers: parse_containers(&get_json(ep, "/containers/json?all=1")?),
+        images: parse_images(&get_json(ep, "/images/json")?),
+        volumes: parse_volumes(&get_json(ep, "/volumes")?),
+        networks: parse_networks(&get_json(ep, "/networks")?),
+        version,
+    })
+}
+
+pub fn parse_containers(v: &Value) -> Vec<Container> {
+    let Some(list) = v.as_array() else { return Vec::new() };
+    let mut out: Vec<Container> = list
+        .iter()
+        .map(|c| {
+            let labels = c.get("Labels");
+            let label = |k: &str| {
+                labels
+                    .and_then(|l| l.get(k))
+                    .and_then(|s| s.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+            };
+            let status = str_of(c, "Status");
+            Container {
+                id: str_of(c, "Id"),
+                // The API hands names back with a leading slash, which is a detail
+                // of how it namespaces them and not part of the name.
+                name: c
+                    .get("Names")
+                    .and_then(|n| n.as_array())
+                    .and_then(|a| a.first())
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("")
+                    .trim_start_matches('/')
+                    .to_string(),
+                image: str_of(c, "Image"),
+                state: str_of(c, "State"),
+                health: health_of(&status),
+                status,
+                project: label("com.docker.compose.project"),
+                service: label("com.docker.compose.service"),
+                ports: parse_ports(c.get("Ports")),
+                volumes: parse_mounts(c.get("Mounts")),
+                config_files: label("com.docker.compose.project.config_files")
+                    .map(|f| f.split(',').map(|s| s.trim().to_string()).collect())
+                    .unwrap_or_default(),
+                created: c.get("Created").and_then(|x| x.as_i64()).unwrap_or(0),
+            }
+        })
+        .collect();
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
+/// The health inside a status line. The list endpoint has no health FIELD — it is
+/// only ever in the parenthesis of `Up 3 days (healthy)`.
+pub fn health_of(status: &str) -> Option<Health> {
+    let s = status.to_ascii_lowercase();
+    if s.contains("(healthy)") {
+        Some(Health::Healthy)
+    } else if s.contains("(unhealthy)") {
+        Some(Health::Unhealthy)
+    } else if s.contains("health: starting") {
+        Some(Health::Starting)
+    } else {
+        None
+    }
+}
+
+fn parse_ports(v: Option<&Value>) -> Vec<(u16, u16, String)> {
+    let Some(list) = v.and_then(|p| p.as_array()) else { return Vec::new() };
+    let mut out: Vec<(u16, u16, String)> = list
+        .iter()
+        .filter_map(|p| {
+            // No PublicPort means nothing is published, and an unpublished port is
+            // not something the panel can offer to open.
+            let public = p.get("PublicPort").and_then(|x| x.as_u64())? as u16;
+            let private = p.get("PrivatePort").and_then(|x| x.as_u64()).unwrap_or(0) as u16;
+            let proto = p.get("Type").and_then(|x| x.as_str()).unwrap_or("tcp").to_string();
+            Some((public, private, proto))
+        })
+        .collect();
+    // The API repeats a published port once per host address (v4 and v6).
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// The NAMED volumes a container mounts.
+fn parse_mounts(v: Option<&Value>) -> Vec<String> {
+    let Some(list) = v.and_then(|m| m.as_array()) else { return Vec::new() };
+    list.iter()
+        .filter(|m| m.get("Type").and_then(|t| t.as_str()) == Some("volume"))
+        .filter_map(|m| m.get("Name").and_then(|n| n.as_str()).map(str::to_string))
+        .collect()
+}
+
+pub fn parse_images(v: &Value) -> Vec<Image> {
+    let Some(list) = v.as_array() else { return Vec::new() };
+    let mut out: Vec<Image> = list
+        .iter()
+        .map(|i| Image {
+            id: str_of(i, "Id"),
+            tags: strings(i.get("RepoTags")),
+            digests: strings(i.get("RepoDigests")),
+            size: i.get("Size").and_then(|x| x.as_u64()).unwrap_or(0),
+            created: i.get("Created").and_then(|x| x.as_i64()).unwrap_or(0),
+        })
+        .collect();
+    // Newest first: an image list is read to find what was just built.
+    out.sort_by(|a, b| b.created.cmp(&a.created).then(a.label().cmp(&b.label())));
+    out
+}
+
+pub fn parse_volumes(v: &Value) -> Vec<Volume> {
+    let Some(list) = v.get("Volumes").and_then(|x| x.as_array()) else { return Vec::new() };
+    let mut out: Vec<Volume> = list
+        .iter()
+        .map(|x| Volume {
+            name: str_of(x, "Name"),
+            driver: str_of(x, "Driver"),
+            mountpoint: str_of(x, "Mountpoint"),
+            project: x
+                .get("Labels")
+                .and_then(|l| l.get("com.docker.compose.project"))
+                .and_then(|s| s.as_str())
+                .map(str::to_string),
+        })
+        .collect();
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
+pub fn parse_networks(v: &Value) -> Vec<Network> {
+    let Some(list) = v.as_array() else { return Vec::new() };
+    let mut out: Vec<Network> = list
+        .iter()
+        .map(|n| Network {
+            id: str_of(n, "Id"),
+            name: str_of(n, "Name"),
+            driver: str_of(n, "Driver"),
+            subnet: n
+                .get("IPAM")
+                .and_then(|i| i.get("Config"))
+                .and_then(|c| c.as_array())
+                .and_then(|a| a.first())
+                .and_then(|c| c.get("Subnet"))
+                .and_then(|s| s.as_str())
+                .map(str::to_string),
+        })
+        .collect();
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
+fn str_of(v: &Value, key: &str) -> String {
+    v.get(key).and_then(|x| x.as_str()).unwrap_or("").to_string()
+}
+
+fn strings(v: Option<&Value>) -> Vec<String> {
+    v.and_then(|x| x.as_array())
+        .map(|a| a.iter().filter_map(|s| s.as_str().map(str::to_string)).collect())
+        .unwrap_or_default()
+}
+
+/// `sha256:abcdef…` down to the twelve characters everything else prints.
+pub fn short_id(id: &str) -> String {
+    id.trim_start_matches("sha256:").chars().take(12).collect()
+}
+
+/// Sizes the way `docker images` writes them.
+pub fn human_size(bytes: u64) -> String {
+    const UNIT: [&str; 5] = ["B", "kB", "MB", "GB", "TB"];
+    let mut v = bytes as f64;
+    let mut i = 0;
+    while v >= 1000.0 && i + 1 < UNIT.len() {
+        v /= 1000.0;
+        i += 1;
+    }
+    if i == 0 {
+        format!("{} {}", bytes, UNIT[0])
+    } else {
+        format!("{v:.1} {}", UNIT[i])
+    }
+}
+
+/// "3 days ago" from a unix timestamp, with `now` passed in so it is testable.
+pub fn ago(created: i64, now: i64) -> String {
+    let d = (now - created).max(0);
+    match d {
+        0..=59 => format!("{d}s ago"),
+        60..=3599 => format!("{}m ago", d / 60),
+        3600..=86399 => format!("{}h ago", d / 3600),
+        _ => format!("{}d ago", d / 86400),
+    }
+}
+
+pub fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+// ---- inspect ---------------------------------------------------------------
+
+/// One object's full JSON, pretty-printed for the detail column.
+pub fn inspect(ep: &Endpoint, kind: Kind, id: &str) -> Result<String, String> {
+    let path = match kind {
+        Kind::Containers => format!("/containers/{id}/json"),
+        Kind::Images => format!("/images/{id}/json"),
+        Kind::Volumes => format!("/volumes/{id}"),
+        Kind::Networks => format!("/networks/{id}"),
+    };
+    let v = get_json(ep, &path)?;
+    serde_json::to_string_pretty(&v).map_err(|e| e.to_string())
+}
+
+/// The last `tail` lines of a container's logs.
+///
+/// The daemon multiplexes stdout and stderr into 8-byte-headed frames whenever the
+/// container has no TTY, so the bytes cannot be shown as they arrive — `demux`
+/// unwraps them. A container WITH a tty sends them raw, and the same function
+/// leaves those alone.
+pub fn logs(ep: &Endpoint, id: &str, tail: usize) -> Result<String, String> {
+    let path = format!("/containers/{id}/logs?stdout=1&stderr=1&timestamps=0&tail={tail}");
+    let raw = request(ep, "GET", &path, None)?;
+    Ok(String::from_utf8_lossy(&demux(&raw)).into_owned())
+}
+
+/// Unwraps the daemon's stream framing: `[stream, 0,0,0, len:u32be]` then payload.
+///
+/// A body that does not look framed is passed through untouched, which is what a
+/// TTY container's logs are.
+pub fn demux(raw: &[u8]) -> Vec<u8> {
+    let framed = raw.len() >= 8 && raw[0] <= 2 && raw[1] == 0 && raw[2] == 0 && raw[3] == 0;
+    if !framed {
+        return raw.to_vec();
+    }
+    let mut out = Vec::with_capacity(raw.len());
+    let mut i = 0;
+    while i + 8 <= raw.len() {
+        let len = u32::from_be_bytes([raw[i + 4], raw[i + 5], raw[i + 6], raw[i + 7]]) as usize;
+        let start = i + 8;
+        let end = (start + len).min(raw.len());
+        out.extend_from_slice(&raw[start..end]);
+        if end == start && len > 0 {
+            break;
+        }
+        i = end;
+    }
+    out
+}
+
+// ---- what the object column groups by --------------------------------------
+
+/// Which kind of object the middle column is listing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Kind {
+    #[default]
+    Containers,
+    Images,
+    Volumes,
+    Networks,
+}
+
+impl Kind {
+    pub const ALL: [Kind; 4] = [Kind::Containers, Kind::Images, Kind::Volumes, Kind::Networks];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Kind::Containers => "containers",
+            Kind::Images => "images",
+            Kind::Volumes => "volumes",
+            Kind::Networks => "networks",
+        }
+    }
+
+    pub fn letter(self) -> char {
+        match self {
+            Kind::Containers => 'C',
+            Kind::Images => 'I',
+            Kind::Volumes => 'V',
+            Kind::Networks => 'N',
+        }
+    }
+
+    pub fn next(self) -> Kind {
+        let i = Kind::ALL.iter().position(|k| *k == self).unwrap_or(0);
+        Kind::ALL[(i + 1) % Kind::ALL.len()]
+    }
+
+    pub fn prev(self) -> Kind {
+        let i = Kind::ALL.iter().position(|k| *k == self).unwrap_or(0);
+        Kind::ALL[(i + Kind::ALL.len() - 1) % Kind::ALL.len()]
+    }
+}
+
+/// The compose projects in a snapshot, in the order the rows will show them, with
+/// the loose containers last under `None`.
+///
+/// Compose is the level this is grouped by because it is the unit the work is
+/// actually done in: nobody deploys a container, they deploy a project.
+pub fn projects(containers: &[Container]) -> Vec<Option<String>> {
+    let mut out: Vec<Option<String>> = Vec::new();
+    for c in containers {
+        let key = c.project.clone();
+        if !out.contains(&key) {
+            out.push(key);
+        }
+    }
+    // Loose containers last: a project is a heading with things under it, and a
+    // heading after a flat list reads as part of the list.
+    out.sort_by_key(|p| p.is_none());
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_context_line_becomes_a_host_and_an_unknown_endpoint_is_dropped() {
+        let hosts = parse_contexts(
+            "default\tunix:///var/run/docker.sock\ttrue\n\
+             cloudmax\tssh://root@cloudmax\tfalse\n\
+             weird\ttcp://1.2.3.4:2375\tfalse\n\
+             \t\t\n",
+        );
+        assert_eq!(hosts.len(), 2, "tcp is not a transport this speaks: {hosts:?}");
+        assert_eq!(hosts[0].name, "default");
+        assert!(hosts[0].current);
+        assert_eq!(hosts[1].endpoint, Endpoint::Ssh("root@cloudmax".into()));
+        assert!(!hosts[1].endpoint.is_local());
+    }
+
+    #[test]
+    fn a_chunked_body_is_reassembled_and_a_plain_one_is_not_touched() {
+        let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\n[{\"\r\n3\r\na\":\r\n3\r\n1}]\r\n0\r\n\r\n";
+        let (status, body) = split_response(raw).unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(String::from_utf8_lossy(&body), "[{\"a\":1}]");
+
+        let plain = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n[]";
+        assert_eq!(split_response(plain).unwrap(), (200, b"[]".to_vec()));
+
+        // Garbage in the middle ends the body instead of panicking: this is data off
+        // a socket, not something we wrote.
+        assert!(dechunk(b"zz\r\nnope").is_empty());
+    }
+
+    #[test]
+    fn the_daemons_own_words_survive_an_error_status() {
+        let raw = b"HTTP/1.1 404 Not Found\r\nContent-Length: 33\r\n\r\n{\"message\":\"No such container: x\"}";
+        let (status, body) = split_response(raw).unwrap();
+        assert_eq!(status, 404);
+        assert_eq!(error_message(&body, status), "No such container: x");
+        // ...and a body that is not JSON still says something better than nothing.
+        assert_eq!(error_message(b"<html>", 500), "docker answered 500");
+    }
+
+    #[test]
+    fn a_container_carries_its_compose_project_and_its_health_apart_from_its_state() {
+        let v: Value = serde_json::from_str(
+            r#"[{"Id":"abc123def4567","Names":["/cromowin-dev-postgres"],"Image":"postgres:16",
+                 "State":"running","Status":"Up 24 minutes (healthy)","Created":100,
+                 "Labels":{"com.docker.compose.project":"cromowin-dev",
+                           "com.docker.compose.service":"postgres"},
+                 "Ports":[{"IP":"0.0.0.0","PrivatePort":5432,"PublicPort":5433,"Type":"tcp"},
+                          {"IP":"::","PrivatePort":5432,"PublicPort":5433,"Type":"tcp"}]},
+                {"Id":"def","Names":["/loose"],"Image":"nginx","State":"exited",
+                 "Status":"Exited (0) 2 days ago","Created":50,"Labels":{},"Ports":[]}]"#,
+        )
+        .unwrap();
+        let cs = parse_containers(&v);
+        assert_eq!(cs.len(), 2);
+        let pg = &cs[0];
+        assert_eq!(pg.name, "cromowin-dev-postgres", "the leading slash is not part of it");
+        assert_eq!(pg.project.as_deref(), Some("cromowin-dev"));
+        assert_eq!(pg.health, Some(Health::Healthy));
+        assert!(pg.running());
+        assert_eq!(pg.short_status(), "Up 24 minutes", "the health has its own mark");
+        // One published port, not one per host address.
+        assert_eq!(pg.ports, [(5433, 5432, "tcp".to_string())]);
+
+        let loose = &cs[1];
+        assert_eq!(loose.health, None);
+        assert!(!loose.running());
+        assert_eq!(loose.project, None);
+
+        // Grouped: the project first, the loose ones under the empty heading last.
+        assert_eq!(projects(&cs), [Some("cromowin-dev".to_string()), None]);
+
+        // Up and UNHEALTHY is the case that must not fold into "up".
+        assert_eq!(health_of("Up 2 hours (unhealthy)"), Some(Health::Unhealthy));
+        assert_eq!(health_of("Up 1 second (health: starting)"), Some(Health::Starting));
+    }
+
+    #[test]
+    fn an_image_is_named_by_a_tag_and_compared_by_a_digest() {
+        let v: Value = serde_json::from_str(
+            r#"[{"Id":"sha256:6315049057080481de47","RepoTags":["go2chaindev/facturation:front-1.0.0"],
+                 "RepoDigests":["go2chaindev/facturation@sha256:aaa","other/thing@sha256:bbb"],
+                 "Size":77252313,"Created":200},
+                {"Id":"sha256:0000111122223333","RepoTags":["<none>:<none>"],"RepoDigests":[],
+                 "Size":10,"Created":300}]"#,
+        )
+        .unwrap();
+        let images = parse_images(&v);
+        // Newest first: an image list is read to find what was just built.
+        assert_eq!(images[0].label(), "<none> 000011112222");
+        assert_eq!(images[1].label(), "go2chaindev/facturation:front-1.0.0");
+        // The digest is per REPOSITORY, and it is the only thing a registry can be
+        // asked about — the local Id says nothing about a remote.
+        assert_eq!(images[1].digest_for("go2chaindev/facturation"), Some("sha256:aaa"));
+        assert_eq!(images[1].digest_for("go2chaindev/nothing"), None);
+        assert_eq!(human_size(77252313), "77.3 MB");
+        assert_eq!(human_size(512), "512 B");
+    }
+
+    #[test]
+    fn volumes_and_networks_keep_what_a_row_has_to_say() {
+        let v: Value = serde_json::from_str(
+            r#"{"Volumes":[{"Name":"aios_pg","Driver":"local","Mountpoint":"/var/lib/docker/volumes/aios_pg/_data",
+                            "Labels":{"com.docker.compose.project":"go2chain-aios"}}]}"#,
+        )
+        .unwrap();
+        let vols = parse_volumes(&v);
+        assert_eq!(vols[0].project.as_deref(), Some("go2chain-aios"));
+
+        let n: Value = serde_json::from_str(
+            r#"[{"Id":"58d2","Name":"docker_default","Driver":"bridge",
+                 "IPAM":{"Config":[{"Subnet":"172.18.0.0/16","Gateway":"172.18.0.1"}]}},
+                {"Id":"aa","Name":"host","Driver":"host","IPAM":{"Config":[]}}]"#,
+        )
+        .unwrap();
+        let nets = parse_networks(&n);
+        assert_eq!(nets[0].subnet.as_deref(), Some("172.18.0.0/16"));
+        assert_eq!(nets[1].subnet, None, "a host network has no subnet, and says so");
+    }
+
+    #[test]
+    fn log_frames_are_unwrapped_and_raw_output_is_left_alone() {
+        // `[stream, 0,0,0, len]` then the payload, which is what a container with no
+        // TTY sends. Shown as-is, the header bytes land in the middle of the text.
+        let mut raw = vec![1u8, 0, 0, 0, 0, 0, 0, 5];
+        raw.extend_from_slice(b"hello");
+        raw.extend_from_slice(&[2u8, 0, 0, 0, 0, 0, 0, 4]);
+        raw.extend_from_slice(b"err!");
+        assert_eq!(String::from_utf8_lossy(&demux(&raw)), "helloerr!");
+
+        // A TTY container sends the bytes plain, and they must survive untouched.
+        assert_eq!(demux(b"plain output\n"), b"plain output\n");
+    }
+
+    #[test]
+    fn the_kind_strip_wraps_both_ways() {
+        assert_eq!(Kind::Containers.next(), Kind::Images);
+        assert_eq!(Kind::Networks.next(), Kind::Containers);
+        assert_eq!(Kind::Containers.prev(), Kind::Networks);
+        assert_eq!(Kind::default(), Kind::Containers);
+    }
+
+    /// Talks to the daemon on this machine. Ignored by default — a test suite that
+    /// needs a running docker is a suite that fails on the machine without one.
+    #[test]
+    #[ignore]
+    fn reads_the_real_daemon() {
+        let ep = Endpoint::Unix(PathBuf::from("/var/run/docker.sock"));
+        let snap = snapshot(&ep).expect("a daemon on the default socket");
+        println!(
+            "version {:?}: {} containers, {} images, {} volumes, {} networks",
+            snap.version,
+            snap.containers.len(),
+            snap.images.len(),
+            snap.volumes.len(),
+            snap.networks.len()
+        );
+        assert!(snap.version.is_some());
+        if let Some(c) = snap.containers.first() {
+            let text = inspect(&ep, Kind::Containers, &c.id).expect("inspect");
+            assert!(text.contains("\"Id\""));
+            let _ = logs(&ep, &c.id, 5).expect("logs");
+        }
+    }
+
+    #[test]
+    fn ages_read_the_way_docker_writes_them() {
+        assert_eq!(ago(100, 130), "30s ago");
+        assert_eq!(ago(0, 3600 * 5), "5h ago");
+        assert_eq!(ago(0, 86400 * 3 + 10), "3d ago");
+        assert_eq!(ago(500, 100), "0s ago", "a clock that went backwards is not an error");
+    }
+}
+
+// ---- what a worker sends back ----------------------------------------------
+
+/// One answer from a docker worker, tagged by the panel's request generation.
+///
+/// Everything the panel shows arrives this way. Nothing here is ever computed on
+/// the UI thread: the cheapest call in this file opens a socket, and the dearest
+/// one opens an ssh connection to another machine.
+pub enum PanelMsg {
+    /// The hosts, with each one's version filled in (or the reason it is down).
+    Hosts(Vec<Host>),
+    /// Everything one host holds. The index says which host asked.
+    Snapshot(usize, Result<Snapshot, String>),
+    /// The detail column's text for one object.
+    Detail(String, Result<String, String>),
+    /// An operation finished.
+    Done(Result<String, String>),
+}
+
+/// Asks every host for its version, in parallel, so one unreachable machine does
+/// not hold up the list. Blocking: worker only.
+pub fn probe(mut hosts: Vec<Host>) -> Vec<Host> {
+    let handles: Vec<_> = hosts
+        .iter()
+        .map(|h| {
+            let ep = h.endpoint.clone();
+            std::thread::spawn(move || match ep {
+                // Hub is not asked: it has no version, and a request to it here
+                // would cost a round trip to the internet before the panel opens.
+                Endpoint::Hub => (None, None),
+                ep => match get_json(&ep, "/version") {
+                    Ok(v) => (v.get("Version").and_then(|x| x.as_str().map(str::to_string)), None),
+                    Err(e) => (None, Some(e)),
+                },
+            })
+        })
+        .collect();
+    for (host, handle) in hosts.iter_mut().zip(handles) {
+        match handle.join() {
+            Ok((version, error)) => {
+                host.version = version;
+                host.error = error;
+            }
+            Err(_) => host.error = Some("the probe panicked".into()),
+        }
+    }
+    hosts
+}
+
+// ---- operations ------------------------------------------------------------
+
+/// Something to do to one object, on the daemon that holds it.
+///
+/// Only the SHORT operations are here. Anything that takes minutes or prints a
+/// progress bar — build, push, pull, `compose up`, `exec` — goes to a real pane
+/// instead (see `compose_command`), because a pane already has colour, Ctrl-C and
+/// scrollback and this panel would have to grow all three.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Op {
+    /// `start`, `stop`, `restart`, `kill`, `pause`, `unpause`.
+    Container { id: String, verb: &'static str },
+    RemoveContainer { id: String, force: bool },
+    RemoveImage { id: String },
+    RemoveVolume { name: String },
+    RemoveNetwork { id: String },
+}
+
+impl Op {
+    /// What the footer says when it worked. Written from the OP rather than from
+    /// the daemon's answer, which is empty for every one of these.
+    pub fn done(&self) -> String {
+        match self {
+            // Spelled out rather than built from the verb: "stop" + "ed" is
+            // "stoped", and a panel that cannot spell reads as one that guessed.
+            Op::Container { verb, .. } => match *verb {
+                "start" => "started".into(),
+                "stop" => "stopped".into(),
+                "restart" => "restarted".into(),
+                "kill" => "killed".into(),
+                "pause" => "paused".into(),
+                "unpause" => "unpaused".into(),
+                other => other.to_string(),
+            },
+            Op::RemoveContainer { .. } => "container removed".into(),
+            Op::RemoveImage { .. } => "image removed".into(),
+            Op::RemoveVolume { .. } => "volume removed".into(),
+            Op::RemoveNetwork { .. } => "network removed".into(),
+        }
+    }
+}
+
+/// Runs one operation. Blocking: worker only.
+pub fn run_op(ep: &Endpoint, op: &Op) -> Result<String, String> {
+    let (method, path) = match op {
+        Op::Container { id, verb } => ("POST", format!("/containers/{id}/{verb}")),
+        // `v=1` takes the volumes that were created ANONYMOUSLY for this container
+        // with it. Named volumes are not touched by it — those are their own row.
+        Op::RemoveContainer { id, force } => {
+            ("DELETE", format!("/containers/{id}?v=1&force={}", if *force { 1 } else { 0 }))
+        }
+        Op::RemoveImage { id } => ("DELETE", format!("/images/{id}")),
+        Op::RemoveVolume { name } => ("DELETE", format!("/volumes/{name}")),
+        Op::RemoveNetwork { id } => ("DELETE", format!("/networks/{id}")),
+    };
+    request(ep, method, &path, None)?;
+    Ok(op.done())
+}
+
+/// How to reach a host from the COMMAND LINE, for the operations that run in a
+/// pane. A context is passed with `-c`, which is what the user would type.
+pub fn cli_prefix(host: &Host) -> Vec<String> {
+    match host.endpoint {
+        // The default socket needs no flag, and adding one would break for anyone
+        // whose current context is not called "default".
+        Endpoint::Unix(_) if host.current => vec!["docker".into()],
+        _ => vec!["docker".into(), "-c".into(), host.name.clone()],
+    }
+}
+
+/// The command line for a compose verb on one project.
+///
+/// Compose is not in the daemon API at all: it is a client that reads yaml and
+/// talks to the daemon, so this is the one place where the CLI is not a shortcut
+/// but the only way. The project's config files come from the labels its own
+/// containers carry, which is how compose itself finds them again.
+pub fn compose_command(host: &Host, project: &str, files: &[String], verb: &[&str]) -> Vec<String> {
+    let mut cmd = cli_prefix(host);
+    cmd.push("compose".into());
+    cmd.push("-p".into());
+    cmd.push(project.to_string());
+    for f in files {
+        cmd.push("-f".into());
+        cmd.push(f.clone());
+    }
+    cmd.extend(verb.iter().map(|v| v.to_string()));
+    cmd
+}
+
+/// The command line for a shell inside a container.
+///
+/// `bash` if it is there and `sh` if it is not, decided INSIDE the container:
+/// a lot of images have no bash, and picking from out here would need another
+/// round trip to find out.
+pub fn exec_command(host: &Host, id: &str) -> Vec<String> {
+    let mut cmd = cli_prefix(host);
+    cmd.extend(["exec".into(), "-it".into(), id.to_string()]);
+    cmd.push("sh".into());
+    cmd.push("-c".into());
+    cmd.push("command -v bash >/dev/null 2>&1 && exec bash || exec sh".into());
+    cmd
+}
+
+/// Which containers use a volume, so a delete confirm can NAME them. Cheap: the
+/// snapshot is already in hand, so this is a scan of it and not a request.
+pub fn volume_users<'a>(containers: &'a [Container], name: &str) -> Vec<&'a str> {
+    containers
+        .iter()
+        .filter(|c| c.volumes.iter().any(|v| v == name))
+        .map(|c| c.name.as_str())
+        .collect()
+}
+
+/// Which containers were started from an image, by tag or by id.
+pub fn image_users<'a>(containers: &'a [Container], image: &Image) -> Vec<&'a str> {
+    let short = short_id(&image.id);
+    containers
+        .iter()
+        .filter(|c| image.tags.iter().any(|t| *t == c.image) || c.image.contains(&short))
+        .map(|c| c.name.as_str())
+        .collect()
+}

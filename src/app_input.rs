@@ -64,7 +64,18 @@ impl Gpu {
     }
 
     /// Puts a confirm away, restoring whatever it was asked over.
+    ///
+    /// The docker panel is parked in its own slot rather than in
+    /// `overlay_under_confirm`, because its confirms are answered on the way to an
+    /// operation that needs the panel BACK: "no" and "yes" both end up looking at
+    /// it again, and only the pending operation is dropped.
     fn dismiss_confirm(&mut self) {
+        if let Some(panel) = self.docker_stash.take() {
+            self.pending_docker = None;
+            self.pending_docker_cmd = None;
+            self.overlay = Some(Overlay::Docker(panel));
+            return;
+        }
         self.overlay = self.overlay_under_confirm.take();
     }
 
@@ -81,6 +92,13 @@ impl Gpu {
             let over_files = self.git_pointer_over_files(self.cursor_px);
             match self.overlay.as_mut() {
                 Some(Overlay::Docs(d)) => d.scroll(-lines.round() as isize),
+                Some(Overlay::Docker(p)) => {
+                    let step = -lines.round() as i32;
+                    match p.focus {
+                        overlay::DockerFocus::Detail => p.scroll_detail(step),
+                        _ => p.move_cursor(step),
+                    }
+                }
                 Some(Overlay::Git(p)) => {
                     let step = -lines.round() as i32;
                     if over_files {
@@ -145,6 +163,10 @@ impl Gpu {
             self.git_drag_split(position);
             return;
         }
+        if self.docker_drag.is_some() {
+            self.docker_drag_split(position);
+            return;
+        }
         // Over a git panel separator the pointer says so: a column you can drag with
         // no sign that you can is a column nobody ever drags.
         {
@@ -153,6 +175,7 @@ impl Gpu {
             // outlives the thing it was pointing at.
             let over = match &self.overlay {
                 Some(Overlay::Git(p)) => p.separator_at(cols, rows, col, row).is_some(),
+                Some(Overlay::Docker(p)) => p.separator_at(cols, rows, col, row).is_some(),
                 _ => false,
             };
             if over != self.git_over_split {
@@ -195,6 +218,7 @@ impl Gpu {
         if state == ElementState::Released && button == MouseButton::Left {
             self.resizing = None;
             self.git_drag = None;
+            self.docker_drag = None;
             if self.explorer_resizing {
                 // The panes learn their new size once, here: a PTY resized on every
                 // frame of a drag is how a full-screen program ends up redrawing
@@ -210,6 +234,14 @@ impl Gpu {
         if matches!(self.overlay, Some(Overlay::Git(_))) {
             if state == ElementState::Pressed && button == MouseButton::Left {
                 self.git_panel_click(self.cursor_px, config);
+            }
+            return;
+        }
+        // The docker panel takes the mouse for the same reason the git panel does:
+        // it is three lists, and lists are things people point at.
+        if matches!(self.overlay, Some(Overlay::Docker(_))) {
+            if state == ElementState::Pressed && button == MouseButton::Left {
+                self.docker_panel_click(self.cursor_px);
             }
             return;
         }
@@ -677,6 +709,7 @@ impl Gpu {
             Action::AiCommand => self.ai_command(),
             Action::FixLastCommand => self.fix_last_command(config),
             Action::GitPanel => self.open_git_panel(config),
+            Action::DockerPanel => self.open_docker_panel(),
             Action::AiExplain => self.ai_explain_selection(config),
             Action::SummarizeSession => self.summarize_session(config),
             Action::OpenScrollbackInEditor => self.open_scrollback_in_editor(config),
@@ -1559,6 +1592,711 @@ impl Gpu {
         self.explorer_read_git(false);
     }
 
+    // ------------------------------------------------------------------
+    // The docker panel (docker.rs + overlay::DockerPanel).
+    // ------------------------------------------------------------------
+
+    /// Opens the panel and starts reading. Nothing is read on this thread: the
+    /// cheapest call opens a socket and the dearest opens an ssh connection.
+    fn open_docker_panel(&mut self) {
+        let hosts = crate::docker::hosts();
+        let mut panel = overlay::DockerPanel::new(hosts);
+        // Open on the CURRENT context, which is the daemon every `docker` command
+        // in a pane would have talked to.
+        panel.host_cursor = panel.hosts.iter().position(|h| h.current).unwrap_or(0);
+        self.overlay = Some(Overlay::Docker(panel));
+        self.docker_probe();
+        self.docker_reload();
+        self.window.request_redraw();
+    }
+
+    /// Asks every host for its version, on one worker that fans out. A host that is
+    /// down is then DRAWN as down instead of being found out about on selection.
+    fn docker_probe(&mut self) {
+        let Some(Overlay::Docker(p)) = &self.overlay else { return };
+        let hosts = p.hosts.clone();
+        let seq = self.docker_gen;
+        let proxy = self.proxy.clone();
+        std::thread::spawn(move || {
+            let hosts = crate::docker::probe(hosts);
+            let _ = proxy.send_event(UserEvent::Docker(seq, crate::docker::PanelMsg::Hosts(hosts)));
+        });
+    }
+
+    /// Reads the selected host's containers, images, volumes and networks.
+    fn docker_reload(&mut self) {
+        self.docker_gen += 1;
+        let seq = self.docker_gen;
+        let Some(Overlay::Docker(p)) = &mut self.overlay else { return };
+        let index = p.host_cursor;
+        let Some(host) = p.host().cloned() else { return };
+        p.loading = true;
+        if matches!(host.endpoint, crate::docker::Endpoint::Hub) {
+            // Hub is not a daemon and has no snapshot to read. Saying so beats a
+            // spinner that never stops.
+            p.loading = false;
+            p.snap = crate::docker::Snapshot::default();
+            p.rebuild();
+            p.message = Ok("docker hub: not built yet".into());
+            return;
+        }
+        let ep = host.endpoint.clone();
+        let proxy = self.proxy.clone();
+        std::thread::spawn(move || {
+            let snap = crate::docker::snapshot(&ep);
+            let _ = proxy
+                .send_event(UserEvent::Docker(seq, crate::docker::PanelMsg::Snapshot(index, snap)));
+        });
+    }
+
+    /// Reads what the detail column is asking for, when it is something only the
+    /// daemon knows. The summary needs no worker at all — it is built from the
+    /// snapshot the panel already has.
+    fn docker_detail_load(&mut self) {
+        self.docker_gen += 1;
+        let seq = self.docker_gen;
+        let Some(Overlay::Docker(p)) = &mut self.overlay else { return };
+        if p.detail == overlay::DockerDetail::Summary {
+            p.detail_lines.clear();
+            p.detail_for = None;
+            return;
+        }
+        // A compose heading is not an object the daemon knows: it has no logs and
+        // nothing to inspect. Falling back to the summary says what it DOES have —
+        // leaving the column on "logs" would spin on "reading…" forever.
+        let (Some(id), Some(host)) = (p.selected_id(), p.host().cloned()) else {
+            p.detail = overlay::DockerDetail::Summary;
+            p.detail_lines.clear();
+            p.detail_for = None;
+            p.message = Ok("a compose project has no logs of its own".into());
+            return;
+        };
+        let kind = p.kind;
+        let mode = p.detail;
+        p.detail_for = Some(id.clone());
+        p.detail_lines.clear();
+        p.detail_scroll = 0;
+        let ep = host.endpoint;
+        let proxy = self.proxy.clone();
+        std::thread::spawn(move || {
+            let text = match mode {
+                overlay::DockerDetail::Logs => crate::docker::logs(&ep, &id, 500),
+                overlay::DockerDetail::Inspect => crate::docker::inspect(&ep, kind, &id),
+                overlay::DockerDetail::Summary => Ok(String::new()),
+            };
+            let _ = proxy
+                .send_event(UserEvent::Docker(seq, crate::docker::PanelMsg::Detail(id, text)));
+        });
+    }
+
+    /// A docker worker answered. Anything tagged with an older generation is
+    /// dropped: hosts get switched faster than a slow daemon answers, and a
+    /// snapshot landing under another host would be a lie about that host.
+    fn on_docker_msg(&mut self, seq: u64, msg: crate::docker::PanelMsg) {
+        let Some(Overlay::Docker(p)) = &mut self.overlay else { return };
+        match msg {
+            // The probe is not generation-guarded on purpose: it describes the
+            // HOSTS, which do not change when the panel reloads a snapshot.
+            crate::docker::PanelMsg::Hosts(hosts) => {
+                if hosts.len() == p.hosts.len() {
+                    p.hosts = hosts;
+                }
+            }
+            crate::docker::PanelMsg::Snapshot(index, snap) => {
+                if seq != self.docker_gen || index != p.host_cursor {
+                    return;
+                }
+                p.loading = false;
+                match snap {
+                    Ok(s) => {
+                        p.apply_snapshot(s);
+                        // Only an ERROR is cleared by a good read. The message is
+                        // usually what the operation that triggered this reload just
+                        // said, and wiping it means the confirmation of what you did
+                        // never survives long enough to be read.
+                        if p.message.is_err() {
+                            p.message = Ok(String::new());
+                        }
+                    }
+                    Err(e) => {
+                        p.apply_snapshot(crate::docker::Snapshot::default());
+                        if let Some(h) = p.hosts.get_mut(index) {
+                            h.error = Some(e.clone());
+                        }
+                        p.message = Err(e);
+                    }
+                }
+            }
+            crate::docker::PanelMsg::Detail(id, text) => {
+                if p.detail_for.as_deref() != Some(id.as_str()) {
+                    return;
+                }
+                match text {
+                    Ok(t) => p.detail_lines = t.lines().map(|l| l.to_string()).collect(),
+                    Err(e) => {
+                        p.detail_lines = vec![e.clone()];
+                        p.message = Err(e);
+                    }
+                }
+            }
+            crate::docker::PanelMsg::Done(result) => {
+                p.busy = false;
+                p.message = result.map(|m| m);
+                self.docker_reload();
+            }
+        }
+        self.window.request_redraw();
+    }
+
+    /// Drags a docker column separator to the pointer, for as long as the button is
+    /// down — the same contract the pane dividers and the git panel's columns have.
+    fn docker_drag_split(&mut self, pos: PhysicalPosition<f64>) {
+        let Some(sep) = self.docker_drag else { return };
+        let (cols, rows, col, _) = self.cell_at(pos);
+        let Some(Overlay::Docker(p)) = &mut self.overlay else { return };
+        let l = p.layout(cols, rows);
+        p.drag_split(sep, col.saturating_sub(l.col), l.w);
+        self.window.request_redraw();
+    }
+
+    /// A left click in the docker panel: the kind strip switches kind, a host row
+    /// selects and reads that host, an object row selects it — and a click on the
+    /// row that is already selected opens it, the way the git panel and a file
+    /// manager both work — and a separator starts a resize.
+    fn docker_panel_click(&mut self, pos: PhysicalPosition<f64>) {
+        let (cols, rows, col, row) = self.cell_at(pos);
+        let mut reload = false;
+        let mut detail = false;
+        {
+            let Some(Overlay::Docker(p)) = &mut self.overlay else { return };
+            let Some(hit) = p.hit(cols, rows, col, row) else {
+                // Outside the panel entirely reads as "put this away".
+                self.overlay = None;
+                self.sync_git_cursor();
+                self.window.request_redraw();
+                return;
+            };
+            match hit {
+                overlay::DockerHit::Kind(k) => {
+                    p.focus = overlay::DockerFocus::Objects;
+                    p.set_kind(k);
+                }
+                overlay::DockerHit::HostRow(i) => {
+                    let same = p.host_cursor == i;
+                    p.host_cursor = i;
+                    p.focus = overlay::DockerFocus::Hosts;
+                    // A host is READ on the second click, never on the first: a
+                    // stray click on an ssh host must not open a connection.
+                    reload = same;
+                }
+                overlay::DockerHit::Row(i) => {
+                    let same = p.cursor() == i;
+                    p.set_cursor(i);
+                    p.focus = overlay::DockerFocus::Objects;
+                    if same && !p.toggle_project() {
+                        detail = true;
+                    }
+                }
+                overlay::DockerHit::Separator(i) => self.docker_drag = Some(i),
+                overlay::DockerHit::Detail => p.focus = overlay::DockerFocus::Detail,
+            }
+        }
+        if reload {
+            self.docker_reload();
+        }
+        if detail {
+            self.docker_detail_load();
+        }
+        self.window.request_redraw();
+    }
+
+    /// The docker panel's own leader layer. Returns whether it consumed the key.
+    ///
+    /// Same reason the git panel and the sidebar have one: with this panel holding
+    /// the keyboard, the global "new tab" under the same letter is not what the hand
+    /// means.
+    fn docker_leader_key(&mut self, key: &Key, mods: ModifiersState, config: &Config) -> bool {
+        if !matches!(self.overlay, Some(Overlay::Docker(_))) {
+            return false;
+        }
+        let is_leader = match (
+            crate::actions::leader_chord(&config.leader),
+            Chord::from_event(key, mods),
+        ) {
+            (Some(l), Some(c)) => l == c,
+            _ => false,
+        };
+        let armed = matches!(&self.overlay, Some(Overlay::Docker(p)) if p.leader.is_some());
+        if is_leader {
+            if let Some(Overlay::Docker(p)) = &mut self.overlay {
+                if armed {
+                    p.cancel_leader();
+                } else {
+                    p.arm_leader();
+                }
+            }
+            self.window.request_redraw();
+            return true;
+        }
+        if !armed {
+            return false;
+        }
+        // A character with ctrl/alt/super is a shortcut attempt, not a choice here.
+        // The panel's layer runs BEFORE the modifier filter in `overlay_key`, so it
+        // has to repeat it.
+        if matches!(key, Key::Character(_))
+            && (mods.control_key() || mods.alt_key() || mods.super_key())
+        {
+            return false;
+        }
+        let press = {
+            let Some(Overlay::Docker(p)) = &mut self.overlay else { return false };
+            match key {
+                Key::Named(NamedKey::Escape) => {
+                    p.cancel_leader();
+                    None
+                }
+                Key::Character(c) => c.chars().next().and_then(|c| p.leader_key(c)),
+                _ => None,
+            }
+        };
+        if let Some(k) = press {
+            let key = match k {
+                overlay::DockerKey::Ch(c) => {
+                    Key::Character(winit::keyboard::SmolStr::new(c.to_string()))
+                }
+                overlay::DockerKey::Enter => Key::Named(NamedKey::Enter),
+            };
+            self.docker_panel_key(&key, config);
+        }
+        self.window.request_redraw();
+        true
+    }
+
+    /// Keys while the docker panel has the keyboard.
+    fn docker_panel_key(&mut self, key: &Key, config: &Config) {
+        let mut reload = false;
+        let mut detail = false;
+        let mut copy: Option<String> = None;
+        let mut op: Option<crate::docker::Op> = None;
+        let mut remove = false;
+        let mut exec = false;
+        let mut browse = false;
+        let mut compose: Option<Vec<&str>> = None;
+        {
+            let Some(Overlay::Docker(p)) = &mut self.overlay else { return };
+            let focus = p.focus;
+            match key {
+                Key::Named(NamedKey::Escape) => {
+                    // Zoom first, then the panel: Escape backs out one thing at a
+                    // time, the way it does everywhere else here.
+                    if p.zoom {
+                        p.zoom = false;
+                    } else {
+                        self.overlay = None;
+                        self.window.request_redraw();
+                        return;
+                    }
+                }
+                Key::Named(NamedKey::Tab) => p.cycle_focus(true),
+                Key::Named(NamedKey::ArrowDown) => match focus {
+                    overlay::DockerFocus::Hosts => {
+                        p.host_cursor = (p.host_cursor + 1).min(p.hosts.len().saturating_sub(1))
+                    }
+                    overlay::DockerFocus::Objects => p.move_cursor(1),
+                    overlay::DockerFocus::Detail => p.scroll_detail(1),
+                },
+                Key::Named(NamedKey::ArrowUp) => match focus {
+                    overlay::DockerFocus::Hosts => p.host_cursor = p.host_cursor.saturating_sub(1),
+                    overlay::DockerFocus::Objects => p.move_cursor(-1),
+                    overlay::DockerFocus::Detail => p.scroll_detail(-1),
+                },
+                Key::Named(NamedKey::PageDown) => p.scroll_detail(10),
+                Key::Named(NamedKey::PageUp) => p.scroll_detail(-10),
+                Key::Named(NamedKey::ArrowRight) | Key::Named(NamedKey::Enter) => match focus {
+                    // A host is only READ when it is chosen: moving over an ssh host
+                    // must not open a connection to it.
+                    overlay::DockerFocus::Hosts => {
+                        p.focus = overlay::DockerFocus::Objects;
+                        reload = true;
+                    }
+                    overlay::DockerFocus::Objects => {
+                        if !p.toggle_project() {
+                            detail = true;
+                        }
+                    }
+                    overlay::DockerFocus::Detail => {}
+                },
+                Key::Named(NamedKey::ArrowLeft) => p.cycle_focus(false),
+                Key::Character(c) => match c.as_str() {
+                    "q" => {
+                        self.overlay = None;
+                        self.window.request_redraw();
+                        return;
+                    }
+                    "j" => match focus {
+                        overlay::DockerFocus::Hosts => {
+                            p.host_cursor = (p.host_cursor + 1).min(p.hosts.len().saturating_sub(1))
+                        }
+                        overlay::DockerFocus::Objects => p.move_cursor(1),
+                        overlay::DockerFocus::Detail => p.scroll_detail(1),
+                    },
+                    "k" => match focus {
+                        overlay::DockerFocus::Hosts => {
+                            p.host_cursor = p.host_cursor.saturating_sub(1)
+                        }
+                        overlay::DockerFocus::Objects => p.move_cursor(-1),
+                        overlay::DockerFocus::Detail => p.scroll_detail(-1),
+                    },
+                    "g" => match focus {
+                        overlay::DockerFocus::Detail => p.detail_scroll = 0,
+                        _ => p.set_cursor(0),
+                    },
+                    "G" => match focus {
+                        overlay::DockerFocus::Detail => p.scroll_detail(i32::MAX),
+                        _ => p.set_cursor(usize::MAX),
+                    },
+                    "h" => p.cycle_focus(false),
+                    "l" => p.cycle_focus(true),
+                    "C" => p.set_kind(crate::docker::Kind::Containers),
+                    "I" => p.set_kind(crate::docker::Kind::Images),
+                    "V" => p.set_kind(crate::docker::Kind::Volumes),
+                    "N" => p.set_kind(crate::docker::Kind::Networks),
+                    "]" => p.set_kind(p.kind.next()),
+                    "[" => p.set_kind(p.kind.prev()),
+                    "z" => p.zoom = !p.zoom,
+                    "r" => reload = true,
+                    "u" => {
+                        p.detail = overlay::DockerDetail::Summary;
+                        detail = true;
+                    }
+                    "L" => {
+                        p.detail = overlay::DockerDetail::Logs;
+                        detail = true;
+                    }
+                    "i" => {
+                        p.detail = overlay::DockerDetail::Inspect;
+                        detail = true;
+                    }
+                    "y" => copy = p.selected_id(),
+                    // The verbs. A container that is paused is started by
+                    // UNpausing it: `start` on a paused container is an error, and
+                    // the key that means "make this run" has to mean it in both
+                    // states.
+                    "s" => {
+                        op = p.selected_container().map(|c| crate::docker::Op::Container {
+                            id: c.id.clone(),
+                            verb: if c.state == "paused" { "unpause" } else { "start" },
+                        })
+                    }
+                    "x" => {
+                        op = p.selected_container().map(|c| crate::docker::Op::Container {
+                            id: c.id.clone(),
+                            verb: "stop",
+                        })
+                    }
+                    "R" => {
+                        op = p.selected_container().map(|c| crate::docker::Op::Container {
+                            id: c.id.clone(),
+                            verb: "restart",
+                        })
+                    }
+                    "p" => {
+                        op = p.selected_container().map(|c| crate::docker::Op::Container {
+                            id: c.id.clone(),
+                            verb: if c.state == "paused" { "unpause" } else { "pause" },
+                        })
+                    }
+                    "d" => remove = true,
+                    "e" => exec = true,
+                    "w" => browse = true,
+                    "U" => compose = Some(vec!["up", "-d"]),
+                    "W" => compose = Some(vec!["down"]),
+                    "P" => compose = Some(vec!["pull"]),
+                    _ => {}
+                },
+                _ => {}
+            }
+        }
+        if reload {
+            self.docker_reload();
+        }
+        if detail {
+            self.docker_detail_load();
+        }
+        if let Some(id) = copy {
+            self.set_clipboard(id);
+            if let Some(Overlay::Docker(p)) = &mut self.overlay {
+                p.message = Ok("id copied".into());
+            }
+        }
+        if let Some(op) = op {
+            self.docker_run_op(op);
+        }
+        if remove {
+            self.docker_remove_prompt();
+        }
+        if exec {
+            self.docker_exec(config);
+        }
+        if browse {
+            self.docker_open_port();
+        }
+        if let Some(verb) = compose {
+            self.docker_compose(&verb, config);
+        }
+        self.window.request_redraw();
+    }
+
+    /// Runs one short operation on a worker. The panel goes busy so a second press
+    /// cannot fire a second one: `stop` twice is harmless, `rm` twice is a second
+    /// error message about something that is already gone.
+    fn docker_run_op(&mut self, op: crate::docker::Op) {
+        self.docker_gen += 1;
+        let seq = self.docker_gen;
+        let Some(Overlay::Docker(p)) = &mut self.overlay else { return };
+        if p.busy {
+            return;
+        }
+        let Some(host) = p.host().cloned() else { return };
+        p.busy = true;
+        p.message = Ok(format!("{}\u{2026}", op.done()));
+        let ep = host.endpoint;
+        let proxy = self.proxy.clone();
+        std::thread::spawn(move || {
+            let result = crate::docker::run_op(&ep, &op);
+            let _ = proxy.send_event(UserEvent::Docker(seq, crate::docker::PanelMsg::Done(result)));
+        });
+    }
+
+    /// Confirms a delete, naming what it would take with it.
+    ///
+    /// Every one of these destroys something with no undo: a container's anonymous
+    /// volumes go with it, an image that something is still running from cannot be
+    /// pulled back from a private registry in a hurry, and a volume IS the data.
+    fn docker_remove_prompt(&mut self) {
+        let Some(Overlay::Docker(p)) = &self.overlay else { return };
+        let Some(row) = p.selected() else { return };
+        let (label, op) = match row {
+            overlay::DockerRow::Container(i) => {
+                let Some(c) = p.snap.containers.get(*i) else { return };
+                let running = c.running();
+                let mut what = format!("Remove the container {}", c.name);
+                if running {
+                    what.push_str(", which is running");
+                }
+                if !c.volumes.is_empty() {
+                    // Named volumes are NOT removed with the container, and saying
+                    // so is the difference between a delete and a lost database.
+                    what.push_str(&format!(
+                        " (its named volumes {} stay)",
+                        c.volumes.join(", ")
+                    ));
+                }
+                (
+                    format!("{what}?"),
+                    crate::docker::Op::RemoveContainer { id: c.id.clone(), force: running },
+                )
+            }
+            overlay::DockerRow::Image(i) => {
+                let Some(m) = p.snap.images.get(*i) else { return };
+                let users = crate::docker::image_users(&p.snap.containers, m);
+                let mut what = format!("Remove the image {}", m.label());
+                if !users.is_empty() {
+                    what.push_str(&format!(", used by {}", users.join(", ")));
+                }
+                (format!("{what}?"), crate::docker::Op::RemoveImage { id: m.id.clone() })
+            }
+            overlay::DockerRow::Volume(i) => {
+                let Some(v) = p.snap.volumes.get(*i) else { return };
+                let users = crate::docker::volume_users(&p.snap.containers, &v.name);
+                let what = if users.is_empty() {
+                    format!("Remove the volume {} and everything in it?", v.name)
+                } else {
+                    format!(
+                        "Remove the volume {} and everything in it? {} still uses it",
+                        v.name,
+                        users.join(", ")
+                    )
+                };
+                (what, crate::docker::Op::RemoveVolume { name: v.name.clone() })
+            }
+            overlay::DockerRow::Network(i) => {
+                let Some(n) = p.snap.networks.get(*i) else { return };
+                (
+                    format!("Remove the network {}?", n.name),
+                    crate::docker::Op::RemoveNetwork { id: n.id.clone() },
+                )
+            }
+            // A project heading has no single thing to remove: `compose down` is
+            // the verb for that, and it has its own key.
+            overlay::DockerRow::Project { .. } => return,
+        };
+        let host = p.host().map(|h| h.name.clone()).unwrap_or_default();
+        self.pending_docker = Some(op);
+        // The confirm REPLACES the panel, so the panel is parked here and put back
+        // on either answer: a "no" that left you looking at the terminal would be a
+        // second surprise on top of the one you just declined.
+        self.docker_stash = match self.overlay.take() {
+            Some(Overlay::Docker(p)) => Some(p),
+            other => {
+                self.overlay = other;
+                return;
+            }
+        };
+        self.overlay = Some(Overlay::Prompt(Prompt::new(
+            PromptKind::DockerRemove,
+            &label,
+            vec![format!("on {host}")],
+        )));
+        self.window.request_redraw();
+    }
+
+    /// Runs the confirmed delete, and puts the panel back where it was.
+    fn docker_confirm_remove(&mut self) {
+        let Some(op) = self.pending_docker.take() else { return };
+        let Some(panel) = self.docker_stash.take() else { return };
+        self.overlay = Some(Overlay::Docker(panel));
+        self.docker_run_op(op);
+    }
+
+    /// Opens a shell inside the selected container, in a pane.
+    ///
+    /// A pane and not the panel: an interactive shell needs a PTY, and building a
+    /// second terminal inside an overlay of the first one is the definition of
+    /// work nobody asked for. On a host that is not this machine it confirms first,
+    /// naming the host — `exec` on the wrong daemon is how a production database
+    /// gets a shell in it by accident.
+    fn docker_exec(&mut self, config: &Config) {
+        let Some(Overlay::Docker(p)) = &self.overlay else { return };
+        let (Some(c), Some(host)) = (p.selected_container(), p.host().cloned()) else { return };
+        if !c.running() {
+            let name = c.name.clone();
+            if let Some(Overlay::Docker(p)) = &mut self.overlay {
+                p.message = Err(format!("{name} is not running"));
+            }
+            return;
+        }
+        let cmd = crate::docker::exec_command(&host, &c.id);
+        if host.endpoint.is_local() {
+            self.docker_to_pane(cmd, config);
+            return;
+        }
+        self.pending_docker_cmd = Some(cmd);
+        let label = format!("Open a shell in {} on {}?", c.name, host.name);
+        self.docker_stash = match self.overlay.take() {
+            Some(Overlay::Docker(p)) => Some(p),
+            other => {
+                self.overlay = other;
+                return;
+            }
+        };
+        self.overlay = Some(Overlay::Prompt(Prompt::new(
+            PromptKind::DockerRemote,
+            &label,
+            vec![host.endpoint.label()],
+        )));
+        self.window.request_redraw();
+    }
+
+    /// A compose verb on the selected project, in a pane: `up`, `down` and `pull`
+    /// print progress for minutes, which is what a pane is for.
+    fn docker_compose(&mut self, verb: &[&str], config: &Config) {
+        let Some(Overlay::Docker(p)) = &self.overlay else { return };
+        let (Some(project), Some(host)) = (p.selected_project(), p.host().cloned()) else {
+            if let Some(Overlay::Docker(p)) = &mut self.overlay {
+                p.message = Err("not part of a compose project".into());
+            }
+            return;
+        };
+        // The files come off the containers' own labels, which is how compose finds
+        // them again. Without them `-p` alone finds nothing to bring up.
+        let files = p
+            .snap
+            .containers
+            .iter()
+            .find(|c| c.project.as_deref() == Some(project.as_str()))
+            .map(|c| c.config_files.clone())
+            .unwrap_or_default();
+        if files.is_empty() && verb.first() == Some(&"up") {
+            if let Some(Overlay::Docker(p)) = &mut self.overlay {
+                p.message = Err(format!("{project}: no compose file recorded on its containers"));
+            }
+            return;
+        }
+        let cmd = crate::docker::compose_command(&host, &project, &files, verb);
+        // `down` stops everything in the project: it asks first, and it names what
+        // it would stop rather than counting containers nobody can see.
+        if verb.first() == Some(&"down") {
+            let running: Vec<&str> = p
+                .snap
+                .containers
+                .iter()
+                .filter(|c| c.project.as_deref() == Some(project.as_str()) && c.running())
+                .map(|c| c.name.as_str())
+                .collect();
+            let label = format!(
+                "compose down {project} on {}? It stops {}",
+                host.name,
+                if running.is_empty() { "nothing that is up".to_string() } else { running.join(", ") }
+            );
+            self.pending_docker_cmd = Some(cmd);
+            self.docker_stash = match self.overlay.take() {
+                Some(Overlay::Docker(p)) => Some(p),
+                other => {
+                    self.overlay = other;
+                    return;
+                }
+            };
+            self.overlay = Some(Overlay::Prompt(Prompt::new(
+                PromptKind::DockerRemote,
+                &label,
+                vec![files.join(", ")],
+            )));
+            self.window.request_redraw();
+            return;
+        }
+        self.docker_to_pane(cmd, config);
+    }
+
+    /// Opens the selected container's first published port in the browser.
+    fn docker_open_port(&mut self) {
+        let Some(Overlay::Docker(p)) = &self.overlay else { return };
+        let Some(c) = p.selected_container() else { return };
+        let Some(&(host_port, _, _)) = c.ports.first() else {
+            let name = c.name.clone();
+            if let Some(Overlay::Docker(p)) = &mut self.overlay {
+                p.message = Err(format!("{name} publishes no port"));
+            }
+            return;
+        };
+        // localhost, because a published port is published on THIS machine — for a
+        // remote daemon it is published on that one, and guessing its address is
+        // how you open a page that belongs to someone else.
+        let remote = !p.host().map(|h| h.endpoint.is_local()).unwrap_or(true);
+        if remote {
+            if let Some(Overlay::Docker(p)) = &mut self.overlay {
+                p.message = Err("that port is published on the remote host, not here".into());
+            }
+            return;
+        }
+        let url = format!("http://localhost:{host_port}");
+        self.explorer_xdg_open(std::path::PathBuf::from(&url));
+        if let Some(Overlay::Docker(p)) = &mut self.overlay {
+            p.message = Ok(format!("opened {url}"));
+        }
+    }
+
+    /// Sends a docker command line to a pane and closes the panel.
+    ///
+    /// The panel closes because the command is the thing to watch now: leaving it
+    /// open over a pane printing a build log would hide the log.
+    fn docker_to_pane(&mut self, cmd: Vec<String>, config: &Config) {
+        self.overlay = None;
+        self.docker_stash = None;
+        self.run_in_pane_or_split(cmd, config);
+    }
+
     /// The leader layer, for one key. Returns whether it consumed it.
     ///
     /// Split out of `on_key` so the remote-control `key` command drives the same
@@ -1692,6 +2430,7 @@ impl Gpu {
         let overlay = match &self.overlay {
             None => "none",
             Some(Overlay::Git(_)) => "git",
+            Some(Overlay::Docker(_)) => "docker",
             Some(Overlay::Prompt(_)) => "prompt",
             Some(Overlay::Palette(_)) => "palette",
             Some(Overlay::Search(_)) => "search",
@@ -1764,6 +2503,56 @@ impl Gpu {
                 "tree_truncated": e.rows.len().saturating_sub(TREE_REPORT),
             });
         }
+        if let Some(Overlay::Docker(p)) = &self.overlay {
+            let l = p.layout(cols, rows);
+            out["docker"] = json!({
+                "host": p.host().map(|h| h.name.clone()),
+                "hosts": p.hosts.iter().map(|h| json!({
+                    "name": h.name,
+                    "endpoint": h.endpoint.label(),
+                    "version": h.version,
+                    "error": h.error,
+                })).collect::<Vec<_>>(),
+                "host_cursor": p.host_cursor,
+                "kind": p.kind.label(),
+                "focus": match p.focus {
+                    crate::overlay::DockerFocus::Hosts => "hosts",
+                    crate::overlay::DockerFocus::Objects => "objects",
+                    crate::overlay::DockerFocus::Detail => "detail",
+                },
+                "detail": p.detail.label(),
+                "detail_lines": p.detail_lines.len(),
+                "cursor": p.cursor(),
+                "rows": p.rows.len(),
+                "selected": p.selected_name(),
+                "zoom": p.zoom,
+                "busy": p.busy,
+                "loading": p.loading,
+                "message": match &p.message { Ok(m) => m.clone(), Err(e) => format!("error: {e}") },
+                "leader": p.leader.is_some(),
+                // In SCREEN cells, like the git panel's: a caller that has to add an
+                // origin it cannot see will aim at the wrong column.
+                "separators": l.separators().iter().map(|(_, x)| l.col + x).collect::<Vec<_>>(),
+                "tree": p.rows.iter().take(TREE_REPORT).map(|r| match r {
+                    crate::overlay::DockerRow::Project { name, total, up, open } => json!({
+                        "kind": "project", "name": name, "total": total, "up": up, "open": open }),
+                    crate::overlay::DockerRow::Container(i) => {
+                        let c = &p.snap.containers[*i];
+                        json!({"kind": "container", "name": c.name, "state": c.state,
+                               "health": c.health.map(|h| h.label()), "image": c.image})
+                    }
+                    crate::overlay::DockerRow::Image(i) => {
+                        json!({"kind": "image", "name": p.snap.images[*i].label()})
+                    }
+                    crate::overlay::DockerRow::Volume(i) => {
+                        json!({"kind": "volume", "name": p.snap.volumes[*i].name})
+                    }
+                    crate::overlay::DockerRow::Network(i) => {
+                        json!({"kind": "network", "name": p.snap.networks[*i].name})
+                    }
+                }).collect::<Vec<_>>(),
+            });
+        }
         if let Some(Overlay::Git(p)) = &self.overlay {
             let l = p.layout(cols, rows);
             out["git"] = json!({
@@ -1817,6 +2606,9 @@ impl Gpu {
         if self.git_leader_key(key, mods, config) {
             return;
         }
+        if self.docker_leader_key(key, mods, config) {
+            return;
+        }
 
         // A character typed with ctrl/alt/super is a shortcut attempt, not text —
         // ignore it so Ctrl+V inside a prompt does not insert a literal 'v'. Named
@@ -1828,6 +2620,7 @@ impl Gpu {
         }
         match self.overlay.as_mut().unwrap() {
             Overlay::Git(_) => self.git_panel_key(key, config),
+            Overlay::Docker(_) => self.docker_panel_key(key, config),
             // The properties panel: move over the nine permission bits, toggle them,
             // and nothing touches the disk until Enter.
             Overlay::Props(p) => {
@@ -2292,6 +3085,7 @@ impl Gpu {
             Action::AiCommand => self.ai_command(),
             Action::FixLastCommand => self.fix_last_command(config),
             Action::GitPanel => self.open_git_panel(config),
+            Action::DockerPanel => self.open_docker_panel(),
             Action::AiExplain => self.ai_explain_selection(config),
             Action::SummarizeSession => self.summarize_session(config),
             Action::OpenScrollbackInEditor => self.open_scrollback_in_editor(config),
@@ -2751,6 +3545,18 @@ impl Gpu {
                 }
             }
             PromptKind::ExplorerChmod => self.explorer_chmod(true),
+            PromptKind::DockerRemove => self.docker_confirm_remove(),
+            // One confirm for both, because they are the same question: this
+            // reaches something the panel is not looking at. The command line was
+            // built before the prompt went up, with the host already in it.
+            PromptKind::DockerRemote => {
+                let cmd = self.pending_docker_cmd.take();
+                self.docker_stash = None;
+                match cmd {
+                    Some(cmd) => self.docker_to_pane(cmd, config),
+                    None => self.overlay = None,
+                }
+            }
             PromptKind::GuardedCommand => {
                 // Confirmed: submit the command that was held back. The line is
                 // already typed in the shell, so this is just the Enter we withheld —

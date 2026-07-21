@@ -25,6 +25,8 @@ pub enum Overlay {
     Media(MediaOverlay),
     /// The native git panel: status, log, branches, stashes.
     Git(GitPanel),
+    /// The native docker panel: hosts, objects, detail.
+    Docker(DockerPanel),
     /// A file being read from the explorer sidebar: text or an image, never edited.
     Viewer(FileViewer),
     /// One path's properties, with its permission bits editable.
@@ -48,6 +50,7 @@ impl Overlay {
             Overlay::ClipHistory(p) => p.render(cols, rows, theme),
             Overlay::Media(m) => m.render(cols, rows, theme),
             Overlay::Git(p) => p.render(cols, rows, theme),
+            Overlay::Docker(p) => p.render(cols, rows, theme),
             Overlay::Viewer(v) => v.render(cols, rows, theme),
             Overlay::Props(p) => p.render(cols, rows, theme),
         }
@@ -2792,6 +2795,11 @@ pub enum PromptKind {
     ExplorerDelete,
     /// Confirmation before a recursive permission change, naming the count.
     ExplorerChmod,
+    /// Confirmation before removing a docker object, naming what goes with it.
+    DockerRemove,
+    /// Confirmation before a docker command that reaches another machine, or that
+    /// stops a whole compose project. The host is NAMED in the label.
+    DockerRemote,
     /// Closing the window (or the last pane) while something is still running.
     /// Answered with y/n, never with typing: the question is whether to kill work,
     /// and a text field would invite Enter — the one key most likely to be pressed
@@ -2809,6 +2817,8 @@ impl PromptKind {
                 | PromptKind::ExplorerRun
                 | PromptKind::ExplorerDelete
                 | PromptKind::ExplorerChmod
+                | PromptKind::DockerRemove
+                | PromptKind::DockerRemote
         )
     }
 }
@@ -3121,6 +3131,257 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
 #[allow(dead_code)]
 fn _cell_marker() -> Cell {
     Cell { ch: ' ', pen: Pen { flags: Flags::empty(), ..Pen::default() } }
+}
+
+#[cfg(test)]
+mod docker_tests {
+    use super::*;
+    use crate::docker::{Container, Endpoint, Health, Host, Image, Kind, Network, Snapshot, Volume};
+
+    fn container(name: &str, project: Option<&str>, running: bool) -> Container {
+        Container {
+            id: format!("id-{name}"),
+            name: name.into(),
+            image: "img:1".into(),
+            state: if running { "running".into() } else { "exited".into() },
+            status: if running { "Up 3 days".into() } else { "Exited (0) 1 day ago".into() },
+            health: None,
+            project: project.map(str::to_string),
+            service: Some(name.into()),
+            ports: Vec::new(),
+            volumes: Vec::new(),
+            config_files: vec!["/srv/app/docker-compose.yml".into()],
+            created: 0,
+        }
+    }
+
+    fn panel(containers: Vec<Container>) -> DockerPanel {
+        let hosts = vec![
+            Host {
+                name: "default".into(),
+                endpoint: Endpoint::Unix("/var/run/docker.sock".into()),
+                version: Some("29.5.2".into()),
+                error: None,
+                current: true,
+            },
+            Host::hub(),
+        ];
+        let mut p = DockerPanel::new(hosts);
+        p.snap = Snapshot { containers, ..Snapshot::default() };
+        p.rebuild();
+        p
+    }
+
+    #[test]
+    fn containers_are_grouped_under_the_compose_project_they_belong_to() {
+        let mut p = panel(vec![
+            container("api", Some("qlaios"), true),
+            container("db", Some("qlaios"), false),
+            container("stray", None, true),
+        ]);
+        // A heading per project, its members under it, and the loose ones LAST:
+        // a heading after a flat list reads as part of the list.
+        assert_eq!(p.rows.len(), 5);
+        assert!(matches!(&p.rows[0], DockerRow::Project { name: Some(n), total: 2, up: 1, .. } if n == "qlaios"));
+        assert!(matches!(&p.rows[3], DockerRow::Project { name: None, total: 1, up: 1, .. }));
+
+        // Folding a project hides its members and nothing else.
+        p.set_cursor(0);
+        assert!(p.toggle_project());
+        assert_eq!(p.rows.len(), 3, "the two members are folded away");
+        assert!(p.toggle_project());
+        assert_eq!(p.rows.len(), 5);
+
+        // A container row answers for its project too, so a compose verb works
+        // from the member you happen to be standing on.
+        p.set_cursor(1);
+        assert_eq!(p.selected_project().as_deref(), Some("qlaios"));
+        assert_eq!(p.selected_name().as_deref(), Some("api"));
+    }
+
+    #[test]
+    fn a_refresh_holds_the_cursor_on_the_same_container_not_the_same_row() {
+        let mut p = panel(vec![
+            container("api", Some("qlaios"), true),
+            container("db", Some("qlaios"), true),
+            container("web", Some("qlaios"), true),
+        ]);
+        p.set_cursor(2);
+        assert_eq!(p.selected_name().as_deref(), Some("db"));
+        // `api` goes away between reads: every row under it shifts up, and a cursor
+        // that stayed on the index would be on `web` just as a key is pressed.
+        let mut snap = p.snap.clone();
+        snap.containers.remove(0);
+        p.apply_snapshot(snap);
+        assert_eq!(p.selected_name().as_deref(), Some("db"));
+    }
+
+    #[test]
+    fn switching_kind_keeps_a_cursor_per_kind_and_never_asks_for_logs_of_a_network() {
+        let mut p = panel(vec![container("api", None, true)]);
+        p.snap.networks = vec![
+            Network { id: "n1".into(), name: "bridge".into(), driver: "bridge".into(), subnet: None },
+            Network { id: "n2".into(), name: "qlaios-net".into(), driver: "bridge".into(), subnet: None },
+        ];
+        p.snap.images = vec![Image { id: "sha256:abc".into(), tags: vec!["a:1".into()], ..Image::default() }];
+        p.detail = DockerDetail::Logs;
+        p.set_kind(Kind::Networks);
+        // Logs are a container word. Landing on a network with the detail still set
+        // to "logs" would ask the daemon for something that does not exist.
+        assert_eq!(p.detail, DockerDetail::Summary);
+        p.set_cursor(1);
+        assert_eq!(p.selected_name().as_deref(), Some("qlaios-net"));
+
+        // Each kind remembers its own cursor.
+        p.set_kind(Kind::Containers);
+        assert_eq!(p.cursor(), 0);
+        p.set_kind(Kind::Networks);
+        assert_eq!(p.selected_name().as_deref(), Some("qlaios-net"));
+    }
+
+    #[test]
+    fn the_summary_says_what_a_row_cannot_fit() {
+        let mut c = container("api", Some("qlaios"), true);
+        c.health = Some(Health::Unhealthy);
+        c.ports = vec![(8080, 80, "tcp".into())];
+        let mut p = panel(vec![c]);
+        p.set_cursor(1);
+        let text = p.summary().join("\n");
+        // Up and UNHEALTHY is the state this panel exists to make visible.
+        assert!(text.contains("unhealthy"), "{text}");
+        assert!(text.contains("8080"), "{text}");
+        assert!(text.contains("qlaios / api"), "{text}");
+    }
+
+    #[test]
+    fn three_columns_shrink_to_two_before_any_of_them_goes_under_its_minimum() {
+        let p = panel(vec![container("api", None, true)]);
+        let wide = p.layout(200, 50);
+        assert!(wide.hosts_w >= MIN_COL && wide.objects_w >= MIN_COL);
+        assert!(wide.detail_w() >= MIN_DETAIL);
+        assert!(wide.sep2() > wide.objects_x());
+
+        // Narrow: the HOSTS column is the one that goes. It is a list of two names
+        // you can also reach with a key; the other two are the panel itself.
+        let narrow = p.layout(52, 20);
+        assert_eq!(narrow.hosts_w, 0);
+        assert!(narrow.objects_w >= MIN_COL);
+        assert_eq!(narrow.separators().len(), 1);
+
+        // Zoomed there is nothing to hit but the detail.
+        let mut z = panel(vec![container("api", None, true)]);
+        z.zoom = true;
+        let l = z.layout(200, 50);
+        assert_eq!((l.hosts_w, l.objects_w), (0, 0));
+        assert!(l.separators().is_empty());
+    }
+
+    #[test]
+    fn a_click_lands_on_what_it_looks_like_it_hit() {
+        let p = panel(vec![container("api", Some("qlaios"), true)]);
+        let (cols, rows) = (120, 30);
+        let l = p.layout(cols, rows);
+        // The kind strip, at the columns it is drawn at.
+        assert_eq!(p.hit(cols, rows, l.col + 2, l.row), Some(DockerHit::Kind(Kind::Containers)));
+        assert_eq!(p.hit(cols, rows, l.col + 5, l.row), Some(DockerHit::Kind(Kind::Images)));
+        // A host row, an object row, and the separator between their columns.
+        assert_eq!(p.hit(cols, rows, l.col + 1, l.row + 2), Some(DockerHit::HostRow(0)));
+        assert_eq!(p.hit(cols, rows, l.col + l.hosts_w, l.row + 4), Some(DockerHit::Separator(0)));
+        assert_eq!(p.hit(cols, rows, l.col + l.objects_x(), l.row + 2), Some(DockerHit::Row(0)));
+        assert_eq!(p.hit(cols, rows, l.col + l.detail_x(), l.row + 3), Some(DockerHit::Detail));
+        // Outside the panel is not a hit at all, which is what closes it.
+        assert_eq!(p.hit(cols, rows, 0, 0), None);
+    }
+
+    #[test]
+    fn dragging_a_separator_cannot_turn_the_panel_inside_out() {
+        let mut p = panel(vec![container("api", None, true)]);
+        // Dragging the first separator past the second pushes the second along
+        // instead of leaving a column with a negative width.
+        p.drag_split(0, 90, 100);
+        assert!(p.split[1] > p.split[0]);
+        p.drag_split(1, 2, 100);
+        assert!(p.split[1] > p.split[0]);
+        // And the layout still gives every column its minimum.
+        let l = p.layout(200, 40);
+        assert!(l.hosts_w >= MIN_COL && l.objects_w >= MIN_COL && l.detail_w() >= MIN_DETAIL);
+    }
+
+    #[test]
+    fn the_leader_only_offers_what_this_row_can_do() {
+        let mut p = panel(vec![container("api", Some("qlaios"), true)]);
+        // On the project heading: the compose verbs, not the container ones.
+        p.set_cursor(0);
+        p.arm_leader();
+        p.leader_key('c');
+        assert!(
+            !p.leader_entries().iter().any(|(k, _, _)| k == "s"),
+            "start is a container verb: {:?}",
+            p.leader_entries()
+        );
+        assert_eq!(p.leader_key('s'), None, "and pressing it ends the sequence");
+        assert!(p.leader.is_none());
+
+        // On the container: the same group offers it, and it presses the key the
+        // panel already binds.
+        p.set_cursor(1);
+        p.arm_leader();
+        p.leader_key('c');
+        assert_eq!(p.leader_key('s'), Some(DockerKey::Ch('s')));
+
+        // The compose verbs are offered from the member row too, because the row
+        // belongs to a project.
+        p.arm_leader();
+        p.leader_key('p');
+        assert_eq!(p.leader_key('u'), Some(DockerKey::Ch('U')));
+    }
+
+    #[test]
+    fn hub_is_a_host_in_the_same_column_but_has_no_kind_strip() {
+        let mut p = panel(Vec::new());
+        assert!(!p.on_hub());
+        p.host_cursor = 1;
+        assert!(p.on_hub());
+        // No strip means nothing to hit in the header: a click there must not
+        // switch to a kind that does not exist on hub.
+        assert_eq!(p.hit(120, 30, 4, 2), None);
+    }
+
+    #[test]
+    fn the_command_lines_carry_the_host_and_the_compose_files() {
+        let local = Host {
+            name: "default".into(),
+            endpoint: Endpoint::Unix("/var/run/docker.sock".into()),
+            version: None,
+            error: None,
+            current: true,
+        };
+        let remote = Host {
+            name: "cloudmax".into(),
+            endpoint: Endpoint::Ssh("root@cloudmax".into()),
+            version: None,
+            error: None,
+            current: false,
+        };
+        // The current local context needs no flag; anything else is named, exactly
+        // as it would be typed.
+        assert_eq!(crate::docker::cli_prefix(&local), ["docker"]);
+        assert_eq!(crate::docker::cli_prefix(&remote), ["docker", "-c", "cloudmax"]);
+
+        let files = vec!["/srv/app/docker-compose.yml".to_string()];
+        let cmd = crate::docker::compose_command(&remote, "qlaios", &files, &["up", "-d"]);
+        assert_eq!(
+            cmd,
+            [
+                "docker", "-c", "cloudmax", "compose", "-p", "qlaios", "-f",
+                "/srv/app/docker-compose.yml", "up", "-d"
+            ]
+        );
+        // The shell is picked INSIDE the container: plenty of images have no bash.
+        let exec = crate::docker::exec_command(&local, "abc");
+        assert_eq!(&exec[..4], ["docker", "exec", "-it", "abc"]);
+        assert!(exec.last().unwrap().contains("exec bash"));
+    }
 }
 
 #[cfg(test)]
@@ -3768,5 +4029,975 @@ mod tests {
         // With no match, raw input is returned so you can type a new host.
         p.input_char('z');
         assert_eq!(p.value(), "z");
+    }
+}
+
+// ---- the docker panel ------------------------------------------------------
+//
+// Same contract as the git panel: three columns, resizable, zoomable, with a leader
+// layer of its own. Not a sidebar (a container table does not fit in thirty
+// columns) and not a full-screen modal (it would cover the shell, which is where
+// the thing the panel is watching gets run).
+
+/// Which column the keyboard is driving.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DockerFocus {
+    Hosts,
+    Objects,
+    Detail,
+}
+
+/// What the detail column is showing about the selection.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum DockerDetail {
+    /// Fields worth reading, laid out. What `docker ps` cannot tell you.
+    #[default]
+    Summary,
+    /// The container's log tail.
+    Logs,
+    /// The whole inspect JSON.
+    Inspect,
+}
+
+impl DockerDetail {
+    pub fn label(self) -> &'static str {
+        match self {
+            DockerDetail::Summary => "summary",
+            DockerDetail::Logs => "logs",
+            DockerDetail::Inspect => "inspect",
+        }
+    }
+}
+
+/// One row of the object column. A compose project is a LEVEL of this tree, not a
+/// filter: the work here is done in projects, and a flat container list makes you
+/// reassemble one in your head every time.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DockerRow {
+    /// A compose project heading: its name, how many containers, how many of them
+    /// are up. `None` is the heading for containers that belong to no project.
+    Project { name: Option<String>, total: usize, up: usize, open: bool },
+    Container(usize),
+    Image(usize),
+    Volume(usize),
+    Network(usize),
+}
+
+pub struct DockerPanel {
+    pub hosts: Vec<crate::docker::Host>,
+    pub host_cursor: usize,
+    pub kind: crate::docker::Kind,
+    pub snap: crate::docker::Snapshot,
+    pub rows: Vec<DockerRow>,
+    /// Cursor per kind, so switching the strip and coming back lands where you left.
+    cursors: [usize; 4],
+    pub focus: DockerFocus,
+    /// Compose projects that are folded shut, by name. `None` (the loose group) is
+    /// never folded: it has no name to remember it by.
+    pub collapsed: std::collections::HashSet<String>,
+    pub split: [f32; 2],
+    pub zoom: bool,
+    pub detail: DockerDetail,
+    pub detail_lines: Vec<String>,
+    pub detail_scroll: usize,
+    /// What the detail column is describing, so an answer that arrives after the
+    /// cursor moved can be dropped instead of drawn under the wrong row.
+    pub detail_for: Option<String>,
+    pub message: Result<String, String>,
+    pub busy: bool,
+    /// A read is in flight for the selected host.
+    pub loading: bool,
+    pub leader: Option<Vec<char>>,
+}
+
+impl DockerPanel {
+    pub fn new(hosts: Vec<crate::docker::Host>) -> Self {
+        Self {
+            hosts,
+            host_cursor: 0,
+            kind: crate::docker::Kind::default(),
+            snap: crate::docker::Snapshot::default(),
+            rows: Vec::new(),
+            cursors: [0; 4],
+            focus: DockerFocus::Objects,
+            collapsed: std::collections::HashSet::new(),
+            split: [0.22, 0.58],
+            zoom: false,
+            detail: DockerDetail::default(),
+            detail_lines: Vec::new(),
+            detail_scroll: 0,
+            detail_for: None,
+            message: Ok(String::new()),
+            busy: false,
+            loading: false,
+            leader: None,
+        }
+    }
+
+    pub fn host(&self) -> Option<&crate::docker::Host> {
+        self.hosts.get(self.host_cursor.min(self.hosts.len().saturating_sub(1)))
+    }
+
+    /// Whether the selected host is Docker Hub, which is not a daemon: the kind
+    /// strip means nothing there and the columns hold repos and tags instead.
+    pub fn on_hub(&self) -> bool {
+        matches!(self.host().map(|h| &h.endpoint), Some(crate::docker::Endpoint::Hub))
+    }
+
+    fn kind_index(&self) -> usize {
+        crate::docker::Kind::ALL.iter().position(|k| *k == self.kind).unwrap_or(0)
+    }
+
+    pub fn cursor(&self) -> usize {
+        self.cursors[self.kind_index()].min(self.rows.len().saturating_sub(1))
+    }
+
+    pub fn set_cursor(&mut self, n: usize) {
+        let n = n.min(self.rows.len().saturating_sub(1));
+        let i = self.kind_index();
+        if self.cursors[i] != n {
+            // The detail belongs to the row it was read for; keeping it beside a
+            // different selection is a lie the panel would keep telling.
+            self.detail_lines.clear();
+            self.detail_for = None;
+            self.detail_scroll = 0;
+        }
+        self.cursors[i] = n;
+    }
+
+    pub fn move_cursor(&mut self, delta: i32) {
+        if self.rows.is_empty() {
+            return;
+        }
+        let n = (self.cursor() as i32 + delta).clamp(0, self.rows.len() as i32 - 1) as usize;
+        self.set_cursor(n);
+    }
+
+    /// The row under the cursor.
+    pub fn selected(&self) -> Option<&DockerRow> {
+        self.rows.get(self.cursor())
+    }
+
+    pub fn selected_container(&self) -> Option<&crate::docker::Container> {
+        match self.selected() {
+            Some(DockerRow::Container(i)) => self.snap.containers.get(*i),
+            _ => None,
+        }
+    }
+
+    /// The id (or name) of whatever is selected, which is what every operation and
+    /// every detail read is keyed by.
+    pub fn selected_id(&self) -> Option<String> {
+        match self.selected()? {
+            DockerRow::Container(i) => self.snap.containers.get(*i).map(|c| c.id.clone()),
+            DockerRow::Image(i) => self.snap.images.get(*i).map(|m| m.id.clone()),
+            DockerRow::Volume(i) => self.snap.volumes.get(*i).map(|v| v.name.clone()),
+            DockerRow::Network(i) => self.snap.networks.get(*i).map(|n| n.id.clone()),
+            DockerRow::Project { .. } => None,
+        }
+    }
+
+    /// The name a confirm or a message calls the selection by.
+    pub fn selected_name(&self) -> Option<String> {
+        match self.selected()? {
+            DockerRow::Container(i) => self.snap.containers.get(*i).map(|c| c.name.clone()),
+            DockerRow::Image(i) => self.snap.images.get(*i).map(|m| m.label()),
+            DockerRow::Volume(i) => self.snap.volumes.get(*i).map(|v| v.name.clone()),
+            DockerRow::Network(i) => self.snap.networks.get(*i).map(|n| n.name.clone()),
+            DockerRow::Project { name, .. } => {
+                Some(name.clone().unwrap_or_else(|| "(no project)".into()))
+            }
+        }
+    }
+
+    /// The compose project the cursor is in: the heading itself, or the project of
+    /// the container under it. Operations on a project are offered from both.
+    pub fn selected_project(&self) -> Option<String> {
+        match self.selected()? {
+            DockerRow::Project { name, .. } => name.clone(),
+            DockerRow::Container(i) => self.snap.containers.get(*i)?.project.clone(),
+            _ => None,
+        }
+    }
+
+    /// Rebuilds the object column from the snapshot.
+    ///
+    /// Containers are grouped by compose project; everything else is a flat list,
+    /// because a volume's project label is a hint about where it came from and not
+    /// the level anyone navigates by.
+    pub fn rebuild(&mut self) {
+        let keep = self.selected_id();
+        self.rebuild_keeping(keep);
+    }
+
+    /// Replaces the snapshot and rebuilds, holding the cursor on the object it was
+    /// on. The id has to be read BEFORE the new snapshot lands: a row holds an
+    /// INDEX into the container list, and the moment that list is replaced the index
+    /// means a different container — reading it after is how a cursor "stays put"
+    /// onto its neighbour.
+    pub fn apply_snapshot(&mut self, snap: crate::docker::Snapshot) {
+        let keep = self.selected_id();
+        self.snap = snap;
+        self.rebuild_keeping(keep);
+    }
+
+    fn rebuild_keeping(&mut self, keep: Option<String>) {
+        let mut rows = Vec::new();
+        match self.kind {
+            crate::docker::Kind::Containers => {
+                for project in crate::docker::projects(&self.snap.containers) {
+                    let members: Vec<usize> = self
+                        .snap
+                        .containers
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, c)| c.project == project)
+                        .map(|(i, _)| i)
+                        .collect();
+                    let up = members.iter().filter(|i| self.snap.containers[**i].running()).count();
+                    let open = project
+                        .as_ref()
+                        .map(|p| !self.collapsed.contains(p))
+                        .unwrap_or(true);
+                    rows.push(DockerRow::Project {
+                        name: project.clone(),
+                        total: members.len(),
+                        up,
+                        open,
+                    });
+                    if open {
+                        rows.extend(members.into_iter().map(DockerRow::Container));
+                    }
+                }
+            }
+            crate::docker::Kind::Images => {
+                rows.extend((0..self.snap.images.len()).map(DockerRow::Image));
+            }
+            crate::docker::Kind::Volumes => {
+                rows.extend((0..self.snap.volumes.len()).map(DockerRow::Volume));
+            }
+            crate::docker::Kind::Networks => {
+                rows.extend((0..self.snap.networks.len()).map(DockerRow::Network));
+            }
+        }
+        self.rows = rows;
+        // Hold the cursor on the same OBJECT across a refresh: a container that
+        // stops shifts every row under it, and a cursor that stays on an index
+        // lands on a neighbour just as you press a key.
+        if let Some(id) = keep {
+            let at = (0..self.rows.len()).find(|i| {
+                let row = &self.rows[*i];
+                self.id_of(row).as_deref() == Some(id.as_str())
+            });
+            if let Some(i) = at {
+                self.cursors[self.kind_index()] = i;
+                return;
+            }
+        }
+        let i = self.kind_index();
+        self.cursors[i] = self.cursors[i].min(self.rows.len().saturating_sub(1));
+    }
+
+    fn id_of(&self, row: &DockerRow) -> Option<String> {
+        match row {
+            DockerRow::Container(i) => self.snap.containers.get(*i).map(|c| c.id.clone()),
+            DockerRow::Image(i) => self.snap.images.get(*i).map(|m| m.id.clone()),
+            DockerRow::Volume(i) => self.snap.volumes.get(*i).map(|v| v.name.clone()),
+            DockerRow::Network(i) => self.snap.networks.get(*i).map(|n| n.id.clone()),
+            DockerRow::Project { name, .. } => name.clone(),
+        }
+    }
+
+    /// Folds a compose project shut, or opens it. Returns whether anything moved,
+    /// so a caller knows whether to redraw.
+    pub fn toggle_project(&mut self) -> bool {
+        let Some(DockerRow::Project { name: Some(name), .. }) = self.selected().cloned() else {
+            return false;
+        };
+        if !self.collapsed.remove(&name) {
+            self.collapsed.insert(name);
+        }
+        self.rebuild();
+        true
+    }
+
+    pub fn set_kind(&mut self, kind: crate::docker::Kind) {
+        if self.kind == kind {
+            return;
+        }
+        self.kind = kind;
+        self.detail_lines.clear();
+        self.detail_for = None;
+        self.detail_scroll = 0;
+        // Logs and a summary are container words. Landing on an image with the
+        // detail still set to "logs" would ask the daemon for something that does
+        // not exist and show the error as if it were the image's.
+        if !matches!(kind, crate::docker::Kind::Containers) {
+            self.detail = DockerDetail::Summary;
+        }
+        self.rebuild();
+    }
+
+    /// Where the panel's parts sit, in cells. Shared by the renderer and the mouse,
+    /// so a click lands where it looks like it should.
+    pub fn layout(&self, cols: usize, rows: usize) -> DockerLayout {
+        let w = cols.saturating_sub(4).max(40);
+        let h = rows.saturating_sub(4).max(12);
+        let body_rows = h.saturating_sub(3);
+        let base = DockerLayout { col: 2, row: 2, w, h, hosts_w: 0, objects_w: 0, body_rows };
+        // Zoomed, the detail gets the whole box: there is nothing else to hit.
+        if self.zoom {
+            return base;
+        }
+        let at = |f: f32| (w as f32 * f).round() as usize;
+        // The widths have to add up to the box: the columns, plus a rule and a
+        // gutter after each of the first two, plus the detail's own right margin.
+        // Clamping each one against that total rather than against `w` is what keeps
+        // the detail from ending up a column under its minimum when both separators
+        // are dragged to the right.
+        const THREE_CHROME: usize = 5;
+        const TWO_CHROME: usize = 4;
+        // Below this there is not room for three columns that each keep their
+        // minimum, and the HOSTS column is the one that goes: it is a list of two or
+        // three names you can also reach with a key, while the other two are the
+        // panel itself.
+        let three = w >= MIN_COL * 2 + MIN_DETAIL + THREE_CHROME;
+        if !three {
+            let room = w.saturating_sub(MIN_DETAIL + TWO_CHROME).max(MIN_COL);
+            let objects_w = at(self.split[1]).clamp(MIN_COL, room);
+            return DockerLayout { objects_w, ..base };
+        }
+        let room = w.saturating_sub(MIN_DETAIL + MIN_COL + THREE_CHROME).max(MIN_COL);
+        let hosts_w = at(self.split[0]).clamp(MIN_COL, room);
+        let objects_w = at(self.split[1])
+            .saturating_sub(hosts_w + 2)
+            .clamp(MIN_COL, w.saturating_sub(hosts_w + MIN_DETAIL + THREE_CHROME).max(MIN_COL));
+        DockerLayout { hosts_w, objects_w, ..base }
+    }
+
+    /// Moves the keyboard between columns. The detail is only reachable when there
+    /// is something in it — a focus on an empty column is a focus that swallows
+    /// j/k for no reason.
+    pub fn cycle_focus(&mut self, forward: bool) {
+        let order = [DockerFocus::Hosts, DockerFocus::Objects, DockerFocus::Detail];
+        let i = order.iter().position(|f| *f == self.focus).unwrap_or(1);
+        let n = order.len();
+        let mut next = i;
+        for _ in 0..n {
+            next = if forward { (next + 1) % n } else { (next + n - 1) % n };
+            if order[next] != DockerFocus::Detail || !self.detail_lines.is_empty() {
+                break;
+            }
+        }
+        self.focus = order[next];
+    }
+
+    pub fn scroll_detail(&mut self, delta: i32) {
+        let max = self.detail_lines.len().saturating_sub(1) as i32;
+        self.detail_scroll = (self.detail_scroll as i32 + delta).clamp(0, max.max(0)) as usize;
+    }
+
+    /// The summary lines for the selection: what a row cannot fit and an inspect
+    /// buries. Built here rather than fetched, so it needs no worker at all.
+    pub fn summary(&self) -> Vec<String> {
+        let now = crate::docker::now_secs();
+        match self.selected() {
+            Some(DockerRow::Container(i)) => {
+                let Some(c) = self.snap.containers.get(*i) else { return Vec::new() };
+                let mut out = vec![
+                    format!("name     {}", c.name),
+                    format!("image    {}", c.image),
+                    format!("id       {}", crate::docker::short_id(&c.id)),
+                    format!("state    {}", c.status),
+                ];
+                if let Some(h) = c.health {
+                    out.push(format!("health   {} {}", h.mark(), h.label()));
+                }
+                if let (Some(p), Some(s)) = (&c.project, &c.service) {
+                    out.push(format!("compose  {p} / {s}"));
+                }
+                out.push(format!("created  {}", crate::docker::ago(c.created, now)));
+                if c.ports.is_empty() {
+                    out.push("ports    none published".to_string());
+                } else {
+                    for (host, cont, proto) in &c.ports {
+                        out.push(format!("port     {host} \u{2192} {cont}/{proto}"));
+                    }
+                }
+                out
+            }
+            Some(DockerRow::Image(i)) => {
+                let Some(m) = self.snap.images.get(*i) else { return Vec::new() };
+                let mut out = vec![
+                    format!("id       {}", crate::docker::short_id(&m.id)),
+                    format!("size     {}", crate::docker::human_size(m.size)),
+                    format!("created  {}", crate::docker::ago(m.created, now)),
+                ];
+                for t in &m.tags {
+                    out.push(format!("tag      {t}"));
+                }
+                // The digest is what a registry can be asked about; the id cannot.
+                for d in &m.digests {
+                    out.push(format!("digest   {d}"));
+                }
+                let users: Vec<&str> = self
+                    .snap
+                    .containers
+                    .iter()
+                    .filter(|c| m.tags.iter().any(|t| *t == c.image))
+                    .map(|c| c.name.as_str())
+                    .collect();
+                if !users.is_empty() {
+                    out.push(format!("used by  {}", users.join(", ")));
+                }
+                out
+            }
+            Some(DockerRow::Volume(i)) => {
+                let Some(v) = self.snap.volumes.get(*i) else { return Vec::new() };
+                let mut out = vec![
+                    format!("name     {}", v.name),
+                    format!("driver   {}", v.driver),
+                    format!("mount    {}", v.mountpoint),
+                ];
+                if let Some(p) = &v.project {
+                    out.push(format!("compose  {p}"));
+                }
+                out
+            }
+            Some(DockerRow::Network(i)) => {
+                let Some(n) = self.snap.networks.get(*i) else { return Vec::new() };
+                let mut out = vec![
+                    format!("name     {}", n.name),
+                    format!("driver   {}", n.driver),
+                    format!("id       {}", crate::docker::short_id(&n.id)),
+                ];
+                out.push(match &n.subnet {
+                    Some(s) => format!("subnet   {s}"),
+                    None => "subnet   none".to_string(),
+                });
+                out
+            }
+            Some(DockerRow::Project { name, total, up, .. }) => {
+                let label = name.clone().unwrap_or_else(|| "(no compose project)".into());
+                let mut out =
+                    vec![format!("project  {label}"), format!("running  {up} of {total}")];
+                for c in self.snap.containers.iter().filter(|c| c.project == *name) {
+                    let mark = if c.running() { '\u{25cf}' } else { '\u{25cb}' };
+                    out.push(format!(
+                        "{mark} {:<16} {}",
+                        c.service.clone().unwrap_or_else(|| c.name.clone()),
+                        c.short_status()
+                    ));
+                }
+                out
+            }
+            None => Vec::new(),
+        }
+    }
+
+    /// The text of one object row, and the pen it is drawn with.
+    fn row_text(&self, i: usize, width: usize) -> (String, Pen) {
+        let Some(row) = self.rows.get(i) else { return (String::new(), dim()) };
+        match row {
+            DockerRow::Project { name, total, up, open } => {
+                let arrow = if *open { '\u{25be}' } else { '\u{25b8}' };
+                let label = name.clone().unwrap_or_else(|| "(loose)".into());
+                let count = format!("{up}/{total}");
+                let text = format!("{arrow} {label}");
+                let pad = width.saturating_sub(text.chars().count() + count.chars().count() + 1);
+                (
+                    format!("{text}{}{count}", " ".repeat(pad + 1)),
+                    Pen { flags: Flags::BOLD, ..accent() },
+                )
+            }
+            DockerRow::Container(ci) => {
+                let Some(c) = self.snap.containers.get(*ci) else { return (String::new(), dim()) };
+                let mark = if c.running() { '\u{25cf}' } else { '\u{25cb}' };
+                // The health mark is its own column: up-and-unhealthy is the state
+                // this panel exists to make visible, and folding it into the dot
+                // would hide exactly that.
+                let health = c.health.map(|h| h.mark()).unwrap_or(' ');
+                let name = c.service.clone().unwrap_or_else(|| c.name.clone());
+                let indent = if c.project.is_some() { "  " } else { "" };
+                let status = c.short_status();
+                let left = format!("{indent}{mark}{health} {name}");
+                let pad = width
+                    .saturating_sub(left.chars().count() + status.chars().count() + 1)
+                    .max(1);
+                let pen = match (c.running(), c.health) {
+                    (_, Some(crate::docker::Health::Unhealthy)) => {
+                        Pen { fg: Color::Rgb(0xff, 0x6b, 0x6b), ..normal() }
+                    }
+                    (true, _) => Pen { fg: Color::Rgb(0x7a, 0xc0, 0x7a), ..normal() },
+                    (false, _) => dim(),
+                };
+                (elide(&format!("{left}{}{status}", " ".repeat(pad)), width), pen)
+            }
+            DockerRow::Image(ii) => {
+                let Some(m) = self.snap.images.get(*ii) else { return (String::new(), dim()) };
+                let size = crate::docker::human_size(m.size);
+                let label = m.label();
+                let pad =
+                    width.saturating_sub(label.chars().count() + size.chars().count() + 1).max(1);
+                (elide(&format!("{label}{}{size}", " ".repeat(pad)), width), normal())
+            }
+            DockerRow::Volume(vi) => {
+                let Some(v) = self.snap.volumes.get(*vi) else { return (String::new(), dim()) };
+                (elide(&v.name, width), normal())
+            }
+            DockerRow::Network(ni) => {
+                let Some(n) = self.snap.networks.get(*ni) else { return (String::new(), dim()) };
+                let right = n.driver.clone();
+                let pad = width
+                    .saturating_sub(n.name.chars().count() + right.chars().count() + 1)
+                    .max(1);
+                (elide(&format!("{}{}{right}", n.name, " ".repeat(pad)), width), normal())
+            }
+        }
+    }
+
+    pub fn render(&self, cols: usize, rows: usize, theme: &Theme) -> Vec<Panel> {
+        let l = self.layout(cols, rows);
+        let (w, h) = (l.w, l.h);
+        let mut g = panel_grid(w, h, theme);
+        let body_rows = l.body_rows;
+
+        // Header: the kind strip, then the host and what it answered.
+        let mut x = 2;
+        if !self.on_hub() {
+            for k in crate::docker::Kind::ALL {
+                let label = format!(" {} ", k.letter());
+                let pen = if k == self.kind { selected() } else { dim() };
+                write(&mut g, 0, x, &label, pen);
+                x += label.chars().count();
+            }
+            x += 1;
+            write(&mut g, 0, x, self.kind.label(), dim());
+        }
+        let head = match self.host() {
+            Some(host) => match (&host.error, &host.version) {
+                (Some(e), _) => format!("{} \u{b7} {e}", host.name),
+                (None, Some(v)) => format!("{} \u{b7} docker {v}", host.name),
+                _ => host.name.clone(),
+            },
+            None => "no host".to_string(),
+        };
+        let head = elide(&head, w.saturating_sub(x + 4));
+        let hw = head.chars().count();
+        if w > x + hw + 2 {
+            write(&mut g, 0, w - hw - 2, &head, accent());
+        }
+
+        // Column 1: hosts, plus Hub as a pseudo-host below a rule.
+        if l.hosts_w > 0 {
+            for (i, host) in self.hosts.iter().enumerate().take(body_rows) {
+                let row = 2 + i;
+                let mark = match (&host.endpoint, &host.error) {
+                    (crate::docker::Endpoint::Hub, _) => '\u{2601}',
+                    (_, Some(_)) => '\u{2717}',
+                    _ if host.current => '\u{25cf}',
+                    _ => '\u{25cb}',
+                };
+                let text = elide(&format!("{mark} {}", host.name), l.hosts_w.saturating_sub(2));
+                if i == self.host_cursor {
+                    let pen = if self.focus == DockerFocus::Hosts { selected() } else { inactive() };
+                    write(&mut g, row, 0, &" ".repeat(l.hosts_w), pen);
+                    write(&mut g, row, 1, &text, pen);
+                } else {
+                    let pen = if host.error.is_some() { dim() } else { normal() };
+                    write(&mut g, row, 1, &text, pen);
+                }
+            }
+            for line in 0..body_rows {
+                write(&mut g, 2 + line, l.hosts_w, "\u{2502}", dim());
+            }
+        }
+
+        // Column 2: the objects.
+        let ox = l.objects_x();
+        if l.objects_w > 0 {
+            let scroll = self.cursor().saturating_sub(body_rows.saturating_sub(1));
+            for line in 0..body_rows {
+                let i = scroll + line;
+                if i >= self.rows.len() {
+                    break;
+                }
+                let (text, pen) = self.row_text(i, l.objects_w.saturating_sub(1));
+                let row = 2 + line;
+                if i == self.cursor() {
+                    let pen =
+                        if self.focus == DockerFocus::Objects { selected() } else { inactive() };
+                    write(&mut g, row, ox, &" ".repeat(l.objects_w), pen);
+                    write(&mut g, row, ox, &text, pen);
+                } else {
+                    write(&mut g, row, ox, &text, pen);
+                }
+            }
+            if self.rows.is_empty() {
+                let note = if self.loading { "reading\u{2026}" } else { "nothing here" };
+                write(&mut g, 2, ox, note, dim());
+            }
+            for line in 0..body_rows {
+                write(&mut g, 2 + line, l.sep2(), "\u{2502}", dim());
+            }
+        }
+
+        // Column 3: the detail. Its own title line, because "summary" and "logs" of
+        // the same row look alike for the first few lines and reading the wrong one
+        // is the kind of mistake that costs a deploy.
+        let dx = l.detail_x();
+        let dw = l.detail_w();
+        let title = format!(
+            "{} \u{b7} {}",
+            self.selected_name().unwrap_or_else(|| "\u{2014}".into()),
+            self.detail.label()
+        );
+        write(&mut g, 1, dx, &elide(&title, dw), Pen { flags: Flags::BOLD, ..dim() });
+        let lines: Vec<String> =
+            if self.detail == DockerDetail::Summary { self.summary() } else { self.detail_lines.clone() };
+        for (line, text) in lines.iter().skip(self.detail_scroll).take(body_rows - 1).enumerate() {
+            write(&mut g, 3 + line, dx, &elide(text, dw), normal());
+        }
+        if lines.is_empty() && self.detail != DockerDetail::Summary {
+            write(&mut g, 3, dx, "reading\u{2026}", dim());
+        }
+
+        // Footer: the last thing that happened, or the keys.
+        let foot = match &self.message {
+            Err(e) => (elide(e, w.saturating_sub(4)), Pen { fg: Color::Rgb(0xff, 0x6b, 0x6b), ..normal() }),
+            Ok(m) if !m.is_empty() => (elide(m, w.saturating_sub(4)), dim()),
+            _ => (
+                elide(
+                    "tab column \u{b7} C I V N kind \u{b7} enter fold \u{b7} L logs \u{b7} \
+                     i inspect \u{b7} y id \u{b7} r reread \u{b7} esc",
+                    w.saturating_sub(4),
+                ),
+                dim(),
+            ),
+        };
+        let busy = if self.busy {
+            " \u{b7} working\u{2026}"
+        } else if self.loading {
+            " \u{b7} reading\u{2026}"
+        } else {
+            ""
+        };
+        write(&mut g, h - 1, 2, &format!("{}{busy}", foot.0), foot.1);
+
+        let col = (cols.saturating_sub(w)) / 2;
+        let row = (rows.saturating_sub(h)) / 2;
+        let mut out = vec![Panel { grid: g, col, row }];
+        // The leader's which-key, as a panel of its own along the bottom of the box
+        // and not as screen chrome: chrome is drawn UNDER the overlay's dimmed
+        // backdrop, which is exactly where it cannot be read.
+        if self.leader.is_some() {
+            let entries = self.leader_entries();
+            if !entries.is_empty() {
+                let wk = crate::whichkey_grid(&entries, &self.leader_path(), w);
+                let wk_rows = wk.rows();
+                out.push(Panel { grid: wk, col, row: (row + h).saturating_sub(wk_rows) });
+            }
+        }
+        out
+    }
+}
+
+/// The narrowest the detail column may be before the hosts column is dropped.
+const MIN_DETAIL: usize = 24;
+
+/// Where the docker panel's parts sit, in cells.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DockerLayout {
+    pub col: usize,
+    pub row: usize,
+    pub w: usize,
+    pub h: usize,
+    /// Width of the hosts column. Zero when it is dropped or zoomed.
+    pub hosts_w: usize,
+    pub objects_w: usize,
+    pub body_rows: usize,
+}
+
+impl DockerLayout {
+    pub fn objects_x(&self) -> usize {
+        if self.hosts_w == 0 { 1 } else { self.hosts_w + 2 }
+    }
+
+    /// The column the second separator is drawn in.
+    pub fn sep2(&self) -> usize {
+        self.objects_x() + self.objects_w
+    }
+
+    pub fn detail_x(&self) -> usize {
+        if self.objects_w == 0 { 2 } else { self.sep2() + 2 }
+    }
+
+    pub fn detail_w(&self) -> usize {
+        self.w.saturating_sub(self.detail_x() + 1)
+    }
+
+    /// The separators a mouse can grab, as `(index, column)`.
+    pub fn separators(&self) -> Vec<(usize, usize)> {
+        let mut out = Vec::new();
+        if self.hosts_w > 0 {
+            out.push((0, self.hosts_w));
+        }
+        if self.objects_w > 0 {
+            out.push((1, self.sep2()));
+        }
+        out
+    }
+}
+
+/// What a click landed on in the docker panel.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DockerHit {
+    /// One letter of the kind strip.
+    Kind(crate::docker::Kind),
+    HostRow(usize),
+    Row(usize),
+    /// A column separator, by index: 0 = hosts/objects, 1 = objects/detail.
+    Separator(usize),
+    Detail,
+}
+
+impl DockerPanel {
+    /// What is under a cell. The renderer and the mouse read the same layout, so a
+    /// click cannot land somewhere other than what it looks like it hit.
+    pub fn hit(&self, cols: usize, rows: usize, col: usize, row: usize) -> Option<DockerHit> {
+        let l = self.layout(cols, rows);
+        let (x, y) = (col.checked_sub(l.col)?, row.checked_sub(l.row)?);
+        if x >= l.w || y >= l.h {
+            return None;
+        }
+        // The header carries the kind strip, at the same columns it is drawn at.
+        if y == 0 {
+            if self.on_hub() {
+                return None;
+            }
+            let mut at = 2;
+            for k in crate::docker::Kind::ALL {
+                if x >= at && x < at + 3 {
+                    return Some(DockerHit::Kind(k));
+                }
+                at += 3;
+            }
+            return None;
+        }
+        // A separator wins over the columns it sits between: it is one cell wide and
+        // the thing you are aiming at when you are near it.
+        for (i, sep) in l.separators() {
+            if x == sep {
+                return Some(DockerHit::Separator(i));
+            }
+        }
+        let line = y.checked_sub(2)?;
+        if line >= l.body_rows {
+            return None;
+        }
+        if l.hosts_w > 0 && x < l.hosts_w {
+            return (line < self.hosts.len()).then_some(DockerHit::HostRow(line));
+        }
+        if l.objects_w > 0 && x < l.sep2() {
+            let scroll = self.cursor().saturating_sub(l.body_rows.saturating_sub(1));
+            let i = scroll + line;
+            return (i < self.rows.len()).then_some(DockerHit::Row(i));
+        }
+        Some(DockerHit::Detail)
+    }
+
+    pub fn separator_at(&self, cols: usize, rows: usize, col: usize, row: usize) -> Option<usize> {
+        match self.hit(cols, rows, col, row) {
+            Some(DockerHit::Separator(i)) => Some(i),
+            _ => None,
+        }
+    }
+
+    /// Drags one separator to a column, as a fraction of the panel's width.
+    ///
+    /// Clamped loosely here and properly in `layout`: a drag that could pin a
+    /// column at its minimum from here would stick there when the window grows.
+    pub fn drag_split(&mut self, sep: usize, x: usize, w: usize) {
+        if w == 0 || sep > 1 {
+            return;
+        }
+        let f = (x as f32 / w as f32).clamp(0.05, 0.95);
+        self.split[sep] = f;
+        // The second separator can never end up left of the first: a negative
+        // column width is a panel that draws itself inside out.
+        if self.split[1] < self.split[0] + 0.05 {
+            self.split[1] = (self.split[0] + 0.05).min(0.95);
+        }
+        if self.split[0] > self.split[1] - 0.05 {
+            self.split[0] = (self.split[1] - 0.05).max(0.05);
+        }
+    }
+}
+
+// ---- the docker panel's leader layer ---------------------------------------
+//
+// Same contract as the git panel's and the sidebar's: every leaf PRESSES a key the
+// panel already binds, and a leaf that this row cannot do is not offered. A verb
+// cannot mean one thing from its letter and another from the menu.
+
+/// A key the docker panel understands.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DockerKey {
+    Ch(char),
+    Enter,
+}
+
+/// What a leaf does, and when it is offered.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DockerPress {
+    Key(DockerKey),
+    /// Only on a container row: `logs` of a network is not a thing.
+    OnContainer(DockerKey),
+    /// Only on a compose project heading or a container inside one.
+    OnProject(DockerKey),
+}
+
+pub enum DockerNode {
+    Leaf(DockerPress),
+    Group(&'static [DockerEntry]),
+}
+
+pub struct DockerEntry {
+    pub key: char,
+    pub title: &'static str,
+    pub node: DockerNode,
+}
+
+const fn dleaf(key: char, title: &'static str, press: DockerPress) -> DockerEntry {
+    DockerEntry { key, title, node: DockerNode::Leaf(press) }
+}
+
+use DockerKey::{Ch as DCh, Enter as DEnter};
+use DockerPress::{Key as DKey, OnContainer, OnProject};
+
+pub static DOCKER_LEADER: &[DockerEntry] = &[
+    DockerEntry {
+        key: 'c',
+        title: "Container",
+        node: DockerNode::Group(&[
+            dleaf('s', "start it (or unpause)", OnContainer(DCh('s'))),
+            dleaf('x', "stop it", OnContainer(DCh('x'))),
+            dleaf('r', "restart it", OnContainer(DCh('R'))),
+            dleaf('p', "pause / unpause", OnContainer(DCh('p'))),
+            dleaf('e', "shell inside it", OnContainer(DCh('e'))),
+            dleaf('w', "open its port in the browser", OnContainer(DCh('w'))),
+            dleaf('d', "remove it (asks)", DKey(DCh('d'))),
+        ]),
+    },
+    DockerEntry {
+        key: 'p',
+        title: "Compose project",
+        node: DockerNode::Group(&[
+            dleaf('u', "up -d", OnProject(DCh('U'))),
+            dleaf('w', "down (asks)", OnProject(DCh('W'))),
+            dleaf('p', "pull", OnProject(DCh('P'))),
+            dleaf('o', "fold / unfold", DKey(DEnter)),
+        ]),
+    },
+    DockerEntry {
+        key: 'v',
+        title: "View",
+        node: DockerNode::Group(&[
+            dleaf('c', "containers", DKey(DCh('C'))),
+            dleaf('i', "images", DKey(DCh('I'))),
+            dleaf('v', "volumes", DKey(DCh('V'))),
+            dleaf('n', "networks", DKey(DCh('N'))),
+            dleaf('r', "reread this host", DKey(DCh('r'))),
+            dleaf('z', "zoom the detail", DKey(DCh('z'))),
+        ]),
+    },
+    DockerEntry {
+        key: 'd',
+        title: "Detail",
+        node: DockerNode::Group(&[
+            dleaf('s', "summary", DKey(DCh('u'))),
+            dleaf('l', "logs", OnContainer(DCh('L'))),
+            dleaf('i', "inspect (the whole JSON)", DKey(DCh('i'))),
+            dleaf('y', "copy the id", DKey(DCh('y'))),
+        ]),
+    },
+    dleaf('q', "Close the panel", DKey(DCh('q'))),
+];
+
+impl DockerPanel {
+    pub fn arm_leader(&mut self) {
+        self.leader = Some(Vec::new());
+    }
+
+    pub fn cancel_leader(&mut self) {
+        self.leader = None;
+    }
+
+    fn leader_level(&self) -> Option<&'static [DockerEntry]> {
+        let path = self.leader.as_ref()?;
+        let mut level: &'static [DockerEntry] = DOCKER_LEADER;
+        for key in path {
+            match level.iter().find(|e| e.key == *key) {
+                Some(DockerEntry { node: DockerNode::Group(next), .. }) => level = next,
+                _ => return Some(DOCKER_LEADER),
+            }
+        }
+        Some(level)
+    }
+
+    fn leader_applies(&self, press: DockerPress) -> bool {
+        match press {
+            DockerPress::OnContainer(_) => {
+                matches!(self.selected(), Some(DockerRow::Container(_)))
+            }
+            DockerPress::OnProject(_) => self.selected_project().is_some(),
+            DockerPress::Key(_) => true,
+        }
+    }
+
+    pub fn leader_entries(&self) -> Vec<(String, String, bool)> {
+        let Some(level) = self.leader_level() else { return Vec::new() };
+        let mut out: Vec<(String, String, bool)> = level
+            .iter()
+            .filter(|e| match &e.node {
+                DockerNode::Leaf(p) => self.leader_applies(*p),
+                DockerNode::Group(_) => true,
+            })
+            .map(|e| {
+                (e.key.to_string(), e.title.to_string(), matches!(e.node, DockerNode::Group(_)))
+            })
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    pub fn leader_path(&self) -> Vec<String> {
+        self.leader.as_ref().map(|p| p.iter().map(|c| c.to_string()).collect()).unwrap_or_default()
+    }
+
+    /// Feeds a key to the layer. `Some` is a key for the panel to act on.
+    pub fn leader_key(&mut self, c: char) -> Option<DockerKey> {
+        let level = self.leader_level()?;
+        match level.iter().find(|e| e.key == c) {
+            Some(DockerEntry { node: DockerNode::Group(_), .. }) => {
+                if let Some(path) = &mut self.leader {
+                    path.push(c);
+                }
+                None
+            }
+            Some(DockerEntry { node: DockerNode::Leaf(p), .. }) if self.leader_applies(*p) => {
+                let key = match *p {
+                    DockerPress::Key(k)
+                    | DockerPress::OnContainer(k)
+                    | DockerPress::OnProject(k) => k,
+                };
+                self.leader = None;
+                Some(key)
+            }
+            _ => {
+                self.leader = None;
+                None
+            }
+        }
     }
 }

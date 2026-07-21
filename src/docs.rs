@@ -563,6 +563,40 @@ Config: explorer.side (left/right), explorer.width in COLUMNS (not a fraction: a
 fraction on an ultrawide gives a 90-column tree), explorer.show_hidden. All three
 are in the settings panel too.
 
+# Docker panel
+
+Leader D opens it: three columns - the docker hosts (your contexts, plus Docker Hub
+as a host of its own), the objects on the selected host, and the detail of what is
+selected. Same shape as the git panel, and the same keys where they mean the same
+thing.
+
+  tab / h l        move between columns    j k / arrows  move in one
+  C I V N          containers, images, volumes, networks   [ ]  the same, in order
+  enter            fold a compose project, or read the selection
+  u L i            summary, logs, the whole inspect JSON
+  s x R p          start (or unpause), stop, restart, pause
+  d                remove it - asks first, naming what goes with it
+  e                a shell inside it, in a pane
+  w                open its published port in the browser
+  U W P            compose up -d, compose down (asks), compose pull
+  y z r            copy the id, zoom the detail, reread this host
+  leader           the panel's own menu of verbs   esc or q   close it
+
+Containers are grouped by their compose project, because that is the unit the work
+is done in: nobody deploys a container, they deploy a project. The heading counts
+how many of its containers are up. Health is its own mark beside the state, never
+folded into it - up and unhealthy is the state worth seeing.
+
+Everything is read over the daemon's own socket, on a worker thread, and a remote
+context is reached through the tunnel the CLI uses (ssh <host> docker system
+dial-stdio). A host that cannot be reached is drawn as down and never stalls the
+window. A host is only READ when you choose it, so moving over one costs nothing.
+
+Short operations run on the socket and answer in the footer. Anything that takes
+minutes or prints progress - a shell, compose up, compose pull - goes to a real
+pane instead, because a pane already has colour, Ctrl-C and scrollback. A command
+that reaches another machine asks first, with the host named.
+
 # Remote control
 
 A running runnir listens on a per-user socket and exports its path to the panes as

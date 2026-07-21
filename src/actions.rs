@@ -88,6 +88,8 @@ pub enum Action {
     FixLastCommand,
     /// The native git panel: status, log, branches, stashes.
     GitPanel,
+    /// The docker panel: hosts, containers/images/volumes/networks, detail.
+    DockerPanel,
     AiExplain,
     SummarizeSession,
     QuickConnect,
@@ -175,6 +177,7 @@ impl Action {
             AiCommand => "ai_command",
             FixLastCommand => "fix_last_command",
             GitPanel => "git_panel",
+            DockerPanel => "docker_panel",
             AiExplain => "ai_explain",
             SummarizeSession => "summarize_session",
             QuickConnect => "quick_connect",
@@ -260,6 +263,7 @@ impl Action {
             AiCommand => "AI: natural language to command",
             FixLastCommand => "AI: fix the last failed command",
             GitPanel => "Git panel (status, log, branches, stashes)",
+            DockerPanel => "Docker panel (containers, images, volumes, networks)",
             AiExplain => "AI: explain the selection",
             SummarizeSession => "AI: summarize this session",
             QuickConnect => "SSH quick connect",
@@ -348,6 +352,7 @@ impl Action {
             "ai_command" => AiCommand,
             "fix_last_command" => FixLastCommand,
             "git_panel" => GitPanel,
+            "docker_panel" => DockerPanel,
             "ai_explain" => AiExplain,
             "summarize_session" => SummarizeSession,
             "quick_connect" => QuickConnect,
@@ -449,6 +454,7 @@ impl Action {
             AiCommand,
             FixLastCommand,
             GitPanel,
+            DockerPanel,
             AiExplain,
             SummarizeSession,
             QuickConnect,
@@ -877,6 +883,9 @@ fn default_leader_bindings() -> HashMap<Chord, LeaderNode> {
     // letter is needed as a group.
     leaf(&mut m, "v", ClipboardHistory);
     leaf(&mut m, "g", GitPanel);
+    // `d` for docker, beside `g` for git and `e` for the explorer: a whole surface
+    // is one key, and `d` was the letter left free at the top level.
+    leaf(&mut m, "d", DockerPanel);
     // `e` for the explorer, beside `g` for git: both are a whole surface, both are
     // one key. It is also the letter LazyVim uses for the same sidebar.
     leaf(&mut m, "e", ToggleExplorer);

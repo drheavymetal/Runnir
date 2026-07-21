@@ -6,6 +6,7 @@ mod config;
 mod control;
 mod dnd;
 mod docs;
+mod docker;
 mod explorer;
 mod font;
 mod git;
@@ -109,6 +110,9 @@ pub enum UserEvent {
     ExplorerConfirm(usize, String),
     /// One path's properties, read on a worker.
     ExplorerProps(Result<explorer::Props, String>),
+    /// Data or a command result for the docker panel, tagged with the request
+    /// sequence so a snapshot of one host never paints under another.
+    Docker(u64, docker::PanelMsg),
     /// What git says about the explorer's tree — a badge per changed file and the
     /// ignored set — for the tab and tree generation that asked. Two `git`
     /// processes, so never on the UI thread.
@@ -640,6 +644,8 @@ struct Gpu {
     resizing: Option<crate::layout::DividerHit>,
     /// A git panel column separator being dragged (0 = list/files, 1 = files/diff).
     git_drag: Option<usize>,
+    /// The same for the docker panel (0 = hosts/objects, 1 = objects/detail).
+    docker_drag: Option<usize>,
     /// The explorer sidebar's edge is being dragged. The panes are reflowed when it
     /// is released, not while it moves.
     explorer_resizing: bool,
@@ -647,6 +653,8 @@ struct Gpu {
     /// for one on every wake that looks stale, and a slow repository would otherwise
     /// stack them up.
     explorer_git_pending: bool,
+    /// Request generation for the docker panel, the same guard the git panel uses.
+    docker_gen: u64,
     /// What the explorer's marks were read at: the root, the repository stamp and
     /// the pane's command counter. Unchanged means there is nothing to re-read —
     /// the same two triggers the status bar uses, for the same reason.
@@ -654,6 +662,13 @@ struct Gpu {
     /// Permission bits waiting on a recursive-chmod confirm, since the confirm
     /// replaces the panel that was holding them.
     pending_mode: Option<u32>,
+    /// A docker operation waiting on its confirm, and the command line waiting on
+    /// the confirm for a remote or a `compose down`. Parked here for the same
+    /// reason: the prompt replaces the panel that was holding them.
+    pending_docker: Option<docker::Op>,
+    pending_docker_cmd: Option<Vec<String>>,
+    /// The docker panel itself while a confirm is up, so either answer puts it back.
+    docker_stash: Option<overlay::DockerPanel>,
     /// Whether the pointer is currently over one, so the resize cursor is set once
     /// on the way in and once on the way out rather than on every motion event.
     git_over_split: bool,
@@ -910,10 +925,15 @@ impl App {
             mouse_down: None,
             resizing: None,
             git_drag: None,
+            docker_drag: None,
             explorer_resizing: false,
             explorer_git_pending: false,
+            docker_gen: 0,
             explorer_git_at: None,
             pending_mode: None,
+            pending_docker: None,
+            pending_docker_cmd: None,
+            docker_stash: None,
             git_over_split: false,
             zoomed: None,
             bell_flash: None,
@@ -1091,6 +1111,7 @@ impl ApplicationHandler<UserEvent> for App {
             }
             UserEvent::Media(msg) => gpu.on_media_msg(msg, &self.config),
             UserEvent::GitPanel(seq, msg) => gpu.on_git_panel_msg(seq, msg, &self.config),
+            UserEvent::Docker(seq, msg) => gpu.on_docker_msg(seq, msg),
             UserEvent::Explorer(tab, seq, dir, entries) => {
                 gpu.on_explorer_read(tab, seq, dir, entries)
             }
