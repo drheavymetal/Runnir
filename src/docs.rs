@@ -270,26 +270,42 @@ Turn it off with behaviour.command_guardian = false.
 
 # Git panel
 
-Leader G opens a git panel over the terminal: four lists, and the selection's diff
+Leader G opens a git panel over the terminal: seven lists, and the selection's diff
 beside them.
 
-  1 / 2 / 3 / 4 or Tab   status, log, branches, stashes
+  1..7 or Tab            status, log, branches, stashes, tags, reflog, worktrees
   j k / arrows           move          J K / PageUp PageDown   scroll the diff
-  y                      copy the sha, path or branch under the cursor
-  r                      refresh        q or Escape            close
+  y                      copy the sha, path, branch or tag under the cursor
+  r  refresh             q or Escape   close
 
-In status: space stages or unstages the file under the cursor, a stages everything,
-c writes a commit message, S stashes (including untracked). In log: o opens the
-commit in a split. In branches: Enter switches, n creates one. In stashes: Enter
-pops. Anywhere: P pushes, p pulls (fast-forward only), f fetches all and prunes.
+status   space stages or unstages the file, a stages everything, ] [ pick a hunk,
+         s and u stage and unstage just that hunk, t switches between the staged
+         and unstaged diff of the same file, c writes a commit message, C hands the
+         commit to a pane so your editor opens for a longer one, A amends, e opens
+         the file, L its history, b blame, S stashes. On a conflicted file, O takes
+         ours and T takes theirs.
+log      Enter checks the commit out, c cherry-picks it, o opens it in a split,
+         / filters by message.
+branches local ones first, then remote-tracking. Enter switches (with --track for a
+         remote one), n creates, m merges it into HEAD, R rebases onto it.
+tags     Enter checks one out, n creates, P pushes tags.
+reflog   every position HEAD has held, and Enter returns to one. This is the way
+         back from a mistake, which is why it is here.
+worktrees and submodules; Enter opens one in a new tab with the shell already there.
+
+Anywhere: P pushes (adding -u the first time a branch is pushed), p pulls
+fast-forward only, f fetches and prunes.
 
 Every key acts at once, with no confirmation, so nothing that can lose uncommitted
 work is bound here at all - no reset --hard, no clean, no discard, no stash drop,
 no branch -D. Those stay at the prompt, where the guardian sees them and asks.
 
+Commands run in the background with a 60 second deadline. One that needs a password
+- an ssh passphrase, an https login, an unknown host key - cannot be answered from
+there, so the panel reruns it in a split where git asks you normally.
+
 Diffs are drawn with line numbers and a full-width tint per changed line instead of
-a + / - column, so the code stays aligned with its context and you can see which
-line you are looking at.
+a + / - column, so the code stays aligned with its context.
 
 # Hint mode knows git
 
@@ -306,14 +322,20 @@ mistyped label can never move a branch or touch the working tree.
 
 # Repository state in the status bar
 
-In a git repository the status bar shows the branch, then only what is not clean:
+In a git repository the status bar shows any unfinished operation first (REBASE,
+MERGE, CHERRY-PICK, REVERT, BISECT), then the branch, then only what is not clean:
 down/up arrows for commits behind and ahead of the upstream, + for staged files,
 a dot for files with unstaged or untracked changes, ! for conflicts. A clean tree
 level with its upstream shows just the branch.
 
-The branch is read from .git/HEAD, so it is right the moment a checkout finishes.
-The counts come from git status run on a worker, refreshed when a command finishes
-in that pane - nothing polls, so an idle terminal never runs git.
+The branch is read from HEAD, so it is right the moment a checkout finishes - and
+that works inside a worktree, where .git is a file pointing elsewhere. The counts
+come from git status on a worker, refreshed when a command finishes in that pane or
+when the repository changes from outside it (an editor, another pane, another
+window). Nothing polls: an idle terminal in an untouched repository never runs git.
+
+A tab whose repository has uncommitted work carries a small marker in the tab bar,
+behind the failed-command and unseen-output badges.
 
 # Named layouts (workspaces)
 

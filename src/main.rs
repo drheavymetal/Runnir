@@ -476,6 +476,10 @@ struct Gpu {
     /// Last seen `git::state_stamp` per repo root, so a change made outside this
     /// pane — another pane, an editor, a second window — still refreshes the bar.
     git_stamp: std::collections::HashMap<PathBuf, u64>,
+    /// Repository root per focused pane id, refreshed on the periodic tick so the
+    /// tab badges can ask "is this tab's repo dirty" without touching the disk from
+    /// the draw path.
+    pane_repo: std::collections::HashMap<u64, PathBuf>,
     /// The pane command counter each root was last refreshed at, keyed by root. The
     /// refresh trigger is "a command finished in a pane sitting in this repo", not a
     /// timer: nothing else the user does can change the repository, and a poll would
@@ -758,6 +762,7 @@ impl App {
             git_seen: std::collections::HashMap::new(),
             git_gen: 0,
             git_stamp: std::collections::HashMap::new(),
+            pane_repo: std::collections::HashMap::new(),
             scroll_glide: None,
             pending_config: None,
             cursor_trail: Vec::new(),
@@ -1254,41 +1259,63 @@ impl Gpu {
     /// Nothing here polls. An idle terminal sitting in a repository never spawns a
     /// git process, which is the whole reason this is not on the 500ms tick.
     fn refresh_git(&mut self) {
-        // The status bar is the only consumer today; with it off, this is free.
-        if !self.status_bar {
+        // The status bar and the tab badges are the consumers; with the bar off the
+        // badges still want it, so this only stops when there is no tab bar either.
+        if !self.status_bar && self.tabs.len() < 2 {
             return;
         }
-        let pane = self.tabs[self.active].focused_ref();
-        let Some(cwd) = pane.cwd() else { return };
-        let Some(root) = git::repo_root(&cwd) else { return };
-        let seq = pane.command_seq();
-        // One in flight per root. A repository slow enough to still be running is a
-        // repository we must not queue a second process against.
-        if self.git_pending.contains(&root) {
+        // Every tab's focused pane, not just the active one: a badge that only knew
+        // about the tab you are looking at would be telling you what you can already
+        // see. The map is what the draw path reads — it never touches the disk.
+        let mut seen_roots: Vec<PathBuf> = Vec::new();
+        self.pane_repo.clear();
+        for tab in &self.tabs {
+            let id = tab.focus;
+            let Some(cwd) = tab.focused_ref().cwd() else { continue };
+            let Some(root) = crate::git::repo_root(&cwd) else { continue };
+            self.pane_repo.insert(id, root.clone());
+            if !seen_roots.contains(&root) {
+                seen_roots.push(root);
+            }
+        }
+        // At most one git per wake, active tab's repo first. A window with eight
+        // tabs in eight repositories must not answer a keystroke with eight
+        // processes.
+        let active_root = self.tabs.get(self.active).and_then(|t| self.pane_repo.get(&t.focus)).cloned();
+        let order = active_root.into_iter().chain(seen_roots).collect::<Vec<_>>();
+        for root in order {
+            if self.git_pending.contains(&root) {
+                continue;
+            }
+            let seq = self
+                .tabs
+                .iter()
+                .find(|t| self.pane_repo.get(&t.focus) == Some(&root))
+                .map(|t| t.focused_ref().command_seq())
+                .unwrap_or(0);
+            // Two triggers, because a repository changes in two ways: something ran
+            // in that pane (the command counter), or something changed the repo from
+            // outside it (the index/HEAD stamp — an editor, another pane, a rebase in
+            // a second window). Neither alone is enough.
+            let stamp = crate::git::state_stamp(&root);
+            let fresh = self.git_seen.get(&root) == Some(&seq)
+                && self.git_stamp.get(&root) == Some(&stamp)
+                && self.git_state.contains_key(&root);
+            if fresh {
+                continue;
+            }
+            self.git_stamp.insert(root.clone(), stamp);
+            self.git_seen.insert(root.clone(), seq);
+            self.git_pending.insert(root.clone());
+            let proxy = self.proxy.clone();
+            // Detached: if git hangs on a network filesystem, this thread hangs, not
+            // the UI, and the `git_pending` guard keeps it to one.
+            std::thread::spawn(move || {
+                let state = crate::git::read_state(&root);
+                let _ = proxy.send_event(UserEvent::Git(root, state));
+            });
             return;
         }
-        // Two triggers, because a repository changes in two ways: something ran in
-        // this pane (the command counter), or something changed the repo from
-        // outside it (the index/HEAD stamp — an editor, another pane, a rebase in a
-        // second window). Neither alone is enough.
-        let stamp = crate::git::state_stamp(&root);
-        let same_stamp = self.git_stamp.get(&root) == Some(&stamp);
-        let fresh = self.git_seen.get(&root) == Some(&seq)
-            && same_stamp
-            && self.git_state.contains_key(&root);
-        if fresh {
-            return;
-        }
-        self.git_stamp.insert(root.clone(), stamp);
-        self.git_seen.insert(root.clone(), seq);
-        self.git_pending.insert(root.clone());
-        let proxy = self.proxy.clone();
-        // Detached: if git hangs on a network filesystem, this thread hangs, not the
-        // UI, and the `git_pending` guard keeps it to one.
-        std::thread::spawn(move || {
-            let state = git::read_state(&root);
-            let _ = proxy.send_event(UserEvent::Git(root, state));
-        });
     }
 
     fn periodic(&mut self, config: &Config) {

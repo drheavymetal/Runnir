@@ -774,9 +774,30 @@ pub fn worktrees(root: &Path) -> Vec<String> {
         .collect()
 }
 
+/// Submodules, as `git submodule status` prints them: a status character, the
+/// commit, the path, and the branch. Listed beside the worktrees because they are
+/// the same question — "what other checkouts hang off this repository" — and both
+/// answers are a directory you may want a shell in.
+pub fn submodules(root: &Path) -> Vec<String> {
+    read_text(root, &["submodule", "status", "--recursive"])
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| format!("submodule {}", l.trim()))
+        .collect()
+}
+
 /// The path column of a `git worktree list` line, so opening one is a real cd.
+/// A submodule row is `submodule <sha> <path> (<branch>)`, so its path is third.
 pub fn worktree_path(line: &str) -> &str {
-    line.split_whitespace().next().unwrap_or(line)
+    let mut parts = line.split_whitespace();
+    match parts.next() {
+        Some("submodule") => {
+            parts.next();
+            parts.next().unwrap_or(line)
+        }
+        Some(first) => first,
+        None => line,
+    }
 }
 
 /// Whether a path is unmerged right now. Checked before binding a resolution key to
@@ -861,6 +882,12 @@ mod tests {
     fn a_worktree_line_yields_its_path() {
         let line = "/home/pedro/projects/runnir/.claude/worktrees/agent-a03  8f6876d [worktree-agent-a03]";
         assert_eq!(worktree_path(line), "/home/pedro/projects/runnir/.claude/worktrees/agent-a03");
+    }
+
+    #[test]
+    fn a_submodule_row_yields_its_path_not_its_sha() {
+        let line = "submodule  8f6876d1 vendor/thing (v1.2.0)";
+        assert_eq!(worktree_path(line), "vendor/thing");
     }
 
     #[test]

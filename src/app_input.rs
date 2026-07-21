@@ -1678,9 +1678,23 @@ impl Gpu {
             Some(('\u{2717}', (0xe0, 0x4f, 0x4f)))
         } else if i != self.active && tab.has_activity() {
             Some(('\u{25cf}', (0xe8, 0xb3, 0x39)))
+        } else if self.tab_repo_dirty(i) {
+            // A tab sitting in a repository with uncommitted work. Ranked below the
+            // other two on purpose: a failed command and unseen output are events,
+            // this is a standing condition.
+            Some(('\u{00b1}', (0x9a, 0x9d, 0xa4)))
         } else {
             None
         }
+    }
+
+    /// Whether tab `i` is in a repository with uncommitted changes. Reads the two
+    /// maps the periodic tick maintains — no filesystem access, because this runs
+    /// once per tab on every frame that draws the bar.
+    fn tab_repo_dirty(&self, i: usize) -> bool {
+        let Some(tab) = self.tabs.get(i) else { return false };
+        let Some(root) = self.pane_repo.get(&tab.focus) else { return false };
+        self.git_state.get(root).is_some_and(|s| s.dirty > 0 || s.staged > 0 || s.conflicts > 0)
     }
 
     /// Cells reserved on the right of the tab bar for the broadcast / context tags,
@@ -1822,9 +1836,10 @@ impl Gpu {
             let _ = proxy.send_event(UserEvent::GitPanel(seq, crate::git::PanelMsg::Tags(tags)));
             let reflog = crate::git::reflog(&root, 200);
             let _ = proxy.send_event(UserEvent::GitPanel(seq, crate::git::PanelMsg::Reflog(reflog)));
-            let worktrees = crate::git::worktrees(&root);
+            let mut trees = crate::git::worktrees(&root);
+            trees.extend(crate::git::submodules(&root));
             let _ = proxy
-                .send_event(UserEvent::GitPanel(seq, crate::git::PanelMsg::Worktrees(worktrees)));
+                .send_event(UserEvent::GitPanel(seq, crate::git::PanelMsg::Worktrees(trees)));
         });
         let _ = config;
     }

@@ -829,6 +829,22 @@ Verification note, learned the hard way: pick the scratch instance by
 keystrokes into PEDRO'S terminal and floated his window onto another monitor.
 `scratchpad/shot.py` now resolves the window by binary path.
 
+## 2026-07-21 - Git: submodules, and a per-tab dirty marker
+
+Submodules are listed beside the worktrees, not in a view of their own: they answer
+the same question ("what other checkouts hang off this repo") and both answers are
+a directory you may want a shell in. `worktree_path` handles both row shapes.
+
+**A tab in a dirty repository carries a marker.** The badge ranks BELOW the failed
+command and unseen-output ones on purpose - those are events, this is a standing
+condition.
+
+Getting there needed the refresh to stop being about the focused pane. `refresh_git`
+now walks every tab's focused pane, keeps `pane_repo: pane id -> repo root` so the
+draw path can ask "is this tab dirty" with no filesystem access at all, and spawns
+**at most one git per wake**, active tab's repository first. Eight tabs in eight
+repositories must not answer a keystroke with eight processes.
+
 ## Gotchas (do not re-learn)
 
 - A binding spec and a keypress must produce the SAME `ChordKey` variant.
@@ -854,6 +870,9 @@ keystrokes into PEDRO'S terminal and floated his window onto another monitor.
 - Claude Code does not probe for the kitty keyboard protocol. Terminal-side protocol
   support alone is not enough; the legacy encoding has to carry Shift+Enter as ESC-CR.
 
+- `pkill -f <pattern>` kills its OWN shell when the pattern appears in the command
+  line that invoked it. Killing a build's binary by path needs `pgrep -x` plus a
+  `/proc/<pid>/exe` check, not `pkill -f target/debug/...`.
 - Target a test instance by `/proc/<pid>/exe`, never by "not these pids". Pedro
   opens runnir windows too, and keys sent to the wrong one land in his session.
 - `.git` is not always a directory: in a worktree and in a submodule it is a file
