@@ -109,6 +109,10 @@ pub enum UserEvent {
     ExplorerConfirm(usize, String),
     /// One path's properties, read on a worker.
     ExplorerProps(Result<explorer::Props, String>),
+    /// What git says about the explorer's tree — a badge per changed file and the
+    /// ignored set — for the tab and tree generation that asked. Two `git`
+    /// processes, so never on the UI thread.
+    ExplorerGit(usize, u64, PathBuf, explorer::GitMarks),
 }
 
 fn main() {
@@ -639,6 +643,14 @@ struct Gpu {
     /// The explorer sidebar's edge is being dragged. The panes are reflowed when it
     /// is released, not while it moves.
     explorer_resizing: bool,
+    /// A `git status` for the explorer is in flight. One at a time: the tree asks
+    /// for one on every wake that looks stale, and a slow repository would otherwise
+    /// stack them up.
+    explorer_git_pending: bool,
+    /// What the explorer's marks were read at: the root, the repository stamp and
+    /// the pane's command counter. Unchanged means there is nothing to re-read —
+    /// the same two triggers the status bar uses, for the same reason.
+    explorer_git_at: Option<(PathBuf, u64, u64)>,
     /// Permission bits waiting on a recursive-chmod confirm, since the confirm
     /// replaces the panel that was holding them.
     pending_mode: Option<u32>,
@@ -899,6 +911,8 @@ impl App {
             resizing: None,
             git_drag: None,
             explorer_resizing: false,
+            explorer_git_pending: false,
+            explorer_git_at: None,
             pending_mode: None,
             git_over_split: false,
             zoomed: None,
@@ -1083,6 +1097,9 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::FileRead(path, read) => gpu.on_file_read(path, read),
             UserEvent::ExplorerConfirm(tab, label) => gpu.on_explorer_confirm(tab, label),
             UserEvent::ExplorerProps(props) => gpu.on_explorer_props(props),
+            UserEvent::ExplorerGit(tab, seq, root, marks) => {
+                gpu.on_explorer_git(tab, seq, root, marks)
+            }
             UserEvent::Git(root, state) => {
                 gpu.git_pending.remove(&root);
                 match state {
@@ -1473,6 +1490,10 @@ impl Gpu {
         // Follow the focused shell into another REPOSITORY (not into every
         // directory) with the explorer's root. Cheap: a cwd read and a compare.
         self.explorer_sync_root();
+
+        // ...and ask git what it says about that tree when something looks to have
+        // changed. Two `stat` calls per wake, no process unless one of them moved.
+        self.explorer_poll_git();
 
         // Refresh the now-playing overlay's metadata on a slow timer while it is open,
         // so a track change shows without reopening. Non-blocking: the fetch runs on a

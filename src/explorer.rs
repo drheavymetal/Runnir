@@ -72,6 +72,96 @@ pub struct Row {
     pub open: bool,
     /// `Some(n)` on the synthetic "… n more" row that closes a capped directory.
     pub more: Option<usize>,
+    /// What git says about this path — for a directory, about anything under it.
+    pub badge: Option<Badge>,
+    /// Ignored by git. Only ever drawn when the tree was asked to show them.
+    pub ignored: bool,
+}
+
+/// The order rows are drawn in inside one directory.
+///
+/// The second mode is the whole of what the "what is the agent touching right now"
+/// idea became: a sort, not a second view to keep in step with the first.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Sort {
+    /// Directories first, then case-insensitively by name — what every file manager
+    /// does, and what the eye scans for.
+    #[default]
+    Name,
+    /// Most recently modified first, directories mixed in: a directory's own mtime
+    /// moves when something is created or removed in it, which is exactly the event
+    /// this mode is for.
+    Mtime,
+}
+
+impl Sort {
+    pub fn flip(self) -> Sort {
+        match self {
+            Sort::Name => Sort::Mtime,
+            Sort::Mtime => Sort::Name,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Sort::Name => "name",
+            Sort::Mtime => "modified",
+        }
+    }
+}
+
+/// What git says about one path, as one letter beside its name.
+///
+/// The unstaged letter wins over the staged one where a path has both: an unstaged
+/// change is the one that is not written down anywhere yet.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Badge {
+    Conflict,
+    Untracked,
+    Modified,
+    Added,
+    Deleted,
+    /// Changed and already staged.
+    Staged,
+    /// Only on a directory: something below it has changed. A directory never
+    /// borrows a letter from one of its children — `M` on a folder would read as
+    /// "this folder was modified", which is not a thing git says.
+    Dirty,
+}
+
+impl Badge {
+    /// Maps a `--porcelain=v2` XY pair. `?` is untracked and `U` is a conflict, both
+    /// of which git reports in both columns.
+    pub fn from_status(index: char, worktree: char) -> Badge {
+        if index == 'U' || worktree == 'U' {
+            return Badge::Conflict;
+        }
+        if index == '?' {
+            return Badge::Untracked;
+        }
+        match worktree {
+            'M' => Badge::Modified,
+            'D' => Badge::Deleted,
+            'A' => Badge::Added,
+            _ => match index {
+                'A' => Badge::Added,
+                'D' => Badge::Deleted,
+                _ => Badge::Staged,
+            },
+        }
+    }
+
+    pub fn letter(self) -> char {
+        match self {
+            Badge::Conflict => '!',
+            Badge::Untracked => '?',
+            Badge::Modified => 'M',
+            Badge::Added => 'A',
+            Badge::Deleted => 'D',
+            Badge::Staged => 'M',
+            Badge::Dirty => '\u{b7}',
+        }
+    }
 }
 
 /// How many children of one directory are kept. A directory with more gets a
@@ -103,6 +193,21 @@ pub struct Explorer {
     /// state: you read the tree while you work in the pane.
     pub focused: bool,
     pub show_hidden: bool,
+    /// Show what git ignores. Off by default: a Rust checkout's tree is `target/`
+    /// and little else, and the whole reason to keep a tree open is that it is the
+    /// project. Never a silent cut — the footer says how many rows this is holding
+    /// back, and `I` brings them back dimmed.
+    pub show_ignored: bool,
+    pub sort: Sort,
+    /// What git says about each changed FILE, absolute.
+    pub git: HashMap<PathBuf, Badge>,
+    /// The same, folded up onto every directory above a changed file.
+    pub git_dirs: HashMap<PathBuf, Badge>,
+    /// Ignored paths, absolute and collapsed to directories where git collapsed
+    /// them: a path is ignored when it or an ancestor is in here.
+    pub ignored: HashSet<PathBuf>,
+    /// How many rows the last rebuild left out because they are ignored.
+    pub hidden_by_ignore: usize,
     /// Read generation: an answer tagged with an older one is dropped, so a slow
     /// `read_dir` cannot land after the tree moved on.
     pub seq: u64,
@@ -130,6 +235,12 @@ impl Explorer {
             open: true,
             focused: true,
             show_hidden: false,
+            show_ignored: false,
+            sort: Sort::default(),
+            git: HashMap::new(),
+            git_dirs: HashMap::new(),
+            ignored: HashSet::new(),
+            hidden_by_ignore: 0,
             seq: 0,
             message: None,
             leader: None,
@@ -154,6 +265,71 @@ impl Explorer {
         self.rows.clear();
         self.cursor = 0;
         self.scroll = 0;
+        // The marks belong to the repository that was left: keeping them would badge
+        // paths of the new tree with another project's status.
+        self.git.clear();
+        self.git_dirs.clear();
+        self.ignored.clear();
+        self.hidden_by_ignore = 0;
+    }
+
+    /// Records what git says about the tree: a badge per changed file, folded up onto
+    /// the directories above it, plus what git ignores.
+    ///
+    /// The fold happens here rather than while drawing because it is O(changes ×
+    /// depth) once, against O(rows × changes) on every rebuild — and rebuilds happen
+    /// on every keypress that moves a fold.
+    pub fn set_git(&mut self, files: Vec<(PathBuf, Badge)>, ignored: HashSet<PathBuf>) {
+        self.git.clear();
+        self.git_dirs.clear();
+        for (path, badge) in files {
+            let mut cur = path.parent().map(|p| p.to_path_buf());
+            while let Some(dir) = cur {
+                if !dir.starts_with(&self.root) {
+                    break;
+                }
+                let slot = self.git_dirs.entry(dir.clone()).or_insert(Badge::Dirty);
+                // A conflict is the one thing a directory does say out loud: it is
+                // the state where a stray keystroke loses a merge.
+                if badge == Badge::Conflict {
+                    *slot = Badge::Conflict;
+                }
+                if dir == self.root {
+                    break;
+                }
+                cur = dir.parent().map(|p| p.to_path_buf());
+            }
+            self.git.insert(path, badge);
+        }
+        self.ignored = ignored;
+        self.rebuild();
+    }
+
+    /// Whether git ignores a path, itself or through an ancestor it collapsed.
+    pub fn is_ignored(&self, path: &Path) -> bool {
+        if self.ignored.is_empty() {
+            return false;
+        }
+        let mut cur = Some(path);
+        while let Some(p) = cur {
+            if self.ignored.contains(p) {
+                return true;
+            }
+            if p == self.root {
+                break;
+            }
+            cur = p.parent();
+        }
+        false
+    }
+
+    /// The badge a row gets: its own for a file, the folded one for a directory.
+    fn badge_for(&self, entry: &Entry) -> Option<Badge> {
+        if entry.dir {
+            self.git_dirs.get(&entry.path).copied()
+        } else {
+            self.git.get(&entry.path).copied()
+        }
     }
 
     /// The area left for the panes: the sidebar's columns, taken off one side.
@@ -246,8 +422,10 @@ impl Explorer {
     pub fn rebuild(&mut self) {
         let keep = self.selected().map(|r| r.entry.path.clone());
         let mut rows = Vec::new();
-        self.walk(&self.root.clone(), 0, &mut rows);
+        let mut hidden = 0usize;
+        self.walk(&self.root.clone(), 0, &mut rows, &mut hidden);
         self.rows = rows;
+        self.hidden_by_ignore = hidden;
         // A path an operation just produced wins: after a rename, the cursor belongs
         // on the new name, not on where the old one used to be.
         if let Some(want) = self.pending_cursor.clone() {
@@ -268,18 +446,43 @@ impl Explorer {
         self.cursor = self.cursor.min(self.rows.len().saturating_sub(1));
     }
 
-    fn walk(&self, dir: &Path, depth: usize, out: &mut Vec<Row>) {
+    fn walk(&self, dir: &Path, depth: usize, out: &mut Vec<Row>, hidden: &mut usize) {
         let Some(entries) = self.children.get(dir) else { return };
-        let shown = entries.len().min(CHILD_CAP);
-        for entry in &entries[..shown] {
+        // Ignored rows are dropped BEFORE the cap, so hiding `target/` cannot be what
+        // pushes a directory past 2000 children.
+        let mut visible: Vec<&Entry> = Vec::with_capacity(entries.len());
+        for entry in entries {
+            if !self.show_ignored && self.is_ignored(&entry.path) {
+                *hidden += 1;
+                continue;
+            }
+            visible.push(entry);
+        }
+        if self.sort == Sort::Mtime {
+            // Newest first, with the name as the tie-break so the order is stable
+            // between rebuilds (a whole checkout shares one mtime to the second).
+            visible.sort_by(|a, b| {
+                b.mtime.cmp(&a.mtime).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+            });
+        }
+        let total = visible.len();
+        let shown = total.min(CHILD_CAP);
+        for entry in &visible[..shown] {
             let open = entry.dir && self.expanded.contains(&entry.path);
-            out.push(Row { entry: entry.clone(), depth, open, more: None });
+            out.push(Row {
+                entry: (*entry).clone(),
+                depth,
+                open,
+                more: None,
+                badge: self.badge_for(entry),
+                ignored: self.show_ignored && self.is_ignored(&entry.path),
+            });
             if open {
-                self.walk(&entry.path.clone(), depth + 1, out);
+                self.walk(&entry.path.clone(), depth + 1, out, hidden);
             }
         }
-        if entries.len() > shown {
-            let n = entries.len() - shown;
+        if total > shown {
+            let n = total - shown;
             let entry = Entry {
                 name: format!("\u{2026} {n} more"),
                 path: dir.join(format!("\u{2026}{n}")),
@@ -289,7 +492,7 @@ impl Explorer {
                 size: 0,
                 mtime: 0,
             };
-            out.push(Row { entry, depth, open: false, more: Some(n) });
+            out.push(Row { entry, depth, open: false, more: Some(n), badge: None, ignored: false });
         }
     }
 
@@ -380,6 +583,8 @@ pub static FILE_LEADER: &[FileEntry] = &[
         title: "View",
         node: FileNode::Group(&[
             fleaf('.', "hidden files", FKey(FCh('.'))),
+            fleaf('i', "files git ignores", FKey(FCh('I'))),
+            fleaf('s', "sort by name / by date", FKey(FCh('s'))),
             fleaf('r', "reread the tree", FKey(FCh('R'))),
             fleaf('t', "to the top", FKey(FCh('g'))),
             fleaf('b', "to the bottom", FKey(FCh('G'))),
@@ -866,6 +1071,24 @@ pub fn mode_string(mode: u32) -> String {
     )
 }
 
+/// What git says about a tree, read on a worker: a badge per changed file and the
+/// set of ignored paths, both absolute.
+///
+/// Absolute here rather than at the far end because git answers in paths relative to
+/// the repository root, and the tree only ever holds absolute ones — converting in
+/// one place is the difference between one join and a join at every comparison.
+pub type GitMarks = (Vec<(PathBuf, Badge)>, HashSet<PathBuf>);
+
+/// Reads both. Blocking (two `git` processes): worker only.
+pub fn read_git(root: &Path) -> GitMarks {
+    let files = crate::git::status_files(root)
+        .into_iter()
+        .map(|f| (root.join(&f.path), Badge::from_status(f.index, f.worktree)))
+        .collect();
+    let ignored = crate::git::ignored_paths(root).into_iter().map(|p| root.join(p)).collect();
+    (files, ignored)
+}
+
 /// The tree's root for a directory: the repository it is in, else the directory
 /// itself. A project is the unit people keep a tree of, and a repo is how a project
 /// says where it ends.
@@ -1123,6 +1346,102 @@ mod tests {
         e.arm_leader();
         e.leader_key('v');
         assert_eq!(e.leader_key('.'), Some(FileKey::Ch('.')));
+    }
+
+    fn at(name: &str, dir: bool, mtime: u64) -> Entry {
+        Entry { mtime, ..entry(name, dir) }
+    }
+
+    #[test]
+    fn a_status_letter_becomes_the_badge_the_row_shows() {
+        // Untracked and conflicted come back in BOTH columns; git says so with `?`
+        // and `U`, and neither is a worktree letter to be read as one.
+        assert_eq!(Badge::from_status('?', '?'), Badge::Untracked);
+        assert_eq!(Badge::from_status('U', 'U'), Badge::Conflict);
+        assert_eq!(Badge::from_status('M', 'U'), Badge::Conflict);
+        // The unstaged letter wins over the staged one: it is the change that is not
+        // written down anywhere yet.
+        assert_eq!(Badge::from_status('M', 'M'), Badge::Modified);
+        assert_eq!(Badge::from_status('M', '.'), Badge::Staged);
+        assert_eq!(Badge::from_status('A', '.'), Badge::Added);
+        assert_eq!(Badge::from_status('.', 'D'), Badge::Deleted);
+        assert_eq!(Badge::from_status('R', '.'), Badge::Staged);
+        assert_eq!(Badge::Dirty.letter(), '\u{b7}');
+    }
+
+    #[test]
+    fn a_directory_says_something_below_it_changed_and_never_borrows_a_letter() {
+        let mut e = Explorer::new(PathBuf::from("/r"), 30, Side::Left);
+        e.insert_children(PathBuf::from("/r"), vec![entry("src", true), entry("README", false)]);
+        e.toggle(Path::new("/r/src"));
+        e.insert_children(
+            PathBuf::from("/r/src"),
+            vec![Entry { path: "/r/src/main.rs".into(), ..entry("main.rs", false) }],
+        );
+
+        e.set_git(vec![(PathBuf::from("/r/src/main.rs"), Badge::Modified)], HashSet::new());
+        fn row(e: &Explorer, name: &str) -> Row {
+            e.rows.iter().find(|r| r.entry.name == name).unwrap().clone()
+        }
+        assert_eq!(row(&e, "main.rs").badge, Some(Badge::Modified));
+        assert_eq!(row(&e, "src").badge, Some(Badge::Dirty), "a folder is not itself modified");
+        assert_eq!(row(&e, "README").badge, None);
+
+        // A conflict is the one state a directory repeats, because it is the one
+        // where a stray keystroke loses a merge.
+        e.set_git(vec![(PathBuf::from("/r/src/main.rs"), Badge::Conflict)], HashSet::new());
+        assert_eq!(row(&e, "src").badge, Some(Badge::Conflict));
+
+        // Moving to another repository drops the marks: badging the new tree with the
+        // old project's status is worse than badging nothing.
+        e.set_root(PathBuf::from("/other"));
+        assert!(e.git.is_empty() && e.git_dirs.is_empty() && e.ignored.is_empty());
+    }
+
+    #[test]
+    fn what_git_ignores_is_hidden_but_never_silently() {
+        let mut e = Explorer::new(PathBuf::from("/r"), 30, Side::Left);
+        e.insert_children(
+            PathBuf::from("/r"),
+            vec![entry("target", true), entry("src", true), entry("Cargo.toml", false)],
+        );
+        // git collapses an ignored directory to one line, so the tree has to test a
+        // path against its ANCESTORS, not just against itself.
+        e.set_git(Vec::new(), HashSet::from([PathBuf::from("/r/target")]));
+        assert!(e.is_ignored(Path::new("/r/target/debug/runnir")));
+        assert!(!e.is_ignored(Path::new("/r/src/main.rs")));
+
+        let names: Vec<&str> = e.rows.iter().map(|r| r.entry.name.as_str()).collect();
+        assert_eq!(names, ["src", "Cargo.toml"]);
+        assert_eq!(e.hidden_by_ignore, 1, "and the footer can say how many");
+
+        e.show_ignored = true;
+        e.rebuild();
+        assert_eq!(e.rows.len(), 3);
+        assert!(e.rows[0].ignored, "shown, but dimmed as what it is");
+        assert_eq!(e.hidden_by_ignore, 0);
+    }
+
+    #[test]
+    fn sorting_by_date_puts_the_newest_first_whatever_it_is() {
+        let mut e = Explorer::new(PathBuf::from("/r"), 30, Side::Left);
+        e.insert_children(
+            PathBuf::from("/r"),
+            vec![at("old_dir", true, 10), at("new.rs", false, 300), at("mid.rs", false, 200)],
+        );
+        // By name: directories first, as every file manager does it.
+        let names = |e: &Explorer| -> Vec<String> {
+            e.rows.iter().map(|r| r.entry.name.clone()).collect()
+        };
+        assert_eq!(names(&e), ["old_dir", "new.rs", "mid.rs"]);
+
+        // By date: the directory sinks. Mixing them is the point — a directory's own
+        // mtime moves when something is created or deleted in it, which is exactly
+        // the event this mode exists to surface.
+        e.sort = Sort::Mtime;
+        e.rebuild();
+        assert_eq!(names(&e), ["new.rs", "mid.rs", "old_dir"]);
+        assert_eq!(e.sort.flip(), Sort::Name);
     }
 
     #[test]

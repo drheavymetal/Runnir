@@ -429,6 +429,10 @@ pub fn parse_blame(text: &str) -> Vec<BlameLine> {
 pub fn status_files(root: &Path) -> Vec<FileEntry> {
     let out = std::process::Command::new("git")
         .arg("--no-optional-locks")
+        // Without this git escapes every non-ASCII path as `"caf\303\251.txt"`, and a
+        // panel that matches a status line against a real filename then misses every
+        // accented name it has.
+        .args(["-c", "core.quotePath=false"])
         .args(["status", "--porcelain=v2", "--untracked-files=normal"])
         .current_dir(root)
         .env("GIT_OPTIONAL_LOCKS", "0")
@@ -438,6 +442,47 @@ pub fn status_files(root: &Path) -> Vec<FileEntry> {
         Ok(o) if o.status.success() => parse_status_files(&String::from_utf8_lossy(&o.stdout)),
         _ => Vec::new(),
     }
+}
+
+/// What git ignores under a root, collapsed to directories where it can be.
+///
+/// `--directory` is the whole point: asking for every ignored PATH in a Rust repo
+/// lists all of `target/`, which is tens of thousands of lines and a walk of the
+/// build tree. Collapsed, the same answer is one line — and a consumer that wants
+/// to know whether a path is ignored tests it against these prefixes.
+///
+/// Paths come back relative to the root, directories with a trailing `/` which is
+/// stripped here: a caller compares them against real paths, and a real path has no
+/// trailing slash.
+pub fn ignored_paths(root: &Path) -> Vec<String> {
+    let out = std::process::Command::new("git")
+        .arg("--no-optional-locks")
+        .args(["-c", "core.quotePath=false"])
+        .args([
+            "ls-files",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "--directory",
+            "--no-empty-directory",
+        ])
+        .current_dir(root)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .stderr(std::process::Stdio::null())
+        .output();
+    match out {
+        Ok(o) if o.status.success() => parse_ignored(&String::from_utf8_lossy(&o.stdout)),
+        _ => Vec::new(),
+    }
+}
+
+/// Splits `ls-files` output into relative paths. Pure, so the shape is testable.
+pub fn parse_ignored(text: &str) -> Vec<String> {
+    text.lines()
+        .map(|l| l.trim_end_matches('/'))
+        .filter(|l| !l.is_empty())
+        .map(|l| l.to_string())
+        .collect()
 }
 
 /// Parses the entry lines of `--porcelain=v2`. Pure, so the format is testable.
@@ -1247,6 +1292,15 @@ diff --git a/x b/x
         assert_eq!(files[2].index, 'D');
         // A rename reports both paths; the new one is what the diff is against.
         assert_eq!((files[3].index, files[3].path.as_str()), ('R', "docs/b.md"));
+    }
+
+    #[test]
+    fn ignored_paths_arrive_without_the_trailing_slash_a_real_path_never_has() {
+        // `--directory` collapses a whole build tree to one line, which is the only
+        // reason asking is cheap; the slash it marks a directory with would make
+        // every comparison against a real path fail.
+        let out = parse_ignored("target/\n.env\nnested/dir/\n\n");
+        assert_eq!(out, ["target", ".env", "nested/dir"]);
     }
 
     #[test]

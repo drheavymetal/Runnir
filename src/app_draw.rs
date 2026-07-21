@@ -629,6 +629,9 @@ impl Gpu {
                     Pen { fg: c, bg, ..Pen::default() }
                 }
             };
+            // The badge sits at the right edge, where a column of letters reads as a
+            // column: beside the name it would move with every indent level.
+            let badge_col = row.badge.map(|b| (b, badge_colour(b)));
             let indent = 1 + row.depth * 2;
             let mark = if row.more.is_some() {
                 " "
@@ -639,8 +642,11 @@ impl Gpu {
             };
             g.write_str(y, indent.min(cols), mark, sel_pen(dim));
             let x = (indent + 2).min(cols);
-            let room = cols.saturating_sub(x + 1);
-            let colour = if row.more.is_some() {
+            // A badge and a symlink arrow both live on the right; the name gives up
+            // the columns they take rather than being drawn under them.
+            let tail = 1 + usize::from(badge_col.is_some()) + usize::from(row.entry.link);
+            let room = cols.saturating_sub(x + tail);
+            let colour = if row.more.is_some() || row.ignored {
                 dim
             } else if row.entry.dir {
                 Color::Rgb(0x6b, 0xb1, 0xff)
@@ -653,17 +659,32 @@ impl Gpu {
             // the part that tells you which file it is.
             let name = crate::overlay::field_view(&row.entry.name, room);
             g.write_str(y, x, &name, sel_pen(colour));
+            let mut at = cols.saturating_sub(1);
+            if let Some((badge, colour)) = badge_col {
+                g.write_str(y, at, &badge.letter().to_string(), sel_pen(colour));
+                at = at.saturating_sub(1);
+            }
             if row.entry.link {
-                let at = cols.saturating_sub(1);
                 g.write_str(y, at, "\u{2192}", sel_pen(dim));
             }
         }
 
-        // Footer: what a key does here, or the last thing that happened.
+        // Footer: what a key does here, or the last thing that happened. What is
+        // being held back is said out loud in both: a tree quietly missing rows is
+        // read as a tree with nothing in them.
+        let held = (e.hidden_by_ignore > 0)
+            .then(|| format!(" \u{b7} {} ignored (I)", e.hidden_by_ignore))
+            .unwrap_or_default();
+        let sorted = match e.sort {
+            crate::explorer::Sort::Name => String::new(),
+            crate::explorer::Sort::Mtime => " \u{b7} by date".to_string(),
+        };
         let foot = match &e.message {
-            Some(m) => m.clone(),
-            None if e.focused => "enter open \u{b7} e edit \u{b7} o system \u{b7} . hidden \u{b7} esc".to_string(),
-            None => format!("{} items \u{b7} leader e", e.rows.len()),
+            Some(m) => format!("{m}{held}"),
+            None if e.focused => {
+                format!("enter open \u{b7} e edit \u{b7} s sort \u{b7} . hidden{held}{sorted}")
+            }
+            None => format!("{} items{held}{sorted} \u{b7} leader e", e.rows.len()),
         };
         g.write_str(
             rows.saturating_sub(1),
@@ -866,4 +887,21 @@ fn whichkey_grid(entries: &[(String, String, bool)], path: &[String], cols: usiz
         }
     }
     grid
+}
+
+/// The colour of a git badge in the tree.
+///
+/// Unstaged red-ish, staged green, untracked and "something below here" quiet: the
+/// eye is meant to land on what is not written down anywhere yet, not on what is
+/// already in the index.
+fn badge_colour(badge: crate::explorer::Badge) -> Color {
+    use crate::explorer::Badge;
+    match badge {
+        Badge::Conflict => Color::Rgb(0xff, 0x6b, 0x6b),
+        Badge::Modified => Color::Rgb(0xe0, 0xaf, 0x68),
+        Badge::Deleted => Color::Rgb(0xd2, 0x6b, 0x6b),
+        Badge::Added | Badge::Staged => Color::Rgb(0x7a, 0xc0, 0x7a),
+        Badge::Untracked => Color::Rgb(0x8f, 0x9a, 0xa8),
+        Badge::Dirty => Color::Rgb(0x7d, 0x81, 0x8a),
+    }
 }

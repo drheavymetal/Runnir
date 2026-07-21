@@ -1104,6 +1104,55 @@ After an operation the tree re-reads and `pending_cursor` lands the selection on
 the operation produced: after a rename you are on the new name, not on the hole where
 the old one was.
 
+## 2026-07-21 - File explorer: git badges, a date sort, and what git ignores
+
+Step 5 of the design below, and the last of the original plan before the images. It
+is where the rejected "what is the agent touching right now" view actually shipped:
+as a **sort mode plus a badge per row**, not as a second view to keep in step.
+
+**A badge is a letter at the right edge**, from `--porcelain=v2`'s XY pair via
+`Badge::from_status`: `!` conflict, `?` untracked, `M` modified (yellow) or staged
+(green), `A`, `D`. The unstaged letter wins over the staged one where a path has
+both — the unstaged change is the one not written down anywhere yet.
+
+**A directory never borrows a child's letter.** `M` on a folder claims the folder
+itself was edited, which is not a thing git says; it gets a dot meaning "something
+below here changed", and a conflict is the one state it repeats out loud. The fold
+onto ancestors happens once in `set_git` (O(changes × depth)) rather than per
+rebuild (O(rows × changes)) — rebuilds happen on every keypress that moves a fold.
+
+**What git ignores is hidden by default.** A Rust checkout's tree is `target/` and
+little else. Never a silent cut: the footer says how many rows are being held back
+and `I` brings them back dimmed. The ignored set comes from `ls-files --others
+--ignored --exclude-standard --directory`, which collapses a whole build tree to one
+line — asking for every ignored PATH would list all of `target/` and walk it. Since
+it answers with collapsed directories, a path is ignored when IT or an ancestor is
+in the set. The filter runs before the 2000-child cap, so hiding `target/` can never
+be what pushes a directory past it.
+
+**`s` sorts by mtime**, directories mixed in rather than pinned on top: a directory's
+own mtime moves when something is created or removed in it, which is exactly the
+event this mode is for. Name is the tie-break, or a fresh checkout (one mtime to the
+second) reorders itself between rebuilds. Both `s` and `I` are views of what is
+already read and neither re-reads the filesystem — a sort that costs a `read_dir` of
+the whole open tree is a sort you stop using.
+
+**Nothing polls.** The marks are re-read on the same two triggers the status bar
+uses: the repository stamp (index/HEAD moved, from anywhere) and the pane's command
+counter (something ran here). Two `stat`s per wake, no process unless one moved. One
+read in flight at a time, and an answer that lands after a re-root or a re-read is
+dropped by `seq` — then immediately re-asked, because a dropped answer otherwise
+leaves a tree with no marks until something else goes stale.
+
+`status_files` and `ignored_paths` both run with `-c core.quotePath=false`. Without
+it git escapes every non-ASCII path as `"caf\303\251.txt"`, and matching a status
+line against a real filename misses every accented name in the tree.
+
+Verified on a real instance through the remote control, which now reports the tree
+rows and their badges in `ui_state` (capped at 200, and the cap is reported): six
+modified files badged `M`, `src` carrying the dot, `target` hidden with `1 ignored
+(I)` in the footer, and the date sort putting the file edited last on top.
+
 ## DESIGN, NOT YET BUILT — the file explorer sidebar (decided 2026-07-21)
 
 Four sessions of design with Pedro, written down before any code so it is not

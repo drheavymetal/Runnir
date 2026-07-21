@@ -772,6 +772,7 @@ impl Gpu {
             }
         }
         self.explorer_read_pending();
+        self.explorer_read_git(true);
         // The panes just lost (or gained) columns: their PTYs have to be told.
         let area = self.active_area();
         self.tabs[self.active].reflow(area);
@@ -897,6 +898,73 @@ impl Gpu {
             e.seq += 1;
         }
         self.explorer_read_pending();
+        self.explorer_read_git(true);
+    }
+
+    /// Asks git what it says about the tree, on a worker.
+    ///
+    /// `force` skips the staleness check, for the cases where the user asked (`R`)
+    /// or the tree just moved to another repository. Otherwise the same two triggers
+    /// the status bar uses decide: the repository stamp (something changed the index
+    /// or HEAD, from anywhere) and the pane's command counter (something ran here).
+    /// Neither alone is enough, and polling `git status` on a timer is what this
+    /// whole shape exists to avoid.
+    fn explorer_read_git(&mut self, force: bool) {
+        if self.explorer_git_pending {
+            return;
+        }
+        let tab_index = self.active;
+        let Some(e) =
+            self.tabs.get(self.active).and_then(|t| t.explorer.as_ref()).filter(|e| e.open)
+        else {
+            return;
+        };
+        let (root, seq) = (e.root.clone(), e.seq);
+        // Not a repository: no marks to read, and nothing to clear either — leaving a
+        // directory that is not a repo shows a plain tree, which is correct.
+        if crate::git::repo_root(&root).as_deref() != Some(root.as_path()) {
+            return;
+        }
+        let stamp = crate::git::state_stamp(&root);
+        let cmd = self.tab().focused_ref().command_seq();
+        let at = (root.clone(), stamp, cmd);
+        if !force && self.explorer_git_at.as_ref() == Some(&at) {
+            return;
+        }
+        self.explorer_git_at = Some(at);
+        self.explorer_git_pending = true;
+        let proxy = self.proxy.clone();
+        std::thread::spawn(move || {
+            let marks = crate::explorer::read_git(&root);
+            let _ = proxy.send_event(UserEvent::ExplorerGit(tab_index, seq, root, marks));
+        });
+    }
+
+    /// Finished git marks. Dropped when the tree has been re-rooted or re-read since
+    /// (`seq`), or when they belong to another root: a slow `git status` landing on
+    /// the tree of another repository badges the wrong files.
+    fn on_explorer_git(
+        &mut self,
+        tab_index: usize,
+        seq: u64,
+        root: std::path::PathBuf,
+        marks: crate::explorer::GitMarks,
+    ) {
+        self.explorer_git_pending = false;
+        let stale = match self.tabs.get_mut(tab_index).and_then(|t| t.explorer.as_mut()) {
+            Some(e) if e.seq == seq && e.root == root => {
+                e.set_git(marks.0, marks.1);
+                false
+            }
+            Some(_) => true,
+            None => false,
+        };
+        // A dropped answer is a tree with no marks at all until something else goes
+        // stale, so the read that overtook this one is re-asked for straight away.
+        if stale {
+            self.explorer_read_git(true);
+        }
+        self.window.request_redraw();
     }
 
     /// The sidebar's leader layer. Returns whether it consumed the key.
@@ -1033,6 +1101,23 @@ impl Gpu {
                     "." => {
                         e.show_hidden = !e.show_hidden;
                         refresh = true;
+                    }
+                    // Both of these are views of what is already read, so neither
+                    // re-reads the filesystem: a sort that costs a `read_dir` of the
+                    // whole open tree is a sort you stop using.
+                    "s" => {
+                        e.sort = e.sort.flip();
+                        e.rebuild();
+                        e.message = Some(format!("sorted by {}", e.sort.label()));
+                    }
+                    "I" => {
+                        e.show_ignored = !e.show_ignored;
+                        e.rebuild();
+                        e.message = Some(if e.show_ignored {
+                            "showing what git ignores".into()
+                        } else {
+                            "hiding what git ignores".into()
+                        });
                     }
                     // `r` renames, as in every file manager. Re-reading the tree is
                     // `R`: the destructive-looking letter goes to the safe verb, not
@@ -1462,8 +1547,15 @@ impl Gpu {
         };
         if changed {
             self.explorer_read_pending();
+            self.explorer_read_git(true);
             self.window.request_redraw();
         }
+    }
+
+    /// The periodic check for the tree's git marks. Cheap when nothing moved: two
+    /// `stat` calls and a compare, the same price the status bar pays.
+    pub fn explorer_poll_git(&mut self) {
+        self.explorer_read_git(false);
     }
 
     /// The leader layer, for one key. Returns whether it consumed it.
@@ -1590,6 +1682,9 @@ impl Gpu {
     /// keypress did could not be a test.
     fn ui_state(&self) -> serde_json::Value {
         use serde_json::json;
+        /// How many tree rows the remote control reports. A whole expanded checkout
+        /// down a socket is not a state report, it is a file listing.
+        const TREE_REPORT: usize = 200;
         let (cw, ch) = self.renderer.cell_size();
         let cols = (self.surface_config.width as f32 / cw).floor().max(1.0) as usize;
         let rows = (self.surface_config.height as f32 / ch).floor().max(1.0) as usize;
@@ -1652,6 +1747,20 @@ impl Gpu {
                 "open_dirs": e.expanded.len(),
                 "hidden": e.show_hidden,
                 "message": e.message,
+                "sort": e.sort.label(),
+                "show_ignored": e.show_ignored,
+                "hidden_by_ignore": e.hidden_by_ignore,
+                // The rows themselves, so a caller can assert on the badges without
+                // reading the screen. Capped, and the cap is reported: a list that
+                // just stops is one a caller draws the wrong conclusion from.
+                "tree": e.rows.iter().take(TREE_REPORT).map(|r| json!({
+                    "name": r.entry.name,
+                    "depth": r.depth,
+                    "dir": r.entry.dir,
+                    "badge": r.badge.map(|b| b.letter().to_string()),
+                    "ignored": r.ignored,
+                })).collect::<Vec<_>>(),
+                "tree_truncated": e.rows.len().saturating_sub(TREE_REPORT),
             });
         }
         if let Some(Overlay::Git(p)) = &self.overlay {

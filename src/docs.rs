@@ -494,11 +494,24 @@ and it takes keys only while it has focus (Escape gives them back).
 
   j k / arrows      move            l or Enter   unfold a directory
   h                 fold, or go to the parent    g G   top, bottom
-  .                 hidden files    r  reread the tree
+  .                 hidden files    I  files git ignores
+  s                 sort by name / by date
   y                 copy the path   Esc or q     back to the pane
   Enter on a file   open it        e  $EDITOR    o  the desktop's handler
   p properties & permissions   a new file (a/ for a directory)
   r rename          d delete       R  reread the tree
+
+Each row carries what git says about it: M modified (yellow) or staged (green),
+A added, D deleted, ? untracked, ! conflicted, and a dot on a directory meaning
+something below it changed. A directory never borrows a child's letter - an M on a
+folder would claim the folder itself was edited.
+
+What git ignores is hidden, and the footer says how many rows that is - I shows
+them again, dimmed. s switches between sorting by name (directories first) and by
+date changed, newest first with directories mixed in: a directory's own mtime moves
+when something is created or removed in it, which is the event that sort is for.
+The marks are re-read when the index or HEAD moves, or when a command finishes in
+the pane. Nothing polls.
 
 What Enter does depends on what the file IS, decided by its bytes and not by its
 name: an image opens in the viewer, text opens in the viewer, and a binary says so
