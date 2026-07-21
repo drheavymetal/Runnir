@@ -521,6 +521,11 @@ a terminal, so its editor is whatever runs in a pane.
   In the viewer: j k J K scroll, h l sideways, g G ends, e $EDITOR, o the desktop,
   y copy the path, Esc back to the tree.
 
+An image is drawn as the real picture, scaled to the panel by the worker that
+decoded it and centred there - not as text art. Scrolling is off for it because the
+whole picture is on screen. Half-block art is still what you get if a file decodes
+to art but not to pixels.
+
 $EDITOR (and a script you choose to run) goes to the focused pane when it is sitting
 at its prompt and to a new split when something is already running there, with the
 path shell-quoted.

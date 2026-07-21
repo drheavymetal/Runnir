@@ -733,6 +733,9 @@ pub enum Kind {
 
 /// How much of a file is sniffed, and how much the viewer will load.
 const SNIFF_BYTES: usize = 8192;
+
+/// The longest side a viewer texture is allowed to have, in pixels.
+const MAX_TEXTURE_PX: u32 = 2048;
 pub const VIEW_LIMIT: u64 = 4 * 1024 * 1024;
 
 /// Decides what a path is by looking at it, not at its name.
@@ -799,10 +802,10 @@ pub struct ViewRead {
 ///
 /// `cols`/`rows` size an image's half-block art, which has to be decided where the
 /// cell size is known and is passed in rather than guessed here.
-pub fn read_for_view(path: &Path, cols: usize, rows: usize, cell_aspect: f32) -> ViewRead {
+pub fn read_for_view(path: &Path, cols: usize, rows: usize, cell: (f32, f32)) -> ViewRead {
     let bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
     let body = match kind_of(path) {
-        Kind::Image => decode_image(path, cols, rows, cell_aspect),
+        Kind::Image => decode_image(path, cols, rows, cell),
         Kind::Binary => Err("binary file".to_string()),
         Kind::Directory => Err("that is a directory".to_string()),
         Kind::Text => read_text(path, bytes),
@@ -834,27 +837,62 @@ fn decode_image(
     path: &Path,
     cols: usize,
     rows: usize,
-    cell_aspect: f32,
+    cell: (f32, f32),
 ) -> Result<crate::overlay::Viewed, String> {
     let img = image::open(path).map_err(|e| e.to_string())?;
     let rgba = img.to_rgba8();
     let (w, h) = rgba.dimensions();
-    // Fit inside the box keeping the aspect ON SCREEN, which is not the aspect in
-    // cells: a cell here is 10x22 px, so a picture drawn as many rows as columns
-    // comes out twice as tall as it is wide. `cell_aspect` is cw/ch and converts
-    // between the two.
-    let (mut c, mut r) = (cols, rows);
-    if w > 0 && h > 0 {
-        let want = (cols as f32 * h as f32 / w as f32 * cell_aspect).round().max(1.0) as usize;
-        if want > rows {
-            c = (rows as f32 * w as f32 / h as f32 / cell_aspect).round().max(1.0) as usize;
-            r = rows;
-        } else {
-            r = want;
-        }
+    let (c, r) = fit_cells((w, h), (cols, rows), cell);
+    let art = crate::media::halfblock_art(&rgba, w, h, c, r);
+    // ...and the same picture as pixels, scaled to the box it will occupy. A cell is
+    // ten by twenty-odd pixels, so this is a small texture even for a big photo, and
+    // it is the worker that pays for the resampling rather than the frame.
+    let (mut tw, mut th) = (
+        ((c as f32 * cell.0).round() as u32).clamp(1, w),
+        ((r as f32 * cell.1).round() as u32).clamp(1, h),
+    );
+    // A ceiling on the texture regardless of how big the window is: a full-screen
+    // box on a 4K monitor is a 30 MB upload for a picture the sampler can stretch
+    // from a quarter of that with nobody able to tell.
+    let over = tw.max(th) as f32 / MAX_TEXTURE_PX as f32;
+    if over > 1.0 {
+        tw = ((tw as f32 / over).round() as u32).max(1);
+        th = ((th as f32 / over).round() as u32).max(1);
     }
-    let art = crate::media::halfblock_art(&rgba, w, h, c.max(1), r.max(1));
-    Ok(crate::overlay::Viewed::Image { art, size: (w, h) })
+    let scaled = if (tw, th) == (w, h) {
+        rgba.clone()
+    } else {
+        image::imageops::resize(&rgba, tw, th, image::imageops::FilterType::CatmullRom)
+    };
+    let texture = Some(crate::overlay::ViewTexture {
+        serial: crate::grid::next_image_serial(),
+        rgba: std::sync::Arc::new(scaled.into_raw()),
+        px: (tw, th),
+        cells: (c, r),
+    });
+    Ok(crate::overlay::Viewed::Image { art, size: (w, h), texture })
+}
+
+/// Fits a picture into a box of cells, keeping its aspect ON SCREEN.
+///
+/// That is not its aspect in cells: a cell is about 10x22 px, so a square picture
+/// drawn as many rows as columns comes out twice as tall as it is wide. This is the
+/// bug that shipped once already — the correction needs the real cell size, which
+/// only the caller knows.
+pub fn fit_cells(px: (u32, u32), box_cells: (usize, usize), cell: (f32, f32)) -> (usize, usize) {
+    let (w, h) = px;
+    let (cols, rows) = (box_cells.0.max(1), box_cells.1.max(1));
+    if w == 0 || h == 0 || cell.0 <= 0.0 || cell.1 <= 0.0 {
+        return (cols, rows);
+    }
+    let aspect = cell.0 / cell.1;
+    let want = (cols as f32 * h as f32 / w as f32 * aspect).round().max(1.0) as usize;
+    if want > rows {
+        let c = (rows as f32 * w as f32 / h as f32 / aspect).round().max(1.0) as usize;
+        (c.min(cols), rows)
+    } else {
+        (cols, want)
+    }
 }
 
 // ---- properties and operations ---------------------------------------------
@@ -1212,7 +1250,7 @@ mod tests {
         let _ = std::fs::create_dir_all(&dir);
         let small = dir.join("small.txt");
         std::fs::write(&small, "one\ntwo\nthree\n").unwrap();
-        let read = read_for_view(&small, 40, 20, 0.45);
+        let read = read_for_view(&small, 40, 20, (10.0, 22.0));
         match read.body.expect("text") {
             crate::overlay::Viewed::Text { lines, truncated } => {
                 assert_eq!(lines, ["one", "two", "three"]);
@@ -1226,7 +1264,7 @@ mod tests {
         // early, silently, is a file you draw the wrong conclusion from.
         let big = dir.join("big.txt");
         std::fs::write(&big, "x".repeat(VIEW_LIMIT as usize + 100)).unwrap();
-        match read_for_view(&big, 40, 20, 0.45).body.expect("text") {
+        match read_for_view(&big, 40, 20, (10.0, 22.0)).body.expect("text") {
             crate::overlay::Viewed::Text { truncated, .. } => assert!(truncated),
             _ => panic!("still text"),
         }
@@ -1234,7 +1272,7 @@ mod tests {
         // A binary is refused rather than shown as mojibake.
         let bin = dir.join("thing.bin");
         std::fs::write(&bin, [0u8, 1, 2, 3]).unwrap();
-        assert!(read_for_view(&bin, 40, 20, 0.45).body.is_err());
+        assert!(read_for_view(&bin, 40, 20, (10.0, 22.0)).body.is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1350,6 +1388,60 @@ mod tests {
 
     fn at(name: &str, dir: bool, mtime: u64) -> Entry {
         Entry { mtime, ..entry(name, dir) }
+    }
+
+    #[test]
+    fn a_picture_is_fitted_by_its_aspect_on_screen_not_in_cells() {
+        // A cell is 10x22 px. A SQUARE picture must therefore come out with well
+        // under half as many rows as columns — fitting it as many rows as columns is
+        // the bug that shipped once already and drew a logo twice as tall as wide.
+        let cell = (10.0, 22.0);
+        let (c, r) = fit_cells((100, 100), (40, 40), cell);
+        assert_eq!(c, 40);
+        assert_eq!(r, 18, "40 cols x 10px = 400px wide, so 400px tall = ~18 rows");
+
+        // A wide picture is capped by the columns, a tall one by the rows, and
+        // neither ever leaves the box.
+        let (c, r) = fit_cells((1000, 200), (40, 40), cell);
+        assert!(c <= 40 && r <= 40 && r < c);
+        let (c, r) = fit_cells((200, 1000), (40, 40), cell);
+        assert!(c <= 40 && r <= 40 && c < r);
+
+        // Degenerate inputs give the box back rather than a division by zero.
+        assert_eq!(fit_cells((0, 0), (40, 40), cell), (40, 40));
+        assert_eq!(fit_cells((100, 100), (40, 40), (0.0, 0.0)), (40, 40));
+    }
+
+    #[test]
+    fn an_image_read_carries_both_the_pixels_and_the_art() {
+        let dir = std::env::temp_dir().join(format!("runnir-img-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("swatch.png");
+        let img = image::RgbaImage::from_fn(64, 64, |x, _| {
+            image::Rgba([if x < 32 { 255 } else { 0 }, 0, 0, 255])
+        });
+        img.save(&path).unwrap();
+
+        match read_for_view(&path, 40, 40, (10.0, 22.0)).body.expect("an image") {
+            crate::overlay::Viewed::Image { art, size, texture } => {
+                assert_eq!(size, (64, 64), "the REAL size, which the art cannot show");
+                let t = texture.expect("decoded to pixels");
+                // Scaled to the box it will be drawn in, not to the file's own size:
+                // a big photo shown 40 cells wide is a small texture.
+                assert_eq!(t.cells, (40, 18));
+                // The box is 400x396 px and the file is 64x64: it is never scaled UP
+                // to fill it. The quad is drawn from the box, so the sampler
+                // stretches it there and only the sharpness ever changes.
+                assert_eq!(t.px, (64, 64));
+                assert_eq!(t.rgba.len(), (t.px.0 * t.px.1 * 4) as usize);
+                assert!(t.serial > 0);
+                // The art is still there: it is the fallback, not a lesser mode.
+                assert_eq!(art.len(), 18);
+            }
+            _ => panic!("a png reads as an image"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

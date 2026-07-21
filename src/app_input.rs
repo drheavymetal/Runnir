@@ -1279,13 +1279,14 @@ impl Gpu {
         let proxy = self.proxy.clone();
         let cell = self.renderer.cell_size();
         let screen = (self.surface_config.width as f32, self.surface_config.height as f32);
-        // The art is sized here, where the cell size is known; the worker only
-        // decodes. Half the panel's width, which is what the viewer gives an image.
-        let cols = ((screen.0 / cell.0) as usize).saturating_sub(8).clamp(20, 200);
-        let rows = ((screen.1 / cell.1) as usize).saturating_sub(8).clamp(10, 100);
-        let aspect = cell.0 / cell.1.max(1.0);
+        // The box is sized here, where the cell size is known; the worker only
+        // decodes and scales into it. These are the viewer's own insets: the panel is
+        // four columns narrower than the window and the picture sits four inside it,
+        // and three rows go to the header, the legend and the border.
+        let cols = ((screen.0 / cell.0) as usize).saturating_sub(8).clamp(20, 300);
+        let rows = ((screen.1 / cell.1) as usize).saturating_sub(7).clamp(10, 150);
         std::thread::spawn(move || {
-            let read = crate::explorer::read_for_view(&path, cols, rows, aspect);
+            let read = crate::explorer::read_for_view(&path, cols, rows, cell);
             let _ = proxy.send_event(UserEvent::FileRead(path, read));
         });
     }

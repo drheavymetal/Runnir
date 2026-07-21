@@ -229,7 +229,6 @@ pub struct Grid {
     /// Inline images (kitty graphics protocol), anchored to a stable row so they
     /// scroll with the content that placed them.
     images: Vec<GridImage>,
-    image_serial: u64,
     /// Cell size in pixels, needed to size an image's cell footprint. Zero until
     /// set, in which case images fall back to their control-supplied rows.
     cell_px: (f32, f32),
@@ -254,8 +253,23 @@ pub struct GridImage {
     pub height: u32,
     /// Stable row (dropped + local) of the image's top-left cell.
     pub anchor: usize,
+    /// Column of that cell, within the grid.
+    pub col: usize,
     pub cols: usize,
     pub rows: usize,
+}
+
+/// Serials are handed out PROCESS-WIDE, not per grid.
+///
+/// The renderer caches textures by serial alone, so a counter that restarts at 1 in
+/// every grid makes two panes each showing their first image ask for the same
+/// texture — and the second one draws the first one's picture.
+static IMAGE_SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// The next texture serial. A caller that redraws the same image every frame keeps
+/// the one it was given: a fresh serial per frame re-uploads the texture per frame.
+pub fn next_image_serial() -> u64 {
+    IMAGE_SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 impl Grid {
@@ -303,7 +317,6 @@ impl Grid {
             clipboard_writes: Vec::new(),
             notifications: Vec::new(),
             images: Vec::new(),
-            image_serial: 0,
             cell_px: (0.0, 0.0),
             kbd_flags_stack: Vec::new(),
         }
@@ -358,14 +371,14 @@ impl Grid {
             1
         };
 
-        self.image_serial += 1;
         self.images.push(GridImage {
-            serial: self.image_serial,
+            serial: next_image_serial(),
             id: img.id,
             rgba: std::sync::Arc::new(img.rgba),
             width: img.width,
             height: img.height,
             anchor: self.local_to_stable(self.cursor_abs()),
+            col: self.col,
             cols: cols.max(1),
             rows: rows.max(1),
         });
@@ -375,6 +388,34 @@ impl Grid {
         for _ in 0..rows.max(1) {
             self.linefeed();
         }
+        self.dirty = true;
+    }
+
+    /// Places an image at an explicit cell, without touching the cursor or reserving
+    /// rows — for a grid that is drawn, not written into: an overlay panel.
+    ///
+    /// The serial comes from the CALLER because a panel is rebuilt from scratch every
+    /// frame: a serial minted here would be a new one each time, and the renderer
+    /// would re-upload the same texture at every redraw.
+    pub fn place_image_at(
+        &mut self,
+        serial: u64,
+        rgba: std::sync::Arc<Vec<u8>>,
+        px: (u32, u32),
+        at: (usize, usize),
+        size: (usize, usize),
+    ) {
+        self.images.push(GridImage {
+            serial,
+            id: 0,
+            rgba,
+            width: px.0,
+            height: px.1,
+            anchor: self.local_to_stable(self.scrollback.len() + at.0),
+            col: at.1,
+            cols: size.0.max(1),
+            rows: size.1.max(1),
+        });
         self.dirty = true;
     }
 

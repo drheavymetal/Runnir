@@ -2347,9 +2347,29 @@ pub enum Viewed {
         art: Vec<Vec<HalfCell>>,
         /// Real pixel size, which the art cannot show.
         size: (u32, u32),
+        /// The picture itself, for the GPU. `None` when it could not be decoded to
+        /// pixels, and then the art is what gets drawn — it is a fallback, not a
+        /// lesser mode: it is also what still works when there is no texture path.
+        texture: Option<ViewTexture>,
     },
     /// A file that is neither, or one that could not be read.
     Note(String),
+}
+
+/// A decoded picture ready to be handed to the renderer.
+///
+/// Already scaled to the box it will be drawn in: uploading a 6000x4000 photo to
+/// show it 60 cells wide is megabytes of texture for a picture nobody sees at that
+/// size, and the scaling happens on the worker that decoded it either way.
+pub struct ViewTexture {
+    /// Minted once, when the file is read. The panel is rebuilt every frame, and a
+    /// serial minted per frame re-uploads the texture per frame.
+    pub serial: u64,
+    pub rgba: std::sync::Arc<Vec<u8>>,
+    pub px: (u32, u32),
+    /// The box it was scaled for, in CELLS, aspect already corrected for a cell
+    /// being taller than it is wide.
+    pub cells: (usize, usize),
 }
 
 pub struct FileViewer {
@@ -2371,6 +2391,10 @@ impl FileViewer {
     pub fn len(&self) -> usize {
         match &self.body {
             Viewed::Text { lines, .. } => lines.len(),
+            // A real texture is drawn whole, in a box that fits the panel: there is
+            // nothing below the fold to scroll to, and a key that moves a number
+            // nobody can see is a key that looks broken.
+            Viewed::Image { texture: Some(_), .. } => 1,
             Viewed::Image { art, .. } => art.len(),
             Viewed::Note(_) => 1,
         }
@@ -2435,10 +2459,28 @@ impl FileViewer {
                     write(&mut g, y, 2, "\u{2026} file is longer than the viewer reads", dim());
                 }
             }
+            // The real thing: the decoded picture as a texture, placed in the panel's
+            // grid and drawn by the renderer over the cells it reserves.
+            Viewed::Image { texture: Some(t), .. } => {
+                let (avail_c, avail_r) = (w.saturating_sub(4).max(1), body_rows.max(1));
+                // The box was chosen when the file was read, against a guess at the
+                // panel size. Shrink both sides by the SAME factor if it does not
+                // fit: clamping them apart is how a picture gets stretched.
+                let k = (avail_c as f32 / t.cells.0.max(1) as f32)
+                    .min(avail_r as f32 / t.cells.1.max(1) as f32)
+                    .min(1.0);
+                let c = ((t.cells.0 as f32 * k).round() as usize).clamp(1, avail_c);
+                let r = ((t.cells.1 as f32 * k).round() as usize).clamp(1, avail_r);
+                // Centred both ways: the panel is sized to the window and not to the
+                // picture, so a picture pinned to its top-left reads as a panel that
+                // failed to lay out rather than as a picture.
+                let x = 2 + (avail_c - c) / 2;
+                let y = 2 + (avail_r - r) / 2;
+                g.place_image_at(t.serial, t.rgba.clone(), t.px, (y, x), (c, r));
+            }
             Viewed::Image { art, .. } => {
-                // Half-block art: one cell carries two vertical pixels. The real
-                // texture path (kitty graphics) is a later step; this works today
-                // and over ssh.
+                // Half-block art: one cell carries two vertical pixels. The fallback
+                // for a picture that decoded to art but not to pixels.
                 for (r, line) in art.iter().skip(self.scroll).take(body_rows).enumerate() {
                     for (c, cell) in line.iter().enumerate() {
                         if 2 + c >= w {
@@ -2459,6 +2501,9 @@ impl FileViewer {
         }
 
         let legend = match &self.body {
+            Viewed::Image { texture: Some(_), .. } => {
+                "e $EDITOR \u{b7} o open with the system \u{b7} y path \u{b7} esc back"
+            }
             Viewed::Image { .. } => "j k scroll \u{b7} e $EDITOR \u{b7} o open with the system \u{b7} esc back",
             _ => "j k / J K scroll \u{b7} h l sideways \u{b7} e $EDITOR \u{b7} o system \u{b7} y path \u{b7} esc back",
         };

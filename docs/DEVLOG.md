@@ -1153,10 +1153,48 @@ rows and their badges in `ui_state` (capped at 200, and the cap is reported): si
 modified files badged `M`, `src` carrying the dot, `target` hidden with `1 ignored
 (I)` in the footer, and the date sort putting the file edited last on top.
 
-## DESIGN, NOT YET BUILT — the file explorer sidebar (decided 2026-07-21)
+## 2026-07-21 - File explorer: the viewer draws the real picture
+
+Step 6, the last of the explorer design. The viewer showed half-block art; it now
+hands the decoded pixels to the renderer and the picture is drawn as a texture over
+the cells it reserves. The art stays as the fallback for an image that decodes to
+art but not to pixels — and it is what `media.rs` still uses for cover art.
+
+Three things had to change, and two of them were bugs that were already there:
+
+**`prepare_images` only walked panes.** The overlay's panels are `PaneDraw`s too, so
+they are simply chained in. While an overlay is up the PANES' images are now left
+out: images are recorded after every other instance, so a pane image would draw at
+full brightness on top of the panel that is dimming it, and read as part of it.
+
+**Image serials were per grid.** `Grid.image_serial` counted from 1 inside each
+grid, and the renderer caches textures by serial ALONE — two panes each showing
+their first image asked for the same texture, and the second one drew the first
+one's picture. The counter is now a process-wide atomic. A panel is rebuilt every
+frame, so `place_image_at` takes the serial from the caller: one minted per frame
+re-uploads the texture per frame, and `FileViewer` keeps the one the read gave it.
+
+**`GridImage` had no column.** Every image drew at its pane's left edge, which is
+right for `icat` at a prompt and wrong for a picture centred in a panel.
+
+The picture is scaled to its box ON THE WORKER that decoded it, never in the frame:
+a 6000x4000 photo shown 60 cells wide is a 600x600-ish texture, and `MAX_TEXTURE_PX`
+caps it regardless of how big the window is. `fit_cells` is the aspect maths, split
+out and tested — the box is chosen by the aspect ON SCREEN, not in cells, which is
+the bug that shipped once already and drew a square logo twice as tall as wide.
+
+`j`/`k` do nothing on a real texture and the legend stops offering them: the picture
+is drawn whole, so there is nothing below the fold, and a key that moves a number
+nobody can see is a key that looks broken.
+
+Verified on a real instance: the logo drawn at texture quality, centred in the
+panel, scroll pinned at 0.
+
+## THE DESIGN the file explorer was built from (decided 2026-07-21, all six steps shipped)
 
 Four sessions of design with Pedro, written down before any code so it is not
-re-litigated from zero next time. Rewrite this section as a normal entry once built.
+re-litigated from zero next time. Kept verbatim now that it is built: the six
+entries above are what each step actually did, and this is what they were held to.
 
 **What it is.** A VS Code-style file explorer: a persistent sidebar with a tree,
 opening a file to view or edit, and changing its properties (rename, permissions,
@@ -1240,6 +1278,8 @@ feature.
 
 Build order: sidebar+tree+focus → viewer → `$EDITOR` → properties+ops → git badges and
 mtime sort → real images. Roughly 1300 lines; the first two steps are usable alone.
+(All six built on 2026-07-21: `b8c1f6c`, `f66dbe8`, `63d29c0`, `a218b8f` and the two
+entries above.)
 
 ## 2026-07-21 - Bug audit of the two commits above (Fable found, Opus fixed)
 

@@ -313,19 +313,27 @@ impl Renderer {
         self.background.set_image(device, queue, rgba, dim);
     }
 
-    /// The inline images to draw this frame, from every pane, as (grid image,
-    /// pixel rect). Uploads new textures and returns quads ready for the pass.
+    /// The inline images to draw this frame, from every pane AND from the overlay's
+    /// panels, as (grid image, pixel rect). Uploads new textures and returns quads
+    /// ready for the pass.
+    ///
+    /// While an overlay is up the panes' images are left out: images are recorded
+    /// after everything else, so a pane image would draw at full brightness on top of
+    /// the panel that is dimming it — which reads as part of the panel.
     fn prepare_images(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         panes: &[PaneDraw],
+        overlay: Option<&Overlay>,
         screen: (f32, f32),
     ) -> usize {
         let (cw, ch) = (self.font.cell_w, self.font.cell_h);
         let mut quads: Vec<ImageQuad> = Vec::new();
         let mut seen = std::collections::HashSet::new();
-        for pane in panes {
+        let behind: &[PaneDraw] = if overlay.is_some() { &[] } else { panes };
+        let over = overlay.map(|o| o.panels.as_slice()).unwrap_or(&[]);
+        for pane in behind.iter().chain(over) {
             let pane_rect = [
                 pane.origin.0,
                 pane.origin.1,
@@ -333,7 +341,7 @@ impl Renderer {
                 pane.grid.rows() as f32 * ch,
             ];
             for (img, row) in pane.grid.images() {
-                let x = pane.origin.0;
+                let x = pane.origin.0 + img.col as f32 * cw;
                 let y = pane.origin.1 + row as f32 * ch;
                 let w = img.cols as f32 * cw;
                 let h = img.rows as f32 * ch;
@@ -433,7 +441,7 @@ impl Renderer {
 
         // Upload/refresh image textures and build their quads before the pass;
         // resources cannot be created while a pass is recording.
-        self.prepare_images(device, queue, panes, screen);
+        self.prepare_images(device, queue, panes, overlay, screen);
         // Update the background's cover-crop scale (also a pre-pass write).
         self.background.prepare(queue, screen);
 
