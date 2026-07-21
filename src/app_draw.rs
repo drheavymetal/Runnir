@@ -82,18 +82,19 @@ impl Gpu {
                 focused: *focused,
                 cursor: (*focused && cursor_on && self.overlay.is_none()).then_some(shape),
                 search: if *focused { search } else { Default::default() },
+                transparent: false,
             })
             .collect();
 
         // The tab bar and any status chrome are grids too (built above), appended.
         for (grid, ox, oy) in &chrome {
-            panes.push(PaneDraw { grid, selection: None, origin: (*ox, *oy), tint: None, focused: true, cursor: None, search: Default::default() });
+            panes.push(PaneDraw { grid, selection: None, origin: (*ox, *oy), tint: None, focused: true, cursor: None, search: Default::default(), transparent: false });
         }
         if let Some((grid, ox, oy)) = &status_holder {
-            panes.push(PaneDraw { grid, selection: None, origin: (*ox, *oy), tint: None, focused: true, cursor: None, search: Default::default() });
+            panes.push(PaneDraw { grid, selection: None, origin: (*ox, *oy), tint: None, focused: true, cursor: None, search: Default::default(), transparent: false });
         }
         if let Some((grid, ox, oy)) = &whichkey_holder {
-            panes.push(PaneDraw { grid, selection: None, origin: (*ox, *oy), tint: None, focused: true, cursor: None, search: Default::default() });
+            panes.push(PaneDraw { grid, selection: None, origin: (*ox, *oy), tint: None, focused: true, cursor: None, search: Default::default(), transparent: false });
         }
 
         // Sticky prompt: while scrolled back, pin the focused command's prompt line
@@ -112,7 +113,7 @@ impl Gpu {
                 })
             });
         if let Some((grid, ox, oy)) = &sticky_holder {
-            panes.push(PaneDraw { grid, selection: None, origin: (*ox, *oy), tint: None, focused: true, cursor: None, search: Default::default() });
+            panes.push(PaneDraw { grid, selection: None, origin: (*ox, *oy), tint: None, focused: true, cursor: None, search: Default::default(), transparent: false });
         }
 
         // Hint labels annotate the focused pane, drawn as a top chrome grid. The
@@ -124,7 +125,9 @@ impl Gpu {
             .find(|(id, ..)| *id == focus)
             .and_then(|(_, _, grid, ..)| self.build_hints(area, cell, focus, grid));
         if let Some((grid, ox, oy)) = &hint_grid {
-            panes.push(PaneDraw { grid, selection: None, origin: (*ox, *oy), tint: None, focused: true, cursor: None, search: Default::default() });
+            // Transparent: the labels point AT the output, so the output has to stay
+            // readable underneath them.
+            panes.push(PaneDraw { grid, selection: None, origin: (*ox, *oy), tint: None, focused: true, cursor: None, search: Default::default(), transparent: true });
         }
 
         // Status toast (e.g. "whispering…"), centred near the top, with a spinner
@@ -144,7 +147,7 @@ impl Gpu {
             (g, x.max(0.0), y.max(0.0))
         });
         if let Some((grid, ox, oy)) = &toast {
-            panes.push(PaneDraw { grid, selection: None, origin: (*ox, *oy), tint: None, focused: true, cursor: None, search: Default::default() });
+            panes.push(PaneDraw { grid, selection: None, origin: (*ox, *oy), tint: None, focused: true, cursor: None, search: Default::default(), transparent: false });
         }
 
         // The search bar draws as chrome (undimmed) so matches stay visible.
@@ -161,7 +164,7 @@ impl Gpu {
             _ => None,
         };
         if let Some((grid, ox, oy)) = &search_bar {
-            panes.push(PaneDraw { grid, selection: None, origin: (*ox, *oy), tint: None, focused: true, cursor: None, search: Default::default() });
+            panes.push(PaneDraw { grid, selection: None, origin: (*ox, *oy), tint: None, focused: true, cursor: None, search: Default::default(), transparent: false });
         }
 
         // Overlay panels, on a dimmed backdrop.
@@ -178,6 +181,7 @@ impl Gpu {
                     focused: true,
                     cursor: None,
                     search: Default::default(),
+                    transparent: false,
                 })
                 .collect(),
         });
@@ -596,8 +600,9 @@ impl Gpu {
         let cols = (rect.w / cw).floor().max(1.0) as usize;
         let rows = (rect.h / ch).floor().max(1.0) as usize;
         let mut grid = Grid::new(cols, rows);
-        // Transparent-ish base: draw only labels, over a faint dim done by the
-        // label cells themselves.
+        // Every cell stays blank with a default background, which the renderer skips
+        // for a `transparent` layer (see `PaneDraw::transparent`). Only the label
+        // cells below emit anything, so the pane reads normally behind them.
         grid.fill(Pen { bg: Color::Default, ..Pen::default() });
 
         for hint in &h.hints {

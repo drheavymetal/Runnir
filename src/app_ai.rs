@@ -325,10 +325,11 @@ impl Gpu {
     }
 
     fn open_hints(&mut self) {
+        let branches = self.focused_branches();
         let hints = {
             let pane = self.tab().focused();
             let grid = pane.grid.lock().unwrap();
-            hints::find(&grid)
+            hints::find(&grid, &hints::Context { branches: &branches })
         };
         if hints.is_empty() {
             return; // Nothing to point at; do not enter a mode with no targets.
@@ -336,9 +337,27 @@ impl Gpu {
         self.overlay = Some(Overlay::Hints(overlay::Hints::new(hints)));
     }
 
-    fn act_on_hint(&mut self, text: String, kind: overlay::HintKind) {
-        if let Some(copied) = hints::act(&text, kind) {
-            self.set_clipboard(copied);
+    /// Local branches of the focused pane's repository, from the status worker's
+    /// cache. Empty outside a repository, or before the first status has come back —
+    /// hint mode then simply has no branch targets, which is right: claiming one
+    /// before the refs have been read would be a guess.
+    fn focused_branches(&self) -> Vec<String> {
+        self.tabs[self.active]
+            .focused_ref()
+            .cwd()
+            .and_then(|p| crate::git::repo_root(&p))
+            .and_then(|root| self.git_state.get(&root))
+            .map(|s| s.branches.clone())
+            .unwrap_or_default()
+    }
+
+    fn act_on_hint(&mut self, text: String, kind: overlay::HintKind, alt: bool, config: &Config) {
+        match hints::act(&text, kind, alt) {
+            hints::HintAct::Copy(t) => self.set_clipboard(t),
+            hints::HintAct::Done => {}
+            // Runs in the pane's own directory, which is what makes a bare
+            // `git show <sha>` resolve at all.
+            hints::HintAct::Split(cmd) => self.split_running(config, cmd),
         }
     }
 }

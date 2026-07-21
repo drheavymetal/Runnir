@@ -672,6 +672,38 @@ tests, so the format is covered without needing a repository in the test run. No
 which is what it is. Conflicts (`u`) are counted apart from dirt: they need
 resolving, not committing.
 
+## 2026-07-21 — Git step 3 (T2): hints become git objects, and stop hiding the screen
+
+Hint mode already found hashes and only knew how to copy them. Now:
+
+- **Branches are recognised by NAME, never by shape.** `hints::Context` carries the
+  repo's local branches, snapshotted from the status worker's cache (`git.rs`
+  gained `local_branches`, which reads `refs/heads` + `packed-refs` — files, no
+  subprocess). `main`, `dev` and `wip` are ordinary English words; guessing them
+  would put a label on half the prose on screen. A token is a branch only if the
+  repo has one by exactly that name, and the branch reading wins over the hex one
+  for a token like `deadbeef` that could be either.
+- **Repo-relative paths** (`src/main.rs`, `src/main.rs:412:7`) are hints now, which
+  is how git and every compiler name a file. No filesystem check: `find` runs on
+  every mouse move for the hover underline, and a stat storm per motion is not worth
+  it. The shape carries it — separator, real extension, ordinary first character —
+  and a test pins the near-misses that must NOT match (`21/07/2026`, `+2/-1`,
+  `he/him`).
+- **UPPER CASE label = the alternate action.** Lower case is the old behaviour
+  (copy, or open a URL); shifted is "show me this": `git show` for a hash, `git log
+  --graph` for a branch, `$EDITOR +line` for a path. A test asserts every command
+  reachable this way is read-only — a hint is one keystroke on a target picked by
+  sight, so a mistyped label must never be able to move a branch.
+
+**Bug found while verifying, older than this work: hint mode blanked the pane.**
+`build_hints` fills a pane-sized grid with `Color::Default` and draws labels into
+it, commented "transparent-ish". It never was: the renderer emits an instance for
+every non-spacer cell, and a blank cell with a default background paints the pane
+background over whatever is beneath. So the labels covered the very output they
+point at. `PaneDraw.transparent` (new) makes the instance loop skip blank
+default-background cells, and only the hint layer sets it. Screenshot before/after
+is the only way this shows up — no test renders.
+
 ## Gotchas (do not re-learn)
 
 - A binding spec and a keypress must produce the SAME `ChordKey` variant.
@@ -697,6 +729,10 @@ resolving, not committing.
 - Claude Code does not probe for the kitty keyboard protocol. Terminal-side protocol
   support alone is not enough; the legacy encoding has to carry Shift+Enter as ESC-CR.
 
+- A grid drawn on top of a pane is OPAQUE, even where it looks empty: every
+  non-spacer cell emits an instance, and a blank cell with `Color::Default` paints
+  the pane background. An annotation layer must set `PaneDraw.transparent`, or it
+  hides what it annotates.
 - A scratch `XDG_CONFIG_HOME` does NOT isolate a test instance. `session.rs` writes to
   `dirs::data_dir()` (`~/.local/share/runnir/session.json`) while `project_session.rs`
   uses `dirs::config_dir()`, so a "clean" instance restores the real session and

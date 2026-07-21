@@ -111,7 +111,7 @@ impl Gpu {
         if state == ElementState::Pressed
             && button == MouseButton::Left
             && mods.control_key()
-            && self.open_hover()
+            && self.open_hover(config)
         {
             return;
         }
@@ -872,9 +872,9 @@ impl Gpu {
                         match h.input(c) {
                             overlay::HintResult::More => {}
                             overlay::HintResult::NoMatch => self.overlay = None,
-                            overlay::HintResult::Chosen(text, kind) => {
+                            overlay::HintResult::Chosen(text, kind, alt) => {
                                 self.overlay = None;
-                                self.act_on_hint(text, kind);
+                                self.act_on_hint(text, kind, alt, config);
                             }
                         }
                     }
@@ -1702,6 +1702,9 @@ impl Gpu {
     fn update_hover(&mut self, pos: PhysicalPosition<f64>) -> bool {
         let prev = self.hover_url.clone();
         self.hover_url = None;
+        // Taken before the grid lock below: `focused_branches` reads the pane list,
+        // and holding a grid mutex across that is how a deadlock starts.
+        let branches = self.focused_branches();
         if self.overlay.is_none() {
             let area = self.active_area();
             if let Some((id, rect)) = self.pane_at(pos, area) {
@@ -1720,7 +1723,7 @@ impl Gpu {
                         });
                         return self.hover_url != prev;
                     }
-                    for h in crate::hints::find(&grid) {
+                    for h in crate::hints::find(&grid, &crate::hints::Context { branches: &branches }) {
                         // Display width (not char count): a wide glyph spans two grid
                         // cells, so the underline and hit-zone must too.
                         let len = unicode_width::UnicodeWidthStr::width(h.text.as_str()).max(1);
@@ -1744,13 +1747,18 @@ impl Gpu {
 
     /// Acts on the hovered URL/path if the pointer is over one: opens a URL in the
     /// browser, copies a path or hash. Returns whether it consumed the click.
-    fn open_hover(&mut self) -> bool {
+    fn open_hover(&mut self, config: &Config) -> bool {
         // Recompute against the pointer's current position first: a keyboard tab
         // switch or a scroll can leave a stale target under the old coordinates.
         self.update_hover(self.cursor_px);
         let Some(h) = self.hover_url.clone() else { return false };
-        if let Some(text) = crate::hints::act(&h.text, h.kind) {
-            self.set_clipboard(text);
+        // Ctrl+click always takes the plain action. The alternate one is reachable
+        // from hint mode, where a shifted label says so explicitly; a click cannot
+        // carry that intent without stealing another modifier chord.
+        match crate::hints::act(&h.text, h.kind, false) {
+            crate::hints::HintAct::Copy(text) => self.set_clipboard(text),
+            crate::hints::HintAct::Done => {}
+            crate::hints::HintAct::Split(cmd) => self.split_running(config, cmd),
         }
         true
     }

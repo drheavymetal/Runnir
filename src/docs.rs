@@ -268,6 +268,19 @@ Only a bare Enter at
 the live prompt is guarded, so editing history and full-screen apps are untouched.
 Turn it off with behaviour.command_guardian = false.
 
+# Hint mode knows git
+
+Hint mode (Ctrl+Shift+Space, or Leader I) labels every URL, path and commit hash on
+screen, and in a repository it also labels branch names - by name, against the real
+ref list, so only a branch this repo actually has is a target. Paths git prints
+relatively (src/main.rs, and src/main.rs:412 from a compiler) are labelled too.
+
+Type the label in lower case for the plain action: copy, or open for a URL. Type it
+in UPPER CASE for the alternate one, which shows you the thing in a split - a hash
+opens git show, a branch its log, a path opens in your editor at that line, and a
+URL is copied instead of opened. Everything on the shifted key only reads: a
+mistyped label can never move a branch or touch the working tree.
+
 # Repository state in the status bar
 
 In a git repository the status bar shows the branch, then only what is not clean:

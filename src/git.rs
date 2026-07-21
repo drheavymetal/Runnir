@@ -37,6 +37,10 @@ pub struct RepoState {
     pub ahead: usize,
     pub behind: usize,
     pub upstream: bool,
+    /// Local branch names, so hint mode can tell a branch from any other word on
+    /// the screen. Read from the refs, never guessed: a token is a branch only if
+    /// this repository actually has a branch by that name.
+    pub branches: Vec<String>,
 }
 
 impl RepoState {
@@ -78,6 +82,52 @@ pub fn head_branch(dir: &Path) -> Option<String> {
     })
 }
 
+/// Local branch names, from `.git/refs/heads` plus `.git/packed-refs`. No git
+/// process: refs are files, and a repository that has just been cloned keeps most
+/// of them packed, which is why both sources are read.
+///
+/// Capped, because a repository with thousands of branches would otherwise make
+/// every hint-mode scan walk them all.
+pub fn local_branches(root: &Path) -> Vec<String> {
+    const CAP: usize = 512;
+    let mut out = Vec::new();
+    let heads = root.join(".git/refs/heads");
+    walk_refs(&heads, &heads, &mut out, CAP);
+    if let Ok(packed) = std::fs::read_to_string(root.join(".git/packed-refs")) {
+        for line in packed.lines() {
+            if line.starts_with('#') || line.starts_with('^') {
+                continue;
+            }
+            if let Some(name) = line.split_whitespace().nth(1).and_then(|r| r.strip_prefix("refs/heads/")) {
+                if out.len() >= CAP {
+                    break;
+                }
+                out.push(name.to_string());
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Recurses `refs/heads`, since a branch called `feature/x` is a directory and a
+/// file, not a file with a slash in its name.
+fn walk_refs(base: &Path, dir: &Path, out: &mut Vec<String>, cap: usize) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for e in entries.flatten() {
+        if out.len() >= cap {
+            return;
+        }
+        let path = e.path();
+        if path.is_dir() {
+            walk_refs(base, &path, out, cap);
+        } else if let Ok(rel) = path.strip_prefix(base) {
+            out.push(rel.to_string_lossy().replace('\\', "/"));
+        }
+    }
+}
+
 /// Runs `git status` in `dir` and parses it. Blocking — call this on a worker.
 pub fn read_state(dir: &Path) -> Option<RepoState> {
     let out = std::process::Command::new("git")
@@ -93,7 +143,13 @@ pub fn read_state(dir: &Path) -> Option<RepoState> {
     if !out.status.success() {
         return None;
     }
-    Some(parse_porcelain_v2(&String::from_utf8_lossy(&out.stdout)))
+    let mut state = parse_porcelain_v2(&String::from_utf8_lossy(&out.stdout));
+    // Collected on the same worker: it is file I/O, and the caller is already off
+    // the UI thread here.
+    if let Some(root) = repo_root(dir) {
+        state.branches = local_branches(&root);
+    }
+    Some(state)
 }
 
 /// Parses `git status --porcelain=v2 --branch`. Kept pure and separate from the

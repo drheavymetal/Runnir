@@ -1097,26 +1097,35 @@ pub enum HintKind {
     Url,
     Path,
     Hash,
+    /// A local branch of the pane's repository. Recognised by name against the real
+    /// ref list, never by shape — see `hints::Context`.
+    Branch,
 }
 
 pub struct Hints {
     pub hints: Vec<Hint>,
     pub typed: String,
+    /// Set when any character of the label was typed in upper case, which asks for
+    /// the alternate action ("show me this" rather than "copy this"). Sticky across
+    /// a two-character label, so `Ab` and `aB` both mean the same thing — a shift
+    /// held for one key of a chord is not a different intent.
+    alt: bool,
 }
 
 impl Hints {
     pub fn new(hints: Vec<Hint>) -> Self {
-        Self { hints, typed: String::new() }
+        Self { hints, typed: String::new(), alt: false }
     }
 
     pub fn input(&mut self, c: char) -> HintResult {
+        self.alt |= c.is_uppercase();
         self.typed.push(c.to_ascii_lowercase());
         let matches: Vec<&Hint> =
             self.hints.iter().filter(|h| h.label.starts_with(&self.typed)).collect();
         match matches.as_slice() {
             [] => HintResult::NoMatch,
             [only] if only.label == self.typed => {
-                HintResult::Chosen(only.text.clone(), only.kind)
+                HintResult::Chosen(only.text.clone(), only.kind, self.alt)
             }
             _ => HintResult::More,
         }
@@ -1126,7 +1135,8 @@ impl Hints {
 pub enum HintResult {
     More,
     NoMatch,
-    Chosen(String, HintKind),
+    /// The chosen target, its kind, and whether the alternate action was asked for.
+    Chosen(String, HintKind, bool),
 }
 
 /// Two-letter labels from a home-row alphabet, enough for ~600 targets, assigned
@@ -1255,7 +1265,18 @@ mod tests {
             Hint { label: "s".into(), abs_row: 1, col: 0, text: "y".into(), kind: HintKind::Path },
         ];
         let mut h = Hints::new(hints);
-        assert!(matches!(h.input('a'), HintResult::Chosen(_, _)));
+        assert!(matches!(h.input('a'), HintResult::Chosen(_, _, false)));
+
+        // The same label typed shifted asks for the alternate action instead.
+        let hints = vec![Hint {
+            label: "a".into(),
+            abs_row: 0,
+            col: 0,
+            text: "x".into(),
+            kind: HintKind::Hash,
+        }];
+        let mut h = Hints::new(hints);
+        assert!(matches!(h.input('A'), HintResult::Chosen(_, _, true)));
     }
 
     #[test]

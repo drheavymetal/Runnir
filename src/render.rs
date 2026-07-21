@@ -112,6 +112,13 @@ pub struct PaneDraw<'a> {
     /// Search matches to highlight: absolute `(row, col)` starts, the match length,
     /// and which one is current. Empty when not searching.
     pub search: SearchHighlight<'a>,
+    /// Drop cells that are blank with a default background instead of drawing them.
+    ///
+    /// A grid drawn on top of a pane is otherwise opaque everywhere: a blank cell
+    /// still emits an instance filled with the pane background, so an annotation
+    /// layer covering the pane hides everything it was meant to annotate. Set for
+    /// the hint layer, which is a handful of labels over live output.
+    pub transparent: bool,
 }
 
 /// Search highlight data for a pane. Cheap to pass empty.
@@ -646,6 +653,13 @@ impl Renderer {
                 if cell.is_spacer() {
                     continue;
                 }
+                // An annotation layer draws only its own marks; everywhere else the
+                // pane below has to show through. Without this a blank cell still
+                // emits a background-filled quad, and a full-pane hint grid hides
+                // exactly the output it is labelling.
+                if pane.transparent && cell.ch == ' ' && matches!(cell.pen.bg, Color::Default) {
+                    continue;
+                }
                 let mut fg = self.resolve(cell.pen.fg, base_bg, true);
                 // A default background uses the pane's (possibly tinted) base; any
                 // explicit colour resolves normally.
@@ -868,6 +882,7 @@ pub fn offscreen_scene(
                 focused: *focused,
                 cursor: focused.then_some(crate::config::CursorShape::Block),
                 search: Default::default(),
+                transparent: false,
             })
             .collect();
         let overlay = overlay_specs.as_ref().map(|panels| Overlay {
@@ -882,6 +897,7 @@ pub fn offscreen_scene(
                     focused: true,
                     cursor: None,
                     search: Default::default(),
+                    transparent: false,
                 })
                 .collect(),
         });
@@ -988,6 +1004,7 @@ pub fn offscreen(path: &str, cmd: &str, font_px: f32, delay_ms: Option<u64>) {
             focused: true,
             cursor: Some(crate::config::CursorShape::Block),
             search: Default::default(),
+            transparent: false,
         }];
         renderer.render(
             &device,
