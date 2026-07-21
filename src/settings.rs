@@ -81,7 +81,7 @@ pub fn rows() -> Vec<Row> {
         row!("Behaviour", "Context tint", ContextTint, Bool),
         row!("Behaviour", "Notify after (s)", NotifyAfter, Int),
         row!("Behaviour", "Confirm close", ConfirmClose, Bool),
-        row!("Behaviour", "Restore session", RestoreSession, Bool),
+        row!("Behaviour", "Restore last closed window", RestoreSession, Bool),
         row!("Behaviour", "Command guardian", CommandGuardian, Bool),
         row!("Behaviour", "Smooth scroll", SmoothScroll, Bool),
         row!("Explorer", "Side", ExplorerSide, Enum),

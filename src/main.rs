@@ -820,10 +820,18 @@ impl App {
 
         let cell = renderer.cell_size();
 
+        // Is another runnir already on screen? Asked once, here, and used for both
+        // reading and clearing the snapshot below: the window you closed belongs to
+        // the next window you open, not to one opened beside a live one.
+        let another_window = control::another_instance_running();
+
         // Restore, in order of precedence:
         //   1. this project's saved layout (opt-in `session_restore`), keyed by the
-        //      nearest git ancestor of the launch cwd — layout + cwd only;
-        //   2. otherwise the previous whole-window session (`restore_session`);
+        //      nearest git ancestor of the launch cwd — layout + cwd only. This one
+        //      is a TEMPLATE you saved on purpose, so a second window in the same
+        //      project gets it too;
+        //   2. otherwise the previous whole-window session (`restore_session`), and
+        //      only when this is the only window running;
         //   3. otherwise a single fresh tab.
         // The project layout is turned into a `session::Session` so the same
         // `restore_tabs` / `Tab::from_session` rebuild path serves all cases.
@@ -838,12 +846,12 @@ impl App {
         let restored = match project {
             Some(entry) => Some(entry.to_session()),
             None => {
-                let saved = self
-                    .config
-                    .behaviour
-                    .restore_session
-                    .then(session::Session::load)
-                    .flatten();
+                let saved = session::should_restore(
+                    self.config.behaviour.restore_session,
+                    another_window,
+                )
+                .then(session::Session::load)
+                .flatten();
                 if saved.is_some() {
                     // Consume the whole-window snapshot so a later crash cannot
                     // restore a stale one; the project store is left intact.
@@ -1216,7 +1224,13 @@ impl ApplicationHandler<UserEvent> for App {
             // Every shell exited: an intentional close. Clear the session so the
             // next launch starts fresh rather than restoring a dead layout — and
             // so this does not overwrite a good autosave with an empty state.
-            session::Session::clear();
+            //
+            // Unless another window is still open: the snapshot on disk is then
+            // ITS layout, kept for when it closes, and this window was never the
+            // one that owned it.
+            if !control::another_instance_running() {
+                session::Session::clear();
+            }
             event_loop.exit();
             return;
         }

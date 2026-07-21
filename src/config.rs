@@ -240,8 +240,15 @@ pub struct Behaviour {
     /// Zero disables.
     pub notify_after_secs: u64,
     pub confirm_close: bool,
-    /// Reopen the previous session (tabs, layout, working dirs, scrollback text)
-    /// on start. The processes do not survive — only the layout and history do.
+    /// Restore the window you closed last, when this is the only window running.
+    ///
+    /// The snapshot (tabs, layout, directories, scrollback) belongs to the NEXT
+    /// window you open, not to one opened beside a live one: a second window
+    /// inheriting the layout of a window still on screen is a copy nobody asked
+    /// for. Off means every launch starts with one fresh tab.
+    ///
+    /// Saving a layout on purpose is a different thing and is not affected by this:
+    /// see `session_restore` for per-project layouts.
     pub restore_session: bool,
     /// Guard dangerous commands: when the command line about to run matches a known
     /// destructive pattern (rm -rf /, dd of=, mkfs, DROP TABLE, git push -f, fork

@@ -304,6 +304,40 @@ pub fn socket_path() -> PathBuf {
     runtime_dir().join(format!("runnir-{}.sock", std::process::id()))
 }
 
+/// Whether another runnir is ALIVE on this machine right now.
+///
+/// Used to decide whether this window is the first one — a second window must not
+/// inherit the layout of one that is still open. Only a socket that accepts a
+/// connection counts: a crashed instance leaves its file behind, and a stale file
+/// must not make a fresh window believe it is the second one.
+///
+/// Our own socket is already bound by the time this runs (the listener starts
+/// before the window), so it is skipped by path.
+pub fn another_instance_running() -> bool {
+    let me = socket_path();
+    let Ok(dir) = std::fs::read_dir(runtime_dir()) else { return false };
+    for entry in dir.flatten() {
+        let path = entry.path();
+        if path == me {
+            continue;
+        }
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !(name.starts_with("runnir-") && name.ends_with(".sock")) {
+            continue;
+        }
+        if UnixStream::connect(&path).is_ok() {
+            return true;
+        }
+        // Nobody is listening: the file is what a crashed instance left behind.
+        // Swept here because this is the one place that already pays for the
+        // connect, and a runtime directory full of corpses is what made the client
+        // aim at one.
+        let _ = std::fs::remove_file(&path);
+    }
+    false
+}
+
 /// Finds the newest live-looking runnir socket in the runtime dir, for a client that
 /// has no `RUNNIR_LISTEN` to go on (e.g. run from a different terminal).
 fn discover_socket() -> Option<PathBuf> {
@@ -312,6 +346,12 @@ fn discover_socket() -> Option<PathBuf> {
         let name = entry.file_name();
         let name = name.to_string_lossy();
         if !(name.starts_with("runnir-") && name.ends_with(".sock")) {
+            continue;
+        }
+        // The newest socket that ANSWERS, not the newest file. A crashed instance
+        // leaves its file behind, and picking it by date alone aimed the client at
+        // a corpse — "connection refused" instead of the terminal next to it.
+        if UnixStream::connect(entry.path()).is_err() {
             continue;
         }
         let Ok(mtime) = entry.metadata().and_then(|m| m.modified()) else { continue };
@@ -465,6 +505,26 @@ fn send_request(path: &std::path::Path, req: &ControlRequest) -> std::io::Result
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_stale_socket_file_is_not_another_instance() {
+        // A crashed runnir leaves its socket FILE behind. If a leftover file counted
+        // as a live window, every launch after a crash would start clean and the
+        // layout would be lost exactly when it is most wanted.
+        let dir = std::env::temp_dir().join(format!("runnir-live-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let stale = dir.join("runnir-999999.sock");
+        std::fs::write(&stale, b"").unwrap();
+        // Not a socket at all, and nothing is listening: connecting must fail.
+        assert!(UnixStream::connect(&stale).is_err());
+
+        // A real listener in the same directory does answer.
+        let live = dir.join("runnir-1.sock");
+        let _listener = UnixListener::bind(&live).unwrap();
+        assert!(UnixStream::connect(&live).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     use super::*;
 
     #[test]

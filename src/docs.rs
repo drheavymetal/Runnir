@@ -444,6 +444,22 @@ log tail and a monitor untouched. With no members, broadcast covers every pane.
 @ Ctrl+Shift+U     bring back the last tab you closed, with its layout, working
                    directories and scrollback — like a browser's reopen-closed-tab.
 
+# The window you closed last
+
+With behaviour.restore_session on (the default), runnir remembers the window you
+closed - tabs, split layout, each pane's directory and its scrollback - and gives it
+back to the next window you open. The processes do not come back; the shells are
+relaunched where they were, with the saved output above them as inert history.
+
+It applies only when this is the ONLY window running. A second runnir opened beside
+a live one starts clean, because inheriting the layout of a window that is still on
+screen is a copy nobody asked for. Every terminal draws this line somewhere: tmux
+attaches to a session by name, kitty applies a template you wrote rather than a
+snapshot, Windows Terminal restores only its first window.
+
+Turn it off (behaviour.restore_session = false) and every launch starts with one
+fresh tab. Saving a layout deliberately is a separate thing - see below.
+
 # Per-project sessions
 
 runnir can remember the pane and tab layout you last used in a project and rebuild
@@ -458,7 +474,9 @@ Restore session for this project rebuilds them in fresh tabs, each shell reopene
 its recorded directory.
 
 Set behaviour.session_restore = true to rebuild the saved layout automatically when
-you launch runnir inside that project. Add behaviour.session_auto_save = true to also
+you launch runnir inside that project. This one is a TEMPLATE you saved on purpose,
+so a second window opened in the same project gets it too - unlike the snapshot of
+the window you closed, which only the first window takes. Add behaviour.session_auto_save = true to also
 save it on exit, closing the loop with no keystroke at all. Both are off by default.
 The store keeps the 50 most recently saved projects in a small file at
 ~/.config/runnir/sessions.json, written atomically.

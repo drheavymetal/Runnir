@@ -51,6 +51,20 @@ pub struct PaneState {
     pub scrollback: Vec<String>,
 }
 
+/// Whether this launch should restore the previous window's snapshot.
+///
+/// The snapshot is of the window you CLOSED, so it belongs to the next window you
+/// open when nothing else is running. A second window opened beside a live one
+/// starts clean instead: inheriting the layout of a window that is still on screen
+/// is a copy nobody asked for, and it is what every other terminal avoids — tmux
+/// attaches by name, kitty applies a template you wrote, Windows Terminal restores
+/// only its FIRST window.
+///
+/// Pure so the rule is testable; the liveness check is the caller's.
+pub fn should_restore(enabled: bool, another_window_open: bool) -> bool {
+    enabled && !another_window_open
+}
+
 const VERSION: u32 = 1;
 /// Lines of scrollback kept per pane in the session file. A hard cap so a session
 /// file cannot grow without bound from a pane that scrolled for hours.
@@ -140,6 +154,17 @@ impl Session {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_second_window_opened_beside_a_live_one_starts_clean() {
+        // The snapshot is of the window you CLOSED. It belongs to the next window
+        // you open when nothing else is running — inheriting the layout of a
+        // window that is still on screen is the copy nobody asked for.
+        assert!(should_restore(true, false), "only window, setting on: restore");
+        assert!(!should_restore(true, true), "another window is open: start clean");
+        assert!(!should_restore(false, false), "setting off: always clean");
+        assert!(!should_restore(false, true));
+    }
+
     use super::*;
     use crate::layout::Axis;
 

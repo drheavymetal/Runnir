@@ -1399,6 +1399,52 @@ context drawn as down with its reason, images/volumes/networks, logs (500 lines,
 unwrapped from the daemon's 8-byte stream framing), inspect, then stop / start /
 remove of a throwaway container including the confirm and its "no".
 
+## 2026-07-22 - A second window no longer copies the panes of a live one
+
+Reported from use: open runnir, open a second one, and the second comes up with the
+first one's tabs. The cause is three lines apart in the code — `restore_session` is
+on by default (`config.rs`), every instance autosaves the whole window to ONE file
+every 30 seconds (`main.rs`), and every instance loads that file on start. There was
+no notion of who OWNS that snapshot.
+
+**The rule now**: the snapshot is of the window you CLOSED, and it belongs to the
+next window you open **when nothing else is running**. A second window opened beside
+a live one starts clean. Every terminal draws this line somewhere and none of them
+draw it where runnir did: tmux attaches to a session by name and keeps the state in
+a server rather than a file; kitty applies a `startup_session` TEMPLATE you wrote,
+never a snapshot of a previous run; Windows Terminal's setting is literally called
+`firstWindowPreference`; iTerm2's arrangements are named and explicit. The common
+shape is that a snapshot restores once, and what applies to every window is a
+template someone wrote on purpose.
+
+The liveness check needed no new machinery: every instance already binds
+`$XDG_RUNTIME_DIR/runnir-<pid>.sock` for the remote control, so
+`control::another_instance_running()` connects to each one and only a socket that
+ANSWERS counts. A crashed instance leaves its file behind, and a stale file must not
+convince a fresh window that it is the second one — which would lose the layout
+exactly when it is most wanted.
+
+The same check gates the CLEAR on exit: closing a window that never owned the
+snapshot must not wipe the layout of one still on screen.
+
+Per-project sessions (`session_restore`, opt-in, keyed by the repo) are deliberately
+untouched: that one is a template you saved on purpose, so a second window in the
+same project should get it too.
+
+**Two bugs found while verifying it**, both in the socket directory:
+- `discover_socket` picked the newest socket FILE by date without checking that
+  anything answered, so the `runnir @` client aimed at a corpse whenever a previous
+  instance had crashed. It now picks the newest one that connects.
+- Nothing ever swept the dead files; there were 17 of them here. The sweep happens
+  in `another_instance_running`, which is the one place that already pays for the
+  connect.
+
+Verified with real windows: window 1 with two tabs autosaves; window 2 opens beside
+it with ONE tab and leaves the snapshot untouched. The restore-when-truly-alone half
+could not be verified end to end on this machine because a runnir of Pedro's is
+always running — and overriding `XDG_RUNTIME_DIR` to isolate one is not a way out:
+the Wayland display socket lives there, so the window fails to open at all.
+
 ## 2026-07-21 - The panel leaders reach git's level, and the site catches up
 
 Two things the day was missing: the new panels' leader layers were thinner than the
