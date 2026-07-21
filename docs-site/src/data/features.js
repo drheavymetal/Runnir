@@ -704,13 +704,13 @@ export const FEATURES = [
     ],
   },
   {
-    key: 'theme-picker', section: 'appearance', status: 'dev',
+    key: 'theme-picker', section: 'appearance', status: 'shipped',
     title: { es: 'Selector de temas con vista previa', en: 'Theme picker with live preview' },
     natural: {
-      es: 'Un selector con 20-30 temas incorporados y vista previa en vivo: recorres la lista y ves cada tema aplicado al momento antes de quedarte con uno.',
-      en: 'A picker with 20-30 built-in themes and live preview: scroll the list and see each theme applied on the spot before you settle on one.',
+      es: 'Un selector con 74 temas incorporados y vista previa en vivo: escribes para filtrar, recorres la lista y ves cada tema aplicado al momento. Cada fila lleva una tira con su paleta. Enter lo guarda en el config, Esc restaura el que tenías.',
+      en: 'A picker with 74 built-in themes and live preview: type to filter, scroll the list and see each theme applied on the spot. Every row carries a strip of its palette. Enter saves it to the config, Esc restores the one you had.',
     },
-    note: { es: 'En desarrollo. Hoy los colores se ajustan en theme.* del config.', en: 'In development. Today colors are set under theme.* in the config.' },
+    note: { es: 'Leader O T, o "Theme picker" en la paleta. Las familias completas están: Catppuccin, Tokyo Night, Gruvbox, Rosé Pine, Kanagawa, Nightfox, Everforest, Ayu, Flexoki, Modus, Selenized.', en: 'Leader O T, or "Theme picker" in the palette. Whole families are bundled: Catppuccin, Tokyo Night, Gruvbox, Rosé Pine, Kanagawa, Nightfox, Everforest, Ayu, Flexoki, Modus, Selenized.' },
   },
   {
     key: 'tab-icons', section: 'appearance', status: 'shipped',

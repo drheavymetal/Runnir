@@ -576,6 +576,43 @@ Not visually verified: `render::offscreen` (and `--demo`) hardcode
 `Theme::default()`, so no headless mode can render a builtin. Only the picker's live
 preview shows it.
 
+## 2026-07-21 — 45 more themes, and where a palette can honestly come from
+
+Pedro: "tenemos pocos". 29 builtins → **74**. Chosen against what people actually
+run (dotfyle's install counts for 2026: tokyonight, catppuccin, kanagawa, rose-pine,
+nightfox, onedark, gruvbox-material, github, everforest; plus the light half, which
+was thin — 8 of the old 29).
+
+Palettes are NOT typed from memory. They come from `mbadolato/iTerm2-Color-Schemes`,
+which keeps a kitty `.conf` per scheme generated from each project's published
+colours; `curl` + a 40-line generator emitted the Rust rows, so a hex digit cannot
+drift on the way in.
+
+Two fields cannot come from that source and were filled per theme by hand:
+- **selection.** Those ports set `selection_background` to the FOREGROUND, because
+  kitty renders a selection as reverse video. runnir's `Theme.selection` is a real
+  background, so copying it would paint a bright block over the text. Each theme's
+  own published selection/visual colour is used instead.
+- **accent.** A terminal palette has no notion of "the colour this project puts on
+  its links and highlights", which is what runnir draws its tab bar, palette and
+  panels with. Picked per theme (Catppuccin → mauve, Poimandres → mint, Srcery →
+  amber, and so on).
+`colour8` is NOT a safe stand-in for either: in Poimandres it equals the foreground,
+in Melange Light it is nearly the background.
+
+The picker needed no change — it already scrolls (`scroll = cursor - (visible - 1)`,
+12 rows) and fuzzy-filters, so 74 entries behave like 29. Verified by driving a real
+instance: leader `o t` opened it, typing `oxo` narrowed to Oxocarbon with its swatch
+strip. That run used a scratch `XDG_DATA_HOME` as well as `XDG_CONFIG_HOME` — see the
+session-file gotcha below.
+
+The test now also asserts selection/accent/dim differ from the background. A
+transcription slip that produces an invisible selection or a background-coloured tab
+bar is exactly the failure this class of change invites.
+
+Docs site was lying about this feature: `theme-picker` was `status: 'dev'`, claimed
+"20-30 temas" and told people colours are only set in the config. Corrected.
+
 ## Gotchas (do not re-learn)
 
 - A binding spec and a keypress must produce the SAME `ChordKey` variant.
@@ -601,6 +638,15 @@ preview shows it.
 - Claude Code does not probe for the kitty keyboard protocol. Terminal-side protocol
   support alone is not enough; the legacy encoding has to carry Shift+Enter as ESC-CR.
 
+- A scratch `XDG_CONFIG_HOME` does NOT isolate a test instance. `session.rs` writes to
+  `dirs::data_dir()` (`~/.local/share/runnir/session.json`) while `project_session.rs`
+  uses `dirs::config_dir()`, so a "clean" instance restores the real session and
+  overwrites it on exit. Set `XDG_DATA_HOME` too, and kill the instance with `kill -9`
+  rather than quitting it, until those two agree on a directory.
+- `dms screenshot window` captures whatever dms thinks is focused, which is not
+  necessarily the window you just focused with `hyprctl`. To shoot a specific window,
+  capture its output (`dms screenshot output -o <name>`) and crop to the geometry from
+  `hyprctl clients -j` with `magick -crop WxH+X+Y`.
 - Never ask wgpu for `Backends::all()` on a hybrid laptop. Enumerating GL wakes a
   runtime-suspended discrete GPU (~1.8s) even when you asked for `LowPower` —
   that preference only ranks adapters that were already enumerated.
