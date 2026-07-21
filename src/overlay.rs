@@ -99,7 +99,10 @@ impl Search {
         } else {
             format!(" {}/{}", self.current + 1, self.matches.len())
         };
-        let line = format!("/{}", self.query);
+        // Same rule as the prompt: the tail stays visible, because that is where
+        // the caret is.
+        let field = w.saturating_sub(count.chars().count() + 4);
+        let line = format!("/{}", field_view(&self.query, field));
         write(&mut g, 0, 1, &line, normal());
         write(&mut g, 0, 1 + line.chars().count(), " ", selected());
         write(&mut g, 0, w.saturating_sub(count.chars().count() + 1), &count, dim());
@@ -746,6 +749,26 @@ fn elide(s: &str, width: usize) -> String {
     let mut out: String = s.chars().take(width.saturating_sub(1)).collect();
     out.push('\u{2026}');
     out
+}
+
+
+/// The visible window of a single-line input field that is wider than its box.
+///
+/// The caret always sits at the end of these fields (they take typing and
+/// backspace, never arrow keys), so the END is what has to stay visible: a field
+/// that clips the tail hides the character you just typed, which is the one thing a
+/// text input may never do. When text is cut, a leading ellipsis says so.
+pub fn field_view(text: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let n = text.chars().count();
+    if n <= width {
+        return text.to_string();
+    }
+    let keep = width.saturating_sub(1);
+    let tail: String = text.chars().skip(n - keep).collect();
+    format!("\u{2026}{tail}")
 }
 
 /// A grid plus where it sits, in cells.
@@ -1625,13 +1648,22 @@ impl Prompt {
 
     fn render(&self, cols: usize, rows: usize, theme: &Theme) -> Vec<Panel> {
         let visible = self.visible();
-        let w = (cols * 6 / 10).clamp(30, 70);
+        // The box grows with what is being typed, up to the window, and only then
+        // does the text scroll inside it. Both halves matter: a fixed box hides a
+        // long answer, and a box that only ever grows would be a modal wider than
+        // the screen.
+        let base = (cols * 6 / 10).clamp(30, 70);
+        let want = self.input.chars().count() + self.label.chars().count().min(20) + 8;
+        let w = base.max(want).min(cols.saturating_sub(4)).max(30);
         let list = visible.len().min(PROMPT_ROWS);
         let h = 3 + list;
         let mut g = panel_grid(w, h, theme);
 
-        write(&mut g, 0, 2, &self.label, accent());
-        let line = format!("> {}", self.input);
+        write(&mut g, 0, 2, &field_view(&self.label, w.saturating_sub(4)), accent());
+        // Room for "> ", the caret cell and a right margin.
+        let field = w.saturating_sub(6);
+        let shown = field_view(&self.input, field);
+        let line = format!("> {shown}");
         write(&mut g, 1, 2, &line, normal());
         write(&mut g, 1, 2 + line.chars().count(), " ", selected());
 
@@ -1908,6 +1940,42 @@ mod tests {
         assert!(labels.iter().all(|l| l.len() == 2), "past the alphabet all are 2 chars");
         let set: std::collections::HashSet<_> = labels.iter().collect();
         assert_eq!(set.len(), 200, "labels must be unique");
+    }
+
+    #[test]
+    fn a_long_prompt_keeps_the_end_of_what_you_typed_visible() {
+        // The caret sits at the end of these fields, so the end is what must stay
+        // on screen — clipping the tail hides the character just typed.
+        assert_eq!(field_view("hello", 10), "hello");
+        // Five cells total: the ellipsis costs one, so four characters survive.
+        assert_eq!(field_view("abcdefghij", 5), "\u{2026}ghij");
+        assert_eq!(field_view("", 5), "");
+        assert_eq!(field_view("abc", 0), "");
+    }
+
+    #[test]
+    fn the_prompt_box_grows_with_the_text_then_scrolls_inside_it() {
+        let long = "a".repeat(400);
+        let mut p = Prompt::new(PromptKind::AiCommand, "Describe the command", Vec::new());
+        for c in "short".chars() {
+            p.input_char(c);
+        }
+        let narrow = p.render(100, 40, &Theme::default());
+        let w_short = narrow[0].grid.cols();
+
+        p.input = long.clone();
+        let wide = p.render(100, 40, &Theme::default());
+        let w_long = wide[0].grid.cols();
+        assert!(w_long > w_short, "the box has to grow: {w_short} -> {w_long}");
+        // ...but never past the window it sits in.
+        assert!(w_long <= 96, "a modal wider than the screen is not a fix: {w_long}");
+
+        // And with the box at its limit, the text scrolls so the tail shows.
+        let row: String = (0..wide[0].grid.cols())
+            .map(|c| wide[0].grid.abs_cell(1, c).ch)
+            .collect();
+        assert!(row.contains('\u{2026}'), "a clipped field must say so: {row:?}");
+        assert!(row.trim_end().ends_with('a'), "the end of the input must be visible: {row:?}");
     }
 
     #[test]

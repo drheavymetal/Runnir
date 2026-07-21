@@ -872,6 +872,27 @@ view labels at their drawn positions, checks row mapping including the scrolled
 case, and `a_click_on_a_diff_row_finds_its_hunk` pins hunk lookup. The drill-down
 itself was verified on screen.
 
+## 2026-07-21 - A prompt that hid what you were typing
+
+Pedro, with a screenshot: type a long answer into the AI prompt and the text runs
+off the right edge - you cannot see the words you are writing.
+
+The box was a fixed `(cols * 6 / 10).clamp(30, 70)` and `write` clips at the grid
+edge, so everything past ~66 characters was drawn into nothing, caret included.
+
+Both halves of the fix, because either alone is wrong:
+- The box now GROWS with the input, up to `cols - 4`. A fixed box hides a long
+  answer; a box that only grows would become a modal wider than the screen.
+- Past that, the text SCROLLS. `field_view` keeps the END of the string, because
+  the caret in these fields is always at the end (they take typing and backspace,
+  never arrow keys) - a field that clips the tail hides the character you just
+  typed, which is the one thing a text input may never do. A leading `…` marks the
+  cut.
+
+The search bar got the same treatment; its query could outgrow its 60-cell bar the
+same way. Tests pin `field_view` and the grow-then-scroll behaviour by rendering a
+400-character input and reading the row back out of the grid.
+
 ## Gotchas (do not re-learn)
 
 - A binding spec and a keypress must produce the SAME `ChordKey` variant.
@@ -897,6 +918,9 @@ itself was verified on screen.
 - Claude Code does not probe for the kitty keyboard protocol. Terminal-side protocol
   support alone is not enough; the legacy encoding has to carry Shift+Enter as ESC-CR.
 
+- A single-line input drawn into a fixed-width panel WILL clip, and `write` clips
+  silently. Grow the box, then scroll the text keeping its end visible - the caret
+  lives there.
 - `pkill -f <pattern>` kills its OWN shell when the pattern appears in the command
   line that invoked it. Killing a build's binary by path needs `pgrep -x` plus a
   `/proc/<pid>/exe` check, not `pkill -f target/debug/...`.
