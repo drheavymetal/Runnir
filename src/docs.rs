@@ -268,6 +268,29 @@ Only a bare Enter at
 the live prompt is guarded, so editing history and full-screen apps are untouched.
 Turn it off with behaviour.command_guardian = false.
 
+# Git panel
+
+Leader G opens a git panel over the terminal: four lists, and the selection's diff
+beside them.
+
+  1 / 2 / 3 / 4 or Tab   status, log, branches, stashes
+  j k / arrows           move          J K / PageUp PageDown   scroll the diff
+  y                      copy the sha, path or branch under the cursor
+  r                      refresh        q or Escape            close
+
+In status: space stages or unstages the file under the cursor, a stages everything,
+c writes a commit message, S stashes (including untracked). In log: o opens the
+commit in a split. In branches: Enter switches, n creates one. In stashes: Enter
+pops. Anywhere: P pushes, p pulls (fast-forward only), f fetches all and prunes.
+
+Every key acts at once, with no confirmation, so nothing that can lose uncommitted
+work is bound here at all - no reset --hard, no clean, no discard, no stash drop,
+no branch -D. Those stay at the prompt, where the guardian sees them and asks.
+
+Diffs are drawn with line numbers and a full-width tint per changed line instead of
+a + / - column, so the code stays aligned with its context and you can see which
+line you are looking at.
+
 # Hint mode knows git
 
 Hint mode (Ctrl+Shift+Space, or Leader I) labels every URL, path and commit hash on

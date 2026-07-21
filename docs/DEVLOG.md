@@ -704,6 +704,45 @@ point at. `PaneDraw.transparent` (new) makes the instance loop skip blank
 default-background cells, and only the hint layer sets it. Screenshot before/after
 is the only way this shows up — no test renders.
 
+## 2026-07-21 - Git step 4 (T3): a native git panel
+
+Pedro's scope change: not lazygit in a split, the operation set inside runnir. Full
+panel in one go, keys acting immediately with no confirmation (his call, asked
+explicitly).
+
+`Overlay::Git(GitPanel)` (overlay.rs) with four lists - status, log, branches,
+stashes - and the selection's diff beside them. `git.rs` grew the data layer:
+`log` (a `%h US %s US ...` format, unit-separated because a subject can contain any
+printable character), `status_files`, `show`, `diff_file`, `stashes`,
+`branch_log`, and `run` for the mutating half. Parsers are pure and tested:
+`parse_log`, `parse_status_files`, `parse_diff`.
+
+**Nothing that can lose uncommitted work is bound.** That is the direct consequence
+of "no confirmation": no reset --hard, no clean, no discard-changes, no stash drop,
+no branch -D. Everything the panel does, git can undo - stage, unstage, commit,
+fetch, pull --ff-only, push, switch branch, stash push, stash pop, new branch. The
+destructive set stays at the prompt, where the guardian already asks.
+
+**Every call is on a worker.** `UserEvent::GitPanel(seq, PanelMsg)` carries the
+answers back. `seq` exists because a fast j/k run would otherwise let an older
+`git show` paint over a newer one - lists always apply, the preview only when the
+sequence still matches. `busy` blocks a second command, so a repeated P cannot fire
+two pushes.
+
+**Diffs are drawn, not echoed.** Pedro compared the raw unified diff against a review
+tool's rendering: a `+`/`-` column shifts every changed line one column away from
+its context, and there is no line number, so you count rows to find out what
+changed. `parse_diff` turns the diff into numbered rows (numbers walked forward from
+the `@@` header - new file's number for added and context lines, old file's for
+removed) and the panel tints the whole row instead of prefixing it.
+
+**Space is `NamedKey::Space`, not `Character(" ")`.** Staging silently did nothing
+until that was fixed; found by pressing it against a real repository and asking git,
+not by reading the code.
+
+The leader root `g` now opens the panel. It was FixLastCommand, which also lives at
+`leader a g`, so nothing lost a binding and git gets the letter everyone reaches for.
+
 ## Gotchas (do not re-learn)
 
 - A binding spec and a keypress must produce the SAME `ChordKey` variant.
@@ -729,6 +768,9 @@ is the only way this shows up — no test renders.
 - Claude Code does not probe for the kitty keyboard protocol. Terminal-side protocol
   support alone is not enough; the legacy encoding has to carry Shift+Enter as ESC-CR.
 
+- winit delivers space as `Key::Named(NamedKey::Space)`, never as
+  `Key::Character(" ")`. An overlay binding it on the character compiles, runs, and
+  does nothing.
 - A grid drawn on top of a pane is OPAQUE, even where it looks empty: every
   non-spacer cell emits an instance, and a blank cell with `Color::Default` paints
   the pane background. An annotation layer must set `PaneDraw.transparent`, or it

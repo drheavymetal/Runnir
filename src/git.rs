@@ -214,6 +214,199 @@ pub fn parse_porcelain_v2(text: &str) -> RepoState {
     s
 }
 
+// ---- data for the git panel ------------------------------------------------
+
+/// One line of history, as the panel lists it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Commit {
+    pub sha: String,
+    pub subject: String,
+    pub author: String,
+    /// Relative date, the way git writes it: "3 hours ago".
+    pub when: String,
+    /// Ref decorations on this commit: `HEAD -> main, origin/main`.
+    pub refs: String,
+}
+
+/// One path in `git status`, split the way the panel shows it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FileEntry {
+    pub path: String,
+    /// Index (staged) status letter, `.` when unchanged, `?` when untracked.
+    pub index: char,
+    /// Worktree status letter, `.` when unchanged.
+    pub worktree: char,
+}
+
+impl FileEntry {
+    pub fn is_staged(&self) -> bool {
+        self.index != '.' && self.index != '?'
+    }
+    pub fn is_unstaged(&self) -> bool {
+        self.worktree != '.' || self.index == '?'
+    }
+    pub fn untracked(&self) -> bool {
+        self.index == '?'
+    }
+}
+
+/// Field separator for the log format. A unit separator cannot appear in a subject,
+/// which splitting on a printable character could not promise.
+const SEP: char = '\u{1f}';
+
+/// Reads history. Blocking — worker only.
+pub fn log(root: &Path, limit: usize) -> Vec<Commit> {
+    let fmt = format!("--pretty=format:%h{SEP}%s{SEP}%an{SEP}%ar{SEP}%D");
+    let out = std::process::Command::new("git")
+        .arg("--no-optional-locks")
+        .args(["log", "--no-color"])
+        .arg(format!("-{limit}"))
+        .arg(fmt)
+        .current_dir(root)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .stderr(std::process::Stdio::null())
+        .output();
+    match out {
+        Ok(o) if o.status.success() => parse_log(&String::from_utf8_lossy(&o.stdout)),
+        _ => Vec::new(),
+    }
+}
+
+pub fn parse_log(text: &str) -> Vec<Commit> {
+    text.lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| {
+            let mut f = l.split(SEP);
+            Commit {
+                sha: f.next().unwrap_or_default().to_string(),
+                subject: f.next().unwrap_or_default().to_string(),
+                author: f.next().unwrap_or_default().to_string(),
+                when: f.next().unwrap_or_default().to_string(),
+                refs: f.next().unwrap_or_default().to_string(),
+            }
+        })
+        .collect()
+}
+
+/// The files `git status` reports, in a stable order: staged first, then the rest.
+pub fn status_files(root: &Path) -> Vec<FileEntry> {
+    let out = std::process::Command::new("git")
+        .arg("--no-optional-locks")
+        .args(["status", "--porcelain=v2", "--untracked-files=normal"])
+        .current_dir(root)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .stderr(std::process::Stdio::null())
+        .output();
+    match out {
+        Ok(o) if o.status.success() => parse_status_files(&String::from_utf8_lossy(&o.stdout)),
+        _ => Vec::new(),
+    }
+}
+
+/// Parses the entry lines of `--porcelain=v2`. Pure, so the format is testable.
+///
+/// A rename (`2`) carries two paths separated by a tab; the new one is what the
+/// panel acts on. Untracked (`?`) has no XY field at all.
+pub fn parse_status_files(text: &str) -> Vec<FileEntry> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let mut it = line.split_whitespace();
+        match it.next() {
+            Some(tag @ ("1" | "2")) => {
+                let Some(xy) = it.next() else { continue };
+                let mut c = xy.chars();
+                let index = c.next().unwrap_or('.');
+                let worktree = c.next().unwrap_or('.');
+                // The header is a fixed number of space-separated fields and the
+                // path is everything after it — split by COUNT, not by whitespace,
+                // because a path may contain spaces, and a rename appends the old
+                // path after a TAB (which `split_whitespace` would eat).
+                let header = if tag == "1" { 8 } else { 9 };
+                let path = line.splitn(header + 1, ' ').nth(header).unwrap_or_default();
+                let path = path.split('\t').next().unwrap_or(path).to_string();
+                if !path.is_empty() {
+                    out.push(FileEntry { path, index, worktree });
+                }
+            }
+            Some("u") => {
+                // `u <XY> <sub> <m1> <m2> <m3> <mW> <h1> <h2> <h3> <path>`.
+                let path = line.splitn(11, ' ').nth(10).unwrap_or_default().to_string();
+                if !path.is_empty() {
+                    out.push(FileEntry { path, index: 'U', worktree: 'U' });
+                }
+            }
+            Some("?") => {
+                let path: String = line[1..].trim().to_string();
+                if !path.is_empty() {
+                    out.push(FileEntry { path, index: '?', worktree: '?' });
+                }
+            }
+            _ => {}
+        }
+    }
+    out.sort_by(|a, b| b.is_staged().cmp(&a.is_staged()).then(a.path.cmp(&b.path)));
+    out
+}
+
+/// A commit's full diff, for the panel's preview pane.
+pub fn show(root: &Path, sha: &str) -> String {
+    read_text(root, &["show", "--no-color", "--stat", "--patch", sha])
+}
+
+/// One file's diff — staged or unstaged, which are different diffs of the same path.
+pub fn diff_file(root: &Path, path: &str, staged: bool, untracked: bool) -> String {
+    if untracked {
+        // An untracked file has no diff; show it, which is what you want to see
+        // before staging it.
+        return std::fs::read_to_string(root.join(path))
+            .unwrap_or_else(|e| format!("cannot read {path}: {e}"));
+    }
+    let mut args = vec!["diff", "--no-color"];
+    if staged {
+        args.push("--staged");
+    }
+    args.push("--");
+    args.push(path);
+    read_text(root, &args)
+}
+
+fn read_text(root: &Path, args: &[&str]) -> String {
+    let out = std::process::Command::new("git")
+        .arg("--no-optional-locks")
+        .args(args)
+        .current_dir(root)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_PAGER", "cat")
+        .output();
+    match out {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
+        Ok(o) => String::from_utf8_lossy(&o.stderr).into_owned(),
+        Err(e) => format!("git: {e}"),
+    }
+}
+
+/// Runs a git command that CHANGES the repository, returning its combined output.
+///
+/// The panel binds only operations git can undo: staging, committing, fetching,
+/// pushing, switching branch, stashing. Nothing that discards uncommitted work is
+/// reachable from a key here — those live at the prompt, where the guardian sees
+/// them and asks.
+pub fn run(root: &Path, args: &[String]) -> Result<String, String> {
+    let out = std::process::Command::new("git")
+        .args(args)
+        .current_dir(root)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_PAGER", "cat")
+        .output()
+        .map_err(|e| format!("git: {e}"))?;
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    if out.status.success() { Ok(text) } else { Err(text) }
+}
+
 /// The status-bar text for a repository: branch first, then only the counts that are
 /// non-zero. A clean repo shows its branch and nothing else, so the bar stays quiet
 /// until there is something to say.
@@ -309,9 +502,215 @@ mod tests {
     }
 
     #[test]
+    fn parses_the_log_format() {
+        let sep = SEP;
+        let text = format!(
+            "59248cc{sep}Make hints understand git objects{sep}drheavymetal{sep}2 minutes ago{sep}HEAD -> main\n\
+             f36a585{sep}Show the repository's real state{sep}drheavymetal{sep}1 hour ago{sep}\n"
+        );
+        let log = parse_log(&text);
+        assert_eq!(log.len(), 2);
+        assert_eq!(log[0].sha, "59248cc");
+        assert_eq!(log[0].subject, "Make hints understand git objects");
+        assert_eq!(log[0].refs, "HEAD -> main");
+        // A subject can contain anything printable, including the characters one
+        // would be tempted to split on. The unit separator cannot appear in it.
+        assert_eq!(log[1].subject, "Show the repository's real state");
+        assert_eq!(log[1].refs, "");
+    }
+
+    #[test]
+    fn parses_status_entries_into_files() {
+        let text = "\
+1 M. N... 100644 100644 100644 aaa bbb src/main.rs
+1 .M N... 100644 100644 100644 ccc ddd src/git.rs
+2 R. N... 100644 100644 100644 eee fff R100 docs/NEW.md\tdocs/OLD.md
+u UU N... 100644 100644 100644 100644 aa bb cc src/conflict.rs
+? notes.txt
+";
+        let files = parse_status_files(text);
+        let by = |p: &str| files.iter().find(|f| f.path == p).unwrap_or_else(|| panic!("{p} missing"));
+        assert!(by("src/main.rs").is_staged());
+        assert!(!by("src/main.rs").is_unstaged());
+        assert!(by("src/git.rs").is_unstaged());
+        assert!(by("notes.txt").untracked());
+        // A rename lists both paths; the panel acts on the new one.
+        assert!(by("docs/NEW.md").is_staged());
+        assert_eq!(by("src/conflict.rs").index, 'U');
+        // Staged first, so the commit-ready set reads as a block.
+        assert!(files[0].is_staged());
+    }
+
+    #[test]
+    fn a_diff_becomes_numbered_rows() {
+        let text = "\
+diff --git a/src/git.rs b/src/git.rs
+index aaa..bbb 100644
+--- a/src/git.rs
++++ b/src/git.rs
+@@ -10,4 +10,5 @@ fn thing() {
+ unchanged one
+-old line
++new line
++extra line
+ unchanged two
+";
+        let rows = parse_diff(text);
+        let body: Vec<_> = rows.iter().filter(|r| r.kind != DiffKind::Meta).collect();
+        assert_eq!(body[0].kind, DiffKind::Context);
+        assert_eq!(body[0].number, Some(10), "context is numbered from the hunk header");
+        // The removed line keeps the OLD file's number, the added ones the new
+        // file's: that is what makes the pair readable side by side.
+        assert_eq!((body[1].kind, body[1].number), (DiffKind::Removed, Some(11)));
+        assert_eq!((body[2].kind, body[2].number), (DiffKind::Added, Some(11)));
+        assert_eq!((body[3].kind, body[3].number), (DiffKind::Added, Some(12)));
+        assert_eq!((body[4].kind, body[4].number), (DiffKind::Context, Some(13)));
+        // The marker character is stripped: the panel shows the code, and says
+        // added or removed with the row's background instead.
+        assert_eq!(body[1].text, "old line");
+        assert_eq!(body[2].text, "new line");
+    }
+
+    #[test]
+    fn diff_metadata_is_not_mistaken_for_content() {
+        let rows = parse_diff("--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b\n");
+        assert!(rows.iter().take(3).all(|r| r.kind == DiffKind::Meta), "{rows:?}");
+        assert_eq!(rows[3].text, "a");
+    }
+
+    #[test]
     fn empty_output_is_not_a_panic() {
         let s = parse_porcelain_v2("");
         assert_eq!(s.branch, "HEAD");
         assert!(s.is_clean());
     }
+}
+
+// ---- panel workers ---------------------------------------------------------
+
+/// A worker's answer for the git panel, delivered through `UserEvent::GitPanel`.
+pub enum PanelMsg {
+    Files(Vec<FileEntry>),
+    Log(Vec<Commit>),
+    /// Branch list plus the branch currently checked out.
+    Branches(Vec<String>, String),
+    Stashes(Vec<String>),
+    Preview(String),
+    /// A command finished: its output, or its error output.
+    Ran(Result<String, String>),
+}
+
+/// The stash list, one entry per line (`stash@{0}: WIP on main: ...`).
+pub fn stashes(root: &Path) -> Vec<String> {
+    read_text(root, &["stash", "list"])
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+pub fn stash_show(root: &Path, name: &str) -> String {
+    read_text(root, &["stash", "show", "--stat", "--patch", "--no-color", name])
+}
+
+/// A branch's recent history, for the panel's preview pane.
+pub fn branch_log(root: &Path, branch: &str) -> String {
+    read_text(root, &["log", "--no-color", "--oneline", "--graph", "--decorate", "-40", branch])
+}
+
+// ---- diff rendering --------------------------------------------------------
+
+/// What a line of a diff is, once parsed. The panel draws each kind differently,
+/// so the `+`/`-` column can go away: a full-width background says it better, and
+/// leaves the code itself starting at a constant column where it stays readable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiffKind {
+    Added,
+    Removed,
+    Context,
+    /// File headers, hunk headers, commit metadata, `git show --stat` output — any
+    /// line that is about the diff rather than in it.
+    Meta,
+}
+
+/// One line of a diff, with the line number it has in the file it belongs to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiffRow {
+    pub kind: DiffKind,
+    /// The number to show: the new file's for added and context lines, the old
+    /// file's for removed ones. `None` on metadata.
+    pub number: Option<u32>,
+    pub text: String,
+}
+
+/// Parses a unified diff into numbered rows.
+///
+/// Line numbers come from the hunk headers (`@@ -a,b +c,d @@`) and are counted
+/// forward, which is the whole point: a raw diff makes you count rows by hand to
+/// find out which line changed.
+pub fn parse_diff(text: &str) -> Vec<DiffRow> {
+    let mut rows = Vec::new();
+    let (mut old_no, mut new_no) = (0u32, 0u32);
+    let mut in_hunk = false;
+    for line in text.lines() {
+        if line.starts_with("@@") {
+            (old_no, new_no) = parse_hunk_header(line).unwrap_or((old_no, new_no));
+            in_hunk = true;
+            rows.push(DiffRow { kind: DiffKind::Meta, number: None, text: line.to_string() });
+            continue;
+        }
+        // Outside a hunk everything is metadata: the commit header, the --stat
+        // block, `diff --git`, `index`, mode changes.
+        if !in_hunk {
+            rows.push(DiffRow { kind: DiffKind::Meta, number: None, text: line.to_string() });
+            continue;
+        }
+        match line.as_bytes().first() {
+            Some(b'+') if !line.starts_with("+++") => {
+                rows.push(DiffRow {
+                    kind: DiffKind::Added,
+                    number: Some(new_no),
+                    text: line[1..].to_string(),
+                });
+                new_no += 1;
+            }
+            Some(b'-') if !line.starts_with("---") => {
+                rows.push(DiffRow {
+                    kind: DiffKind::Removed,
+                    number: Some(old_no),
+                    text: line[1..].to_string(),
+                });
+                old_no += 1;
+            }
+            Some(b'\\') => {
+                // "\ No newline at end of file" belongs to neither side.
+                rows.push(DiffRow { kind: DiffKind::Meta, number: None, text: line.to_string() });
+            }
+            Some(b' ') | None => {
+                rows.push(DiffRow {
+                    kind: DiffKind::Context,
+                    number: Some(new_no),
+                    text: line.get(1..).unwrap_or("").to_string(),
+                });
+                old_no += 1;
+                new_no += 1;
+            }
+            // A new `diff --git` ends the hunk we were in.
+            _ => {
+                in_hunk = false;
+                rows.push(DiffRow { kind: DiffKind::Meta, number: None, text: line.to_string() });
+            }
+        }
+    }
+    rows
+}
+
+/// `@@ -12,7 +12,9 @@ context` -> the first old and new line numbers.
+fn parse_hunk_header(line: &str) -> Option<(u32, u32)> {
+    let mut parts = line.split_whitespace();
+    parts.next()?; // @@
+    let old = parts.next()?.trim_start_matches('-');
+    let new = parts.next()?.trim_start_matches('+');
+    let first = |s: &str| s.split(',').next().unwrap_or("0").parse().ok();
+    Some((first(old)?, first(new)?))
 }

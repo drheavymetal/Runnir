@@ -84,6 +84,8 @@ pub enum Action {
     AskAiAboutError,
     AiCommand,
     FixLastCommand,
+    /// The native git panel: status, log, branches, stashes.
+    GitPanel,
     AiExplain,
     SummarizeSession,
     QuickConnect,
@@ -169,6 +171,7 @@ impl Action {
             AskAiAboutError => "ask_ai_about_error",
             AiCommand => "ai_command",
             FixLastCommand => "fix_last_command",
+            GitPanel => "git_panel",
             AiExplain => "ai_explain",
             SummarizeSession => "summarize_session",
             QuickConnect => "quick_connect",
@@ -252,6 +255,7 @@ impl Action {
             AskAiAboutError => "Ask AI: why did this fail?",
             AiCommand => "AI: natural language to command",
             FixLastCommand => "AI: fix the last failed command",
+            GitPanel => "Git panel (status, log, branches, stashes)",
             AiExplain => "AI: explain the selection",
             SummarizeSession => "AI: summarize this session",
             QuickConnect => "SSH quick connect",
@@ -338,6 +342,7 @@ impl Action {
             "ask_ai_about_error" => AskAiAboutError,
             "ai_command" => AiCommand,
             "fix_last_command" => FixLastCommand,
+            "git_panel" => GitPanel,
             "ai_explain" => AiExplain,
             "summarize_session" => SummarizeSession,
             "quick_connect" => QuickConnect,
@@ -437,6 +442,7 @@ impl Action {
             AskAiAboutError,
             AiCommand,
             FixLastCommand,
+            GitPanel,
             AiExplain,
             SummarizeSession,
             QuickConnect,
@@ -853,7 +859,7 @@ fn default_leader_bindings() -> HashMap<Chord, LeaderNode> {
     // Kept from the flat layer: both were already muscle memory, and neither
     // letter is needed as a group.
     leaf(&mut m, "v", ClipboardHistory);
-    leaf(&mut m, "g", FixLastCommand);
+    leaf(&mut m, "g", GitPanel);
     // Font size, where every terminal already puts it — but +, - and = are not all
     // one keypress on every layout (on the Spanish one `=` is shift+0), so the
     // letters are the binding that always works and the symbols are the alias.

@@ -23,6 +23,8 @@ pub enum Overlay {
     Snippets(SnippetPicker),
     ClipHistory(ClipHistoryPicker),
     Media(MediaOverlay),
+    /// The native git panel: status, log, branches, stashes.
+    Git(GitPanel),
 }
 
 impl Overlay {
@@ -41,6 +43,7 @@ impl Overlay {
             Overlay::Snippets(s) => s.render(cols, rows, theme),
             Overlay::ClipHistory(p) => p.render(cols, rows, theme),
             Overlay::Media(m) => m.render(cols, rows, theme),
+            Overlay::Git(p) => p.render(cols, rows, theme),
         }
     }
 }
@@ -103,6 +106,358 @@ impl Search {
         // Anchored to the bottom row, vim-style.
         vec![Panel { grid: g, col: 0, row: rows.saturating_sub(1) }]
     }
+}
+
+// ---- git panel -------------------------------------------------------------
+
+/// Which list the git panel is showing. The preview pane on the right always shows
+/// what the selection in the current list means: a file's diff, a commit's diff, a
+/// branch's log, a stash's contents.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum GitView {
+    Status,
+    Log,
+    Branches,
+    Stashes,
+}
+
+impl GitView {
+    pub fn title(self) -> &'static str {
+        match self {
+            GitView::Status => "status",
+            GitView::Log => "log",
+            GitView::Branches => "branches",
+            GitView::Stashes => "stashes",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            GitView::Status => GitView::Log,
+            GitView::Log => GitView::Branches,
+            GitView::Branches => GitView::Stashes,
+            GitView::Stashes => GitView::Status,
+        }
+    }
+}
+
+/// The native git panel: a list on the left, the selection's diff on the right.
+///
+/// It holds only DATA. Every read and every command runs on a worker and comes back
+/// through `UserEvent::Git*`, so a slow `git push` cannot freeze the terminal it is
+/// pushing from.
+pub struct GitPanel {
+    pub root: std::path::PathBuf,
+    pub view: GitView,
+    pub files: Vec<crate::git::FileEntry>,
+    pub log: Vec<crate::git::Commit>,
+    pub branches: Vec<String>,
+    pub stashes: Vec<String>,
+    pub current_branch: String,
+    /// Selection per view, kept apart so switching back lands where you left off.
+    cursors: [usize; 4],
+    pub preview: String,
+    /// The preview, parsed into numbered diff rows. Kept beside the text so the
+    /// draw path never re-parses on every frame.
+    pub preview_rows: Vec<crate::git::DiffRow>,
+    pub preview_scroll: usize,
+    /// The last command's result, shown in the footer; `Err` is drawn red.
+    pub message: Result<String, String>,
+    /// A command is in flight: the footer says so and the keys that start another
+    /// are ignored, so a double tap cannot fire two pushes.
+    pub busy: bool,
+}
+
+impl GitPanel {
+    pub fn new(root: std::path::PathBuf) -> Self {
+        Self {
+            root,
+            view: GitView::Status,
+            files: Vec::new(),
+            log: Vec::new(),
+            branches: Vec::new(),
+            stashes: Vec::new(),
+            current_branch: String::new(),
+            cursors: [0; 4],
+            preview: String::new(),
+            preview_rows: Vec::new(),
+            preview_scroll: 0,
+            message: Ok(String::new()),
+            busy: false,
+        }
+    }
+
+    fn view_index(&self) -> usize {
+        match self.view {
+            GitView::Status => 0,
+            GitView::Log => 1,
+            GitView::Branches => 2,
+            GitView::Stashes => 3,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        match self.view {
+            GitView::Status => self.files.len(),
+            GitView::Log => self.log.len(),
+            GitView::Branches => self.branches.len(),
+            GitView::Stashes => self.stashes.len(),
+        }
+    }
+
+    pub fn cursor(&self) -> usize {
+        self.cursors[self.view_index()].min(self.len().saturating_sub(1))
+    }
+
+    pub fn set_cursor(&mut self, n: usize) {
+        let i = self.view_index();
+        self.cursors[i] = n.min(self.len().saturating_sub(1));
+        self.preview_scroll = 0;
+    }
+
+    pub fn down(&mut self) {
+        let c = self.cursor();
+        if c + 1 < self.len() {
+            self.set_cursor(c + 1);
+        }
+    }
+
+    pub fn up(&mut self) {
+        let c = self.cursor();
+        self.set_cursor(c.saturating_sub(1));
+    }
+
+    pub fn cycle_view(&mut self) {
+        self.view = self.view.next();
+        self.preview_scroll = 0;
+    }
+
+    pub fn set_view(&mut self, v: GitView) {
+        self.view = v;
+        self.preview_scroll = 0;
+    }
+
+    pub fn selected_file(&self) -> Option<&crate::git::FileEntry> {
+        matches!(self.view, GitView::Status).then(|| self.files.get(self.cursor()))?
+    }
+
+    pub fn selected_commit(&self) -> Option<&crate::git::Commit> {
+        matches!(self.view, GitView::Log).then(|| self.log.get(self.cursor()))?
+    }
+
+    pub fn selected_branch(&self) -> Option<&String> {
+        matches!(self.view, GitView::Branches).then(|| self.branches.get(self.cursor()))?
+    }
+
+    pub fn selected_stash(&self) -> Option<&String> {
+        matches!(self.view, GitView::Stashes).then(|| self.stashes.get(self.cursor()))?
+    }
+
+    /// Replaces the preview and reparses it into rows.
+    pub fn set_preview(&mut self, text: String) {
+        self.preview_rows = crate::git::parse_diff(&text);
+        self.preview = text;
+        self.preview_scroll = 0;
+    }
+
+    pub fn scroll_preview(&mut self, delta: i32) {
+        let lines = self.preview_rows.len() as i32;
+        let next = self.preview_scroll as i32 + delta;
+        self.preview_scroll = next.clamp(0, (lines - 1).max(0)) as usize;
+    }
+
+    fn row_text(&self, i: usize, width: usize) -> (String, Pen) {
+        let green = Pen { fg: Color::Rgb(0x7a, 0xc0, 0x7a), bg: bg(), ..Pen::default() };
+        let red = Pen { fg: Color::Rgb(0xe0, 0x60, 0x60), bg: bg(), ..Pen::default() };
+        match self.view {
+            GitView::Status => match self.files.get(i) {
+                Some(f) => {
+                    // Two columns, like git's own short status: index then worktree.
+                    let mark = if f.index == 'U' {
+                        "!!"
+                    } else if f.untracked() {
+                        "??"
+                    } else if f.is_staged() && f.is_unstaged() {
+                        "M+"
+                    } else if f.is_staged() {
+                        " +"
+                    } else {
+                        " M"
+                    };
+                    let pen = if f.index == 'U' {
+                        red
+                    } else if f.is_staged() {
+                        green
+                    } else {
+                        normal()
+                    };
+                    (format!("{mark} {}", elide(&f.path, width.saturating_sub(3))), pen)
+                }
+                None => (String::new(), normal()),
+            },
+            GitView::Log => match self.log.get(i) {
+                Some(c) => {
+                    let head =
+                        if c.refs.is_empty() { String::new() } else { format!("({}) ", c.refs) };
+                    let body = format!("{head}{}", c.subject);
+                    (format!("{} {}", c.sha, elide(&body, width.saturating_sub(9))), normal())
+                }
+                None => (String::new(), normal()),
+            },
+            GitView::Branches => match self.branches.get(i) {
+                Some(b) => {
+                    let here = *b == self.current_branch;
+                    let pen = if here { accent() } else { normal() };
+                    (format!("{} {}", if here { "*" } else { " " }, elide(b, width - 2)), pen)
+                }
+                None => (String::new(), normal()),
+            },
+            GitView::Stashes => match self.stashes.get(i) {
+                Some(s) => (elide(s, width), normal()),
+                None => (String::new(), normal()),
+            },
+        }
+    }
+
+    /// The key legend for the current view. Spelled out rather than left implicit:
+    /// every one of these acts immediately, so the user has to be able to read what
+    /// a key does before pressing it.
+    fn keys_legend(&self) -> &'static str {
+        match self.view {
+            GitView::Status => {
+                "space stage/unstage · a all · c commit · P push · p pull · f fetch · S stash"
+            }
+            GitView::Log => "y copy sha · o open in split · P push · p pull · f fetch",
+            GitView::Branches => "enter switch · n new · P push · f fetch",
+            GitView::Stashes => "enter pop · S stash push",
+        }
+    }
+
+    pub fn render(&self, cols: usize, rows: usize, theme: &Theme) -> Vec<Panel> {
+        let w = cols.saturating_sub(4).max(40);
+        let h = rows.saturating_sub(4).max(12);
+        let mut g = panel_grid(w, h, theme);
+        let list_w = (w * 2 / 5).clamp(24, 64).min(w.saturating_sub(10));
+
+        // Header: the four views, the active one reversed, then the branch.
+        let mut x = 2;
+        for v in [GitView::Status, GitView::Log, GitView::Branches, GitView::Stashes] {
+            let label = format!(" {} ", v.title());
+            let pen = if v == self.view { selected() } else { dim() };
+            write(&mut g, 0, x, &label, pen);
+            x += label.chars().count() + 1;
+        }
+        let head = if self.current_branch.is_empty() {
+            String::new()
+        } else {
+            format!("\u{e0a0} {}", self.current_branch)
+        };
+        let head_w = head.chars().count();
+        if head_w > 0 && w > x + head_w + 2 {
+            write(&mut g, 0, w - head_w - 2, &head, accent());
+        }
+
+        // Left: the list. Right: the preview, with a rule between them.
+        let body_rows = h.saturating_sub(3);
+        let scroll = self.cursor().saturating_sub(body_rows.saturating_sub(1));
+        for line in 0..body_rows {
+            let i = scroll + line;
+            if i >= self.len() {
+                break;
+            }
+            let (text, pen) = self.row_text(i, list_w.saturating_sub(2));
+            let row = 2 + line;
+            if i == self.cursor() {
+                write(&mut g, row, 0, &" ".repeat(list_w), selected());
+                write(&mut g, row, 1, &text, selected());
+            } else {
+                write(&mut g, row, 1, &text, pen);
+            }
+        }
+        for line in 0..body_rows {
+            write(&mut g, 2 + line, list_w, "\u{2502}", dim());
+        }
+
+        // The diff is drawn the way a review tool draws one: a line number, then the
+        // code, on a row whose whole width is tinted. A raw `+`/`-` column makes
+        // every changed line start one column further in than its neighbours, and
+        // leaves you counting rows to find out which line it is.
+        let prev_x = list_w + 2;
+        let prev_w = w.saturating_sub(prev_x);
+        let add_bg = Color::Rgb(0x12, 0x2c, 0x18);
+        let del_bg = Color::Rgb(0x35, 0x14, 0x18);
+        let num_fg = Color::Rgb(0x6a, 0x6d, 0x74);
+        for (line, row) in
+            self.preview_rows.iter().skip(self.preview_scroll).take(body_rows).enumerate()
+        {
+            let y = 2 + line;
+            let row_bg = match row.kind {
+                crate::git::DiffKind::Added => add_bg,
+                crate::git::DiffKind::Removed => del_bg,
+                _ => bg(),
+            };
+            // Tint the whole row first, so the change reads as a band rather than as
+            // coloured text that competes with the syntax colours.
+            if !matches!(row.kind, crate::git::DiffKind::Context | crate::git::DiffKind::Meta) {
+                write(&mut g, y, prev_x, &" ".repeat(prev_w), Pen { bg: row_bg, ..Pen::default() });
+            }
+            let num = match row.number {
+                Some(n) => format!("{n:>5} "),
+                None => "      ".to_string(),
+            };
+            write(&mut g, y, prev_x, &num, Pen { fg: num_fg, bg: row_bg, ..Pen::default() });
+            let text_x = prev_x + 6;
+            let text_w = prev_w.saturating_sub(6);
+            let fg = match row.kind {
+                crate::git::DiffKind::Meta => Color::Rgb(DIMFG.0, DIMFG.1, DIMFG.2),
+                _ => Color::Rgb(0xd4, 0xd6, 0xd9),
+            };
+            write(
+                &mut g,
+                y,
+                text_x,
+                &elide(&row.text, text_w),
+                Pen { fg, bg: row_bg, ..Pen::default() },
+            );
+        }
+
+        // Footer: what just happened, or the legend when there is nothing to report.
+        let (foot, pen) = if self.busy {
+            ("working\u{2026}".to_string(), accent())
+        } else {
+            match &self.message {
+                Err(e) => (
+                    first_line(e),
+                    Pen { fg: Color::Rgb(0xe0, 0x70, 0x70), bg: bg(), ..Pen::default() },
+                ),
+                Ok(m) if !m.is_empty() => (first_line(m), normal()),
+                _ => (self.keys_legend().to_string(), dim()),
+            }
+        };
+        write(&mut g, h - 1, 2, &elide(&foot, w.saturating_sub(4)), pen);
+
+        vec![Panel { grid: g, col: 2, row: 2 }]
+    }
+}
+
+/// First non-empty line, so a multi-line git message fits a one-row footer.
+fn first_line(s: &str) -> String {
+    s.lines().find(|l| !l.trim().is_empty()).unwrap_or("").to_string()
+}
+
+/// Clips to `width` columns, marking the cut, so a truncated path is never mistaken
+/// for a shorter one.
+fn elide(s: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let n = s.chars().count();
+    if n <= width {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(width.saturating_sub(1)).collect();
+    out.push('\u{2026}');
+    out
 }
 
 /// A grid plus where it sits, in cells.
@@ -927,6 +1282,11 @@ pub enum PromptKind {
     PipeScrollback,
     /// A directory to auto-preview new images from (empty clears the watch).
     ImageWatchDir,
+    /// A commit message, typed in the git panel. Confirming commits the staged set
+    /// and reopens the panel on the result.
+    GitCommit,
+    /// A new branch name, typed in the git panel; confirming creates and switches.
+    GitBranch,
 }
 
 impl Prompt {

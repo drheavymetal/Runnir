@@ -565,6 +565,18 @@ export const FEATURES = [
 
   // ------------------------------------------------------- FUNCIONES DISTINTIVAS
   {
+    key: 'git-panel', section: 'distinctive', status: 'shipped',
+    title: { es: 'Panel de git nativo', en: 'Native git panel' },
+    natural: {
+      es: 'Leader G abre un panel de git dentro de runnir: status, log, ramas y stashes, con el diff de lo seleccionado al lado. Espacio pone y quita del stage, c escribe el mensaje de commit, P empuja, p tira (solo fast-forward), f hace fetch. Las teclas act\u00faan al momento, sin confirmar \u2014 por eso no hay ninguna que pueda perder trabajo sin commitear: ni reset --hard, ni clean, ni descartar cambios, ni stash drop, ni branch -D. Eso se sigue tecleando en el prompt, donde el guardi\u00e1n pregunta.',
+      en: 'Leader G opens a git panel inside runnir: status, log, branches and stashes, with the selection\u2019s diff beside them. Space stages and unstages, c writes the commit message, P pushes, p pulls (fast-forward only), f fetches. Keys act immediately, with no confirmation \u2014 which is why nothing that can lose uncommitted work is bound at all: no reset --hard, no clean, no discard, no stash drop, no branch -D. Those stay at the prompt, where the guardian asks.',
+    },
+    note: {
+      es: 'Los diffs se dibujan con n\u00famero de l\u00ednea y la fila teida entera, no con una columna de + y -, as\u00ed el c\u00f3digo queda alineado con su contexto. Todo git corre en un worker: un push lento no congela la terminal.',
+      en: 'Diffs are drawn with line numbers and a full-width tint per line rather than a +/- column, so the code stays aligned with its context. Every git call runs on a worker, so a slow push never freezes the terminal.',
+    },
+  },
+  {
     key: 'command-guardian', section: 'distinctive', status: 'shipped',
     title: { es: 'Guardian de comandos', en: 'Command guardian' },
     natural: {

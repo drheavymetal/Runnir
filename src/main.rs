@@ -93,6 +93,9 @@ pub enum UserEvent {
     /// command failed or the directory stopped being a repository. Never computed on
     /// the UI thread: in a large repository `git status` takes seconds.
     Git(PathBuf, Option<git::RepoState>),
+    /// Data or a command result for the git panel, tagged with the request sequence
+    /// so a stale preview never paints over a newer one.
+    GitPanel(u64, git::PanelMsg),
 }
 
 fn main() {
@@ -467,6 +470,9 @@ struct Gpu {
     /// Roots with a `git status` worker in flight, so a slow repository cannot
     /// accumulate one process per wake.
     git_pending: std::collections::HashSet<PathBuf>,
+    /// Sequence for git-panel requests: a reply older than the current one is only
+    /// allowed to update lists, never the preview.
+    git_gen: u64,
     /// The pane command counter each root was last refreshed at, keyed by root. The
     /// refresh trigger is "a command finished in a pane sitting in this repo", not a
     /// timer: nothing else the user does can change the repository, and a poll would
@@ -747,6 +753,7 @@ impl App {
             git_state: std::collections::HashMap::new(),
             git_pending: std::collections::HashSet::new(),
             git_seen: std::collections::HashMap::new(),
+            git_gen: 0,
             scroll_glide: None,
             pending_config: None,
             cursor_trail: Vec::new(),
@@ -947,6 +954,7 @@ impl ApplicationHandler<UserEvent> for App {
                 let _ = reply.send(resp);
             }
             UserEvent::Media(msg) => gpu.on_media_msg(msg, &self.config),
+            UserEvent::GitPanel(seq, msg) => gpu.on_git_panel_msg(seq, msg, &self.config),
             UserEvent::Git(root, state) => {
                 gpu.git_pending.remove(&root);
                 match state {

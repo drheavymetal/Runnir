@@ -548,6 +548,7 @@ impl Gpu {
             Action::AskAiAboutError => self.ask_ai_about_error(config),
             Action::AiCommand => self.ai_command(),
             Action::FixLastCommand => self.fix_last_command(config),
+            Action::GitPanel => self.open_git_panel(config),
             Action::AiExplain => self.ai_explain_selection(config),
             Action::SummarizeSession => self.summarize_session(config),
             Action::OpenScrollbackInEditor => self.open_scrollback_in_editor(config),
@@ -617,6 +618,7 @@ impl Gpu {
             return;
         }
         match self.overlay.as_mut().unwrap() {
+            Overlay::Git(_) => self.git_panel_key(key, config),
             Overlay::Palette(p) => match key {
                 Key::Named(NamedKey::Escape) => self.overlay = None,
                 Key::Named(NamedKey::ArrowUp) => p.up(),
@@ -966,6 +968,7 @@ impl Gpu {
             Action::AskAiAboutError => self.ask_ai_about_error(config),
             Action::AiCommand => self.ai_command(),
             Action::FixLastCommand => self.fix_last_command(config),
+            Action::GitPanel => self.open_git_panel(config),
             Action::AiExplain => self.ai_explain_selection(config),
             Action::SummarizeSession => self.summarize_session(config),
             Action::OpenScrollbackInEditor => self.open_scrollback_in_editor(config),
@@ -1400,6 +1403,20 @@ impl Gpu {
                     self.pipe_through(value, true, config);
                 }
             }
+            // Both git prompts hand control back to the panel: it owns the overlay
+            // slot, and its lists are refetched from the repository anyway.
+            PromptKind::GitCommit => {
+                if !value.trim().is_empty() {
+                    self.open_git_panel(config);
+                    self.git_exec(vec!["commit".into(), "-m".into(), value.trim().to_string()]);
+                }
+            }
+            PromptKind::GitBranch => {
+                if !value.trim().is_empty() {
+                    self.open_git_panel(config);
+                    self.git_exec(vec!["checkout".into(), "-b".into(), value.trim().to_string()]);
+                }
+            }
             PromptKind::ImageWatchDir => {
                 if value.trim().is_empty() {
                     self.image_watch = None;
@@ -1743,6 +1760,282 @@ impl Gpu {
             }
         }
         self.hover_url != prev
+    }
+
+    /// Opens the git panel on the focused pane's repository.
+    fn open_git_panel(&mut self, config: &Config) {
+        let root = self.tabs[self.active].focused_ref().cwd().and_then(|p| crate::git::repo_root(&p));
+        let Some(root) = root else {
+            self.status = Some("not a git repository".into());
+            self.status_expiry = Some(Instant::now() + Duration::from_secs(2));
+            return;
+        };
+        self.overlay = Some(Overlay::Git(overlay::GitPanel::new(root)));
+        self.git_reload(config);
+        self.window.request_redraw();
+    }
+
+    /// Refetches every list the panel shows, plus the preview for the selection.
+    ///
+    /// All of it on workers: this is called after every command, and `git log` on a
+    /// large repository is not something the UI thread may wait for.
+    fn git_reload(&mut self, config: &Config) {
+        let Some(Overlay::Git(p)) = &self.overlay else { return };
+        let root = p.root.clone();
+        self.git_gen += 1;
+        let seq = self.git_gen;
+        let proxy = self.proxy.clone();
+        std::thread::spawn(move || {
+            let files = crate::git::status_files(&root);
+            let _ = proxy.send_event(UserEvent::GitPanel(seq, crate::git::PanelMsg::Files(files)));
+            let log = crate::git::log(&root, 200);
+            let _ = proxy.send_event(UserEvent::GitPanel(seq, crate::git::PanelMsg::Log(log)));
+            let branches = crate::git::local_branches(&root);
+            let current = crate::git::head_branch(&root).unwrap_or_default();
+            let _ = proxy
+                .send_event(UserEvent::GitPanel(seq, crate::git::PanelMsg::Branches(branches, current)));
+            let stashes = crate::git::stashes(&root);
+            let _ = proxy.send_event(UserEvent::GitPanel(seq, crate::git::PanelMsg::Stashes(stashes)));
+        });
+        let _ = config;
+    }
+
+    /// Fetches the preview for whatever is selected now. Tagged with the current
+    /// generation so a fast j/k run does not paint an older diff over a newer one.
+    fn git_preview(&mut self) {
+        let Some(Overlay::Git(p)) = &self.overlay else { return };
+        let root = p.root.clone();
+        let job = match p.view {
+            overlay::GitView::Status => p.selected_file().map(|f| {
+                (f.path.clone(), f.is_staged() && !f.is_unstaged(), f.untracked())
+            }).map(|(path, staged, untracked)| {
+                Box::new(move |root: &std::path::Path| crate::git::diff_file(root, &path, staged, untracked))
+                    as Box<dyn FnOnce(&std::path::Path) -> String + Send>
+            }),
+            overlay::GitView::Log => p.selected_commit().map(|c| c.sha.clone()).map(|sha| {
+                Box::new(move |root: &std::path::Path| crate::git::show(root, &sha))
+                    as Box<dyn FnOnce(&std::path::Path) -> String + Send>
+            }),
+            overlay::GitView::Branches => p.selected_branch().cloned().map(|b| {
+                Box::new(move |root: &std::path::Path| crate::git::branch_log(root, &b))
+                    as Box<dyn FnOnce(&std::path::Path) -> String + Send>
+            }),
+            overlay::GitView::Stashes => p.selected_stash().cloned().map(|s| {
+                let name = s.split(':').next().unwrap_or("stash@{0}").to_string();
+                Box::new(move |root: &std::path::Path| crate::git::stash_show(root, &name))
+                    as Box<dyn FnOnce(&std::path::Path) -> String + Send>
+            }),
+        };
+        let Some(job) = job else { return };
+        self.git_gen += 1;
+        let seq = self.git_gen;
+        let proxy = self.proxy.clone();
+        std::thread::spawn(move || {
+            let text = job(&root);
+            let _ = proxy.send_event(UserEvent::GitPanel(seq, crate::git::PanelMsg::Preview(text)));
+        });
+    }
+
+    /// Runs a git command for the panel and reloads when it lands.
+    ///
+    /// Only commands git can undo are ever passed here — see `git::run`. `busy`
+    /// blocks a second one, so a repeated keypress cannot start two pushes.
+    fn git_exec(&mut self, args: Vec<String>) {
+        let Some(Overlay::Git(p)) = &mut self.overlay else { return };
+        if p.busy {
+            return;
+        }
+        p.busy = true;
+        p.message = Ok(String::new());
+        let root = p.root.clone();
+        self.git_gen += 1;
+        let seq = self.git_gen;
+        let proxy = self.proxy.clone();
+        std::thread::spawn(move || {
+            let out = crate::git::run(&root, &args);
+            let _ = proxy.send_event(UserEvent::GitPanel(seq, crate::git::PanelMsg::Ran(out)));
+        });
+        self.window.request_redraw();
+    }
+
+    /// Applies a worker message to the panel. Stale generations are dropped, except
+    /// a command's result, which is always worth showing.
+    fn on_git_panel_msg(&mut self, seq: u64, msg: crate::git::PanelMsg, config: &Config) {
+        let current = self.git_gen;
+        let mut reload = false;
+        let mut preview = false;
+        if let Some(Overlay::Git(p)) = &mut self.overlay {
+            match msg {
+                crate::git::PanelMsg::Files(f) => {
+                    p.files = f;
+                    preview = true;
+                }
+                crate::git::PanelMsg::Log(l) => p.log = l,
+                crate::git::PanelMsg::Branches(b, cur) => {
+                    p.branches = b;
+                    p.current_branch = cur;
+                }
+                crate::git::PanelMsg::Stashes(s) => p.stashes = s,
+                crate::git::PanelMsg::Preview(text) => {
+                    // Only the newest request may paint: a fast j/k run would
+                    // otherwise leave an older diff on screen.
+                    if seq == current {
+                        p.set_preview(text);
+                    }
+                }
+                crate::git::PanelMsg::Ran(result) => {
+                    p.busy = false;
+                    p.message = result;
+                    reload = true;
+                }
+            }
+        }
+        if reload {
+            self.git_reload(config);
+        } else if preview {
+            self.git_preview();
+        }
+        self.window.request_redraw();
+    }
+
+    /// Keys inside the git panel. Every one of these acts at once — the panel binds
+    /// nothing that discards uncommitted work, so there is nothing here to confirm.
+    fn git_panel_key(&mut self, key: &Key, config: &Config) {
+        use overlay::GitView;
+        let Some(Overlay::Git(p)) = &mut self.overlay else { return };
+        let view = p.view;
+        let mut moved = false;
+        let mut exec: Option<Vec<String>> = None;
+        let mut copy: Option<String> = None;
+        let mut split: Option<Vec<String>> = None;
+        let mut prompt: Option<(PromptKind, &str)> = None;
+        let mut close = false;
+        let mut reload = false;
+
+        let s = |v: &str| v.to_string();
+        match key {
+            Key::Named(NamedKey::Escape) => close = true,
+            Key::Named(NamedKey::Tab) => {
+                p.cycle_view();
+                moved = true;
+            }
+            Key::Named(NamedKey::ArrowDown) => {
+                p.down();
+                moved = true;
+            }
+            Key::Named(NamedKey::ArrowUp) => {
+                p.up();
+                moved = true;
+            }
+            // Space arrives as a NamedKey, not as the character " " — staging is the
+            // panel's most-pressed key and binding it on the character alone made it
+            // silently do nothing.
+            Key::Named(NamedKey::Space) if view == GitView::Status => {
+                if let Some(f) = p.selected_file() {
+                    exec = Some(if f.is_staged() && !f.is_unstaged() {
+                        vec![s("restore"), s("--staged"), f.path.clone()]
+                    } else {
+                        vec![s("add"), s("--"), f.path.clone()]
+                    });
+                }
+            }
+            Key::Named(NamedKey::PageDown) => p.scroll_preview(10),
+            Key::Named(NamedKey::PageUp) => p.scroll_preview(-10),
+            Key::Named(NamedKey::Enter) => match view {
+                GitView::Branches => {
+                    if let Some(b) = p.selected_branch() {
+                        exec = Some(vec![s("checkout"), b.clone()]);
+                    }
+                }
+                GitView::Stashes => {
+                    if let Some(st) = p.selected_stash() {
+                        let name = st.split(':').next().unwrap_or("stash@{0}").to_string();
+                        exec = Some(vec![s("stash"), s("pop"), name]);
+                    }
+                }
+                _ => {}
+            },
+            Key::Character(c) => match c.as_str() {
+                "q" => close = true,
+                "j" => {
+                    p.down();
+                    moved = true;
+                }
+                "k" => {
+                    p.up();
+                    moved = true;
+                }
+                "J" => p.scroll_preview(5),
+                "K" => p.scroll_preview(-5),
+                "1" => {
+                    p.set_view(GitView::Status);
+                    moved = true;
+                }
+                "2" => {
+                    p.set_view(GitView::Log);
+                    moved = true;
+                }
+                "3" => {
+                    p.set_view(GitView::Branches);
+                    moved = true;
+                }
+                "4" => {
+                    p.set_view(GitView::Stashes);
+                    moved = true;
+                }
+                "r" => reload = true,
+                "a" if view == GitView::Status => exec = Some(vec![s("add"), s("-A")]),
+                "c" if view == GitView::Status => {
+                    prompt = Some((PromptKind::GitCommit, "Commit message"))
+                }
+                "S" => exec = Some(vec![s("stash"), s("push"), s("-u")]),
+                "n" if view == GitView::Branches => {
+                    prompt = Some((PromptKind::GitBranch, "New branch"))
+                }
+                "y" => {
+                    copy = match view {
+                        GitView::Log => p.selected_commit().map(|c| c.sha.clone()),
+                        GitView::Status => p.selected_file().map(|f| f.path.clone()),
+                        GitView::Branches => p.selected_branch().cloned(),
+                        GitView::Stashes => p.selected_stash().cloned(),
+                    }
+                }
+                "o" if view == GitView::Log => {
+                    split = p.selected_commit().map(|c| {
+                        vec![s("git"), s("show"), s("--stat"), s("--patch"), c.sha.clone()]
+                    })
+                }
+                "P" => exec = Some(vec![s("push")]),
+                "p" => exec = Some(vec![s("pull"), s("--ff-only")]),
+                "f" => exec = Some(vec![s("fetch"), s("--all"), s("--prune")]),
+                _ => {}
+            },
+            _ => {}
+        }
+
+        if close {
+            self.overlay = None;
+        }
+        if let Some((kind, label)) = prompt {
+            // The panel is dropped for the prompt and rebuilt on confirm: the prompt
+            // owns the overlay slot, and the panel's state is all refetched anyway.
+            self.overlay = Some(Overlay::Prompt(Prompt::new(kind, label, Vec::new())));
+        }
+        if let Some(text) = copy {
+            self.set_clipboard(text);
+        }
+        if let Some(cmd) = split {
+            self.split_running(config, cmd);
+            self.overlay = None;
+        }
+        if let Some(args) = exec {
+            self.git_exec(args);
+        } else if reload {
+            self.git_reload(config);
+        } else if moved {
+            self.git_preview();
+        }
+        self.window.request_redraw();
     }
 
     /// Acts on the hovered URL/path if the pointer is over one: opens a URL in the
