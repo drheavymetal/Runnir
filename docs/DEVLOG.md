@@ -613,6 +613,30 @@ bar is exactly the failure this class of change invites.
 Docs site was lying about this feature: `theme-picker` was `status: 'dev'`, claimed
 "20-30 temas" and told people colours are only set in the config. Corrected.
 
+## 2026-07-21 — Git in the terminal, step 1: the guardian learns what git destroys
+
+Pedro wants git worked into runnir itself, in four steps: guardian rules, repo state
+in the status bar, git-aware hints, then a native panel with the full operation set
+(log, diff of an old commit, stage/commit/push). This is step 1.
+
+The guardian knew exactly one git hazard — force-push, the loud famous one. The ones
+people actually lose an afternoon to are quiet, and share a property worth naming:
+**they destroy work that is in no commit**, which is the only thing git cannot hand
+back. `git_destroys_work` covers reset --hard/--merge/--keep, clean with -f, a path
+checkout (`--` or `.`), restore that touches the worktree, stash clear/drop, branch
+-D, push --delete/--mirror, and gc --prune=now / reflog expire — the last two because
+the reflog is what makes every other mistake on the list survivable.
+
+Deliberately NOT flagged, each with a test: `clean -n` (dry run), `checkout main` (a
+switch git refuses when it would lose edits), `restore --staged` (unstages only),
+`reset --soft`, `branch -d` (already refuses an unmerged branch), `stash pop`. The
+guardian is a confirmation, not a wall, and a rule that fires on daily commands is
+one the user turns off.
+
+One trap: `danger` lowercases the line, and `-D` versus `-d` is the ENTIRE difference
+between force-deleting a branch and being refused. The branch rule reads a
+case-preserving copy of the tail; a test asserts both halves.
+
 ## Gotchas (do not re-learn)
 
 - A binding spec and a keypress must produce the SAME `ChordKey` variant.

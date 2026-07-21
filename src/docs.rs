@@ -255,7 +255,16 @@ When you press Enter on a command that matches a known destructive pattern, runn
 pauses and asks you to confirm instead of running it blindly. Enter confirms and
 runs it; Escape returns to the line so you can fix or cancel it. It catches things
 like recursive force-removes of a root or home path, dd onto a raw device, mkfs,
-SQL DROP/TRUNCATE, git force-push and the classic fork bomb. Only a bare Enter at
+SQL DROP/TRUNCATE, git force-push and the classic fork bomb.
+
+It also guards the git commands that destroy work no commit holds: reset --hard,
+clean -f, checkout of a path, restore, stash clear/drop, branch -D, push
+--delete/--mirror, and dropping the reflog with gc --prune=now or reflog expire.
+The safe shapes are deliberately left alone — clean -n is a dry run, checkout of a
+branch is a switch git refuses when it would lose edits, restore --staged only
+unstages, and branch -d already refuses an unmerged branch.
+
+Only a bare Enter at
 the live prompt is guarded, so editing history and full-screen apps are untouched.
 Turn it off with behaviour.command_guardian = false.
 

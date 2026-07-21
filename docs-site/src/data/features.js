@@ -568,8 +568,8 @@ export const FEATURES = [
     key: 'command-guardian', section: 'distinctive', status: 'shipped',
     title: { es: 'Guardian de comandos', en: 'Command guardian' },
     natural: {
-      es: 'Al pulsar Enter sobre un comando que coincide con un patrón destructivo conocido, runnir se detiene y pide confirmación. Enter confirma; Escape vuelve a la línea. Pilla rm -rf de una raíz o el home, dd sobre un dispositivo, mkfs, DROP/TRUNCATE, git push forzado y la fork bomb. Es una regla, no la IA: instantáneo y sin conexión.',
-      en: 'Press Enter on a command matching a known destructive pattern and runnir stops to confirm. Enter runs it; Escape returns to the line. Catches rm -rf of a root or home, dd onto a device, mkfs, SQL DROP/TRUNCATE, git force-push and the fork bomb. It’s a rule, not AI: instant and offline.',
+      es: 'Al pulsar Enter sobre un comando que coincide con un patrón destructivo conocido, runnir se detiene y pide confirmación. Enter confirma; Escape vuelve a la línea. Pilla rm -rf de una raíz o el home, dd sobre un dispositivo, mkfs, DROP/TRUNCATE, git push forzado y la fork bomb. También los git que borran lo que no está en ningún commit: reset --hard, clean -f, checkout de una ruta, restore, stash clear/drop, branch -D, push --delete/--mirror y tirar el reflog. Es una regla, no la IA: instantáneo y sin conexión.',
+      en: 'Press Enter on a command matching a known destructive pattern and runnir stops to confirm. Enter runs it; Escape returns to the line. Catches rm -rf of a root or home, dd onto a device, mkfs, SQL DROP/TRUNCATE, git force-push and the fork bomb. Also the git commands that erase what no commit holds: reset --hard, clean -f, checkout of a path, restore, stash clear/drop, branch -D, push --delete/--mirror and dropping the reflog. It’s a rule, not AI: instant and offline.',
     },
     config: [{ k: 'behaviour.command_guardian', v: 'true', d: { es: 'Confirmar comandos destructivos antes de ejecutarlos.', en: 'Confirm destructive commands before running them.' } }],
     note: {
