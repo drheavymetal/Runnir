@@ -323,6 +323,20 @@ pub fn builtins() -> Vec<(&'static str, Theme)> {
                 ],
             ),
         ),
+        // Transcribed from the kitty palette DankMaterialShell generates for its
+        // synthwaveElectric theme: near-black blue ground, electric-blue selection,
+        // an orange ramp for the accent side. `color0` deliberately equals the
+        // background, as it does in the source.
+        (
+            "Synthwave Electric",
+            theme(
+                0x0a0a15, 0xe6f0ff, 0xe6f0ff, 0x0080ff, 0xff6600, 0xa5968c,
+                [
+                    0x0a0a15, 0xff0c00, 0x2dff00, 0xffd100, 0xf26000, 0x762f00, 0xff6600, 0xffece0,
+                    0xa5968c, 0xff483f, 0x6cff4c, 0xffdf4c, 0xff7c26, 0xff934c, 0xffba8c, 0xfff7f2,
+                ],
+            ),
+        ),
     ]
 }
 

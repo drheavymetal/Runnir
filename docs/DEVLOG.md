@@ -556,6 +556,26 @@ a filename, not a command. Tested for spaces, globs, `$`, apostrophes and a newl
 the name. winit's own `DroppedFile` (X11/macOS/Windows) is one event per file and
 carries no coordinates, so it passes `None` and lands in the focused pane.
 
+## 2026-07-21 — Synthwave Electric (Pedro's kitty palette) bundled
+
+Pedro: "me gusta el tema de kitty que tengo en este equipo y no lo veo en runnir".
+It is not a kitty theme — **DankMaterialShell generates it**. `dms` writes
+`~/.config/kitty/dank-theme.conf` (+ `dank-tabs.conf`) from
+`~/.config/DankMaterialShell/themes/synthwaveElectric/theme.json`, so the file is
+regenerated whenever the dms theme changes. Transcribed as a static builtin anyway
+(Pedro's call): bg `#0a0a15`, fg `#e6f0ff`, selection `#0080ff`, accent `#ff6600`
+(kitty's `url_color`/`color6`), dim `#a5968c` (`color8`). `color0` equals the
+background in the source and is kept that way. themes.rs only, one row of hex.
+
+Consequence to remember: it is a SNAPSHOT. Switch dms to another theme and runnir
+does not follow. The general fix, if it ever comes up again, is a `theme_file`
+config pointing at a kitty `.conf` plus a parser for `color0..15`/`foreground`/
+`background`/`cursor`/`selection_*` — that would also unlock all ~300 kitty-themes.
+
+Not visually verified: `render::offscreen` (and `--demo`) hardcode
+`Theme::default()`, so no headless mode can render a builtin. Only the picker's live
+preview shows it.
+
 ## Gotchas (do not re-learn)
 
 - A binding spec and a keypress must produce the SAME `ChordKey` variant.
