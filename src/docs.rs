@@ -486,6 +486,30 @@ application global hotkeys, so the toggle is the compositor's job. For Hyprland:
   bind = , F12, togglespecialworkspace, runnir
   exec-once = runnir --quake
 
+# Remote control
+
+A running runnir listens on a per-user socket and exports its path to the panes as
+RUNNIR_LISTEN, so anything inside a pane can drive its own terminal:
+
+  runnir @ ls                          tabs, panes, ids, cwds
+  runnir @ send-text --text 'ls\n'     write to a pane's shell
+  runnir @ get-text                    read a pane's text back
+  runnir @ launch --type split --cmd htop
+  runnir @ new-tab / focus-tab --index 2 / close-tab
+  runnir @ set-colors --opacity 0.85 --bg '#101014'
+
+send-text talks to the CHILD. These four talk to runnir itself, so they reach the
+overlays, the leader layer and everything bound to a key:
+
+  runnir @ action --id git_panel       run an action by its config id
+  runnir @ key --chord enter           press a key (same spellings as the config)
+  runnir @ click --col 30 --row 6      click a cell of the window
+  runnir @ drag --col 40 --row 6 --to-col 60    press, move, release
+
+They answer with what is on screen — which overlay is up, and for the git panel its
+view, focus, cursor, column widths and open commit — so a script can check what it
+just did instead of guessing. This is how the panels are tested.
+
 # Inline images (kitty graphics protocol)
 
 runnir understands the kitty graphics protocol, so tools that speak it draw real

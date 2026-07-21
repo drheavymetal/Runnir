@@ -79,6 +79,32 @@ pub enum ControlRequest {
         #[serde(default)]
         index: Option<usize>,
     },
+    /// Press a key AT THE TERMINAL, not at the pane: the chord goes through the
+    /// same path a real keypress does, so it drives overlays, the leader layer and
+    /// the bound actions. `send-text` writes to the child; this drives runnir
+    /// itself, which is the only way to script (or test) a panel from outside.
+    Key { chord: String },
+    /// Click at a cell of the window. Cells, not pixels, because everything runnir
+    /// draws is laid out in them and a cell is what a caller can compute.
+    Click {
+        col: usize,
+        row: usize,
+        #[serde(default)]
+        button: Option<String>,
+    },
+    /// Press at one cell, move to another, release — a drag, for the things that
+    /// only exist under one (a pane divider, a git panel column separator).
+    Drag {
+        col: usize,
+        row: usize,
+        #[serde(rename = "to-col")]
+        to_col: usize,
+        #[serde(default, rename = "to-row")]
+        to_row: Option<usize>,
+    },
+    /// Run an action by the id the config and the palette use (`git_panel`,
+    /// `new_tab`, …), with no binding needed.
+    Action { id: String },
     /// Apply colours/opacity live through the config apply path.
     SetColors {
         #[serde(default)]
@@ -163,6 +189,27 @@ pub fn parse_client_args(cmd: &str, flags: &[String]) -> Result<ControlRequest, 
             index: opt_usize(&m, "index")?.ok_or("focus-tab needs --index")?,
         },
         "close-tab" => ControlRequest::CloseTab { index: opt_usize(&m, "index")? },
+        "key" => ControlRequest::Key {
+            chord: m
+                .get("chord")
+                .or_else(|| m.get("key"))
+                .ok_or("key needs --chord (e.g. --chord 'alt+shift+space')")?
+                .clone(),
+        },
+        "click" => ControlRequest::Click {
+            col: opt_usize(&m, "col")?.ok_or("click needs --col")?,
+            row: opt_usize(&m, "row")?.ok_or("click needs --row")?,
+            button: m.get("button").cloned(),
+        },
+        "drag" => ControlRequest::Drag {
+            col: opt_usize(&m, "col")?.ok_or("drag needs --col")?,
+            row: opt_usize(&m, "row")?.ok_or("drag needs --row")?,
+            to_col: opt_usize(&m, "to-col")?.ok_or("drag needs --to-col")?,
+            to_row: opt_usize(&m, "to-row")?,
+        },
+        "action" => ControlRequest::Action {
+            id: m.get("id").ok_or("action needs --id (e.g. --id git_panel)")?.clone(),
+        },
         "set-colors" => ControlRequest::SetColors {
             opacity: opt_f32(&m, "opacity")?,
             foreground: m.get("foreground").or_else(|| m.get("fg")).cloned(),
@@ -520,6 +567,31 @@ mod tests {
             parse_client_args("close-tab", &[]).unwrap(),
             ControlRequest::CloseTab { index: None }
         );
+    }
+
+    #[test]
+    fn parses_the_input_commands() {
+        assert_eq!(
+            parse_client_args("key", &flags(&["--chord", "alt+shift+space"])).unwrap(),
+            ControlRequest::Key { chord: "alt+shift+space".into() }
+        );
+        assert_eq!(
+            parse_client_args("click", &flags(&["--col", "4", "--row", "9"])).unwrap(),
+            ControlRequest::Click { col: 4, row: 9, button: None }
+        );
+        assert_eq!(
+            parse_client_args("drag", &flags(&["--col", "40", "--row", "5", "--to-col", "60"]))
+                .unwrap(),
+            ControlRequest::Drag { col: 40, row: 5, to_col: 60, to_row: None }
+        );
+        assert_eq!(
+            parse_client_args("action", &flags(&["--id", "git_panel"])).unwrap(),
+            ControlRequest::Action { id: "git_panel".into() }
+        );
+        // A missing coordinate has to fail loudly: a click at a defaulted 0,0 would
+        // land on the tab bar and look like the command did something else.
+        assert!(parse_client_args("click", &flags(&["--col", "4"])).is_err());
+        assert!(parse_client_args("key", &[]).is_err());
     }
 
     #[test]

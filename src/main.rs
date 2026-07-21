@@ -163,7 +163,11 @@ fn print_help() {
          runnir --render OUT CMD    render CMD's output to a PNG (debug)\n  \
          runnir @ CMD [flags]       remote-control a running terminal\n\n\
          Remote control (like kitty @): ls, send-text, get-text, focus-tab,\n  \
-         launch, new-tab, close-tab, set-colors. Example: runnir @ send-text --text 'ls\\n'\n\n\
+         launch, new-tab, close-tab, set-colors. Example: runnir @ send-text --text 'ls\\n'\n  \
+         Driving runnir itself: key, click, drag, action — e.g.\n  \
+         runnir @ action --id git_panel, runnir @ key --chord enter,\n  \
+         runnir @ drag --col 40 --row 6 --to-col 60. They answer with what is\n  \
+         on screen, so a script can check what it just did.\n\n\
          Press F1 inside runnir for the full key reference.",
         env!("CARGO_PKG_VERSION")
     );
@@ -1027,7 +1031,7 @@ impl ApplicationHandler<UserEvent> for App {
         }
     }
 
-    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         let Some(gpu) = self.gpu.as_mut() else { return };
         match event {
             UserEvent::Redraw => gpu.window.request_redraw(),
@@ -1045,7 +1049,9 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::Control(req, reply) => {
                 // Run the request against the live terminal and answer the socket
                 // thread. A dropped receiver (client hung up) just discards the reply.
-                let resp = gpu.handle_control(req, &self.config);
+                // The keymap and the event loop go in because `key` and `action` run
+                // real actions, which is what makes the panels scriptable.
+                let resp = gpu.handle_control(req, &self.config, &self.keymap, event_loop);
                 let _ = reply.send(resp);
             }
             UserEvent::Media(msg) => gpu.on_media_msg(msg, &self.config),

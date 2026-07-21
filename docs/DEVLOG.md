@@ -1113,8 +1113,45 @@ The split is the point: one agent that may only READ and must verify each claim 
 the source, then a second that fixes with the list in hand. The finder cannot talk
 itself into its own fix.
 
+## 2026-07-21 - Remote control can drive runnir itself, not just the child
+
+Everything above was verified with headless scenes and one hand on the keyboard,
+because there is no `wtype`/`ydotool` on this machine and `send-text` writes to the
+PTY, not to the app. So a panel could not be driven from outside at all.
+
+Four commands fix that: `key`, `click`, `drag` and `action`. They go in where a real
+event does — `key` through the overlays, the leader layer and the bound actions;
+`click`/`drag` through `on_click`/`on_cursor` with the pointer parked on a cell.
+
+Three things it needed:
+- **A `KeyEvent` cannot be built outside winit** (`platform_specific` is private), so
+  the handlers had to stop asking for one. `overlay_key` and `git_leader_key` now
+  take `(&Key, ModifiersState)`, which is all they ever read.
+- **`actions::chord_to_key`**, the inverse of `Chord::from_event`, so a scripted key
+  is spelled exactly like a config binding (`alt+shift+space`, `pagedown`, `]`). A
+  test round-trips every shape.
+- **The leader block moved out of `on_key`** into `leader_key(...) -> bool`, shared
+  with the scripted path. A second implementation of a modal layer is a second set of
+  bugs.
+
+Every one of them answers with `ui_state()`: which overlay is up and, for the git
+panel, its view, focus, zoom, cursor, open commit, column widths and — in SCREEN
+cells — where its separators are. That last field exists because the first drag this
+tool ever ran missed: the widths are panel-local, the panel is inset two cells, and
+aiming at `list_w` clicked a row instead of the rule beside it. A caller that has to
+add an origin it cannot see will get it wrong, so the panel reports the number to
+aim at.
+
+With it, the whole feature above was driven from a shell: open the panel, switch to
+the log, Enter a commit, walk its files, zoom, escape, drag both separators, arm the
+leader and descend into a group — each step asserted on the JSON that came back.
+
 ## Gotchas (do not re-learn)
 
+- Handlers that take a `winit::event::KeyEvent` cannot be called by anything but
+  winit. Take `(&Key, ModifiersState)` and they stay scriptable and testable.
+- Any coordinate a remote API hands out has to be in the space the caller will aim
+  in. Panel-local widths plus an unstated origin is a trap that fires on first use.
 - One guard on `j`/`k` is half a guard: the arrows are the same motion and get
   reached by reflex. Bind them in the same arm or they will diverge.
 - A worker message that mutates panel state needs the SAME `seq == current` guard the

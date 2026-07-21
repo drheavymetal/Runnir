@@ -1072,6 +1072,90 @@ pub fn default_hints() -> HashMap<String, String> {
     hints
 }
 
+#[cfg(test)]
+mod chord_roundtrip_tests {
+    use super::*;
+
+    #[test]
+    fn a_chord_spec_becomes_the_keypress_that_produces_it() {
+        // The remote-control `key` command stands on this: what `chord_to_key`
+        // builds must chord back to what was asked for, or a scripted keypress is
+        // not the keypress it names.
+        for spec in [
+            "alt+shift+space",
+            "ctrl+shift+t",
+            "enter",
+            "escape",
+            "j",
+            "shift+j",
+            "f1",
+            "pagedown",
+            "]",
+        ] {
+            let (key, mods) = chord_to_key(spec).unwrap_or_else(|| panic!("{spec} does not parse"));
+            assert_eq!(
+                Chord::from_event(&key, mods),
+                Chord::parse(spec),
+                "{spec} did not round-trip"
+            );
+        }
+        assert!(chord_to_key("not+a+key").is_none());
+    }
+}
+
+/// Turns a chord spec into the key and modifiers a real press of it would carry.
+///
+/// The inverse of `Chord::from_event`, for the remote-control `key` command: a
+/// `winit::KeyEvent` cannot be built outside winit, so a scripted keypress has to
+/// enter the app as the (key, modifiers) pair the handlers actually read. Going
+/// through `Chord::parse` means the spellings are the SAME ones the config accepts.
+pub fn chord_to_key(spec: &str) -> Option<(Key, ModifiersState)> {
+    let chord = Chord::parse(spec)?;
+    let key = match chord.key {
+        ChordKey::Char(c) => Key::Character(winit::keyboard::SmolStr::new(c.to_string())),
+        ChordKey::Named(id) => Key::Named(named_key(id)?),
+    };
+    let mut mods = ModifiersState::empty();
+    mods.set(ModifiersState::CONTROL, chord.ctrl);
+    mods.set(ModifiersState::SHIFT, chord.shift);
+    mods.set(ModifiersState::ALT, chord.alt);
+    mods.set(ModifiersState::SUPER, chord.supr);
+    Some((key, mods))
+}
+
+/// The `NamedKey` behind a canonical id — the inverse of `named_id`.
+fn named_key(id: &str) -> Option<NamedKey> {
+    Some(match id {
+        "enter" => NamedKey::Enter,
+        "tab" => NamedKey::Tab,
+        "space" => NamedKey::Space,
+        "escape" => NamedKey::Escape,
+        "backspace" => NamedKey::Backspace,
+        "delete" => NamedKey::Delete,
+        "up" => NamedKey::ArrowUp,
+        "down" => NamedKey::ArrowDown,
+        "left" => NamedKey::ArrowLeft,
+        "right" => NamedKey::ArrowRight,
+        "home" => NamedKey::Home,
+        "end" => NamedKey::End,
+        "pageup" => NamedKey::PageUp,
+        "pagedown" => NamedKey::PageDown,
+        "f1" => NamedKey::F1,
+        "f2" => NamedKey::F2,
+        "f3" => NamedKey::F3,
+        "f4" => NamedKey::F4,
+        "f5" => NamedKey::F5,
+        "f6" => NamedKey::F6,
+        "f7" => NamedKey::F7,
+        "f8" => NamedKey::F8,
+        "f9" => NamedKey::F9,
+        "f10" => NamedKey::F10,
+        "f11" => NamedKey::F11,
+        "f12" => NamedKey::F12,
+        _ => return None,
+    })
+}
+
 fn named_id(named: NamedKey) -> Option<&'static str> {
     Some(match named {
         NamedKey::Enter => "enter",

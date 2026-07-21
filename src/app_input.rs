@@ -376,7 +376,7 @@ impl Gpu {
 
         // An overlay swallows all keys while open.
         if self.overlay.is_some() {
-            self.overlay_key(&event, mods, config);
+            self.overlay_key(&event.logical_key, mods, config);
             return;
         }
 
@@ -386,69 +386,8 @@ impl Gpu {
             return;
         }
 
-        // The leader layer. A modifier press alone must not consume the arming — the
-        // user is allowed to reach for shift on the way to the second key.
-        let modifier_only = matches!(
-            event.logical_key,
-            Key::Named(
-                NamedKey::Shift | NamedKey::Control | NamedKey::Alt | NamedKey::Super
-                    | NamedKey::AltGraph | NamedKey::CapsLock
-            )
-        );
-        if !modifier_only {
-            if let Some(armed_at) = self.leader_armed {
-                // An expired arm is treated as no arm at all: the key falls through to
-                // the pane, so a stray keystroke is never silently eaten.
-                if self.leader_timeout.is_some_and(|d| armed_at.elapsed() >= d) {
-                    self.cancel_leader();
-                } else {
-                    // Escape backs out of the whole layer, the way it leaves every
-                    // other modal thing in runnir.
-                    if matches!(event.logical_key, Key::Named(NamedKey::Escape)) {
-                        self.cancel_leader();
-                        self.window.request_redraw();
-                        return;
-                    }
-                    if let Some(chord) = Chord::from_event(&event.logical_key, mods) {
-                        self.leader_path.push(chord);
-                    }
-                    match keymap.resolve_leader(&self.leader_path) {
-                        // A group: stay armed, restart the clock (the panel is on
-                        // screen now, so the user is reading, not stalling) and let
-                        // the which-key panel show what this group holds.
-                        Some(LeaderNode::Group { .. }) => {
-                            self.leader_armed = Some(Instant::now());
-                            self.leader_entries = keymap.leader_entries(&self.leader_path);
-                        }
-                        Some(LeaderNode::Run(action)) => {
-                            let action = action.clone();
-                            self.cancel_leader();
-                            self.run_action(action, config, event_loop);
-                        }
-                        // A miss ends the sequence, bound or not. Falling through to
-                        // the pane would leak a stray character into the shell after
-                        // a mistyped sequence.
-                        None => self.cancel_leader(),
-                    }
-                    self.window.request_redraw();
-                    return;
-                }
-            }
-            if keymap.is_leader(&event.logical_key, mods) {
-                self.leader_armed = Some(Instant::now());
-                self.leader_path.clear();
-                self.leader_entries = keymap.leader_entries(&[]);
-                // The armed state shows as a chip in the status bar, which lives
-                // exactly as long as the arming (`build_status` reads `leader_armed`).
-                // With the bar hidden there is nowhere to put it, so fall back to a
-                // toast — an invisible modal layer is how you eat a keystroke and
-                // leave the user wondering.
-                if !self.status_bar {
-                    self.toast("leader…", self.leader_timeout.map_or(30, |d| d.as_secs()));
-                }
-                self.window.request_redraw();
-                return;
-            }
+        if self.leader_key(&event.logical_key, mods, config, keymap, event_loop) {
+            return;
         }
 
         // The XF86 media transport keys drive the media backend directly, wherever the
@@ -739,14 +678,189 @@ impl Gpu {
         self.window.request_redraw();
     }
 
-    fn overlay_key(&mut self, event: &winit::event::KeyEvent, mods: ModifiersState, config: &Config) {
-        let key = &event.logical_key;
+    /// The leader layer, for one key. Returns whether it consumed it.
+    ///
+    /// Split out of `on_key` so the remote-control `key` command drives the same
+    /// layer a hand does — a second implementation of a modal layer is a second
+    /// set of bugs.
+    fn leader_key(
+        &mut self,
+        key: &Key,
+        mods: ModifiersState,
+        config: &Config,
+        keymap: &Keymap,
+        event_loop: &ActiveEventLoop,
+    ) -> bool {
+        // A modifier press alone must not consume the arming — the user is allowed
+        // to reach for shift on the way to the second key.
+        if matches!(
+            key,
+            Key::Named(
+                NamedKey::Shift | NamedKey::Control | NamedKey::Alt | NamedKey::Super
+                    | NamedKey::AltGraph | NamedKey::CapsLock
+            )
+        ) {
+            return false;
+        }
+        if let Some(armed_at) = self.leader_armed {
+            // An expired arm is treated as no arm at all: the key falls through to
+            // the pane, so a stray keystroke is never silently eaten.
+            if self.leader_timeout.is_some_and(|d| armed_at.elapsed() >= d) {
+                self.cancel_leader();
+            } else {
+                // Escape backs out of the whole layer, the way it leaves every
+                // other modal thing in runnir.
+                if matches!(key, Key::Named(NamedKey::Escape)) {
+                    self.cancel_leader();
+                    self.window.request_redraw();
+                    return true;
+                }
+                if let Some(chord) = Chord::from_event(key, mods) {
+                    self.leader_path.push(chord);
+                }
+                match keymap.resolve_leader(&self.leader_path) {
+                    // A group: stay armed, restart the clock (the panel is on
+                    // screen now, so the user is reading, not stalling) and let
+                    // the which-key panel show what this group holds.
+                    Some(LeaderNode::Group { .. }) => {
+                        self.leader_armed = Some(Instant::now());
+                        self.leader_entries = keymap.leader_entries(&self.leader_path);
+                    }
+                    Some(LeaderNode::Run(action)) => {
+                        let action = action.clone();
+                        self.cancel_leader();
+                        self.run_action(action, config, event_loop);
+                    }
+                    // A miss ends the sequence, bound or not. Falling through to
+                    // the pane would leak a stray character into the shell after
+                    // a mistyped sequence.
+                    None => self.cancel_leader(),
+                }
+                self.window.request_redraw();
+                return true;
+            }
+        }
+        if keymap.is_leader(key, mods) {
+            self.leader_armed = Some(Instant::now());
+            self.leader_path.clear();
+            self.leader_entries = keymap.leader_entries(&[]);
+            // The armed state shows as a chip in the status bar, which lives
+            // exactly as long as the arming (`build_status` reads `leader_armed`).
+            // With the bar hidden there is nowhere to put it, so fall back to a
+            // toast — an invisible modal layer is how you eat a keystroke and
+            // leave the user wondering.
+            if !self.status_bar {
+                self.toast("leader\u{2026}", self.leader_timeout.map_or(30, |d| d.as_secs()));
+            }
+            self.window.request_redraw();
+            return true;
+        }
+        false
+    }
+
+    /// A keypress with no `KeyEvent` behind it, for the remote-control `key`
+    /// command: overlays, the leader layer and the bound actions, in the order
+    /// `on_key` tries them.
+    ///
+    /// It deliberately stops short of the pane: text for the child goes through
+    /// `send-text`, which does not have to guess an encoding.
+    fn press_key(
+        &mut self,
+        key: &Key,
+        mods: ModifiersState,
+        config: &Config,
+        keymap: &Keymap,
+        event_loop: &ActiveEventLoop,
+    ) {
+        if self.overlay.is_some() {
+            self.overlay_key(key, mods, config);
+            return;
+        }
+        if self.leader_key(key, mods, config, keymap, event_loop) {
+            return;
+        }
+        if let Some(action) = keymap.resolve(key, mods) {
+            let action = action.clone();
+            self.run_action(action, config, event_loop);
+        }
+    }
+
+    /// What is on screen now, for the answer to a scripted key or click.
+    ///
+    /// Enough to assert on: which overlay is up and, for the git panel, the state a
+    /// key would have changed. A caller that had to screenshot to find out what its
+    /// keypress did could not be a test.
+    fn ui_state(&self) -> serde_json::Value {
+        use serde_json::json;
+        let (cw, ch) = self.renderer.cell_size();
+        let cols = (self.surface_config.width as f32 / cw).floor().max(1.0) as usize;
+        let rows = (self.surface_config.height as f32 / ch).floor().max(1.0) as usize;
+        let overlay = match &self.overlay {
+            None => "none",
+            Some(Overlay::Git(_)) => "git",
+            Some(Overlay::Prompt(_)) => "prompt",
+            Some(Overlay::Palette(_)) => "palette",
+            Some(Overlay::Search(_)) => "search",
+            Some(Overlay::Docs(_)) => "docs",
+            Some(_) => "other",
+        };
+        let mut out = json!({
+            "overlay": overlay,
+            "cols": cols,
+            "rows": rows,
+            "leader_armed": self.leader_armed.is_some(),
+        });
+        if let Some(Overlay::Git(p)) = &self.overlay {
+            let l = p.layout(cols, rows);
+            out["git"] = json!({
+                "view": p.view.title(),
+                "focus": match p.focus {
+                    crate::overlay::GitFocus::List => "list",
+                    crate::overlay::GitFocus::Files => "files",
+                    crate::overlay::GitFocus::Diff => "diff",
+                },
+                "zoom": p.zoom,
+                "open_commit": p.open_commit,
+                "cursor": p.cursor(),
+                "rows": p.len(),
+                "files_cursor": p.files_cursor(),
+                "files": p.commit_files.iter().map(|f| f.path.clone()).collect::<Vec<_>>(),
+                "leader": p.leader.as_ref().map(|path| path.iter().collect::<String>()),
+                "columns": [l.list_w, l.files_w, l.prev_w()],
+                // In SCREEN cells, unlike the widths: the panel is inset, and a
+                // caller that has to add the origin itself to aim a drag will get
+                // it wrong and click a row instead.
+                "separators": [l.sep1().map(|s| s + l.col), l.sep2().map(|s| s + l.col)],
+                "origin": [l.col, l.row],
+                "preview_lines": p.preview_rows.len(),
+                "message": match &p.message {
+                    Ok(m) => m.clone(),
+                    Err(e) => format!("error: {e}"),
+                },
+            });
+        }
+        out
+    }
+
+    /// The middle of a cell, in physical pixels — what a click at `col`/`row` means.
+    fn cell_centre(&self, col: usize, row: usize) -> PhysicalPosition<f64> {
+        let (cw, ch) = self.renderer.cell_size();
+        PhysicalPosition::new(
+            (col as f32 + 0.5) as f64 * cw as f64,
+            (row as f32 + 0.5) as f64 * ch as f64,
+        )
+    }
+
+    /// Keys while an overlay owns the keyboard. Takes the logical key rather than
+    /// the `KeyEvent`, because a `KeyEvent` cannot be built outside winit and the
+    /// remote-control `key` command has to reach exactly this path.
+    fn overlay_key(&mut self, key: &Key, mods: ModifiersState, config: &Config) {
 
         // The git panel has a leader layer of its own, armed by the same chord as
         // the global one and drawn with the same which-key. It is checked before
         // everything else here, including the modifier filter below: the leader
         // chord is a modifier chord by definition.
-        if self.git_leader_key(event, mods, config) {
+        if self.git_leader_key(key, mods, config) {
             return;
         }
 
@@ -2256,12 +2370,7 @@ impl Gpu {
     /// keyboard is for git, and "new tab" or "split pane" under the same letters
     /// would be a different meaning for the same muscle memory. Every leaf presses
     /// a key the panel already has, so the letters and the leader can never drift.
-    fn git_leader_key(
-        &mut self,
-        event: &winit::event::KeyEvent,
-        mods: ModifiersState,
-        config: &Config,
-    ) -> bool {
+    fn git_leader_key(&mut self, key: &Key, mods: ModifiersState, config: &Config) -> bool {
         let Some(Overlay::Git(p)) = &mut self.overlay else { return false };
         // A rebase being planned owns the keyboard, leader included.
         if p.rebase.is_some() {
@@ -2272,7 +2381,7 @@ impl Gpu {
         // Parsing it raw here left an unparseable value with a working global layer
         // and an unreachable panel one.
         let configured = crate::actions::leader_chord(&config.leader);
-        let is_leader = match (configured, Chord::from_event(&event.logical_key, mods)) {
+        let is_leader = match (configured, Chord::from_event(key, mods)) {
             (Some(l), Some(c)) => l == c,
             _ => false,
         };
@@ -2293,12 +2402,12 @@ impl Gpu {
         // on this layer: Ctrl+C with the menu up must not descend into Commit. This
         // runs before `overlay_key`'s own modifier filter, so it has to repeat it —
         // and it has to come after the leader chord, which is a modifier chord.
-        if matches!(event.logical_key, Key::Character(_))
+        if matches!(key, Key::Character(_))
             && (mods.control_key() || mods.alt_key() || mods.super_key())
         {
             return false;
         }
-        let press = match &event.logical_key {
+        let press = match key {
             Key::Named(NamedKey::Escape) => {
                 p.cancel_leader();
                 None
@@ -3682,11 +3791,60 @@ impl Gpu {
         &mut self,
         req: crate::control::ControlRequest,
         config: &Config,
+        keymap: &Keymap,
+        event_loop: &ActiveEventLoop,
     ) -> crate::control::ControlResponse {
         use crate::control::{ControlRequest, ControlResponse, LaunchTarget};
         use serde_json::json;
 
         match req {
+            // Input, delivered where a real one lands. The answer carries a snapshot
+            // of whatever panel is open, so a script can assert what a key did
+            // without taking a screenshot of it.
+            ControlRequest::Key { chord } => {
+                let Some((key, mods)) = crate::actions::chord_to_key(&chord) else {
+                    return ControlResponse::error(format!("cannot parse chord {chord:?}"));
+                };
+                self.press_key(&key, mods, config, keymap, event_loop);
+                self.window.request_redraw();
+                ControlResponse::ok(self.ui_state())
+            }
+            ControlRequest::Click { col, row, button } => {
+                let btn = match button.as_deref() {
+                    None | Some("left") => MouseButton::Left,
+                    Some("right") => MouseButton::Right,
+                    Some("middle") => MouseButton::Middle,
+                    Some(other) => return ControlResponse::error(format!("unknown button {other:?}")),
+                };
+                self.cursor_px = self.cell_centre(col, row);
+                self.on_click(ElementState::Pressed, btn, ModifiersState::empty(), config);
+                self.on_click(ElementState::Released, btn, ModifiersState::empty(), config);
+                self.window.request_redraw();
+                ControlResponse::ok(self.ui_state())
+            }
+            ControlRequest::Drag { col, row, to_col, to_row } => {
+                let from = self.cell_centre(col, row);
+                let to = self.cell_centre(to_col, to_row.unwrap_or(row));
+                self.cursor_px = from;
+                self.on_click(ElementState::Pressed, MouseButton::Left, ModifiersState::empty(), config);
+                // Two steps, because a drag handler is allowed to care about motion
+                // rather than about the final position — one jump would not exercise
+                // what a hand does.
+                let mid = PhysicalPosition::new((from.x + to.x) / 2.0, (from.y + to.y) / 2.0);
+                self.on_cursor(mid, ModifiersState::empty());
+                self.on_cursor(to, ModifiersState::empty());
+                self.on_click(ElementState::Released, MouseButton::Left, ModifiersState::empty(), config);
+                self.window.request_redraw();
+                ControlResponse::ok(self.ui_state())
+            }
+            ControlRequest::Action { id } => {
+                let Some(action) = Action::parse(&id) else {
+                    return ControlResponse::error(format!("unknown action {id:?}"));
+                };
+                self.run_action(action, config, event_loop);
+                self.window.request_redraw();
+                ControlResponse::ok(self.ui_state())
+            }
             ControlRequest::Ls => {
                 let active = self.active;
                 let tabs: Vec<_> = self
