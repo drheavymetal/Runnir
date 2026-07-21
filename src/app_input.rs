@@ -1853,7 +1853,29 @@ impl Gpu {
         let proxy = self.proxy.clone();
         std::thread::spawn(move || {
             let out = crate::git::run(&root, &args);
-            let _ = proxy.send_event(UserEvent::GitPanel(seq, crate::git::PanelMsg::Ran(out)));
+            let _ = proxy.send_event(UserEvent::GitPanel(seq, crate::git::PanelMsg::Ran(args, out)));
+        });
+        self.window.request_redraw();
+    }
+
+    /// Stages or unstages one hunk, by feeding a rebuilt patch to `git apply
+    /// --cached`. Same worker + busy discipline as `git_exec`.
+    fn git_apply(&mut self, patch: String, reverse: bool) {
+        let Some(Overlay::Git(p)) = &mut self.overlay else { return };
+        if p.busy {
+            return;
+        }
+        p.busy = true;
+        let root = p.root.clone();
+        self.git_gen += 1;
+        let seq = self.git_gen;
+        let proxy = self.proxy.clone();
+        std::thread::spawn(move || {
+            let out = crate::git::apply_patch(&root, &patch, reverse);
+            let _ = proxy.send_event(UserEvent::GitPanel(
+                seq,
+                crate::git::PanelMsg::Ran(vec!["apply".into()], out),
+            ));
         });
         self.window.request_redraw();
     }
@@ -1864,6 +1886,7 @@ impl Gpu {
         let current = self.git_gen;
         let mut reload = false;
         let mut preview = false;
+        let mut rerun: Option<Vec<String>> = None;
         if let Some(Overlay::Git(p)) = &mut self.overlay {
             match msg {
                 crate::git::PanelMsg::Files(f) => {
@@ -1883,11 +1906,27 @@ impl Gpu {
                         p.set_preview(text);
                     }
                 }
-                crate::git::PanelMsg::Ran(result) => {
+                crate::git::PanelMsg::Ran(args, result) => {
                     p.busy = false;
+                    // A credential prompt cannot be answered from a worker with no
+                    // terminal. Rather than fail, hand the SAME command to a real
+                    // pane, where ssh and git ask the way they always do.
+                    if let Err(e) = &result {
+                        if crate::git::needs_terminal(e) {
+                            let mut cmd = vec!["git".to_string()];
+                            cmd.extend(args);
+                            rerun = Some(cmd);
+                        }
+                    }
                     p.message = result;
                     reload = true;
                 }
+            }
+        }
+        if let Some(cmd) = rerun {
+            self.split_running(config, cmd);
+            if let Some(Overlay::Git(p)) = &mut self.overlay {
+                p.message = Err("needs a terminal — rerunning in a split".into());
             }
         }
         if reload {
@@ -1911,6 +1950,8 @@ impl Gpu {
         let mut prompt: Option<(PromptKind, &str)> = None;
         let mut close = false;
         let mut reload = false;
+        // A hunk patch to stage (or, reversed, unstage).
+        let mut patch: Option<(String, bool)> = None;
 
         let s = |v: &str| v.to_string();
         match key {
@@ -1967,6 +2008,17 @@ impl Gpu {
                 }
                 "J" => p.scroll_preview(5),
                 "K" => p.scroll_preview(-5),
+                // Hunk selection. `body_rows` is approximated from the panel's own
+                // layout rule rather than threaded from the draw path: it only
+                // decides when to scroll the hunk into view.
+                "]" => p.step_hunk(1, 20),
+                "[" => p.step_hunk(-1, 20),
+                "s" | "u" if view == GitView::Status => {
+                    patch = p.hunk_patch().map(|text| (text, c.as_str() == "u"));
+                    if patch.is_none() {
+                        p.message = Err("no hunk here — stage the file with space".into());
+                    }
+                }
                 "1" => {
                     p.set_view(GitView::Status);
                     moved = true;
@@ -2028,7 +2080,9 @@ impl Gpu {
             self.split_running(config, cmd);
             self.overlay = None;
         }
-        if let Some(args) = exec {
+        if let Some((text, reverse)) = patch {
+            self.git_apply(text, reverse);
+        } else if let Some(args) = exec {
             self.git_exec(args);
         } else if reload {
             self.git_reload(config);

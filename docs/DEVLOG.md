@@ -762,6 +762,33 @@ CHERRY-PICK, REVERT, BISECT, from the marker files in the git dir. It leads the
 line because it changes what the rest of it means - "2 ahead" mid-rebase is not the
 same fact as 2 ahead on a finished branch.
 
+## 2026-07-21 - Git: credentials in a real pane, a deadline, and hunk staging
+
+**A background git cannot be asked for a password.** `run` sets
+`GIT_TERMINAL_PROMPT=0` AND `GIT_SSH_COMMAND=ssh -o BatchMode=yes`, so a push that
+needs a passphrase, a username or an unknown host key fails IMMEDIATELY instead of
+blocking on a /dev/tty that is not there. `needs_terminal` recognises those
+failures by their message and the panel reruns the same argv in a split, where ssh
+and git ask the way they always do. A plain rejection (non-fast-forward) is
+deliberately not in that set: nothing can be typed to fix it, and a split per failed
+push is noise.
+
+**Every command has a 60s deadline.** The child is spawned rather than `output()`d,
+a thread waits on it, and `recv_timeout` decides: past the deadline it is SIGKILLed
+and the panel says so. Without it a hung remote pinned the panel in `busy` for the
+rest of the session, with no way back short of closing it.
+
+**Hunk staging.** `hunk_ranges` splits the parsed diff at each `@@`, `patch_for_hunk`
+rebuilds a one-hunk patch — putting the `+`/`-` column back from the row kind, and
+carrying the file header, without which git has nothing to apply against — and
+`apply_patch` pipes it to `git apply --cached`. `--cached` is the whole safety
+argument: the index moves, the working tree does not, so a mistaken hunk stage
+cannot lose an edit. `]`/`[` move the selection (a yellow bar marks its rows, drawn
+only when there is more than one hunk), `s` stages it, `u` unstages it.
+
+Verified against the real repo: staged one hunk of `src/git.rs` and `git diff
+--cached --stat` showed 38 insertions while 196 stayed unstaged in the same file.
+
 ## Gotchas (do not re-learn)
 
 - A binding spec and a keypress must produce the SAME `ChordKey` variant.

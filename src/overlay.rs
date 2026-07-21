@@ -161,6 +161,9 @@ pub struct GitPanel {
     /// draw path never re-parses on every frame.
     pub preview_rows: Vec<crate::git::DiffRow>,
     pub preview_scroll: usize,
+    /// Which hunk of the preview is selected, for partial staging. Kept as an index
+    /// into `hunk_ranges`, not a row, so it survives the preview being reparsed.
+    pub hunk: usize,
     /// The last command's result, shown in the footer; `Err` is drawn red.
     pub message: Result<String, String>,
     /// A command is in flight: the footer says so and the keys that start another
@@ -182,6 +185,7 @@ impl GitPanel {
             preview: String::new(),
             preview_rows: Vec::new(),
             preview_scroll: 0,
+            hunk: 0,
             message: Ok(String::new()),
             busy: false,
         }
@@ -258,6 +262,34 @@ impl GitPanel {
         self.preview_rows = crate::git::parse_diff(&text);
         self.preview = text;
         self.preview_scroll = 0;
+        self.hunk = 0;
+    }
+
+    pub fn hunks(&self) -> Vec<(usize, usize)> {
+        crate::git::hunk_ranges(&self.preview_rows)
+    }
+
+    /// Moves the hunk selection and scrolls the preview so the whole hunk is in
+    /// view — selecting something off screen would be an invisible state, and this
+    /// selection decides what a keypress stages.
+    pub fn step_hunk(&mut self, delta: i32, body_rows: usize) {
+        let hunks = self.hunks();
+        if hunks.is_empty() {
+            return;
+        }
+        let next = (self.hunk as i32 + delta).clamp(0, hunks.len() as i32 - 1) as usize;
+        self.hunk = next;
+        let (start, end) = hunks[next];
+        if start < self.preview_scroll || end > self.preview_scroll + body_rows {
+            self.preview_scroll = start;
+        }
+    }
+
+    /// The patch for the selected hunk, or `None` when the preview is not a diff
+    /// (an untracked file, a branch log).
+    pub fn hunk_patch(&self) -> Option<String> {
+        let hunks = self.hunks();
+        crate::git::patch_for_hunk(&self.preview_rows, *hunks.get(self.hunk)?)
     }
 
     pub fn scroll_preview(&mut self, delta: i32) {
@@ -325,7 +357,7 @@ impl GitPanel {
     fn keys_legend(&self) -> &'static str {
         match self.view {
             GitView::Status => {
-                "space stage/unstage · a all · c commit · P push · p pull · f fetch · S stash"
+                "space stage · a all · ]/[ hunk · s/u stage hunk · c commit · P push · p pull · S stash"
             }
             GitView::Log => "y copy sha · o open in split · P push · p pull · f fetch",
             GitView::Branches => "enter switch · n new · P push · f fetch",
@@ -387,10 +419,14 @@ impl GitPanel {
         let add_bg = Color::Rgb(0x12, 0x2c, 0x18);
         let del_bg = Color::Rgb(0x35, 0x14, 0x18);
         let num_fg = Color::Rgb(0x6a, 0x6d, 0x74);
+        let hunks = self.hunks();
+        let selected_hunk = hunks.get(self.hunk).copied();
+        let hunk_marker = matches!(self.view, GitView::Status) && hunks.len() > 1;
         for (line, row) in
             self.preview_rows.iter().skip(self.preview_scroll).take(body_rows).enumerate()
         {
             let y = 2 + line;
+            let idx = self.preview_scroll + line;
             let row_bg = match row.kind {
                 crate::git::DiffKind::Added => add_bg,
                 crate::git::DiffKind::Removed => del_bg,
@@ -406,6 +442,22 @@ impl GitPanel {
                 None => "      ".to_string(),
             };
             write(&mut g, y, prev_x, &num, Pen { fg: num_fg, bg: row_bg, ..Pen::default() });
+            // A bar down the left of the hunk a key would act on. Only drawn when
+            // there is more than one hunk: with a single one there is no choice to
+            // show, and the bar would just be noise.
+            if hunk_marker {
+                if let Some((hs, he)) = selected_hunk {
+                    if idx >= hs && idx < he {
+                        write(
+                            &mut g,
+                            y,
+                            prev_x,
+                            "\u{258c}",
+                            Pen { fg: Color::Rgb(0xf5, 0xd5, 0x43), bg: row_bg, ..Pen::default() },
+                        );
+                    }
+                }
+            }
             let text_x = prev_x + 6;
             let text_w = prev_w.saturating_sub(6);
             let fg = match row.kind {

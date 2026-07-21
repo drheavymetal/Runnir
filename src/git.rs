@@ -439,26 +439,96 @@ fn read_text(root: &Path, args: &[&str]) -> String {
     }
 }
 
+/// How long a panel command may take before it is killed. Generous enough for a
+/// push over a slow link, short enough that a hung one does not leave the panel
+/// saying "working…" for the rest of the session.
+pub const RUN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Runs a git command that CHANGES the repository, returning its combined output.
 ///
 /// The panel binds only operations git can undo: staging, committing, fetching,
 /// pushing, switching branch, stashing. Nothing that discards uncommitted work is
 /// reachable from a key here — those live at the prompt, where the guardian sees
 /// them and asks.
+///
+/// Two things make this safe to run behind a UI:
+/// - **No prompting.** `GIT_TERMINAL_PROMPT=0` and ssh in batch mode mean a command
+///   that needs a password FAILS instead of blocking on a terminal that is not
+///   there. [`needs_terminal`] recognises that failure so the caller can rerun it
+///   in a real pane.
+/// - **A deadline.** A remote that never answers, or a filesystem that hangs, would
+///   otherwise pin the panel in its busy state forever.
 pub fn run(root: &Path, args: &[String]) -> Result<String, String> {
-    let out = std::process::Command::new("git")
+    let child = std::process::Command::new("git")
         .args(args)
         .current_dir(root)
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_PAGER", "cat")
-        .output()
+        // Batch mode turns "ask for the passphrase" into an immediate, recognisable
+        // failure. Without it ssh opens /dev/tty behind our back and hangs there.
+        .env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .map_err(|e| format!("git: {e}"))?;
+    let pid = child.id();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(child.wait_with_output());
+    });
+    let out = match rx.recv_timeout(RUN_TIMEOUT) {
+        Ok(Ok(out)) => out,
+        Ok(Err(e)) => return Err(format!("git: {e}")),
+        Err(_) => {
+            kill(pid);
+            return Err(format!(
+                "git {} timed out after {}s — killed",
+                args.first().map(String::as_str).unwrap_or(""),
+                RUN_TIMEOUT.as_secs()
+            ));
+        }
+    };
     let text = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
     if out.status.success() { Ok(text) } else { Err(text) }
+}
+
+/// Kills a git that ran past its deadline. The reader thread ends when the pipes
+/// close, so nothing is leaked by walking away from it.
+fn kill(pid: u32) {
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(pid as i32, libc::SIGKILL);
+    }
+    #[cfg(not(unix))]
+    let _ = pid;
+}
+
+/// Whether this failure means "there was nobody to ask for a credential".
+///
+/// A push to a repo behind HTTPS, an ssh key with a passphrase, an unknown host
+/// key, a 2FA prompt: none of them can be answered from a background process with
+/// no terminal. The answer is not to prompt inside the panel — it is to run the
+/// same command again in a real pane, where ssh and git already know how to ask.
+pub fn needs_terminal(err: &str) -> bool {
+    const SIGNS: &[&str] = &[
+        "terminal prompts disabled",
+        "could not read username",
+        "could not read password",
+        "authentication failed",
+        "permission denied (publickey",
+        "host key verification failed",
+        "no such identity",
+        "enter passphrase",
+        "askpass",
+        "connection closed by remote host",
+    ];
+    let low = err.to_lowercase();
+    SIGNS.iter().any(|s| low.contains(s))
 }
 
 /// The status-bar text for a repository: branch first, then only the counts that are
@@ -493,6 +563,106 @@ pub fn status_text(s: &RepoState) -> String {
         out.push_str(&format!(" !{}", s.conflicts));
     }
     out
+}
+
+/// The line ranges of each hunk in a parsed diff: from its `@@` header to the row
+/// before the next one.
+pub fn hunk_ranges(rows: &[DiffRow]) -> Vec<(usize, usize)> {
+    let starts: Vec<usize> = rows
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.kind == DiffKind::Meta && r.text.starts_with("@@"))
+        .map(|(i, _)| i)
+        .collect();
+    starts
+        .iter()
+        .enumerate()
+        .map(|(n, &start)| (start, starts.get(n + 1).copied().unwrap_or(rows.len())))
+        .collect()
+}
+
+/// Rebuilds a one-hunk patch that `git apply` will take.
+///
+/// The panel strips the `+`/`-` column for display, so it is put back here from the
+/// row's kind. The file header has to come along — a hunk on its own applies to
+/// nothing — and it is taken from the metadata rows above the hunk, which is where
+/// `diff --git` and the `---`/`+++` pair live.
+pub fn patch_for_hunk(rows: &[DiffRow], range: (usize, usize)) -> Option<String> {
+    let (start, end) = range;
+    if start >= rows.len() {
+        return None;
+    }
+    let mut out = String::new();
+    for row in &rows[..start] {
+        let t = &row.text;
+        if t.starts_with("diff --git")
+            || t.starts_with("index ")
+            || t.starts_with("--- ")
+            || t.starts_with("+++ ")
+            || t.starts_with("old mode")
+            || t.starts_with("new mode")
+            || t.starts_with("new file mode")
+            || t.starts_with("deleted file mode")
+            || t.starts_with("rename from")
+            || t.starts_with("rename to")
+        {
+            out.push_str(t);
+            out.push('\n');
+        }
+    }
+    if !out.contains("--- ") || !out.contains("+++ ") {
+        return None; // No file header: nothing to apply this against.
+    }
+    for row in &rows[start..end.min(rows.len())] {
+        match row.kind {
+            DiffKind::Added => out.push('+'),
+            DiffKind::Removed => out.push('-'),
+            DiffKind::Context => out.push(' '),
+            DiffKind::Meta => {}
+        }
+        out.push_str(&row.text);
+        out.push('\n');
+    }
+    Some(out)
+}
+
+/// Stages (or, reversed, unstages) a patch by feeding it to `git apply --cached`.
+///
+/// `--cached` touches only the index, so a hunk staged this way leaves the working
+/// tree exactly as it was — the property that makes partial staging safe to bind to
+/// a key at all.
+pub fn apply_patch(root: &Path, patch: &str, reverse: bool) -> Result<String, String> {
+    use std::io::Write;
+    let mut args = vec!["apply", "--cached", "--whitespace=nowarn"];
+    if reverse {
+        args.push("--reverse");
+    }
+    args.push("-");
+    let mut child = std::process::Command::new("git")
+        .args(&args)
+        .current_dir(root)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("git apply: {e}"))?;
+    child
+        .stdin
+        .as_mut()
+        .ok_or("git apply: no stdin")?
+        .write_all(patch.as_bytes())
+        .map_err(|e| format!("git apply: {e}"))?;
+    let out = child.wait_with_output().map_err(|e| format!("git apply: {e}"))?;
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    if out.status.success() {
+        Ok(if reverse { "hunk unstaged".into() } else { "hunk staged".into() })
+    } else {
+        Err(text)
+    }
 }
 
 #[cfg(test)]
@@ -547,6 +717,63 @@ mod tests {
         assert!(s.detached);
         assert_eq!(s.branch, "12345678");
         assert!(!s.has_upstream(), "a detached head has no upstream to be ahead of");
+    }
+
+    #[test]
+    fn rebuilds_a_patch_for_one_hunk_of_many() {
+        let text = "\
+diff --git a/src/x.rs b/src/x.rs
+index aaa..bbb 100644
+--- a/src/x.rs
++++ b/src/x.rs
+@@ -1,3 +1,3 @@
+ one
+-two
++TWO
+@@ -10,3 +10,3 @@
+ ten
+-eleven
++ELEVEN
+";
+        let rows = parse_diff(text);
+        let ranges = hunk_ranges(&rows);
+        assert_eq!(ranges.len(), 2);
+        let patch = patch_for_hunk(&rows, ranges[1]).expect("second hunk");
+        // The file header travels with it, or git apply has nothing to apply to.
+        assert!(patch.starts_with("diff --git a/src/x.rs b/src/x.rs\n"));
+        assert!(patch.contains("--- a/src/x.rs\n+++ b/src/x.rs\n"));
+        // Only the SECOND hunk's lines, with the markers put back.
+        assert!(patch.contains("@@ -10,3 +10,3 @@\n ten\n-eleven\n+ELEVEN\n"));
+        assert!(!patch.contains("TWO"), "the first hunk must not leak in: {patch}");
+    }
+
+    #[test]
+    fn a_diff_with_no_file_header_yields_no_patch() {
+        // An untracked file's "diff" is its contents; there is nothing to apply.
+        let rows = parse_diff("@@ -0,0 +1 @@\n+hello\n");
+        let ranges = hunk_ranges(&rows);
+        assert!(patch_for_hunk(&rows, ranges[0]).is_none());
+    }
+
+    #[test]
+    fn recognises_a_failure_that_needs_a_real_terminal() {
+        for err in [
+            "fatal: could not read Username for 'https://github.com': terminal prompts disabled",
+            "git@github.com: Permission denied (publickey).",
+            "Host key verification failed.",
+            "remote: Authentication failed for 'https://github.com/x/y.git/'",
+        ] {
+            assert!(needs_terminal(err), "{err:?} should ask for a terminal");
+        }
+        // An ordinary rejection must NOT reopen in a pane: nothing there can be
+        // typed to fix it, and a split per failed push would be noise.
+        for err in [
+            "error: failed to push some refs to 'origin' (non-fast-forward)",
+            "error: Your local changes would be overwritten by merge",
+            "fatal: not a git repository",
+        ] {
+            assert!(!needs_terminal(err), "{err:?} is not an auth failure");
+        }
     }
 
     #[test]
@@ -664,8 +891,9 @@ pub enum PanelMsg {
     Branches(Vec<String>, String),
     Stashes(Vec<String>),
     Preview(String),
-    /// A command finished: its output, or its error output.
-    Ran(Result<String, String>),
+    /// A command finished: what it was, and its output or its error. The argv comes
+    /// back too, because a failure that needs a terminal is rerun in a real pane.
+    Ran(Vec<String>, Result<String, String>),
 }
 
 /// The stash list, one entry per line (`stash@{0}: WIP on main: ...`).
