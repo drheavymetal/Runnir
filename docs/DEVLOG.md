@@ -893,6 +893,37 @@ The search bar got the same treatment; its query could outgrow its 60-cell bar t
 same way. Tests pin `field_view` and the grow-then-scroll behaviour by rendering a
 400-character input and reading the row back out of the grid.
 
+## 2026-07-21 - Git: graph, blame view, staging by line, interactive rebase
+
+The four Pedro asked for, plus the answer to "I cannot see a commit's files": that
+was already there (Enter on a commit) and is now also visible as `--stat` at the top
+of every commit preview.
+
+**Graph.** `log --graph` and `parse_log` keeps the art. Art-only rows (`|\`, `|/`)
+arrive with no sha and are kept as dimmed, unselectable rows: dropping them would
+leave a graph with holes.
+
+**Blame is a view, not a pager.** `parse_blame` turns `git blame` into rows (sha,
+author, date, line, text); the preview is the commit behind the selected line, and
+Enter drills into that commit's files. Two traps: `git blame --no-color` is
+AMBIGUOUS in this git (against `--no-color-lines`), so it uses `-c color.ui=false`;
+and an author name has spaces, so the fields are parsed from the RIGHT.
+
+**Staging by line.** `l` moves the keyboard into the diff, `v` anchors a selection,
+`s`/`u` act on exactly those lines. `patch_for_lines` does what git's own edit mode
+expects: an unpicked `+` is dropped, an unpicked `-` becomes context. Two things
+made it work: the cursor lands on the first CHANGED line (starting on context means
+the first keypress does nothing and reads as broken), and `git apply` needs
+**`--recount`** - the `@@` counts come from the original hunk and no longer match
+after dropping lines. Without it: `error: corrupt patch at <stdin>:14`.
+
+**Interactive rebase, planned in the panel.** `i` on a commit builds a plan of
+everything above it; p/r/e/s/f/d set the action, K/J reorder, Enter runs. The trick
+that avoids an editor: git invokes `$GIT_SEQUENCE_EDITOR <todo path>`, so setting it
+to `cp <our file>` makes the copy the edit. `GIT_EDITOR=true` keeps reword/squash
+from blocking on a terminal. The plan is newest-first (as the log shows it) and
+reversed when written, since git replays oldest-first.
+
 ## Gotchas (do not re-learn)
 
 - A binding spec and a keypress must produce the SAME `ChordKey` variant.
@@ -918,6 +949,10 @@ same way. Tests pin `field_view` and the grow-then-scroll behaviour by rendering
 - Claude Code does not probe for the kitty keyboard protocol. Terminal-side protocol
   support alone is not enough; the legacy encoding has to carry Shift+Enter as ESC-CR.
 
+- A hand-built patch needs `git apply --recount`: the `@@` counts come from the
+  hunk it was cut from and stop matching the moment a line is dropped or converted.
+- `git blame --no-color` is ambiguous (`--no-color-lines`, `--no-color-by-age`).
+  Use `-c color.ui=false` instead.
 - A single-line input drawn into a fixed-width panel WILL clip, and `write` clips
   silently. Grow the box, then scroll the text keeping its end visible - the caret
   lives there.

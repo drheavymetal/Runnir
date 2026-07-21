@@ -127,6 +127,10 @@ pub enum GitView {
     /// deliberately refuses to bind.
     Reflog,
     Worktrees,
+    /// Blame for one file: every line, with the commit that last touched it.
+    /// Reached from the status view rather than by number, because it is about a
+    /// file rather than about the repository.
+    Blame,
 }
 
 impl GitView {
@@ -139,6 +143,7 @@ impl GitView {
             GitView::Tags => "tags",
             GitView::Reflog => "reflog",
             GitView::Worktrees => "worktrees",
+            GitView::Blame => "blame",
         }
     }
 
@@ -151,6 +156,9 @@ impl GitView {
             GitView::Tags => GitView::Reflog,
             GitView::Reflog => GitView::Worktrees,
             GitView::Worktrees => GitView::Status,
+            // Blame is not part of the cycle: you enter it from a file and leave it
+            // with Escape, like the commit drill-down.
+            GitView::Blame => GitView::Status,
         }
     }
 }
@@ -174,9 +182,21 @@ pub struct GitPanel {
     pub tags: Vec<String>,
     pub reflog: Vec<crate::git::Commit>,
     pub worktrees: Vec<String>,
+    /// Blame rows for `blame_path`, when the blame view is up.
+    pub blame: Vec<crate::git::BlameLine>,
+    pub blame_path: String,
+    /// Which half of the panel the keyboard is driving. Line-level staging needs a
+    /// cursor INSIDE the diff, and one set of j/k cannot mean two things.
+    pub diff_focus: bool,
+    /// Cursor and selection anchor within `preview_rows`, for staging by line.
+    pub diff_cursor: usize,
+    pub diff_anchor: Option<usize>,
+    /// An interactive rebase being planned: one step per commit, oldest LAST here
+    /// (the order the log shows them) and reversed when the todo is written.
+    pub rebase: Option<RebasePlan>,
     pub current_branch: String,
     /// Selection per view, kept apart so switching back lands where you left off.
-    cursors: [usize; 7],
+    cursors: [usize; 8],
     /// In the status view, whether the preview shows the STAGED diff. A file can be
     /// both staged and modified, and those are two different diffs of one path.
     pub show_staged: bool,
@@ -217,8 +237,14 @@ impl GitPanel {
             tags: Vec::new(),
             reflog: Vec::new(),
             worktrees: Vec::new(),
+            blame: Vec::new(),
+            blame_path: String::new(),
+            diff_focus: false,
+            diff_cursor: 0,
+            diff_anchor: None,
+            rebase: None,
             current_branch: String::new(),
-            cursors: [0; 7],
+            cursors: [0; 8],
             show_staged: false,
             log_filter: String::new(),
             open_commit: None,
@@ -242,6 +268,7 @@ impl GitPanel {
             GitView::Tags => 4,
             GitView::Reflog => 5,
             GitView::Worktrees => 6,
+            GitView::Blame => 7,
         }
     }
 
@@ -278,6 +305,7 @@ impl GitPanel {
             GitView::Tags => self.tags.len(),
             GitView::Reflog => self.reflog.len(),
             GitView::Worktrees => self.worktrees.len(),
+            GitView::Blame => self.blame.len(),
         }
     }
 
@@ -389,6 +417,82 @@ impl GitPanel {
         self.hunk = 0;
     }
 
+    /// Moves the keyboard into the diff, starting the line cursor at the top of the
+    /// selected hunk — the lines a stage key would have acted on a moment ago.
+    pub fn enter_diff(&mut self) {
+        let hunks = self.hunks();
+        // Land on the first CHANGED line of the hunk, not its first line: a context
+        // line is not something you can stage, so starting there means the first
+        // keypress does nothing and reads as broken.
+        self.diff_cursor = hunks
+            .get(self.hunk)
+            .and_then(|&(start, end)| {
+                (start..end.min(self.preview_rows.len())).find(|&i| {
+                    matches!(
+                        self.preview_rows[i].kind,
+                        crate::git::DiffKind::Added | crate::git::DiffKind::Removed
+                    )
+                })
+            })
+            .unwrap_or(0);
+        self.diff_anchor = None;
+        self.diff_focus = true;
+        self.scroll_to_diff_cursor();
+    }
+
+    pub fn leave_diff(&mut self) {
+        self.diff_focus = false;
+        self.diff_anchor = None;
+    }
+
+    /// Moves the line cursor, keeping it on screen and keeping `hunk` in step so the
+    /// hunk-level keys stay meaningful after using the line-level ones.
+    pub fn step_diff(&mut self, delta: i32) {
+        let n = self.preview_rows.len();
+        if n == 0 {
+            return;
+        }
+        self.diff_cursor =
+            (self.diff_cursor as i32 + delta).clamp(0, n as i32 - 1) as usize;
+        if let Some(h) = self.hunk_at(self.diff_cursor) {
+            self.hunk = h;
+        }
+        self.scroll_to_diff_cursor();
+    }
+
+    fn scroll_to_diff_cursor(&mut self) {
+        // The body height is not known here; 20 rows is the panel's usual body and
+        // only decides when to nudge the scroll, never what is drawn.
+        const WINDOW: usize = 20;
+        if self.diff_cursor < self.preview_scroll {
+            self.preview_scroll = self.diff_cursor;
+        } else if self.diff_cursor >= self.preview_scroll + WINDOW {
+            self.preview_scroll = self.diff_cursor + 1 - WINDOW;
+        }
+    }
+
+    /// Starts or clears a line selection at the cursor.
+    pub fn toggle_anchor(&mut self) {
+        self.diff_anchor = match self.diff_anchor {
+            Some(_) => None,
+            None => Some(self.diff_cursor),
+        };
+    }
+
+    /// The selected line range, which is just the cursor when nothing is anchored.
+    pub fn line_range(&self) -> (usize, usize) {
+        match self.diff_anchor {
+            Some(a) => (a.min(self.diff_cursor), a.max(self.diff_cursor)),
+            None => (self.diff_cursor, self.diff_cursor),
+        }
+    }
+
+    /// A patch for the selected lines only.
+    pub fn line_patch(&self) -> Option<String> {
+        let hunk = *self.hunks().get(self.hunk_at(self.diff_cursor)?)?;
+        crate::git::patch_for_lines(&self.preview_rows, hunk, self.line_range())
+    }
+
     pub fn hunks(&self) -> Vec<(usize, usize)> {
         crate::git::hunk_ranges(&self.preview_rows)
     }
@@ -465,11 +569,19 @@ impl GitPanel {
                 None => (String::new(), normal()),
             },
             GitView::Log => match self.log.get(i) {
+                Some(c) if c.sha.is_empty() => {
+                    // A graph-art row: topology only, dimmed, and not selectable.
+                    (c.graph.clone(), dim())
+                }
                 Some(c) => {
                     let head =
                         if c.refs.is_empty() { String::new() } else { format!("({}) ", c.refs) };
                     let body = format!("{head}{}", c.subject);
-                    (format!("{} {}", c.sha, elide(&body, width.saturating_sub(9))), normal())
+                    let used = c.graph.chars().count() + 9;
+                    (
+                        format!("{}{} {}", c.graph, c.sha, elide(&body, width.saturating_sub(used))),
+                        normal(),
+                    )
                 }
                 None => (String::new(), normal()),
             },
@@ -505,6 +617,18 @@ impl GitPanel {
                 Some(w) => (elide(w, width), normal()),
                 None => (String::new(), normal()),
             },
+            GitView::Blame => match self.blame.get(i) {
+                Some(b) => (
+                    format!(
+                        "{} {:>4} {}",
+                        b.sha.chars().take(7).collect::<String>(),
+                        b.line,
+                        elide(&b.text, width.saturating_sub(13))
+                    ),
+                    normal(),
+                ),
+                None => (String::new(), normal()),
+            },
             GitView::Stashes => match self.stashes.get(i) {
                 Some(s) => (elide(s, width), normal()),
                 None => (String::new(), normal()),
@@ -529,10 +653,51 @@ impl GitPanel {
             GitView::Tags => "enter checkout · n new tag · P push tags",
             GitView::Reflog => "enter checkout this position · y copy sha (nothing here rewrites)",
             GitView::Worktrees => "enter open it in a new tab · y copy path",
+            GitView::Blame => "enter the commit behind this line · esc back · y copy sha",
         }
     }
 
+    /// The rebase plan, drawn instead of the usual two panes: it is a decision to
+    /// make, not something to browse, so it gets the whole box.
+    fn render_rebase(&self, plan: &RebasePlan, cols: usize, rows: usize, theme: &Theme) -> Vec<Panel> {
+        let l = self.layout(cols, rows);
+        let mut g = panel_grid(l.w, l.h, theme);
+        write(&mut g, 0, 2, &format!("interactive rebase onto {}", plan.onto), accent());
+        for (i, (action, c)) in plan.steps.iter().take(l.body_rows).enumerate() {
+            let row = 2 + i;
+            let sel = i == plan.cursor;
+            if sel {
+                write(&mut g, row, 0, &" ".repeat(l.w), selected());
+            }
+            let pen = if sel {
+                selected()
+            } else if *action == crate::git::RebaseAction::Drop {
+                Pen { fg: Color::Rgb(0xe0, 0x60, 0x60), bg: bg(), ..Pen::default() }
+            } else {
+                normal()
+            };
+            let line = format!(
+                "{:<7} {} {}",
+                action.word(),
+                c.sha,
+                elide(&c.subject, l.w.saturating_sub(20))
+            );
+            write(&mut g, row, 2, &line, pen);
+        }
+        write(
+            &mut g,
+            l.h - 1,
+            2,
+            "p pick · r reword · e edit · s squash · f fixup · d drop · K J move · enter run · esc cancel",
+            dim(),
+        );
+        vec![Panel { grid: g, col: l.col, row: l.row }]
+    }
+
     pub fn render(&self, cols: usize, rows: usize, theme: &Theme) -> Vec<Panel> {
+        if let Some(plan) = &self.rebase {
+            return self.render_rebase(plan, cols, rows, theme);
+        }
         let l = self.layout(cols, rows);
         let (w, h, list_w) = (l.w, l.h, l.list_w);
         let mut g = panel_grid(w, h, theme);
@@ -614,10 +779,29 @@ impl GitPanel {
                 None => "      ".to_string(),
             };
             write(&mut g, y, prev_x, &num, Pen { fg: num_fg, bg: row_bg, ..Pen::default() });
-            // A bar down the left of the hunk a key would act on. Only drawn when
-            // there is more than one hunk: with a single one there is no choice to
-            // show, and the bar would just be noise.
-            if hunk_marker {
+            // With the diff focused, the line cursor and its selection outrank the
+            // hunk bar: they are what a stage key will act on now.
+            if self.diff_focus {
+                let (lo, hi) = self.line_range();
+                if idx >= lo && idx <= hi {
+                    write(
+                        &mut g,
+                        y,
+                        prev_x,
+                        "\u{258c}",
+                        Pen { fg: Color::Rgb(0x4c, 0x9f, 0xd4), bg: row_bg, ..Pen::default() },
+                    );
+                }
+                if idx == self.diff_cursor {
+                    write(
+                        &mut g,
+                        y,
+                        prev_x + 1,
+                        "\u{25b8}",
+                        Pen { fg: Color::Rgb(0xf5, 0xd5, 0x43), bg: row_bg, ..Pen::default() },
+                    );
+                }
+            } else if hunk_marker {
                 if let Some((hs, he)) = selected_hunk {
                     if idx >= hs && idx < he {
                         write(
@@ -708,6 +892,51 @@ impl GitPanel {
         GitView::Reflog,
         GitView::Worktrees,
     ];
+}
+
+/// An interactive rebase being planned inside the panel.
+///
+/// The list is kept newest-first, the way the log shows it, and reversed when the
+/// todo file is written — git replays oldest first, but a plan that reads in the
+/// opposite order to the list it came from is a plan people get wrong.
+pub struct RebasePlan {
+    /// The commit the rebase is based on: everything after it is replayed.
+    pub onto: String,
+    pub steps: Vec<(crate::git::RebaseAction, crate::git::Commit)>,
+    pub cursor: usize,
+}
+
+impl RebasePlan {
+    pub fn new(onto: String, commits: Vec<crate::git::Commit>) -> Self {
+        let steps = commits.into_iter().map(|c| (crate::git::RebaseAction::Pick, c)).collect();
+        Self { onto, steps, cursor: 0 }
+    }
+
+    /// The todo git will run: oldest first.
+    pub fn todo(&self) -> String {
+        let steps: Vec<_> =
+            self.steps.iter().rev().map(|(a, c)| (*a, c.sha.clone())).collect();
+        crate::git::rebase_todo(&steps)
+    }
+
+    pub fn set_action(&mut self, action: crate::git::RebaseAction) {
+        if let Some(step) = self.steps.get_mut(self.cursor) {
+            step.0 = action;
+        }
+    }
+
+    /// Moves the selected commit within the plan, carrying the cursor with it.
+    pub fn move_step(&mut self, delta: i32) {
+        let n = self.steps.len();
+        if n == 0 {
+            return;
+        }
+        let to = (self.cursor as i32 + delta).clamp(0, n as i32 - 1) as usize;
+        if to != self.cursor {
+            self.steps.swap(self.cursor, to);
+            self.cursor = to;
+        }
+    }
 }
 
 /// The panel's geometry in cells, produced once and used by both the renderer and
@@ -2023,6 +2252,52 @@ mod tests {
         assert_eq!(p.len(), 1);
         assert!(matches!(p.hit(cols, rows, l.col + 1, l.row + 2), Some(GitHit::Row(0))));
         let _ = Commit::default();
+    }
+
+    #[test]
+    fn line_staging_selects_a_range_inside_the_focused_hunk() {
+        let mut p = GitPanel::new(std::path::PathBuf::from("/tmp/repo"));
+        p.set_preview(
+            "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1,3 +1,4 @@\n one\n+two\n+three\n four\n"
+                .into(),
+        );
+        p.enter_diff();
+        // The cursor starts on the first CHANGED line, skipping context: a context
+        // line cannot be staged, so starting there would make the first key do
+        // nothing.
+        assert_eq!(p.diff_cursor, 5);
+        p.toggle_anchor();
+        p.step_diff(1);
+        assert_eq!(p.line_range(), (5, 6), "anchor to cursor, in order");
+        let patch = p.line_patch().expect("a patch for the picked lines");
+        assert!(patch.contains("+two"));
+        assert!(patch.contains("+three"));
+
+        // With only one line picked, the other addition must not be in the patch.
+        p.toggle_anchor();
+        p.step_diff(-1);
+        let patch = p.line_patch().expect("a patch");
+        assert!(patch.contains("+two"), "{patch}");
+        assert!(!patch.contains("+three"), "{patch}");
+    }
+
+    #[test]
+    fn a_rebase_plan_reverses_into_git_order_and_moves_steps() {
+        use crate::git::{Commit, RebaseAction};
+        let c = |sha: &str| Commit { sha: sha.into(), ..Commit::default() };
+        // The panel lists newest first, git replays oldest first.
+        let mut plan = RebasePlan::new("base000".into(), vec![c("ccc"), c("bbb"), c("aaa")]);
+        assert_eq!(plan.todo(), "pick aaa\npick bbb\npick ccc\n");
+
+        plan.cursor = 0;
+        plan.set_action(RebaseAction::Fixup);
+        assert_eq!(plan.todo(), "pick aaa\npick bbb\nfixup ccc\n");
+
+        // Moving a step carries the cursor with it, or the next key would act on a
+        // different commit than the one that just moved.
+        plan.move_step(1);
+        assert_eq!(plan.cursor, 1);
+        assert_eq!(plan.todo(), "pick aaa\nfixup ccc\npick bbb\n");
     }
 
     #[test]

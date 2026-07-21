@@ -284,15 +284,29 @@ status   space stages or unstages the file, a stages everything, ] [ pick a hunk
          commit to a pane so your editor opens for a longer one, A amends, e opens
          the file, L its history, b blame, S stashes. On a conflicted file, O takes
          ours and T takes theirs.
-log      Enter opens the commit's FILES, and picking one shows just that file's
-         diff - Escape goes back. x checks the commit out, c cherry-picks it,
-         o opens it in a split, / filters by message.
+
+         l moves into the diff itself (h comes back). There j and k walk the lines,
+         v starts a selection, and s and u stage or unstage EXACTLY those lines -
+         the working tree never moves, only the index. A blue bar marks the
+         selection and an arrow the line under the cursor.
+log      drawn with the branch graph down the left. Enter opens the commit's
+         FILES, and picking one shows just that file's diff - Escape goes back.
+         x checks the commit out, c cherry-picks it, o opens it in a split,
+         / filters by message, i plans an interactive rebase of everything above
+         the selected commit.
+
+         In the rebase planner: p pick, r reword, e edit, s squash, f fixup,
+         d drop, K and J move a commit up or down, Enter runs it, Escape cancels.
+         Nothing happens until you press Enter. A rebase that stops on a conflict
+         leaves the repository mid-rebase, which the status bar says out loud.
 branches local ones first, then remote-tracking. Enter switches (with --track for a
          remote one), n creates, m merges it into HEAD, R rebases onto it.
 tags     Enter checks one out, n creates, P pushes tags.
 reflog   every position HEAD has held. Enter opens its files, x returns to it.
          This is the way back from a mistake, which is why it is here.
 worktrees and submodules; Enter opens one in a new tab with the shell already there.
+blame    b on a file in the status view. Every line with the commit that last
+         touched it; Enter opens that commit's files, Escape comes back.
 
 Anywhere: P pushes (adding -u the first time a branch is pushed), p pulls
 fast-forward only, f fetches and prunes.

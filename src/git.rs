@@ -273,6 +273,9 @@ pub fn parse_porcelain_v2(text: &str) -> RepoState {
 /// One line of history, as the panel lists it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Commit {
+    /// The graph column drawn to the left of this row (`* `, `|\\ `, `|/`). Empty
+    /// when the log was read without a graph.
+    pub graph: String,
     pub sha: String,
     pub subject: String,
     pub author: String,
@@ -320,7 +323,10 @@ pub fn log_filtered(root: &Path, limit: usize, grep: &str) -> Vec<Commit> {
     let fmt = format!("--pretty=format:%h{SEP}%s{SEP}%an{SEP}%ar{SEP}%D");
     let mut cmd = std::process::Command::new("git");
     cmd.arg("--no-optional-locks")
-        .args(["log", "--no-color"])
+        // `--graph` draws the branch topology in the first columns. A merge history
+        // read as a flat list loses the one thing the list is for: which commits
+        // came from where.
+        .args(["log", "--no-color", "--graph"])
         .arg(format!("-{limit}"))
         .arg(fmt);
     if !grep.trim().is_empty() {
@@ -337,18 +343,84 @@ pub fn log_filtered(root: &Path, limit: usize, grep: &str) -> Vec<Commit> {
     }
 }
 
+/// Parses the log format, with or without the graph column.
+///
+/// With `--graph`, git prefixes each line with the topology art and emits extra
+/// lines that are art ONLY (`|\`, `|/`) to join merges up. Those are kept, as rows
+/// with no sha: dropping them would leave a graph with holes in it, and the panel
+/// simply refuses to select them.
 pub fn parse_log(text: &str) -> Vec<Commit> {
     text.lines()
         .filter(|l| !l.trim().is_empty())
-        .map(|l| {
-            let mut f = l.split(SEP);
-            Commit {
-                sha: f.next().unwrap_or_default().to_string(),
-                subject: f.next().unwrap_or_default().to_string(),
-                author: f.next().unwrap_or_default().to_string(),
-                when: f.next().unwrap_or_default().to_string(),
-                refs: f.next().unwrap_or_default().to_string(),
+        .map(|l| match l.split_once(SEP) {
+            None => Commit { graph: l.trim_end().to_string(), ..Commit::default() },
+            Some((head, rest)) => {
+                // Everything before the last whitespace run is graph art; the token
+                // itself is the abbreviated sha.
+                let (graph, sha) = match head.rsplit_once(' ') {
+                    Some((g, sha)) => (format!("{g} "), sha),
+                    None => (String::new(), head),
+                };
+                let mut f = rest.split(SEP);
+                Commit {
+                    graph,
+                    sha: sha.to_string(),
+                    subject: f.next().unwrap_or_default().to_string(),
+                    author: f.next().unwrap_or_default().to_string(),
+                    when: f.next().unwrap_or_default().to_string(),
+                    refs: f.next().unwrap_or_default().to_string(),
+                }
             }
+        })
+        .collect()
+}
+
+/// One line of `git blame`, as the blame view lists them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BlameLine {
+    pub sha: String,
+    pub author: String,
+    pub date: String,
+    pub line: u32,
+    pub text: String,
+}
+
+/// Blame for a file, parsed into rows so the view can navigate them and open the
+/// commit behind any line.
+pub fn blame(root: &Path, path: &str) -> Vec<BlameLine> {
+    // NOT `--no-color`: git rejects it here as ambiguous against --no-color-lines
+    // and --no-color-by-age. Turning the colour config off outright is unambiguous
+    // and covers a user who set color.blame in their config.
+    parse_blame(&read_text(
+        root,
+        &["-c", "color.ui=false", "blame", "--date=short", "-w", "--", path],
+    ))
+}
+
+/// `8f6876d1 (drheavymetal 2026-07-21  42) code`, and the boundary form where the
+/// sha is prefixed with `^`.
+pub fn parse_blame(text: &str) -> Vec<BlameLine> {
+    text.lines()
+        .filter_map(|l| {
+            let (sha, rest) = l.split_once(' ')?;
+            let open = rest.find('(')?;
+            let close = rest.find(')')?;
+            if close < open {
+                return None;
+            }
+            let inside = &rest[open + 1..close];
+            let mut fields: Vec<&str> = inside.split_whitespace().collect();
+            let line = fields.pop()?.parse().ok()?;
+            // Author names contain spaces; the date is the field before the number.
+            let date = fields.pop().unwrap_or("").to_string();
+            let author = fields.join(" ");
+            Some(BlameLine {
+                sha: sha.trim_start_matches('^').to_string(),
+                author,
+                date,
+                line,
+                text: rest[close + 1..].trim_start_matches(' ').to_string(),
+            })
         })
         .collect()
 }
@@ -703,7 +775,11 @@ pub fn patch_for_hunk(rows: &[DiffRow], range: (usize, usize)) -> Option<String>
 /// a key at all.
 pub fn apply_patch(root: &Path, patch: &str, reverse: bool) -> Result<String, String> {
     use std::io::Write;
-    let mut args = vec!["apply", "--cached", "--whitespace=nowarn"];
+    // `--recount` is what makes a hand-built patch acceptable: the `@@` counts come
+    // straight from the original hunk, and dropping or converting lines for a
+    // partial stage changes them. Recomputing them here would be a second place to
+    // get them wrong, and git already knows how.
+    let mut args = vec!["apply", "--cached", "--recount", "--whitespace=nowarn"];
     if reverse {
         args.push("--reverse");
     }
@@ -859,6 +935,160 @@ pub fn push_args(root: &Path) -> Vec<String> {
     }
 }
 
+/// Rebuilds a patch containing only SOME lines of a hunk — the line-level equivalent
+/// of `git add -p` then `e`.
+///
+/// The transformation is the one git's own edit mode expects: a `+` line you did not
+/// pick is dropped (it stays in the working tree, out of the index), and a `-` line
+/// you did not pick becomes context (the deletion is not staged). What is left is a
+/// patch that applies cleanly to the index alone.
+///
+/// The `@@` counts are deliberately left as they were: `git apply --recount` works
+/// them out, and computing them here would be a second place to get them wrong.
+pub fn patch_for_lines(rows: &[DiffRow], hunk: (usize, usize), picked: (usize, usize)) -> Option<String> {
+    let (start, end) = hunk;
+    let (lo, hi) = (picked.0.min(picked.1), picked.0.max(picked.1));
+    let mut out = String::new();
+    for row in &rows[..start] {
+        let t = &row.text;
+        if t.starts_with("diff --git")
+            || t.starts_with("index ")
+            || t.starts_with("--- ")
+            || t.starts_with("+++ ")
+            || t.starts_with("old mode")
+            || t.starts_with("new mode")
+            || t.starts_with("new file mode")
+            || t.starts_with("deleted file mode")
+            || t.starts_with("rename from")
+            || t.starts_with("rename to")
+        {
+            out.push_str(t);
+            out.push('\n');
+        }
+    }
+    if !out.contains("--- ") || !out.contains("+++ ") {
+        return None;
+    }
+    let mut touched = false;
+    for (i, row) in rows.iter().enumerate().take(end.min(rows.len())).skip(start) {
+        let picked_here = i >= lo && i <= hi;
+        match row.kind {
+            DiffKind::Meta => {
+                out.push_str(&row.text);
+                out.push('\n');
+            }
+            DiffKind::Context => {
+                out.push(' ');
+                out.push_str(&row.text);
+                out.push('\n');
+            }
+            DiffKind::Added if picked_here => {
+                touched = true;
+                out.push('+');
+                out.push_str(&row.text);
+                out.push('\n');
+            }
+            // An added line left out simply is not in this patch.
+            DiffKind::Added => {}
+            DiffKind::Removed if picked_here => {
+                touched = true;
+                out.push('-');
+                out.push_str(&row.text);
+                out.push('\n');
+            }
+            // A removal left out stays as context: the line is not deleted here.
+            DiffKind::Removed => {
+                out.push(' ');
+                out.push_str(&row.text);
+                out.push('\n');
+            }
+        }
+    }
+    touched.then_some(out)
+}
+
+/// One step of an interactive rebase plan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RebaseAction {
+    Pick,
+    Reword,
+    Edit,
+    Squash,
+    Fixup,
+    Drop,
+}
+
+impl RebaseAction {
+    pub fn word(self) -> &'static str {
+        match self {
+            RebaseAction::Pick => "pick",
+            RebaseAction::Reword => "reword",
+            RebaseAction::Edit => "edit",
+            RebaseAction::Squash => "squash",
+            RebaseAction::Fixup => "fixup",
+            RebaseAction::Drop => "drop",
+        }
+    }
+}
+
+/// The todo file for `git rebase -i`, oldest commit first — the order git writes it
+/// in, and the order it replays.
+pub fn rebase_todo(steps: &[(RebaseAction, String)]) -> String {
+    let mut out = String::new();
+    for (action, sha) in steps {
+        out.push_str(action.word());
+        out.push(' ');
+        out.push_str(sha);
+        out.push('\n');
+    }
+    out
+}
+
+/// Runs an interactive rebase with a todo we wrote ourselves.
+///
+/// `GIT_SEQUENCE_EDITOR` is invoked by git as `<editor> <todo path>`, so setting it
+/// to `cp <our file>` makes the copy the "edit". That is the whole trick, and it is
+/// why the panel can offer a real interactive rebase without opening an editor.
+///
+/// `GIT_EDITOR=true` covers the message editors reword and squash would open: they
+/// keep the existing messages instead of blocking on a terminal that is not there.
+/// A rebase that stops (a conflict, an `edit` step) leaves the repository mid-rebase,
+/// which the status bar now says out loud.
+pub fn run_rebase_interactive(root: &Path, onto: &str, todo: &str) -> Result<String, String> {
+    let dir = runtime_dir().join(format!("runnir-rebase-{}.todo", std::process::id()));
+    std::fs::write(&dir, todo).map_err(|e| format!("todo: {e}"))?;
+    let seq = format!("cp {}", shell_quote_path(&dir));
+    let out = std::process::Command::new("git")
+        .args(["rebase", "-i", onto])
+        .current_dir(root)
+        .env("GIT_SEQUENCE_EDITOR", seq)
+        .env("GIT_EDITOR", "true")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .map_err(|e| format!("git rebase: {e}"))?;
+    let _ = std::fs::remove_file(&dir);
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    if out.status.success() { Ok(text) } else { Err(text) }
+}
+
+/// Where the todo file goes: the runtime dir, like every other private temp file
+/// runnir writes.
+fn runtime_dir() -> PathBuf {
+    std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+}
+
+/// Single-quotes a path for the `GIT_SEQUENCE_EDITOR` string, which git hands to a
+/// shell. A path with a space in it would otherwise become two arguments.
+fn shell_quote_path(p: &Path) -> String {
+    format!("'{}'", p.to_string_lossy().replace('\'', "'\\''"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -917,6 +1147,93 @@ mod tests {
     fn a_worktree_line_yields_its_path() {
         let line = "/home/pedro/projects/runnir/.claude/worktrees/agent-a03  8f6876d [worktree-agent-a03]";
         assert_eq!(worktree_path(line), "/home/pedro/projects/runnir/.claude/worktrees/agent-a03");
+    }
+
+    #[test]
+    fn a_line_patch_drops_unpicked_additions_and_keeps_unpicked_removals() {
+        let text = "\
+diff --git a/x b/x
+--- a/x
++++ b/x
+@@ -1,4 +1,4 @@
+ keep
+-old one
+-old two
++new one
++new two
+";
+        let rows = parse_diff(text);
+        let hunk = hunk_ranges(&rows)[0];
+        // Pick only "old one" (row 5) and "new one" (row 7)? They are not adjacent,
+        // so pick the range covering the first removal and the first addition is not
+        // possible; pick just the second addition instead.
+        let idx = rows.iter().position(|r| r.text == "new two").unwrap();
+        let patch = patch_for_lines(&rows, hunk, (idx, idx)).expect("a patch");
+        // The picked addition is in.
+        assert!(patch.contains("+new two"));
+        // The addition NOT picked is simply absent — it stays in the working tree.
+        assert!(!patch.contains("+new one"), "{patch}");
+        // Removals not picked become context, so the deletion is not staged.
+        assert!(patch.contains(" old one"), "{patch}");
+        assert!(patch.contains(" old two"), "{patch}");
+        assert!(!patch.contains("-old one"), "{patch}");
+    }
+
+    #[test]
+    fn a_line_patch_with_nothing_picked_is_no_patch() {
+        let rows = parse_diff("diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n context\n");
+        let hunk = hunk_ranges(&rows)[0];
+        assert!(patch_for_lines(&rows, hunk, (0, 0)).is_none());
+    }
+
+    #[test]
+    fn a_rebase_todo_is_oldest_first_and_one_step_per_line() {
+        let todo = rebase_todo(&[
+            (RebaseAction::Pick, "aaa1111".into()),
+            (RebaseAction::Fixup, "bbb2222".into()),
+            (RebaseAction::Drop, "ccc3333".into()),
+        ]);
+        assert_eq!(todo, "pick aaa1111\nfixup bbb2222\ndrop ccc3333\n");
+    }
+
+    #[test]
+    fn parses_a_log_with_graph_art() {
+        let sep = SEP;
+        let text = format!(
+            "* 59248cc{sep}Make hints understand git{sep}pedro{sep}2 hours ago{sep}HEAD -> main\n\
+             |\\\n\
+             | * d1fc7b6{sep}Merge branch wip{sep}pedro{sep}3 hours ago{sep}\n\
+             |/\n"
+        );
+        let log = parse_log(&text);
+        assert_eq!(log.len(), 4);
+        assert_eq!(log[0].graph, "* ");
+        assert_eq!(log[0].sha, "59248cc");
+        // Art-only rows survive with no sha, so the graph keeps its shape and the
+        // panel can refuse to select them.
+        assert_eq!(log[1].sha, "");
+        assert_eq!(log[1].graph, "|\\");
+        assert_eq!(log[2].graph, "| * ");
+        assert_eq!(log[2].sha, "d1fc7b6");
+        assert_eq!(log[2].subject, "Merge branch wip");
+    }
+
+    #[test]
+    fn parses_blame_lines() {
+        let text = "\
+8f6876d1 (drheavymetal 2026-07-21  42) let x = 1;
+^a45624f (Ana Maria Lopez 2026-07-01 100)     return None;
+";
+        let rows = parse_blame(text);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].sha, "8f6876d1");
+        assert_eq!(rows[0].author, "drheavymetal");
+        assert_eq!(rows[0].line, 42);
+        assert_eq!(rows[0].text, "let x = 1;");
+        // A boundary commit is marked with ^, and an author name can have spaces.
+        assert_eq!(rows[1].sha, "a45624f");
+        assert_eq!(rows[1].author, "Ana Maria Lopez");
+        assert_eq!(rows[1].line, 100);
     }
 
     #[test]
@@ -1121,6 +1438,7 @@ pub enum PanelMsg {
     Branches(Vec<String>, Vec<String>, String),
     /// The files one commit touched, after drilling into it.
     CommitFiles(Vec<FileEntry>),
+    Blame(Vec<BlameLine>),
     Tags(Vec<String>),
     Reflog(Vec<Commit>),
     Worktrees(Vec<String>),

@@ -1922,6 +1922,15 @@ impl Gpu {
                 Box::new(move |root: &std::path::Path| crate::git::show(root, &sha))
                     as Box<dyn FnOnce(&std::path::Path) -> String + Send>
             }),
+            // Blame's preview is the commit that last touched the selected line.
+            overlay::GitView::Blame => p
+                .blame
+                .get(p.cursor())
+                .map(|b| b.sha.clone())
+                .map(|sha| {
+                    Box::new(move |root: &std::path::Path| crate::git::show(root, &sha))
+                        as Box<dyn FnOnce(&std::path::Path) -> String + Send>
+                }),
             overlay::GitView::Worktrees => p.selected_worktree().cloned().map(|w| {
                 let path = crate::git::worktree_path(&w).to_string();
                 Box::new(move |_root: &std::path::Path| {
@@ -2039,6 +2048,106 @@ impl Gpu {
         self.window.request_redraw();
     }
 
+    /// Loads blame for a file and switches to the blame view.
+    fn git_load_blame(&mut self, path: String) {
+        let Some(Overlay::Git(p)) = &mut self.overlay else { return };
+        let root = p.root.clone();
+        p.blame_path = path.clone();
+        p.set_view(crate::overlay::GitView::Blame);
+        self.git_gen += 1;
+        let seq = self.git_gen;
+        let proxy = self.proxy.clone();
+        std::thread::spawn(move || {
+            let rows = crate::git::blame(&root, &path);
+            let _ = proxy.send_event(UserEvent::GitPanel(seq, crate::git::PanelMsg::Blame(rows)));
+        });
+    }
+
+    /// Opens the interactive-rebase planner for everything above `sha`.
+    ///
+    /// The base is the SELECTED commit: git replays what comes after it, so picking
+    /// the commit you want to keep untouched is the reading that matches the list.
+    fn git_start_rebase(&mut self, sha: String) {
+        let Some(Overlay::Git(p)) = &mut self.overlay else { return };
+        // Commits newer than the base, in the order the log shows them. Graph-art
+        // rows carry no sha and are not steps.
+        let mut steps = Vec::new();
+        for c in &p.log {
+            if c.sha.is_empty() {
+                continue;
+            }
+            if c.sha == sha {
+                break;
+            }
+            steps.push(c.clone());
+        }
+        if steps.is_empty() {
+            p.message = Err("nothing above that commit to rebase".into());
+            return;
+        }
+        p.rebase = Some(crate::overlay::RebasePlan::new(sha, steps));
+        self.window.request_redraw();
+    }
+
+    /// Keys while an interactive rebase is being planned.
+    fn rebase_plan_key(&mut self, key: &Key, config: &Config) {
+        let Some(Overlay::Git(p)) = &mut self.overlay else { return };
+        let Some(plan) = &mut p.rebase else { return };
+        use crate::git::RebaseAction as A;
+        let mut run = false;
+        match key {
+            Key::Named(NamedKey::Escape) => p.rebase = None,
+            Key::Named(NamedKey::Enter) => run = true,
+            Key::Named(NamedKey::ArrowDown) => {
+                plan.cursor = (plan.cursor + 1).min(plan.steps.len().saturating_sub(1))
+            }
+            Key::Named(NamedKey::ArrowUp) => plan.cursor = plan.cursor.saturating_sub(1),
+            Key::Character(c) => match c.as_str() {
+                "j" => plan.cursor = (plan.cursor + 1).min(plan.steps.len().saturating_sub(1)),
+                "k" => plan.cursor = plan.cursor.saturating_sub(1),
+                "J" => plan.move_step(1),
+                "K" => plan.move_step(-1),
+                "p" => plan.set_action(A::Pick),
+                "r" => plan.set_action(A::Reword),
+                "e" => plan.set_action(A::Edit),
+                "s" => plan.set_action(A::Squash),
+                "f" => plan.set_action(A::Fixup),
+                "d" => plan.set_action(A::Drop),
+                "q" => p.rebase = None,
+                _ => {}
+            },
+            _ => {}
+        }
+        if run {
+            self.run_rebase_plan(config);
+        }
+        self.window.request_redraw();
+    }
+
+    /// Runs the planned rebase on a worker, with the todo we wrote.
+    fn run_rebase_plan(&mut self, _config: &Config) {
+        let Some(Overlay::Git(p)) = &mut self.overlay else { return };
+        let Some(plan) = p.rebase.take() else { return };
+        if p.busy {
+            return;
+        }
+        p.busy = true;
+        p.message = Ok("rebasing…".into());
+        let root = p.root.clone();
+        let (onto, todo) = (plan.onto.clone(), plan.todo());
+        self.git_gen += 1;
+        let seq = self.git_gen;
+        let proxy = self.proxy.clone();
+        std::thread::spawn(move || {
+            let out = crate::git::run_rebase_interactive(&root, &onto, &todo);
+            let _ = proxy.send_event(UserEvent::GitPanel(
+                seq,
+                crate::git::PanelMsg::Ran(vec!["rebase".into(), "-i".into()], out),
+            ));
+        });
+        self.window.request_redraw();
+    }
+
     /// Loads the file list of the commit the panel drilled into.
     fn git_load_commit_files(&mut self) {
         let Some(Overlay::Git(p)) = &self.overlay else { return };
@@ -2093,6 +2202,10 @@ impl Gpu {
                     p.remotes = r;
                     p.current_branch = cur;
                 }
+                crate::git::PanelMsg::Blame(rows) => {
+                    p.blame = rows;
+                    preview = true;
+                }
                 crate::git::PanelMsg::CommitFiles(f) => {
                     p.commit_files = f;
                     p.commit_cursor = 0;
@@ -2145,6 +2258,13 @@ impl Gpu {
     fn git_panel_key(&mut self, key: &Key, config: &Config) {
         use overlay::GitView;
         let Some(Overlay::Git(p)) = &mut self.overlay else { return };
+        // A rebase being planned owns the keyboard: every key here means something
+        // about the plan, and letting the ordinary bindings through would fire a
+        // push or a checkout in the middle of writing one.
+        if p.rebase.is_some() {
+            self.rebase_plan_key(key, config);
+            return;
+        }
         let view = p.view;
         let mut moved = false;
         let mut exec: Option<Vec<String>> = None;
@@ -2156,6 +2276,8 @@ impl Gpu {
         let mut open_dir: Option<String> = None;
         // A commit to drill into: the list becomes its files.
         let mut drill: Option<String> = None;
+        let mut blame_path: Option<String> = None;
+        let mut rebase_from: Option<String> = None;
         // A hunk patch to stage (or, reversed, unstage).
         let mut patch: Option<(String, bool)> = None;
 
@@ -2164,7 +2286,14 @@ impl Gpu {
             // Escape backs out of an open commit before it closes the panel: the
             // drill-down is a place you are in, not a mode you toggled.
             Key::Named(NamedKey::Escape) => {
-                if p.leave_commit() {
+                // Peel one layer at a time: the diff focus, then an open commit,
+                // then the blame view, and only then the panel itself.
+                if p.diff_focus {
+                    p.leave_diff();
+                } else if p.leave_commit() {
+                    moved = true;
+                } else if p.view == GitView::Blame {
+                    p.set_view(GitView::Status);
                     moved = true;
                 } else {
                     close = true;
@@ -2243,10 +2372,20 @@ impl Gpu {
                         open_dir = Some(crate::git::worktree_path(w).to_string());
                     }
                 }
+                GitView::Blame => {
+                    if let Some(b) = p.blame.get(p.cursor()) {
+                        drill = Some(b.sha.clone());
+                    }
+                }
                 _ => {}
             },
             Key::Character(c) => match c.as_str() {
                 "q" => close = true,
+                // With the diff focused, j/k walk the DIFF, not the list: that is
+                // the cursor line staging needs, and one pair of keys cannot mean
+                // two things at once.
+                "j" if p.diff_focus => p.step_diff(1),
+                "k" if p.diff_focus => p.step_diff(-1),
                 "j" => {
                     p.down();
                     moved = true;
@@ -2255,6 +2394,14 @@ impl Gpu {
                     p.up();
                     moved = true;
                 }
+                // Focus follows the vim direction keys: l moves into the diff, h
+                // back to the list.
+                "l" if view == GitView::Status && !p.diff_focus => {
+                    p.enter_diff();
+                }
+                "h" if p.diff_focus => p.leave_diff(),
+                // v marks the start of a line selection, the way copy mode does.
+                "v" if p.diff_focus => p.toggle_anchor(),
                 "J" => p.scroll_preview(5),
                 "K" => p.scroll_preview(-5),
                 // Hunk selection. `body_rows` is approximated from the panel's own
@@ -2263,9 +2410,17 @@ impl Gpu {
                 "]" => p.step_hunk(1, 20),
                 "[" => p.step_hunk(-1, 20),
                 "s" | "u" if view == GitView::Status => {
-                    patch = p.hunk_patch().map(|text| (text, c.as_str() == "u"));
+                    let reverse = c.as_str() == "u";
+                    // Focused on the diff, s and u act on the SELECTED LINES; on the
+                    // list they act on the whole hunk. Same keys, and the focus says
+                    // which, so there is nothing extra to remember.
+                    patch = if p.diff_focus {
+                        p.line_patch().map(|text| (text, reverse))
+                    } else {
+                        p.hunk_patch().map(|text| (text, reverse))
+                    };
                     if patch.is_none() {
-                        p.message = Err("no hunk here — stage the file with space".into());
+                        p.message = Err("nothing to stage there — space stages the file".into());
                     }
                 }
                 "1" => {
@@ -2344,10 +2499,12 @@ impl Gpu {
                         ]);
                     }
                 }
-                // Blame, likewise: a pager in a pane beats reimplementing one.
+                // Blame is a VIEW: every line with the commit that last touched it,
+                // and Enter opens that commit. A pager could show the same text but
+                // could not take you from a line to its history.
                 "b" if view == GitView::Status => {
                     if let Some(f) = p.selected_file() {
-                        split = Some(vec![s("git"), s("blame"), s("--date=short"), s("-w"), s("--"), f.path.clone()]);
+                        blame_path = Some(f.path.clone());
                     }
                 }
                 "m" if view == GitView::Branches => {
@@ -2367,6 +2524,13 @@ impl Gpu {
                     };
                     if let Some(sha) = sha {
                         exec = Some(vec![s("checkout"), sha]);
+                    }
+                }
+                // An interactive rebase of everything above the selected commit,
+                // planned inside the panel rather than in an editor.
+                "i" if view == GitView::Log => {
+                    if let Some(c) = p.selected_commit() {
+                        rebase_from = Some(c.sha.clone());
                     }
                 }
                 "c" if view == GitView::Log => {
@@ -2404,6 +2568,7 @@ impl Gpu {
                         GitView::Worktrees => {
                             p.selected_worktree().map(|w| crate::git::worktree_path(w).to_string())
                         }
+                        GitView::Blame => p.blame.get(p.cursor()).map(|b| b.sha.clone()),
                     }
                 }
                 "o" if view == GitView::Log => {
@@ -2440,6 +2605,12 @@ impl Gpu {
         if let Some(dir) = open_dir {
             self.overlay = None;
             self.new_tab_in(config, std::path::PathBuf::from(dir));
+        }
+        if let Some(path) = blame_path {
+            self.git_load_blame(path);
+        }
+        if let Some(sha) = rebase_from {
+            self.git_start_rebase(sha);
         }
         if let Some(sha) = drill {
             if let Some(Overlay::Git(p)) = &mut self.overlay {
