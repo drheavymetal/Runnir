@@ -76,6 +76,11 @@ impl Endpoint {
 pub struct Host {
     pub name: String,
     pub endpoint: Endpoint,
+    /// This host is a real `docker context`. The invented fallback is not, and a
+    /// command line built for it must say WHERE it is going: bare `docker` would
+    /// resolve through whatever context the CLI thinks is current, which is how the
+    /// panel could list one daemon while its verbs ran against another.
+    pub from_context: bool,
     /// What the daemon said its version was, once asked. `None` until then.
     pub version: Option<String>,
     /// Why it could not be reached. A host that is down is DRAWN as down and never
@@ -89,6 +94,7 @@ impl Host {
         Host {
             name: "docker hub".into(),
             endpoint: Endpoint::Hub,
+            from_context: false,
             version: None,
             error: None,
             current: false,
@@ -109,6 +115,7 @@ pub fn hosts() -> Vec<Host> {
         out.push(Host {
             name: "default".into(),
             endpoint: Endpoint::Unix(PathBuf::from("/var/run/docker.sock")),
+            from_context: false,
             version: None,
             error: None,
             current: true,
@@ -137,7 +144,8 @@ pub fn parse_contexts(text: &str) -> Vec<Host> {
             let name = it.next()?.trim().to_string();
             let endpoint = Endpoint::parse(it.next().unwrap_or(""))?;
             let current = it.next().unwrap_or("false").trim() == "true";
-            (!name.is_empty()).then_some(Host { name, endpoint, version: None, error: None, current })
+            (!name.is_empty())
+                .then_some(Host { name, endpoint, from_context: true, version: None, error: None, current })
         })
         .collect()
 }
@@ -149,6 +157,7 @@ enum Stream {
     Unix(std::os::unix::net::UnixStream),
     Child(std::process::Child),
 }
+
 
 impl Stream {
     fn open(ep: &Endpoint) -> Result<Stream, String> {
@@ -209,14 +218,80 @@ impl Stream {
         }
     }
 
+    /// Starts the clock on an ssh child: if the answer has not arrived by the
+    /// deadline the child is killed, which is what unblocks the read.
+    ///
+    /// A watchdog rather than a socket timeout because the stream here is a pipe to
+    /// a process, and a pipe has no read timeout to set.
+    #[allow(clippy::type_complexity)]
+    fn arm_deadline(
+        &mut self,
+    ) -> Option<(
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+    )> {
+        let Stream::Child(c) = self else { return None };
+        let pid = c.id();
+        let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = fired.clone();
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let answered = done.clone();
+        std::thread::spawn(move || {
+            let step = std::time::Duration::from_millis(200);
+            let mut waited = std::time::Duration::ZERO;
+            while waited < TIMEOUT {
+                if done.load(std::sync::atomic::Ordering::Relaxed) {
+                    return;
+                }
+                std::thread::sleep(step);
+                waited += step;
+            }
+            if done.load(std::sync::atomic::Ordering::Relaxed) {
+                return;
+            }
+            flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            // SIGKILL by pid: `Child` cannot be shared with this thread, and the
+            // point is precisely that the process is not answering.
+            #[cfg(unix)]
+            unsafe {
+                libc::kill(pid as i32, libc::SIGKILL);
+            }
+            #[cfg(not(unix))]
+            let _ = pid;
+        });
+        Some((fired, answered))
+    }
+
     /// What the transport itself said when it failed — `ssh`'s stderr, which is
     /// where "Permission denied (publickey)" and "Could not resolve hostname" live.
     fn failure_text(&mut self) -> Option<String> {
         let Stream::Child(c) = self else { return None };
         let mut text = String::new();
         c.stderr.as_mut()?.read_to_string(&mut text).ok()?;
-        let line = text.lines().find(|l| !l.trim().is_empty())?;
-        Some(line.trim().to_string())
+        let lines: Vec<&str> = text.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+        // The FAILURE, not the first thing printed: ssh's first line is often
+        // "Warning: Permanently added '…' to the list of known hosts", and taking
+        // it would hide the "Permission denied (publickey)" underneath.
+        const SIGNS: &[&str] = &[
+            "permission denied",
+            "could not resolve",
+            "connection refused",
+            "connection closed",
+            "host key verification failed",
+            "no such file",
+            "command not found",
+            "timed out",
+        ];
+        let pick = lines
+            .iter()
+            .rev()
+            .find(|l| {
+                let low = l.to_lowercase();
+                SIGNS.iter().any(|s| low.contains(s))
+            })
+            .or_else(|| lines.iter().rev().find(|l| !l.to_lowercase().starts_with("warning:")))
+            .or_else(|| lines.first())?;
+        Some(pick.to_string())
     }
 }
 
@@ -275,9 +350,28 @@ pub fn request(ep: &Endpoint, method: &str, path: &str, body: Option<&str>) -> R
         }
         None => req.push_str("\r\n"),
     }
-    stream.write_all(req.as_bytes()).map_err(|e| e.to_string())?;
+    // A write that fails means the transport died before it read the request, and
+    // ssh's stderr is again the only sentence that says why.
+    if let Err(e) = stream.write_all(req.as_bytes()) {
+        return Err(stream.failure_text().unwrap_or_else(|| e.to_string()));
+    }
+    // A deadline for the ssh path too. `ConnectTimeout` and the keepalives only
+    // notice a transport that DIED; a healthy tunnel to a daemon that accepted and
+    // then hung (a stuck storage driver, a full disk) leaves the read below waiting
+    // for an EOF that never comes — which is what the socket's read timeout is for
+    // on the local side, and what `probe`'s join would then wait on forever.
+    let deadline = stream.arm_deadline();
     let mut raw = Vec::new();
-    stream.read_to_end(&mut raw).map_err(|e| e.to_string())?;
+    let read = stream.read_to_end(&mut raw);
+    if let Some((timed_out, answered)) = deadline {
+        // Called off first, so the watchdog never kills a pid the OS may have
+        // handed to somebody else by the time it wakes.
+        answered.store(true, std::sync::atomic::Ordering::Relaxed);
+        if timed_out.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(format!("{} did not answer in {}s", ep.label(), TIMEOUT.as_secs()));
+        }
+    }
+    read.map_err(|e| e.to_string())?;
     // An ssh transport that failed says why on ITS stderr, and the socket answer is
     // then empty. Reporting "no HTTP header in the answer" for a refused key throws
     // away the only sentence that explains the panel's most common failure.
@@ -1229,10 +1323,15 @@ pub fn run_op(ep: &Endpoint, op: &Op) -> Result<String, String> {
 /// How to reach a host from the COMMAND LINE, for the operations that run in a
 /// pane. A context is passed with `-c`, which is what the user would type.
 pub fn cli_prefix(host: &Host) -> Vec<String> {
-    match host.endpoint {
-        // The default socket needs no flag, and adding one would break for anyone
-        // whose current context is not called "default".
-        Endpoint::Unix(_) if host.current => vec!["docker".into()],
+    match &host.endpoint {
+        // The current context needs no flag: bare `docker` is what the user would
+        // type, and it is what their shell already resolves.
+        Endpoint::Unix(_) if host.current && host.from_context => vec!["docker".into()],
+        // The invented fallback names its socket instead of trusting the CLI's idea
+        // of "current", which may be a context this panel could not even parse.
+        Endpoint::Unix(path) => {
+            vec!["docker".into(), "-H".into(), format!("unix://{}", path.display())]
+        }
         _ => vec!["docker".into(), "-c".into(), host.name.clone()],
     }
 }

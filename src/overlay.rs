@@ -3187,6 +3187,7 @@ mod docker_tests {
             Host {
                 name: "default".into(),
                 endpoint: Endpoint::Unix("/var/run/docker.sock".into()),
+                from_context: true,
                 version: Some("29.5.2".into()),
                 error: None,
                 current: true,
@@ -3334,6 +3335,51 @@ mod docker_tests {
         assert!(l.hosts_w >= MIN_COL && l.objects_w >= MIN_COL && l.detail_w() >= MIN_DETAIL);
     }
 
+
+    #[test]
+    fn the_detail_column_scrolls_without_overflowing_or_pinning_itself() {
+        let mut p = panel(vec![container("api", Some("qlaios"), true)]);
+        p.detail = DockerDetail::Inspect;
+        p.detail_lines = (0..50).map(|i| format!("line {i}")).collect();
+        // `G` passes i32::MAX. Adding that to a scroll that is already past zero
+        // overflows — a panic with the debug profile's checks on, and a jump to the
+        // TOP in release. Twice in a row is the sequence that finds it.
+        p.scroll_detail(i32::MAX);
+        p.scroll_detail(i32::MAX);
+        assert_eq!(p.detail_scroll, 49);
+        p.scroll_detail(-i32::MAX);
+        assert_eq!(p.detail_scroll, 0);
+
+        // The summary is built on the fly, so scrolling has to measure what is
+        // DRAWN: against the stored lines it was pinned at zero.
+        p.detail = DockerDetail::Summary;
+        p.set_cursor(0);
+        assert!(p.detail_len() > 1, "a project heading lists its members");
+        p.scroll_detail(1);
+        assert_eq!(p.detail_scroll, 1);
+    }
+
+    #[test]
+    fn a_rebuild_that_loses_the_selection_drops_the_detail_with_it() {
+        let mut p = panel(vec![
+            container("api", Some("qlaios"), true),
+            container("db", Some("qlaios"), true),
+        ]);
+        p.set_cursor(1);
+        p.detail = DockerDetail::Logs;
+        p.detail_lines = vec!["a log line".into()];
+        p.detail_for = Some(("id-api".into(), DockerDetail::Logs));
+
+        // `api` is removed elsewhere: the cursor falls onto its neighbour, and the
+        // logs on screen belong to the container that left — under the new row's
+        // name, which is the confusion the title exists to prevent.
+        let mut snap = p.snap.clone();
+        snap.containers.remove(0);
+        p.apply_snapshot(snap);
+        assert!(p.detail_lines.is_empty());
+        assert_eq!(p.detail_for, None);
+    }
+
     #[test]
     fn the_leader_only_offers_what_this_row_can_do() {
         let mut p = panel(vec![container("api", Some("qlaios"), true)]);
@@ -3354,13 +3400,39 @@ mod docker_tests {
         p.set_cursor(1);
         p.arm_leader();
         p.leader_key('c');
-        assert_eq!(p.leader_key('s'), Some(DockerKey::Ch('s')));
+        assert_eq!(p.leader_key('s'), Some(DockerPress::OnContainer(DockerKey::Ch('s'))));
 
         // The compose verbs are offered from the member row too, because the row
         // belongs to a project.
         p.arm_leader();
         p.leader_key('p');
-        assert_eq!(p.leader_key('u'), Some(DockerKey::Ch('U')));
+        assert_eq!(p.leader_key('u'), Some(DockerPress::OnProject(DockerKey::Ch('U'))));
+
+        // A leaf can take you somewhere before it acts, the way the git panel's
+        // menu can jump into the log and act in one sequence: the image verbs are
+        // offered from a container row and switch the column on the way.
+        p.arm_leader();
+        p.leader_key('i');
+        assert_eq!(
+            p.leader_key('i'),
+            Some(DockerPress::Switch(crate::docker::Kind::Images)),
+            "and the plain switch is offered too"
+        );
+
+        // Hub verbs are not offered on a daemon, and the kind strip is not offered
+        // on hub: a menu entry that cannot work is worse than a missing one.
+        p.arm_leader();
+        p.leader_key('b');
+        assert!(!p.leader_entries().iter().any(|(k, _, _)| k == "o"), "{:?}", p.leader_entries());
+        p.cancel_leader();
+        p.host_cursor = 1;
+        p.arm_leader();
+        p.leader_key('o');
+        assert!(
+            !p.leader_entries().iter().any(|(k, _, _)| k == "c"),
+            "no kind strip on hub: {:?}",
+            p.leader_entries()
+        );
     }
 
     #[test]
@@ -3380,6 +3452,7 @@ mod docker_tests {
         let local = Host {
             name: "default".into(),
             endpoint: Endpoint::Unix("/var/run/docker.sock".into()),
+            from_context: true,
             version: None,
             error: None,
             current: true,
@@ -3387,6 +3460,7 @@ mod docker_tests {
         let remote = Host {
             name: "cloudmax".into(),
             endpoint: Endpoint::Ssh("root@cloudmax".into()),
+            from_context: true,
             version: None,
             error: None,
             current: false,
@@ -4230,6 +4304,13 @@ impl DockerPanel {
         self.cursors[self.kind_index()].min(self.rows.len().saturating_sub(1))
     }
 
+    /// Drops whatever the detail column was showing.
+    pub fn clear_detail(&mut self) {
+        self.detail_lines.clear();
+        self.detail_for = None;
+        self.detail_scroll = 0;
+    }
+
     pub fn set_cursor(&mut self, n: usize) {
         let n = n.min(self.rows.len().saturating_sub(1));
         let i = self.kind_index();
@@ -4401,6 +4482,10 @@ impl DockerPanel {
                 self.cursors[self.kind_index()] = i;
                 return;
             }
+            // The object it was on is GONE. The cursor lands on a neighbour, and
+            // the logs still on screen belong to the one that left — under the new
+            // row's name, which is the confusion the title exists to prevent.
+            self.clear_detail();
         }
         let i = self.kind_index();
         self.cursors[i] = self.cursors[i].min(self.rows.len().saturating_sub(1));
@@ -4498,7 +4583,9 @@ impl DockerPanel {
         let usable = |f: DockerFocus| match f {
             DockerFocus::Hosts => l.hosts_w > 0,
             DockerFocus::Objects => l.objects_w > 0,
-            DockerFocus::Detail => true,
+            // Empty, it swallows j/k for nothing — unless it is the only column
+            // there is, which is what zoom leaves.
+            DockerFocus::Detail => self.detail_len() > 0 || l.objects_w == 0,
         };
         let i = order.iter().position(|f| *f == self.focus).unwrap_or(1);
         let n = order.len();
@@ -4514,8 +4601,8 @@ impl DockerPanel {
         }
     }
 
-    /// Puts the keyboard somewhere that exists, after a layout change (a zoom, a
-    /// resize) took the focused column away.
+    /// Puts the keyboard somewhere that exists, after a layout change (a zoom, or a
+    /// window narrow enough to drop a column) took the focused one away.
     pub fn sync_focus(&mut self, cols: usize, rows: usize) {
         let l = self.layout(cols, rows);
         let gone = match self.focus {
@@ -4529,9 +4616,26 @@ impl DockerPanel {
         }
     }
 
+    /// Scrolls the detail column. `len` is what is actually DRAWN there, which in
+    /// summary mode is not `detail_lines` at all — the summary is built on the fly,
+    /// so scrolling against the stored lines pinned it at zero.
     pub fn scroll_detail(&mut self, delta: i32) {
-        let max = self.detail_lines.len().saturating_sub(1) as i32;
-        self.detail_scroll = (self.detail_scroll as i32 + delta).clamp(0, max.max(0)) as usize;
+        let len = self.detail_len();
+        let max = len.saturating_sub(1) as i64;
+        // Saturating: `G` passes `i32::MAX`, and adding that to a scroll position
+        // that is already past zero overflows — a panic in the debug profile and a
+        // jump to the TOP in release.
+        let next = (self.detail_scroll as i64).saturating_add(delta as i64);
+        self.detail_scroll = next.clamp(0, max.max(0)) as usize;
+    }
+
+    /// How many lines the detail column has, whichever mode it is in.
+    pub fn detail_len(&self) -> usize {
+        if self.detail == DockerDetail::Summary {
+            self.summary().len()
+        } else {
+            self.detail_lines.len()
+        }
     }
 
     /// The summary lines for the selection: what a row cannot fit and an inspect
@@ -4690,7 +4794,7 @@ impl DockerPanel {
                 let text = format!("{arrow} {label}");
                 let pad = width.saturating_sub(text.chars().count() + count.chars().count() + 1);
                 (
-                    format!("{text}{}{count}", " ".repeat(pad + 1)),
+                    elide(&format!("{text}{}{count}", " ".repeat(pad + 1)), width),
                     Pen { flags: Flags::BOLD, ..accent() },
                 )
             }
@@ -5080,6 +5184,11 @@ pub enum DockerKey {
 }
 
 /// What a leaf does, and when it is offered.
+///
+/// The shape the git panel's leader already has: a leaf can be gated on what the
+/// cursor is standing on, and it can TAKE you somewhere before it acts — a menu
+/// that can only press keys in the context you are already in is a menu you have to
+/// navigate to before you can use it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DockerPress {
     Key(DockerKey),
@@ -5087,6 +5196,13 @@ pub enum DockerPress {
     OnContainer(DockerKey),
     /// Only on a compose project heading or a container inside one.
     OnProject(DockerKey),
+    /// Only on Docker Hub — a repository or one of its tags.
+    OnHub(DockerKey),
+    /// Switches the object column to this kind and stops there.
+    Switch(crate::docker::Kind),
+    /// Switches to this kind and then presses. Offered whatever is selected: it is
+    /// the way to reach a verb of another kind without walking there first.
+    InKind(crate::docker::Kind, DockerKey),
 }
 
 pub enum DockerNode {
@@ -5105,7 +5221,10 @@ const fn dleaf(key: char, title: &'static str, press: DockerPress) -> DockerEntr
 }
 
 use DockerKey::{Ch as DCh, Enter as DEnter};
-use DockerPress::{Key as DKey, OnContainer, OnProject};
+use DockerPress::{InKind, Key as DKey, OnContainer, OnHub, OnProject};
+
+/// Spelled out so the leader table below stays readable.
+const IMAGES: crate::docker::Kind = crate::docker::Kind::Images;
 
 pub static DOCKER_LEADER: &[DockerEntry] = &[
     DockerEntry {
@@ -5116,8 +5235,12 @@ pub static DOCKER_LEADER: &[DockerEntry] = &[
             dleaf('x', "stop it", OnContainer(DCh('x'))),
             dleaf('r', "restart it", OnContainer(DCh('R'))),
             dleaf('p', "pause / unpause", OnContainer(DCh('p'))),
+            dleaf('k', "kill it now", OnContainer(DCh('K'))),
             dleaf('e', "shell inside it", OnContainer(DCh('e'))),
             dleaf('w', "open its port in the browser", OnContainer(DCh('w'))),
+            dleaf('l', "its logs", OnContainer(DCh('L'))),
+            dleaf('i', "inspect it", OnContainer(DCh('i'))),
+            dleaf('y', "copy its id", OnContainer(DCh('y'))),
             dleaf('d', "remove it (asks)", OnContainer(DCh('d'))),
         ]),
     },
@@ -5128,22 +5251,56 @@ pub static DOCKER_LEADER: &[DockerEntry] = &[
             dleaf('u', "up -d", OnProject(DCh('U'))),
             dleaf('w', "down (asks)", OnProject(DCh('W'))),
             dleaf('p', "pull", OnProject(DCh('P'))),
-            dleaf('t', "deploy it (pull, then up -d)", OnProject(DCh('T'))),
+            dleaf('t', "deploy: pull, then up -d (asks)", OnProject(DCh('T'))),
             dleaf('o', "fold / unfold", DKey(DEnter)),
         ]),
     },
     DockerEntry {
-        key: 'v',
-        title: "View",
+        key: 'i',
+        title: "Images",
         node: DockerNode::Group(&[
-            dleaf('c', "containers", DKey(DCh('C'))),
-            dleaf('i', "images", DKey(DCh('I'))),
-            dleaf('v', "volumes", DKey(DCh('V'))),
-            dleaf('n', "networks", DKey(DCh('N'))),
-            dleaf('r', "reread this host", DKey(DCh('r'))),
-            dleaf('p', "publish this image (push)", DKey(DCh('>'))),
+            // These SWITCH to the image list first, so the verb is reachable from
+            // wherever the cursor happens to be — the way the git panel's menu can
+            // jump into the log and act in one sequence.
+            dleaf('i', "the image list", DockerPress::Switch(crate::docker::Kind::Images)),
+            // These SWITCH to the image list and then act, so an image verb is one
+            // sequence from anywhere — the way `leader c p` cherry-picks from the
+            // git panel whatever view you were in.
+            dleaf('p', "publish it: docker push (asks)", InKind(IMAGES, DCh('>'))),
+            dleaf('s', "what uses it, size, digests", InKind(IMAGES, DCh('u'))),
+            dleaf('j', "inspect it", InKind(IMAGES, DCh('i'))),
+            dleaf('d', "remove it (asks)", InKind(IMAGES, DCh('d'))),
+        ]),
+    },
+    DockerEntry {
+        key: 'o',
+        title: "Objects",
+        node: DockerNode::Group(&[
+            dleaf('c', "containers", DockerPress::Switch(crate::docker::Kind::Containers)),
+            dleaf('i', "images", DockerPress::Switch(crate::docker::Kind::Images)),
+            dleaf('v', "volumes", DockerPress::Switch(crate::docker::Kind::Volumes)),
+            dleaf('n', "networks", DockerPress::Switch(crate::docker::Kind::Networks)),
             dleaf('d', "remove what is selected (asks)", DKey(DCh('d'))),
-            dleaf('z', "zoom the detail", DKey(DCh('z'))),
+            dleaf('y', "copy its id", DKey(DCh('y'))),
+        ]),
+    },
+    DockerEntry {
+        key: 'h',
+        title: "Hosts",
+        node: DockerNode::Group(&[
+            dleaf('h', "pick a host", DKey(DCh('H'))),
+            dleaf('r', "reread this host", DKey(DCh('r'))),
+            dleaf('u', "docker hub", DKey(DCh('B'))),
+        ]),
+    },
+    DockerEntry {
+        key: 'b',
+        title: "Docker Hub",
+        node: DockerNode::Group(&[
+            dleaf('u', "go to hub", DKey(DCh('B'))),
+            dleaf('o', "open this repository", OnHub(DEnter)),
+            dleaf('p', "publish this tag (asks)", OnHub(DCh('>'))),
+            dleaf('r', "reread it", OnHub(DCh('r'))),
         ]),
     },
     DockerEntry {
@@ -5154,8 +5311,24 @@ pub static DOCKER_LEADER: &[DockerEntry] = &[
             dleaf('l', "logs", OnContainer(DCh('L'))),
             dleaf('i', "inspect (the whole JSON)", DKey(DCh('i'))),
             dleaf('y', "copy the id", DKey(DCh('y'))),
+            dleaf('z', "full width, and back", DKey(DCh('z'))),
         ]),
     },
+    DockerEntry {
+        key: 'v',
+        title: "View",
+        node: DockerNode::Group(&[
+            dleaf('1', "containers", DockerPress::Switch(crate::docker::Kind::Containers)),
+            dleaf('2', "images", DockerPress::Switch(crate::docker::Kind::Images)),
+            dleaf('3', "volumes", DockerPress::Switch(crate::docker::Kind::Volumes)),
+            dleaf('4', "networks", DockerPress::Switch(crate::docker::Kind::Networks)),
+            dleaf('t', "to the top", DKey(DCh('g'))),
+            dleaf('b', "to the bottom", DKey(DCh('G'))),
+            dleaf('r', "reread this host", DKey(DCh('r'))),
+            dleaf('z', "full width, and back", DKey(DCh('z'))),
+        ]),
+    },
+    dleaf('z', "Full width, and back", DKey(DCh('z'))),
     dleaf('q', "Close the panel", DKey(DCh('q'))),
 ];
 
@@ -5186,6 +5359,10 @@ impl DockerPanel {
                 matches!(self.selected(), Some(DockerRow::Container(_)))
             }
             DockerPress::OnProject(_) => self.selected_project().is_some(),
+            DockerPress::OnHub(_) => self.on_hub(),
+            // The kind strip does not exist on hub, so neither does anything that
+            // would switch it.
+            DockerPress::Switch(_) | DockerPress::InKind(..) => !self.on_hub(),
             DockerPress::Key(_) => true,
         }
     }
@@ -5210,8 +5387,8 @@ impl DockerPanel {
         self.leader.as_ref().map(|p| p.iter().map(|c| c.to_string()).collect()).unwrap_or_default()
     }
 
-    /// Feeds a key to the layer. `Some` is a key for the panel to act on.
-    pub fn leader_key(&mut self, c: char) -> Option<DockerKey> {
+    /// Feeds a key to the layer. `Some` is a leaf for the panel to run.
+    pub fn leader_key(&mut self, c: char) -> Option<DockerPress> {
         let level = self.leader_level()?;
         match level.iter().find(|e| e.key == c) {
             Some(DockerEntry { node: DockerNode::Group(_), .. }) => {
@@ -5221,13 +5398,9 @@ impl DockerPanel {
                 None
             }
             Some(DockerEntry { node: DockerNode::Leaf(p), .. }) if self.leader_applies(*p) => {
-                let key = match *p {
-                    DockerPress::Key(k)
-                    | DockerPress::OnContainer(k)
-                    | DockerPress::OnProject(k) => k,
-                };
+                let press = *p;
                 self.leader = None;
-                Some(key)
+                Some(press)
             }
             _ => {
                 self.leader = None;

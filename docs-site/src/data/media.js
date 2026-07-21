@@ -19,6 +19,15 @@ export const MEDIA = {
   themes: { src: './img/colors.png', cap: { es: 'Captura real (runnir --render): las 16 colores ANSI y una rampa truecolor.', en: 'Real screenshot (runnir --render): the 16 ANSI colors and a truecolor ramp.' } },
   ligatures: { src: './img/ligatures.png', cap: { es: 'Captura real (runnir --render): ligaturas de fuente de código (->, =>, !=, >=, <=, ==).', en: 'Real screenshot (runnir --render): code-font ligatures (->, =>, !=, >=, <=, ==).' } },
   boxdraw: { src: './img/boxdraw.png', cap: { es: 'Captura real (runnir --render): recuadros de línea simple y doble más bloques de sombreado, al tamaño de celda.', en: 'Real screenshot (runnir --render): single- and double-line boxes plus shading blocks, at cell size.' } },
+  // Estas cuatro son capturas de una VENTANA real (no headless): los paneles
+  // hablan con git y con el daemon de docker de la máquina, así que una escena
+  // sintética no podría enseñar lo que muestran.
+  'file-explorer': { src: './img/file-explorer.png', cap: { es: 'Captura de una ventana real: el árbol del proyecto con los distintivos de git a la derecha de cada fila (M en amarillo = modificado) y el punto en src, que dice que algo de dentro cambió. El pie cuenta lo que se está ocultando.', en: 'Real window screenshot: the project tree with git badges at the right of each row (M in yellow = modified) and the dot on src, which says something below it changed. The footer counts what is being held back.' } },
+  'file-viewer': { src: './img/file-viewer.png', cap: { es: 'Captura de una ventana real: una imagen abierta desde el árbol, dibujada como textura de GPU y centrada en el panel — no como arte de caracteres.', en: 'Real window screenshot: an image opened from the tree, drawn as a GPU texture and centred in the panel — not as character art.' } },
+  'docker-panel': [
+    { src: './img/docker-panel.png', cap: { es: 'Captura de una ventana real: hosts a la izquierda (con desktop-linux marcado como caído), los contenedores agrupados por proyecto compose con su marca de salud, y el resumen del seleccionado.', en: 'Real window screenshot: hosts on the left (with desktop-linux marked as down), containers grouped by compose project with their health mark, and the summary of the selected one.' } },
+    { src: './img/docker-leader.png', cap: { es: 'Captura de una ventana real: el menú del leader dentro del panel, con el grupo Container. Sólo ofrece lo que la fila bajo el cursor puede hacer.', en: 'Real window screenshot: the leader menu inside the panel, showing the Container group. It only offers what the row under the cursor can do.' } },
+  ],
   underline: { src: './img/underlines.png', cap: { es: 'Captura real (runnir --render): subrayado clásico (SGR 4). Los estilos ondulado/punteado/color son la parte en desarrollo.', en: 'Real screenshot (runnir --render): classic underline (SGR 4). The curly/dotted/colored styles are the in-development part.' } },
 }
 

@@ -577,6 +577,88 @@ export const FEATURES = [
     },
   },
   {
+    key: 'file-explorer', section: 'distinctive', status: 'shipped',
+    title: { es: 'Explorador de ficheros', en: 'File explorer sidebar' },
+    natural: {
+      es: 'Leader E abre un árbol del proyecto al lado de los paneles y pone el teclado en él. Es cromo, no una capa modal: sigue visible mientras trabajas en el panel de al lado, y sólo se queda las teclas mientras tiene el foco (Escape las devuelve). La raíz es el repositorio git del directorio del panel enfocado, y se re-ancla sólo cuando cambia el repositorio, nunca en cada cd. Cada fila lleva lo que git dice de ella: M modificado (amarillo) o en el índice (verde), A añadido, D borrado, ? sin seguimiento, ! en conflicto, y un punto en un directorio cuando algo de dentro cambió. Lo que git ignora se oculta, y el pie dice cuántas filas se están conteniendo.',
+      en: 'Leader E opens a tree of the project beside the panes and puts the keyboard in it. It is chrome, not a modal layer: it stays up while you work in the pane next to it, and it only takes keys while it has focus (Escape gives them back). The root is the git repository of the focused pane’s directory, and it re-anchors only when that repository changes, never on every cd. Each row carries what git says about it: M modified (yellow) or staged (green), A added, D deleted, ? untracked, ! conflicted, and a dot on a directory when something below it changed. What git ignores is hidden, and the footer says how many rows that is.',
+    },
+    keys: [
+      { es: 'Leader E (abrir y enfocar)', en: 'Leader E (open and focus)' },
+      { es: 'j k / flechas (mover), h l (plegar / desplegar)', en: 'j k / arrows (move), h l (fold / unfold)' },
+      { es: 'Enter (abrir), e ($EDITOR), o (abrir con el sistema)', en: 'Enter (open), e ($EDITOR), o (the desktop’s handler)' },
+      { es: 'p propiedades y permisos, a crear, r renombrar, d borrar', en: 'p properties & permissions, a create, r rename, d delete' },
+      { es: 's ordenar por nombre / por fecha, . ocultos, I ignorados por git', en: 's sort by name / by date, . hidden files, I files git ignores' },
+      { es: 'y copiar la ruta, R releer, Esc o q volver al panel', en: 'y copy the path, R reread, Esc or q back to the pane' },
+      { es: 'Leader (con el árbol enfocado): menú de verbos, sólo lo que la fila puede hacer', en: 'Leader (with the tree focused): a menu of verbs, only what the row can do' },
+    ],
+    palette: 'File explorer sidebar',
+    config: [
+      { k: 'explorer.side', v: '"left"', d: { es: 'Lado en el que se dibuja: left o right.', en: 'Which edge it sits on: left or right.' } },
+      { k: 'explorer.width', v: '30', d: { es: 'Ancho en COLUMNAS, no en fracción: una fracción en un ultrapanorámico da un árbol de 90 columnas.', en: 'Width in COLUMNS, not a fraction: a fraction on an ultrawide gives a 90-column tree.' } },
+      { k: 'explorer.show_hidden', v: 'false', d: { es: 'Mostrar los ficheros que empiezan por punto.', en: 'Show dotfiles.' } },
+      { k: 'explorer.open_on_start', v: 'false', d: { es: 'Abrir la barra al arrancar, en cada pestaña.', en: 'Open the sidebar on start, in every tab.' } },
+    ],
+    note: {
+      es: 'Sin editor propio: runnir es una terminal, así que su editor es el que corra en un panel. Nada que se ejecute se ejecuta con una tecla — un script ejecutable levanta un selector (ver / editar / ejecutar / abrir con el sistema) y un binario o un .desktop piden confirmación nombrando qué se lanzaría. Borrar un directorio cuenta lo que hay dentro antes de preguntar, y Enter no cuenta como sí.',
+      en: 'No built-in editor: runnir is a terminal, so its editor is whatever runs in a pane. Nothing that RUNS is run by one keypress — an executable script raises a chooser (view / edit / run / open with the system) and a binary or a .desktop asks first, naming what would be launched. Deleting a directory counts what is inside before it asks, and Enter is not a yes.',
+    },
+  },
+  {
+    key: 'file-viewer', section: 'distinctive', status: 'shipped',
+    title: { es: 'Visor de ficheros e imágenes', en: 'File and image viewer' },
+    natural: {
+      es: 'Enter sobre un fichero del árbol lo abre, y lo que hace depende de lo que el fichero ES, decidido por sus bytes y no por su nombre: un log sin extensión es texto, un .dat puede serlo y un PNG llamado .txt sigue siendo PNG. El texto se muestra de sólo lectura con números de línea y tabuladores expandidos; una imagen se dibuja como imagen de verdad —textura en la GPU, escalada en el hilo que la decodificó y centrada en el panel—, no como arte de caracteres.',
+      en: 'Enter on a file in the tree opens it, and what that means comes from what the file IS, decided by its bytes and not by its name: a log with no extension is text, a .dat may well be, and a PNG called .txt is still a PNG. Text is shown read-only with line numbers and expanded tabs; an image is drawn as a real picture — a GPU texture, scaled on the worker that decoded it and centred in the panel — not as character art.',
+    },
+    keys: [
+      { es: 'j k J K (scroll), h l (lateral), g G (extremos)', en: 'j k J K (scroll), h l (sideways), g G (ends)' },
+      { es: 'e ($EDITOR), o (abrir con el sistema), y (copiar la ruta), Esc', en: 'e ($EDITOR), o (open with the system), y (copy the path), Esc' },
+    ],
+    note: {
+      es: 'El arte de medios bloques sigue ahí como respaldo para un fichero que decodifica a arte pero no a píxeles. El visor tiene un tope de 4 MB de texto y lo dice cuando corta; una imagen mayor de 64 MB no se decodifica.',
+      en: 'Half-block art is still the fallback for a file that decodes to art but not to pixels. The viewer stops at 4 MB of text and says so; an image file over 64 MB is not decoded at all.',
+    },
+  },
+  {
+    key: 'docker-panel', section: 'distinctive', status: 'shipped',
+    title: { es: 'Panel de Docker nativo', en: 'Native Docker panel' },
+    natural: {
+      es: 'Leader D abre tres columnas: los hosts de docker (tus contextos, más Docker Hub como un host propio), los objetos del host seleccionado y el detalle de lo que está marcado. Los contenedores se agrupan por proyecto compose, porque esa es la unidad en la que se trabaja: nadie despliega un contenedor. La salud es una marca propia al lado del estado y nunca se funde con él — "arriba y con el healthcheck rojo" es justo el estado que hay que ver. Todo se lee por el socket del daemon en un hilo aparte, y un contexto remoto se alcanza por el mismo túnel que usa el CLI (ssh <host> docker system dial-stdio). Un host que no responde se dibuja como caído y nunca congela la ventana.',
+      en: 'Leader D opens three columns: the docker hosts (your contexts, plus Docker Hub as a host of its own), the objects on the selected host, and the detail of what is selected. Containers are grouped by compose project, because that is the unit the work is done in: nobody deploys a container. Health is its own mark beside the state and is never folded into it — up-and-unhealthy is exactly the state worth seeing. Everything is read over the daemon’s socket on a worker, and a remote context is reached through the same tunnel the CLI uses (ssh <host> docker system dial-stdio). A host that cannot be reached is drawn as down and never freezes the window.',
+    },
+    keys: [
+      { es: 'Leader D (abrir)', en: 'Leader D (open)' },
+      { es: 'Tab / h l (columnas), j k (mover), C I V N (contenedores, imágenes, volúmenes, redes)', en: 'Tab / h l (columns), j k (move), C I V N (containers, images, volumes, networks)' },
+      { es: 'Enter (plegar un proyecto o leer la selección), u L i (resumen, logs, inspect)', en: 'Enter (fold a project or read the selection), u L i (summary, logs, inspect)' },
+      { es: 's x R p K (arrancar, parar, reiniciar, pausar, matar)', en: 's x R p K (start, stop, restart, pause, kill)' },
+      { es: 'd (borrar: pregunta nombrando lo que se lleva), e (shell dentro), w (abrir su puerto)', en: 'd (remove: asks, naming what goes with it), e (a shell inside), w (open its port)' },
+      { es: 'U W P T (compose up -d, down, pull, desplegar)', en: 'U W P T (compose up -d, down, pull, deploy)' },
+      { es: 'Leader (dentro del panel): el mismo menú que el de git, filtrado por la fila', en: 'Leader (inside the panel): the same menu the git panel has, filtered by the row' },
+    ],
+    palette: 'Docker panel',
+    note: {
+      es: 'Las operaciones cortas corren sobre el socket y contestan en el pie. Lo que tarda minutos o pinta barras de progreso —una shell, compose up, compose pull— se va a un panel de terminal de verdad, porque un panel ya tiene color, Ctrl-C y scrollback. Cualquier cosa que llegue a otra máquina pregunta antes, nombrando el host.',
+      en: 'Short operations run over the socket and answer in the footer. Anything that takes minutes or paints progress bars — a shell, compose up, compose pull — goes to a real terminal pane instead, because a pane already has colour, Ctrl-C and scrollback. Anything that reaches another machine asks first, with the host named.',
+    },
+  },
+  {
+    key: 'docker-hub', section: 'distinctive', status: 'shipped',
+    title: { es: 'Docker Hub: diff local ↔ publicado y despliegue', en: 'Docker Hub: local ↔ published diff and deploy' },
+    natural: {
+      es: 'Docker Hub es el último host de la columna. Lista los repositorios que tu login puede ver; cuando la credencial guardada es un token de organización, la API web de Hub lo rechaza (el registry no), así que la lista cae de vuelta a los repositorios que nombran tus imágenes locales — y la cabecera dice cuál de las dos estás mirando. Enter lee los tags de un repositorio y cada tag dice cómo se compara con lo que hay aquí: la misma imagen, otra distinta, no descargada, o construida aquí y nunca publicada. Se compara por DIGEST, nunca por id: el id local es un hash de cómo esta máquina guardó la imagen y no dice nada de lo que tiene un registry.',
+      en: 'Docker Hub is the last host in the column. It lists the repositories your login can see; when the stored credential is an organisation token, Hub’s web API refuses it (the registry does not), so the list falls back to the repositories your local images name — and the header says which of the two you are looking at. Enter reads a repository’s tags, and each tag says how it compares with what is here: the same image, a different one, not pulled here, or built here and never pushed. Compared by DIGEST, never by id: a local id is a hash of how this machine stored the image and says nothing about what a registry holds.',
+    },
+    keys: [
+      { es: '> (publicar la imagen o el tag: docker push, pregunta antes)', en: '> (publish the image or tag: docker push, asks first)' },
+      { es: 'T sobre un proyecto compose (desplegar: compose pull y luego up -d)', en: 'T on a compose project (deploy: compose pull, then up -d)' },
+    ],
+    note: {
+      es: 'Las credenciales salen de ~/.docker/config.json y su credential helper primero: si ya hubo docker login no hay nada que runnir tenga que guardar. El despliegue es una sola línea encadenada con && a propósito — un up después de un pull fallido rearranca el proyecto con la imagen que ya corría, que es el despliegue que parece que funcionó.',
+      en: 'Credentials come from ~/.docker/config.json and its credential helper first: if docker login already happened there is nothing for runnir to store. The deploy is one line chained with && on purpose — an up after a failed pull restarts the project on the image it was already running, which is the deploy that looks like it worked.',
+    },
+  },
+  {
     key: 'command-guardian', section: 'distinctive', status: 'shipped',
     title: { es: 'Guardian de comandos', en: 'Command guardian' },
     natural: {

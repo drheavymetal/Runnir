@@ -1353,6 +1353,13 @@ impl Gpu {
             return;
         }
         self.pending_view = None;
+        // ...and only over an empty screen or the viewer it replaces. Something
+        // went up while the read was out — a rename prompt, a delete confirm, the
+        // git panel — and a picture landing on top of it is the same surprise in a
+        // different shape.
+        if !matches!(self.overlay, None | Some(Overlay::Viewer(_))) {
+            return;
+        }
         let body = match read.body {
             Ok(b) => b,
             Err(e) => crate::overlay::Viewed::Note(e),
@@ -1626,6 +1633,12 @@ impl Gpu {
     /// Opens the panel and starts reading. Nothing is read on this thread: the
     /// cheapest call opens a socket and the dearest opens an ssh connection.
     fn open_docker_panel(&mut self) {
+        // Nothing parked survives a fresh open: a confirm that was hijacked by
+        // something else leaves a stashed panel and a pending operation behind, and
+        // the next confirm would answer with them.
+        self.docker_stash = None;
+        self.pending_docker = None;
+        self.pending_docker_cmd = None;
         let hosts = crate::docker::hosts();
         let mut panel = overlay::DockerPanel::new(hosts);
         // Open on the CURRENT context, which is the daemon every `docker` command
@@ -1696,6 +1709,15 @@ impl Gpu {
                     .send_event(UserEvent::Docker(seq, crate::docker::PanelMsg::Repos(repos, note)));
             });
             return;
+        }
+        // Leaving hub: its rows are repositories and tags, which mean nothing on a
+        // daemon. Left in place they are drawn under the daemon's header until the
+        // snapshot lands, and Enter on one asks the daemon to inspect `repo:tag`.
+        if p.open_repo.is_some() || !p.repos.is_empty() {
+            p.open_repo = None;
+            p.tags.clear();
+            p.repos.clear();
+            p.rebuild();
         }
         let ep = host.endpoint.clone();
         let proxy = self.proxy.clone();
@@ -1821,19 +1843,29 @@ impl Gpu {
                 }
             }
             crate::docker::PanelMsg::Snapshot(index, snap) => {
-                if seq != self.docker_gen || index != p.host_cursor {
-                    // Dropped, but the spinner belongs to the read that just ended:
-                    // leaving it on says "reading…" with nothing in flight. A newer
-                    // read turns it back on when it starts.
+                if seq != self.docker_gen {
+                    // A NEWER read is in flight — it set the spinner and it owns
+                    // it. Clearing here would say "done" over a read that is still
+                    // running, which over ssh is most of the wait.
+                    return;
+                }
+                if index != p.host_cursor {
+                    // Current generation, but for a host that is no longer selected
+                    // (a click that only moved the selection). Nothing else will
+                    // clear the spinner this read turned on.
                     p.loading = false;
                     return;
                 }
                 p.loading = false;
                 match snap {
                     Ok(s) => {
-                        // Kept for the hub column, which has no images of its own
-                        // and exists to compare against these.
-                        p.local_images = s.images.clone();
+                        // Kept for the hub column — but only from a LOCAL daemon.
+                        // The hub rows say "same as local"; filling that from a
+                        // remote host answers a question nobody asked, and answers
+                        // it with a verdict that would skip a push.
+                        if p.host().map(|h| h.endpoint.is_local()).unwrap_or(false) {
+                            p.local_images = s.images.clone();
+                        }
                         p.apply_snapshot(s);
                         // Only an ERROR is cleared by a good read. The message is
                         // usually what the operation that triggered this reload just
@@ -2053,22 +2085,56 @@ impl Gpu {
                 _ => None,
             }
         };
-        if let Some(k) = press {
-            let key = match k {
-                overlay::DockerKey::Ch(c) => {
-                    Key::Character(winit::keyboard::SmolStr::new(c.to_string()))
-                }
-                overlay::DockerKey::Enter => Key::Named(NamedKey::Enter),
-            };
-            self.docker_panel_key(&key, config);
+        if let Some(press) = press {
+            self.run_docker_press(press, config);
         }
         self.window.request_redraw();
         true
     }
 
+    /// Runs a leader leaf: switches the object column where the leaf says to, then
+    /// presses the key the panel already binds for that verb.
+    ///
+    /// The same shape as the git panel's `run_git_press`, and for the same reason:
+    /// a menu that can only press keys in the context you are already standing in
+    /// is a menu you have to navigate to before you can use it.
+    fn run_docker_press(&mut self, press: overlay::DockerPress, config: &Config) {
+        use overlay::{DockerKey, DockerPress};
+        let as_key = |k: DockerKey| match k {
+            DockerKey::Ch(c) => Key::Character(winit::keyboard::SmolStr::new(c.to_string())),
+            DockerKey::Enter => Key::Named(NamedKey::Enter),
+        };
+        let switch = |gpu: &mut Self, kind| {
+            if let Some(Overlay::Docker(p)) = &mut gpu.overlay {
+                p.focus = overlay::DockerFocus::Objects;
+                p.set_kind(kind);
+            }
+        };
+        match press {
+            DockerPress::Switch(kind) => {
+                switch(self, kind);
+                self.window.request_redraw();
+            }
+            DockerPress::InKind(kind, k) => {
+                switch(self, kind);
+                self.docker_panel_key(&as_key(k), config);
+            }
+            DockerPress::Key(k)
+            | DockerPress::OnContainer(k)
+            | DockerPress::OnProject(k)
+            | DockerPress::OnHub(k) => self.docker_panel_key(&as_key(k), config),
+        }
+    }
+
     /// Keys while the docker panel has the keyboard.
     fn docker_panel_key(&mut self, key: &Key, config: &Config) {
         let (cols, rows) = self.screen_cells();
+        // A window narrowed since the last keypress may have dropped the column the
+        // keyboard is in. Reconciled here rather than on the resize event: this is
+        // the only place that can act on it, and it costs one layout computation.
+        if let Some(Overlay::Docker(p)) = &mut self.overlay {
+            p.sync_focus(cols, rows);
+        }
         let mut reload = false;
         let mut detail = false;
         let mut copy: Option<String> = None;
@@ -2230,6 +2296,26 @@ impl Gpu {
                             verb: if c.state == "paused" { "unpause" } else { "pause" },
                         })
                     }
+                    // The menu offers these, so the panel has to bind them: a leaf
+                    // that pressed a key nothing answers would be a menu entry that
+                    // does nothing.
+                    "K" => {
+                        op = p.selected_container().map(|c| crate::docker::Op::Container {
+                            id: c.id.clone(),
+                            verb: "kill",
+                        })
+                    }
+                    "H" => p.focus = overlay::DockerFocus::Hosts,
+                    "B" => {
+                        // Docker Hub is always the last host in the column.
+                        if let Some(i) = p.hosts.iter().position(|h| !h.endpoint.is_local()
+                            && matches!(h.endpoint, crate::docker::Endpoint::Hub))
+                        {
+                            p.host_cursor = i;
+                            p.focus = overlay::DockerFocus::Objects;
+                            reload = true;
+                        }
+                    }
                     "d" => remove = true,
                     "e" => exec = true,
                     "w" => browse = true,
@@ -2270,6 +2356,14 @@ impl Gpu {
         if let Some(verb) = compose {
             self.docker_compose(&verb, config);
         }
+        // A cursor move clears the detail, so the read has to be re-issued — the
+        // same rule the click path follows. Without it `L` then `j` leaves the
+        // column saying "reading…" with nothing in flight.
+        if matches!(&self.overlay, Some(Overlay::Docker(p))
+            if p.detail != overlay::DockerDetail::Summary && p.detail_for.is_none())
+        {
+            self.docker_detail_load();
+        }
         if let Some(repo) = open_repo {
             self.docker_open_repo(repo);
         }
@@ -2294,7 +2388,11 @@ impl Gpu {
         // The generation is bumped only once the operation is really going to run:
         // bumping it and then refusing (no panel, already busy) would orphan a
         // snapshot that is still in flight for no reason at all.
-        if matches!(&self.overlay, Some(Overlay::Docker(p)) if p.busy) {
+        let refuse = match &self.overlay {
+            Some(Overlay::Docker(p)) => p.busy || p.host().is_none(),
+            _ => true,
+        };
+        if refuse {
             return;
         }
         self.docker_gen += 1;
@@ -2319,6 +2417,15 @@ impl Gpu {
     /// volumes go with it, an image that something is still running from cannot be
     /// pulled back from a private registry in a hurry, and a volume IS the data.
     fn docker_remove_prompt(&mut self) {
+        // Not while something is running: the confirm would be answered into a
+        // `docker_run_op` that refuses on `busy`, and the delete would be dropped
+        // with the user believing it happened.
+        if matches!(&self.overlay, Some(Overlay::Docker(p)) if p.busy) {
+            if let Some(Overlay::Docker(p)) = &mut self.overlay {
+                p.message = Err("something is still running here".into());
+            }
+            return;
+        }
         let Some(Overlay::Docker(p)) = &self.overlay else { return };
         let Some(row) = p.selected() else { return };
         let (label, op) = match row {
@@ -2559,6 +2666,15 @@ impl Gpu {
             .find(|c| c.project.as_deref() == Some(project.as_str()))
             .map(|c| c.config_files.clone())
             .unwrap_or_default();
+        if files.is_empty() {
+            // Without `-f`, compose falls back to whatever `compose.yaml` sits in
+            // the shell's directory and brings THAT up under this project's name —
+            // a deploy of something the confirm never mentioned.
+            if let Some(Overlay::Docker(p)) = &mut self.overlay {
+                p.message = Err(format!("{project}: no compose file recorded on its containers"));
+            }
+            return;
+        }
         let cmd = crate::docker::deploy_command(&host, &project, &files);
         let label = format!("Deploy {project} on {}? compose pull, then up -d", host.name);
         self.docker_confirm_command(cmd, label, host.endpoint.label());

@@ -84,6 +84,15 @@ export const CONFIG_GROUPS = [
     ],
   },
   {
+    group: '[explorer]',
+    rows: [
+      { k: 'side', v: '"left"', d: { es: 'Lado en el que se dibuja la barra: "left" (donde la pone cualquier editor) o "right".', en: 'Which edge the sidebar sits on: "left" (where every editor puts it) or "right".' } },
+      { k: 'width', v: '30', d: { es: 'Ancho en COLUMNAS, no en fracción de la ventana: una fracción en un ultrapanorámico da un árbol de 90 columnas. Se acota contra la ventana al dibujarlo, así que encogerla nunca deja la barra más ancha que la pestaña.', en: 'Width in COLUMNS, not a fraction of the window: a fraction on an ultrawide gives a 90-column tree. Clamped against the window when drawn, so shrinking it never leaves the sidebar wider than the tab.' } },
+      { k: 'show_hidden', v: 'false', d: { es: 'Mostrar los ficheros que empiezan por punto. La tecla . lo cambia en caliente.', en: 'Show dotfiles. The . key toggles it live.' } },
+      { k: 'open_on_start', v: 'false', d: { es: 'Abrir la barra al arrancar, en cada pestaña.', en: 'Open the sidebar on start, in every tab.' } },
+    ],
+  },
+  {
     group: '[keys]',
     rows: [
       { k: '"ctrl+shift+t"', v: '"new_tab"', d: { es: 'Ejemplo: reasignar un atajo. Se fusiona sobre los de fábrica.', en: 'Example: rebind a shortcut. Merges over the defaults.' } },

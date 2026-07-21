@@ -557,7 +557,10 @@ resize it — the panes are only resized when you let go, because a PTY resized 
 every frame of a drag is one full-screen program redrawing itself into a corner.
 
 With the tree focused, the leader key opens a menu of file verbs, the same which-key
-the git panel uses. It offers only what the row under the cursor can do.
+the git panel uses: F file, D directory, V view, Q back to the pane. It offers only
+what the row under the cursor can do - the file verbs are not offered on a directory
+and the directory ones are not offered on a file - and every leaf presses a key the
+sidebar already binds.
 
 Config: explorer.side (left/right), explorer.width in COLUMNS (not a fraction: a
 fraction on an ultrawide gives a 90-column tree), explorer.show_hidden. All three
@@ -582,7 +585,17 @@ thing.
   T                deploy the project: compose pull, then up -d (asks)
   >                publish the image or tag: docker push (asks)
   y z r            copy the id, zoom the detail, reread this host
+  K H B            kill it, the hosts column, jump to Docker Hub
   leader           the panel's own menu of verbs   esc or q   close it
+
+The leader inside the panel is the git panel's, in shape and in depth: C container
+verbs, P compose project, I images, O objects, H hosts, B Docker Hub, D detail,
+V view, Z zoom, Q close. It only offers what the row under the cursor can do - no
+compose verbs on a network, no hub verbs on a daemon, no kind strip on hub - and a
+leaf can TAKE you somewhere before it acts: leader I P publishes an image from
+wherever you are standing, switching the column on the way. Every leaf presses a
+key the panel already binds, so a verb cannot mean one thing from its letter and
+another from the menu.
 
 Containers are grouped by their compose project, because that is the unit the work
 is done in: nobody deploys a container, they deploy a project. The heading counts
