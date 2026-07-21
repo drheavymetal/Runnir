@@ -419,6 +419,10 @@ impl Gpu {
             overlay.as_ref(),
             flash,
             screen,
+            // Hints and search draw as chrome with no overlay behind them, and an
+            // inline image recorded afterwards would cover the very labels that
+            // point at it.
+            matches!(self.overlay, Some(Overlay::Hints(_) | Overlay::Search(_))),
         );
 
         drop(guards);

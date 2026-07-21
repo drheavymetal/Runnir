@@ -1399,6 +1399,66 @@ context drawn as down with its reason, images/volumes/networks, logs (500 lines,
 unwrapped from the daemon's 8-byte stream framing), inspect, then stop / start /
 remove of a throwaway container including the confirm and its "no".
 
+## 2026-07-21 - Bug audit of everything above (four Fable finders, Opus fixed)
+
+Four read-only agents audited the day's four commits — the explorer's git badges,
+the real-image viewer, the docker data layer and the docker panel — one each, each
+told to verify every claim in the source. 34 findings, all fixed here. The ones
+worth remembering:
+
+**The pictures were double-encoded.** The image texture was `Rgba8Unorm` with a
+comment saying the data is "passed through untouched", while the surface is
+`*UnormSrgb` and encodes on write — the exact thing `to_linear` exists to prevent
+for text, done to every image since the kitty path was written. A 50% grey came out
+at 0.74. One word: `Rgba8UnormSrgb`, and the sampler linearises on read.
+
+**The deploy could never run.** `deploy_command` returned `[<whole pull line>, "&&",
+<whole up line>]` while every consumer of a command here treats it as ARGV, so the
+shell looked for a program named `docker compose -p x pull`. A chain has to be
+handed to a shell: `sh -c "<pull> && <up>"`, or `ssh <host> "<pull> && <up>"`.
+
+**And on a remote host it was pointed at the wrong filesystem.** `docker -c <ctx>
+compose -f <path>` redirects the DAEMON connection while the local compose client
+reads `-f` off the local disk — and those paths came from labels written on the
+remote machine. A remote compose has to be a remote command.
+
+**The ssh transport had no timeout of any kind** — `TIMEOUT` was set on the unix
+socket only — and `probe()` joins every host thread, so one silent remote daemon
+never populated the hosts column at all. Now `ConnectTimeout` plus keepalives, and
+ssh's stderr is kept: every ssh failure used to read as "no HTTP header in the
+answer" when the real sentence was "Permission denied (publickey)".
+
+**A click inside the panel closed it.** `hit()` answered `None` for the header, the
+footer, and the blank below a short list, and the click handler reads `None` as
+"outside, put it away". There is a `DockerHit::Inside` now, the way the git panel
+has always had `GitHit::Header`.
+
+**Answers landed under the wrong thing**, three ways: a hub reload emptied `tags`
+without rebuilding, so the remote control's state dump indexed a list that was gone
+(a panic that took the window); `Done` had no host guard, so an operation's result
+appeared under whichever daemon you had switched to; and the detail was keyed by the
+object alone, so slow logs could arrive after a fast inspect and be drawn under the
+word "inspect". Worse, every worker answer was DROPPED while the panel sat behind a
+confirm — which left `busy` set forever and silently discarded the delete that had
+just been confirmed.
+
+**Smaller, and all real**: `Exited (0) 2 days ago` was truncated to `Exited` by a
+health-stripper that split on the first ` (`; an unstaged typechange (`.T`) was
+badged green as staged; a collapsed untracked directory (`? newdir/`) got no badge
+at all because the fold only ever looked at ancestors; git marks outlived the
+repository when its `.git` was deleted; the mark staleness key was global while the
+marks are per tab; `clamp(1, w)` with a zero-dimension decode panics on the worker
+and the viewer just never opened; a stale file read replaced whatever overlay was on
+screen when it landed; hub and registry pagination were ignored, so a tag list
+silently stopped at 200; `ghcr.io/...` images were asked about on Docker Hub; the
+credential helper leaked a zombie on a failed write; and `elide`/`field_view`
+budgeted in chars while the grid advances in display width, so a CJK name ran under
+the badge column beside it.
+
+The split is the point, again: finders that may only READ, then one agent that
+fixes with the whole list in hand. A finder that could also fix would talk itself
+into its own patch.
+
 ## 2026-07-21 - The docker panel, step 2: Docker Hub, the drift, and the deploy
 
 **Hub is a host in the same column, and it authenticates twice.** The registry

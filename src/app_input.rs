@@ -69,12 +69,19 @@ impl Gpu {
     /// `overlay_under_confirm`, because its confirms are answered on the way to an
     /// operation that needs the panel BACK: "no" and "yes" both end up looking at
     /// it again, and only the pending operation is dropped.
-    fn dismiss_confirm(&mut self) {
-        if let Some(panel) = self.docker_stash.take() {
-            self.pending_docker = None;
-            self.pending_docker_cmd = None;
-            self.overlay = Some(Overlay::Docker(panel));
-            return;
+    fn dismiss_confirm(&mut self, kind: PromptKind) {
+        // Only the panel's OWN confirms bring it back. Keyed on the kind because
+        // anything can replace the prompt in between — a remote-control action, a
+        // hook — and restoring the docker panel in answer to somebody else's
+        // confirm would throw away what that confirm was asked over.
+        let mine = matches!(kind, PromptKind::DockerRemove | PromptKind::DockerRemote);
+        if mine {
+            if let Some(panel) = self.docker_stash.take() {
+                self.pending_docker = None;
+                self.pending_docker_cmd = None;
+                self.overlay = Some(Overlay::Docker(panel));
+                return;
+            }
         }
         self.overlay = self.overlay_under_confirm.take();
     }
@@ -953,14 +960,25 @@ impl Gpu {
             return;
         };
         let (root, seq) = (e.root.clone(), e.seq);
-        // Not a repository: no marks to read, and nothing to clear either — leaving a
-        // directory that is not a repo shows a plain tree, which is correct.
+        // Not a repository (any more): there is nothing to read, and anything read
+        // BEFORE has to go. A tree whose `.git` was deleted kept its badges and its
+        // "N ignored" filter for the rest of the session otherwise.
         if crate::git::repo_root(&root).as_deref() != Some(root.as_path()) {
+            if let Some(e) = self.tabs[self.active].explorer.as_mut() {
+                if !e.git.is_empty() || !e.ignored.is_empty() {
+                    e.set_git(Vec::new(), std::collections::HashSet::new());
+                    self.window.request_redraw();
+                }
+            }
+            self.explorer_git_at = None;
             return;
         }
         let stamp = crate::git::state_stamp(&root);
         let cmd = self.tab().focused_ref().command_seq();
-        let at = (root.clone(), stamp, cmd);
+        // The tab is part of the key: the marks are delivered to ONE tab, so a
+        // second tab on the same repository would find the triple already
+        // satisfied and keep showing badges from before the index moved.
+        let at = (tab_index, root.clone(), stamp, cmd);
         if !force && self.explorer_git_at.as_ref() == Some(&at) {
             return;
         }
@@ -1309,6 +1327,7 @@ impl Gpu {
     /// On a worker because this is the other call that hangs: a file on a network
     /// mount, or a 4 MB one, is not something the frame can wait for.
     fn explorer_view(&mut self, path: std::path::PathBuf) {
+        self.pending_view = Some(path.clone());
         let proxy = self.proxy.clone();
         let cell = self.renderer.cell_size();
         let screen = (self.surface_config.width as f32, self.surface_config.height as f32);
@@ -1326,6 +1345,14 @@ impl Gpu {
 
     /// A finished file read: put the viewer up.
     fn on_file_read(&mut self, path: std::path::PathBuf, read: crate::explorer::ViewRead) {
+        // Only the read that is still wanted opens a viewer. Two Enters on a slow
+        // filesystem land in the order the READS finish, not the order they were
+        // asked for, and a late one would replace whatever is on screen by then —
+        // including a prompt in the middle of a file operation.
+        if self.pending_view.as_deref() != Some(path.as_path()) {
+            return;
+        }
+        self.pending_view = None;
         let body = match read.body {
             Ok(b) => b,
             Err(e) => crate::overlay::Viewed::Note(e),
@@ -1637,6 +1664,11 @@ impl Gpu {
             // without a second round trip.
             p.open_repo = None;
             p.tags.clear();
+            // Rebuilt here, not when the answer lands: the rows still hold
+            // `Tag(i)` indices into the vector just emptied, and anything that
+            // reads a row by index — the remote control's state dump — would be
+            // indexing an empty list until then.
+            p.rebuild();
             let images = p.local_images.clone();
             let proxy = self.proxy.clone();
             std::thread::spawn(move || {
@@ -1708,7 +1740,7 @@ impl Gpu {
         };
         let kind = p.kind;
         let mode = p.detail;
-        p.detail_for = Some(id.clone());
+        p.detail_for = Some((id.clone(), mode));
         p.detail_lines.clear();
         p.detail_scroll = 0;
         let ep = host.endpoint;
@@ -1720,7 +1752,7 @@ impl Gpu {
                 overlay::DockerDetail::Summary => Ok(String::new()),
             };
             let _ = proxy
-                .send_event(UserEvent::Docker(seq, crate::docker::PanelMsg::Detail(id, text)));
+                .send_event(UserEvent::Docker(seq, crate::docker::PanelMsg::Detail(id, mode, text)));
         });
     }
 
@@ -1771,7 +1803,15 @@ impl Gpu {
     /// dropped: hosts get switched faster than a slow daemon answers, and a
     /// snapshot landing under another host would be a lie about that host.
     fn on_docker_msg(&mut self, seq: u64, msg: crate::docker::PanelMsg) {
-        let Some(Overlay::Docker(p)) = &mut self.overlay else { return };
+        // The panel may be PARKED behind a confirm. Its workers keep running, and
+        // dropping their answers left `busy` set for the life of the panel — every
+        // verb after that silently refused, including the delete just confirmed.
+        let Some(p) = (match &mut self.overlay {
+            Some(Overlay::Docker(p)) => Some(p),
+            _ => self.docker_stash.as_mut(),
+        }) else {
+            return;
+        };
         match msg {
             // The probe is not generation-guarded on purpose: it describes the
             // HOSTS, which do not change when the panel reloads a snapshot.
@@ -1782,6 +1822,10 @@ impl Gpu {
             }
             crate::docker::PanelMsg::Snapshot(index, snap) => {
                 if seq != self.docker_gen || index != p.host_cursor {
+                    // Dropped, but the spinner belongs to the read that just ended:
+                    // leaving it on says "reading…" with nothing in flight. A newer
+                    // read turns it back on when it starts.
+                    p.loading = false;
                     return;
                 }
                 p.loading = false;
@@ -1808,8 +1852,8 @@ impl Gpu {
                     }
                 }
             }
-            crate::docker::PanelMsg::Detail(id, text) => {
-                if p.detail_for.as_deref() != Some(id.as_str()) {
+            crate::docker::PanelMsg::Detail(id, mode, text) => {
+                if p.detail_for.as_ref() != Some(&(id, mode)) {
                     return;
                 }
                 match text {
@@ -1844,7 +1888,13 @@ impl Gpu {
                 }
                 p.loading = false;
                 match tags {
-                    Ok(list) => {
+                    Ok((list, truncated)) => {
+                        // Never a silent cut: a list that just stops reads as the
+                        // whole tag list, and "the tag I pushed is not there" is
+                        // the wrong conclusion to hand anyone.
+                        if truncated {
+                            p.message = Ok(format!("showing the first {} tags", list.len()));
+                        }
                         p.tags = list;
                         p.rebuild();
                     }
@@ -1868,9 +1918,15 @@ impl Gpu {
                     Err(e) => p.message = Err(e),
                 }
             }
-            crate::docker::PanelMsg::Done(result) => {
+            crate::docker::PanelMsg::Done(index, result) => {
                 p.busy = false;
-                p.message = result.map(|m| m);
+                // An answer about the host you have LEFT is not this host's news:
+                // "stopped" under another daemon reads as something that happened
+                // there, and the reload it triggers would be of the wrong machine.
+                if index != p.host_cursor {
+                    return;
+                }
+                p.message = result;
                 self.docker_reload();
             }
         }
@@ -1928,12 +1984,20 @@ impl Gpu {
                 }
                 overlay::DockerHit::Separator(i) => self.docker_drag = Some(i),
                 overlay::DockerHit::Detail => p.focus = overlay::DockerFocus::Detail,
+                // Inside the panel but on nothing: the header, the footer, the
+                // blank below a short list. A click there is not a click away.
+                overlay::DockerHit::Inside => {}
             }
         }
         if reload {
             self.docker_reload();
         }
-        if detail {
+        // A cursor move clears the detail, so the read has to be re-issued: without
+        // this the column says "reading…" with nothing in flight until a mode key
+        // is pressed again.
+        let moved_in_mode = matches!(&self.overlay, Some(Overlay::Docker(p))
+            if p.detail != overlay::DockerDetail::Summary && p.detail_for.is_none());
+        if detail || moved_in_mode {
             self.docker_detail_load();
         }
         self.window.request_redraw();
@@ -2004,6 +2068,7 @@ impl Gpu {
 
     /// Keys while the docker panel has the keyboard.
     fn docker_panel_key(&mut self, key: &Key, config: &Config) {
+        let (cols, rows) = self.screen_cells();
         let mut reload = false;
         let mut detail = false;
         let mut copy: Option<String> = None;
@@ -2035,7 +2100,7 @@ impl Gpu {
                         return;
                     }
                 }
-                Key::Named(NamedKey::Tab) => p.cycle_focus(true),
+                Key::Named(NamedKey::Tab) => p.cycle_focus(true, cols, rows),
                 Key::Named(NamedKey::ArrowDown) => match focus {
                     overlay::DockerFocus::Hosts => {
                         p.host_cursor = (p.host_cursor + 1).min(p.hosts.len().saturating_sub(1))
@@ -2073,7 +2138,7 @@ impl Gpu {
                     }
                     overlay::DockerFocus::Detail => {}
                 },
-                Key::Named(NamedKey::ArrowLeft) => p.cycle_focus(false),
+                Key::Named(NamedKey::ArrowLeft) => p.cycle_focus(false, cols, rows),
                 Key::Character(c) => match c.as_str() {
                     "q" => {
                         self.overlay = None;
@@ -2102,23 +2167,35 @@ impl Gpu {
                         overlay::DockerFocus::Detail => p.scroll_detail(i32::MAX),
                         _ => p.set_cursor(usize::MAX),
                     },
-                    "h" => p.cycle_focus(false),
-                    "l" => p.cycle_focus(true),
+                    "h" => p.cycle_focus(false, cols, rows),
+                    "l" => p.cycle_focus(true, cols, rows),
                     "C" => p.set_kind(crate::docker::Kind::Containers),
                     "I" => p.set_kind(crate::docker::Kind::Images),
                     "V" => p.set_kind(crate::docker::Kind::Volumes),
                     "N" => p.set_kind(crate::docker::Kind::Networks),
                     "]" => p.set_kind(p.kind.next()),
                     "[" => p.set_kind(p.kind.prev()),
-                    "z" => p.zoom = !p.zoom,
+                    "z" => {
+                        p.zoom = !p.zoom;
+                        // Zoom drops both list columns; the keyboard cannot stay in
+                        // one of them.
+                        p.sync_focus(cols, rows);
+                    }
                     "r" => reload = true,
                     "u" => {
                         p.detail = overlay::DockerDetail::Summary;
                         detail = true;
                     }
+                    // Logs are a container word. On an image or a volume the id
+                    // would be handed to `/containers/<id>/logs`, and the daemon's
+                    // 404 would be drawn as that object's detail.
                     "L" => {
-                        p.detail = overlay::DockerDetail::Logs;
-                        detail = true;
+                        if matches!(p.selected(), Some(overlay::DockerRow::Container(_))) {
+                            p.detail = overlay::DockerDetail::Logs;
+                            detail = true;
+                        } else {
+                            p.message = Err("only a container has logs".into());
+                        }
                     }
                     "i" => {
                         p.detail = overlay::DockerDetail::Inspect;
@@ -2214,20 +2291,25 @@ impl Gpu {
     /// cannot fire a second one: `stop` twice is harmless, `rm` twice is a second
     /// error message about something that is already gone.
     fn docker_run_op(&mut self, op: crate::docker::Op) {
+        // The generation is bumped only once the operation is really going to run:
+        // bumping it and then refusing (no panel, already busy) would orphan a
+        // snapshot that is still in flight for no reason at all.
+        if matches!(&self.overlay, Some(Overlay::Docker(p)) if p.busy) {
+            return;
+        }
         self.docker_gen += 1;
         let seq = self.docker_gen;
         let Some(Overlay::Docker(p)) = &mut self.overlay else { return };
-        if p.busy {
-            return;
-        }
         let Some(host) = p.host().cloned() else { return };
+        let index = p.host_cursor;
         p.busy = true;
         p.message = Ok(format!("{}\u{2026}", op.done()));
         let ep = host.endpoint;
         let proxy = self.proxy.clone();
         std::thread::spawn(move || {
             let result = crate::docker::run_op(&ep, &op);
-            let _ = proxy.send_event(UserEvent::Docker(seq, crate::docker::PanelMsg::Done(result)));
+            let _ =
+                proxy.send_event(UserEvent::Docker(seq, crate::docker::PanelMsg::Done(index, result)));
         });
     }
 
@@ -2453,7 +2535,11 @@ impl Gpu {
             return;
         };
         let cmd = crate::docker::push_command(&host, &tag);
-        self.docker_confirm_command(cmd, format!("Push {tag} to the registry?"), tag);
+        self.docker_confirm_command(
+            cmd,
+            format!("Push {tag} to the registry, from {}?", host.name),
+            host.endpoint.label(),
+        );
     }
 
     /// The deploy, as one action: pull what was published, then bring the project
@@ -2773,31 +2859,39 @@ impl Gpu {
                 "tree": p.rows.iter().take(TREE_REPORT).map(|r| match r {
                     crate::overlay::DockerRow::Project { name, total, up, open } => json!({
                         "kind": "project", "name": name, "total": total, "up": up, "open": open }),
-                    crate::overlay::DockerRow::Container(i) => {
-                        let c = &p.snap.containers[*i];
-                        json!({"kind": "container", "name": c.name, "state": c.state,
-                               "health": c.health.map(|h| h.label()), "image": c.image})
-                    }
+                    // Every one of these goes through `get`: a row holds an INDEX,
+                    // and a list can be emptied between the rebuild and this dump.
+                    // The renderer already reads them that way; a state report that
+                    // panicked would take the window with it.
+                    crate::overlay::DockerRow::Container(i) => match p.snap.containers.get(*i) {
+                        Some(c) => json!({"kind": "container", "name": c.name, "state": c.state,
+                               "health": c.health.map(|h| h.label()), "image": c.image}),
+                        None => json!({"kind": "container"}),
+                    },
                     crate::overlay::DockerRow::Image(i) => {
-                        json!({"kind": "image", "name": p.snap.images[*i].label()})
+                        json!({"kind": "image", "name": p.snap.images.get(*i).map(|m| m.label())})
                     }
                     crate::overlay::DockerRow::Volume(i) => {
-                        json!({"kind": "volume", "name": p.snap.volumes[*i].name})
+                        json!({"kind": "volume",
+                               "name": p.snap.volumes.get(*i).map(|v| v.name.clone())})
                     }
                     crate::overlay::DockerRow::Network(i) => {
-                        json!({"kind": "network", "name": p.snap.networks[*i].name})
+                        json!({"kind": "network",
+                               "name": p.snap.networks.get(*i).map(|n| n.name.clone())})
                     }
                     crate::overlay::DockerRow::Repo(i) => {
-                        json!({"kind": "repo", "name": p.repos[*i].name,
-                               "private": p.repos[*i].private})
+                        json!({"kind": "repo", "name": p.repos.get(*i).map(|r| r.name.clone()),
+                               "private": p.repos.get(*i).map(|r| r.private)})
                     }
-                    crate::overlay::DockerRow::Tag(i) => {
-                        let t = &p.tags[*i];
-                        let repo = p.open_repo.clone().unwrap_or_default();
-                        json!({"kind": "tag", "name": t.name, "digest": t.digest,
-                               "drift": crate::docker::drift(&p.local_images, &repo, &t.name,
-                                                             t.digest.as_deref()).label()})
-                    }
+                    crate::overlay::DockerRow::Tag(i) => match p.tags.get(*i) {
+                        Some(t) => {
+                            let repo = p.open_repo.clone().unwrap_or_default();
+                            json!({"kind": "tag", "name": t.name, "digest": t.digest,
+                                   "drift": crate::docker::drift(&p.local_images, &repo, &t.name,
+                                                                 t.digest.as_deref()).label()})
+                        }
+                        None => json!({"kind": "tag"}),
+                    },
                 }).collect::<Vec<_>>(),
             });
         }
@@ -3140,14 +3234,14 @@ impl Gpu {
             Overlay::Prompt(p) if p.kind.is_confirm() => {
                 let kind = p.kind;
                 match key {
-                    Key::Named(NamedKey::Escape) => self.dismiss_confirm(),
+                    Key::Named(NamedKey::Escape) => self.dismiss_confirm(kind),
                     Key::Character(s) => match s.to_lowercase().as_str() {
                         "y" => {
                             self.overlay = None;
                             self.overlay_under_confirm = None;
                             self.confirm_prompt(kind, String::new(), config);
                         }
-                        "n" | "q" => self.dismiss_confirm(),
+                        "n" | "q" => self.dismiss_confirm(kind),
                         _ => {}
                     },
                     _ => {}
@@ -4408,6 +4502,14 @@ impl Gpu {
     }
 
     /// Cell coordinates of a pointer position, for the panel's hit test.
+    /// The window in cells. What a panel's layout is computed against, and the one
+    /// thing a key handler needs from the screen.
+    fn screen_cells(&self) -> (usize, usize) {
+        let (cw, ch) = self.renderer.cell_size();
+        let screen = (self.surface_config.width as f32, self.surface_config.height as f32);
+        ((screen.0 / cw).floor().max(1.0) as usize, (screen.1 / ch).floor().max(1.0) as usize)
+    }
+
     fn cell_at(&self, pos: PhysicalPosition<f64>) -> (usize, usize, usize, usize) {
         let (cw, ch) = self.renderer.cell_size();
         let screen = (self.surface_config.width as f32, self.surface_config.height as f32);

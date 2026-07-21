@@ -165,11 +165,35 @@ impl Stream {
                 // here and ssh would otherwise try to allocate one; BatchMode so a
                 // host that wants a password fails instead of hanging on a prompt
                 // nobody can see.
-                let child = std::process::Command::new("ssh")
-                    .args(["-T", "-o", "BatchMode=yes", host, "docker", "system", "dial-stdio"])
+                //
+                // The timeouts are not optional: the read below blocks until EOF and
+                // NOTHING else bounds it, so a host that accepts the connection and
+                // goes quiet would hang this worker for as long as the process runs
+                // — and `probe` joins every one of them.
+                let (dest, port) = ssh_destination(host);
+                let mut cmd = std::process::Command::new("ssh");
+                cmd.args([
+                    "-T",
+                    "-o",
+                    "BatchMode=yes",
+                    "-o",
+                    "ConnectTimeout=10",
+                    "-o",
+                    "ServerAliveInterval=5",
+                    "-o",
+                    "ServerAliveCountMax=3",
+                ]);
+                if let Some(port) = port {
+                    cmd.args(["-p", &port]);
+                }
+                let child = cmd
+                    .args([&dest, "docker", "system", "dial-stdio"])
+                    // Kept, not thrown away: an auth refusal or an unknown host key
+                    // is the whole answer, and discarding it left every ssh failure
+                    // reading as "no HTTP header in the answer".
                     .stdin(std::process::Stdio::piped())
                     .stdout(std::process::Stdio::piped())
-                    .stderr(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::piped())
                     .spawn()
                     .map_err(|e| format!("ssh {host}: {e}"))?;
                 Ok(Stream::Child(child))
@@ -183,6 +207,16 @@ impl Stream {
             Stream::Unix(s) => s.write_all(buf),
             Stream::Child(c) => c.stdin.as_mut().expect("piped").write_all(buf),
         }
+    }
+
+    /// What the transport itself said when it failed — `ssh`'s stderr, which is
+    /// where "Permission denied (publickey)" and "Could not resolve hostname" live.
+    fn failure_text(&mut self) -> Option<String> {
+        let Stream::Child(c) = self else { return None };
+        let mut text = String::new();
+        c.stderr.as_mut()?.read_to_string(&mut text).ok()?;
+        let line = text.lines().find(|l| !l.trim().is_empty())?;
+        Some(line.trim().to_string())
     }
 }
 
@@ -204,6 +238,21 @@ impl Drop for Stream {
             let _ = c.wait();
         }
     }
+}
+
+/// Splits a docker context's ssh endpoint into a destination and a port.
+///
+/// `ssh://root@host:2222` is a URI; as a bare argument `root@host:2222` is a
+/// HOSTNAME to ssh, which then fails to resolve it. The port has to become `-p`.
+pub fn ssh_destination(endpoint: &str) -> (String, Option<String>) {
+    // Only a trailing `:<digits>` is a port. A bare IPv6 address has colons too, and
+    // splitting one of those apart would break a host that works today.
+    if let Some((host, port)) = endpoint.rsplit_once(':') {
+        if !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()) && !host.ends_with(':') {
+            return (host.to_string(), Some(port.to_string()));
+        }
+    }
+    (endpoint.to_string(), None)
 }
 
 /// One request, one connection, closed after the answer.
@@ -229,7 +278,13 @@ pub fn request(ep: &Endpoint, method: &str, path: &str, body: Option<&str>) -> R
     stream.write_all(req.as_bytes()).map_err(|e| e.to_string())?;
     let mut raw = Vec::new();
     stream.read_to_end(&mut raw).map_err(|e| e.to_string())?;
-    let (status, body) = split_response(&raw)?;
+    // An ssh transport that failed says why on ITS stderr, and the socket answer is
+    // then empty. Reporting "no HTTP header in the answer" for a refused key throws
+    // away the only sentence that explains the panel's most common failure.
+    let (status, body) = match split_response(&raw) {
+        Ok(pair) => pair,
+        Err(e) => return Err(stream.failure_text().unwrap_or(e)),
+    };
     if !(200..300).contains(&status) {
         return Err(error_message(&body, status));
     }
@@ -364,8 +419,18 @@ impl Container {
     /// What a row shows on the right: the status, shortened. `Up 3 days` is what
     /// people read; the rest of the line is the health, which has its own mark.
     pub fn short_status(&self) -> String {
-        let s = self.status.split(" (").next().unwrap_or(&self.status);
-        s.to_string()
+        // Only the HEALTH parenthesis comes off. Splitting on the first ` (` also
+        // ate the exit code and the age of every stopped container — `Exited (0) 2
+        // days ago` became `Exited`, which is the row that most needed the rest.
+        for suffix in [" (healthy)", " (unhealthy)"] {
+            if let Some(rest) = self.status.strip_suffix(suffix) {
+                return rest.to_string();
+            }
+        }
+        match self.status.find(" (health: ") {
+            Some(at) => self.status[..at].to_string(),
+            None => self.status.clone(),
+        }
     }
 }
 
@@ -977,6 +1042,44 @@ mod tests {
         assert!(parsed[0].digest.is_none(), "a digest is one request per tag, asked for on demand");
     }
 
+
+    #[test]
+    fn the_registrys_next_page_is_found_in_its_link_header() {
+        let link = "</v2/go2chaindev/api/tags/list?n=200&last=1.9>; rel=\"next\"";
+        assert_eq!(
+            next_link(link).as_deref(),
+            Some("https://registry-1.docker.io/v2/go2chaindev/api/tags/list?n=200&last=1.9")
+        );
+        // A header that is only a previous link is not a next page.
+        assert_eq!(next_link("</v2/x/tags/list?n=1>; rel=\"prev\""), None);
+        assert_eq!(next_link(""), None);
+    }
+
+    #[test]
+    fn an_ssh_endpoint_keeps_its_port_out_of_the_hostname() {
+        assert_eq!(ssh_destination("root@cloudmax"), ("root@cloudmax".into(), None));
+        assert_eq!(ssh_destination("root@cloudmax:2222"), ("root@cloudmax".into(), Some("2222".into())));
+        // Not a port: a trailing colon, or something that is not a number. Splitting
+        // either off would break a host that works today.
+        assert_eq!(ssh_destination("host:name"), ("host:name".into(), None));
+        assert_eq!(ssh_destination("host:"), ("host:".into(), None));
+    }
+
+    #[test]
+    fn a_stopped_containers_status_keeps_its_exit_code_and_its_age() {
+        let stopped = Container { status: "Exited (137) 2 days ago".into(), ..Container::default() };
+        // The health parenthesis is what comes off — not the exit code, which is
+        // the most useful thing on the row.
+        assert_eq!(stopped.short_status(), "Exited (137) 2 days ago");
+        let up = Container { status: "Up 3 days (healthy)".into(), ..Container::default() };
+        assert_eq!(up.short_status(), "Up 3 days");
+        let starting = Container { status: "Up 1 second (health: starting)".into(), ..Container::default() };
+        assert_eq!(starting.short_status(), "Up 1 second");
+        let restarting = Container { status: "Restarting (1) 5 seconds ago".into(), ..Container::default() };
+        assert_eq!(restarting.short_status(), "Restarting (1) 5 seconds ago");
+    }
+
+
     /// Talks to the daemon on this machine. Ignored by default — a test suite that
     /// needs a running docker is a suite that fails on the machine without one.
     #[test]
@@ -1021,15 +1124,15 @@ pub enum PanelMsg {
     Hosts(Vec<Host>),
     /// Everything one host holds. The index says which host asked.
     Snapshot(usize, Result<Snapshot, String>),
-    /// The detail column's text for one object.
-    Detail(String, Result<String, String>),
-    /// An operation finished.
-    Done(Result<String, String>),
+    /// The detail column's text for one object, in the mode it was asked for.
+    Detail(String, crate::overlay::DockerDetail, Result<String, String>),
+    /// An operation finished, on the host at this index.
+    Done(usize, Result<String, String>),
     /// The repositories on Docker Hub, and how they were found: the web API, or
     /// the local images when the API refused the credentials.
     Repos(Result<Vec<HubRepo>, String>, String),
-    /// One repository's tags.
-    Tags(String, Result<Vec<HubTag>, String>),
+    /// One repository's tags, and whether the list stopped at the page cap.
+    Tags(String, Result<(Vec<HubTag>, bool), String>),
     /// One tag's manifest digest, which is what the local one is compared against.
     Digest(String, String, Result<String, String>),
 }
@@ -1141,15 +1244,44 @@ pub fn cli_prefix(host: &Host) -> Vec<String> {
 /// but the only way. The project's config files come from the labels its own
 /// containers carry, which is how compose itself finds them again.
 pub fn compose_command(host: &Host, project: &str, files: &[String], verb: &[&str]) -> Vec<String> {
-    let mut cmd = cli_prefix(host);
-    cmd.push("compose".into());
-    cmd.push("-p".into());
-    cmd.push(project.to_string());
+    match &host.endpoint {
+        // Over ssh the whole thing runs THERE. `docker -c <ctx>` only redirects the
+        // daemon connection, while the compose client still reads `-f` from the
+        // local filesystem — and those paths came off the containers' labels, which
+        // are paths on the remote machine. So a remote compose has to be a remote
+        // command, not a local client pointed at a remote daemon.
+        Endpoint::Ssh(dest) => ssh_wrap(dest, &shell_join(&compose_argv("docker", project, files, verb))),
+        _ => {
+            let mut cmd = cli_prefix(host);
+            cmd.extend(compose_argv("", project, files, verb).into_iter().skip(1));
+            cmd
+        }
+    }
+}
+
+/// `docker compose -p <project> [-f <file>…] <verb>` as argv.
+fn compose_argv(program: &str, project: &str, files: &[String], verb: &[&str]) -> Vec<String> {
+    let mut cmd = vec![program.to_string(), "compose".into(), "-p".into(), project.to_string()];
     for f in files {
         cmd.push("-f".into());
         cmd.push(f.clone());
     }
     cmd.extend(verb.iter().map(|v| v.to_string()));
+    cmd
+}
+
+/// Wraps one remote command line in an `ssh` invocation, port and all.
+fn ssh_wrap(dest: &str, line: &str) -> Vec<String> {
+    let (dest, port) = ssh_destination(dest);
+    let mut cmd = vec!["ssh".to_string(), "-t".into()];
+    if let Some(port) = port {
+        cmd.push("-p".into());
+        cmd.push(port);
+    }
+    cmd.push(dest);
+    // One argument: ssh joins what follows with spaces and hands it to a remote
+    // shell, so a path with a space would fall apart if it were split here.
+    cmd.push(line.to_string());
     cmd
 }
 
@@ -1172,9 +1304,22 @@ pub fn push_command(host: &Host, tag: &str) -> Vec<String> {
 /// new to bring up, and an `up` after a failed pull silently restarts the project
 /// on the image it was already running — the deploy that looks like it worked.
 pub fn deploy_command(host: &Host, project: &str, files: &[String]) -> Vec<String> {
-    let pull = compose_command(host, project, files, &["pull"]);
-    let up = compose_command(host, project, files, &["up", "-d"]);
-    vec![shell_join(&pull), "&&".into(), shell_join(&up)]
+    // Every caller of a command here treats it as ARGV — one word per element — so
+    // a chain cannot be expressed as three elements with a bare `&&` in the middle:
+    // the shell would look for a program whose name is the whole first command.
+    // It has to be handed to a shell explicitly.
+    match &host.endpoint {
+        Endpoint::Ssh(dest) => {
+            let pull = shell_join(&compose_argv("docker", project, files, &["pull"]));
+            let up = shell_join(&compose_argv("docker", project, files, &["up", "-d"]));
+            ssh_wrap(dest, &format!("{pull} && {up}"))
+        }
+        _ => {
+            let pull = shell_join(&compose_command(host, project, files, &["pull"]));
+            let up = shell_join(&compose_command(host, project, files, &["up", "-d"]));
+            vec!["sh".into(), "-c".into(), format!("{pull} && {up}")]
+        }
+    }
 }
 
 /// Joins one command into a single shell word-safe string, for chaining.
@@ -1279,9 +1424,16 @@ fn credential_helper(helper: &str) -> Option<HubAuth> {
         .stderr(std::process::Stdio::null())
         .spawn()
         .ok()?;
-    child.stdin.as_mut()?.write_all(HUB_SERVER.as_bytes()).ok()?;
+    // Written before the wait, and a failed write does NOT return early: the child
+    // has to be reaped either way, or a helper that exits at once leaves a zombie
+    // for the life of the terminal.
+    let wrote = child
+        .stdin
+        .as_mut()
+        .map(|stdin| stdin.write_all(HUB_SERVER.as_bytes()).is_ok())
+        .unwrap_or(false);
     let out = child.wait_with_output().ok()?;
-    if !out.status.success() {
+    if !wrote || !out.status.success() {
         return None;
     }
     let v: Value = serde_json::from_slice(&out.stdout).ok()?;
@@ -1374,18 +1526,33 @@ pub fn drift(images: &[Image], repo: &str, tag: &str, remote: Option<&str>) -> D
 /// accepts it, so the caller has a fallback and this returning `Err` is normal.
 pub fn hub_repos(auth: &HubAuth, namespace: &str) -> Result<Vec<HubRepo>, String> {
     let token = hub_bearer(auth)?;
-    let url =
-        format!("https://hub.docker.com/v2/repositories/{namespace}/?page_size=100&ordering=name");
-    let mut resp = ureq::get(&url)
-        .config()
-        .timeout_global(Some(std::time::Duration::from_secs(20)))
-        .build()
-        .header("Authorization", &format!("Bearer {token}"))
-        .call()
-        .map_err(|e| format!("hub: {e}"))?;
-    let v: Value = resp.body_mut().read_json().map_err(|e| format!("hub: {e}"))?;
-    parse_hub_repos(&v, namespace)
+    let mut url = Some(format!(
+        "https://hub.docker.com/v2/repositories/{namespace}/?page_size=100&ordering=name"
+    ));
+    let mut out = Vec::new();
+    // Followed to the end, not just the first page: a namespace with 120 repos
+    // would otherwise lose 20 of them with nothing said. The cap is a runaway
+    // guard, not a limit anyone should reach.
+    for _ in 0..PAGE_CAP {
+        let Some(next) = url.take() else { break };
+        let mut resp = ureq::get(&next)
+            .config()
+            .timeout_global(Some(std::time::Duration::from_secs(20)))
+            .build()
+            .header("Authorization", &format!("Bearer {token}"))
+            .call()
+            .map_err(|e| format!("hub: {e}"))?;
+        let v: Value = resp.body_mut().read_json().map_err(|e| format!("hub: {e}"))?;
+        out.extend(parse_hub_repos(&v, namespace)?);
+        url = v.get("next").and_then(|n| n.as_str()).map(str::to_string);
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(out)
 }
+
+/// How many pages of a paginated answer are followed. Ten pages of repositories is
+/// a thousand; a namespace past that is not a namespace this panel can help with.
+const PAGE_CAP: usize = 10;
 
 /// Exchanges a personal (or organisation) access token for a Hub API bearer.
 fn hub_bearer(auth: &HubAuth) -> Result<String, String> {
@@ -1438,9 +1605,14 @@ pub fn repos_from_images(images: &[Image]) -> Vec<HubRepo> {
     for image in images {
         for tag in &image.tags {
             let Some((repo, _)) = tag.rsplit_once(':') else { continue };
-            // Only what a registry could hold: an unqualified `postgres:16` is a
-            // library image and `foo-api:dev` is a local build nobody published.
-            if !repo.contains('/') || out.iter().any(|r| r.name == repo) {
+            // Only what DOCKER HUB could hold: an unqualified `postgres:16` is a
+            // library image, `foo-api:dev` is a local build nobody published, and
+            // `ghcr.io/org/app` lives on another registry entirely — asking Hub
+            // about that one answers "not on the registry" about an image that is
+            // published, which is a wrong answer to the question this panel asks.
+            let first = repo.split('/').next().unwrap_or("");
+            let elsewhere = first.contains('.') || first.contains(':') || first == "localhost";
+            if !repo.contains('/') || elsewhere || out.iter().any(|r| r.name == repo) {
                 continue;
             }
             out.push(HubRepo { name: repo.to_string(), private: false, last_updated: String::new() });
@@ -1479,18 +1651,49 @@ fn registry_token(auth: Option<&HubAuth>, repo: &str, scope: &str) -> Result<Str
 }
 
 /// The tags of one repository, from the registry.
-pub fn hub_tags(auth: Option<&HubAuth>, repo: &str) -> Result<Vec<HubTag>, String> {
+pub fn hub_tags(auth: Option<&HubAuth>, repo: &str) -> Result<(Vec<HubTag>, bool), String> {
     let token = registry_token(auth, repo, "pull")?;
-    let url = format!("https://registry-1.docker.io/v2/{repo}/tags/list?n=200");
-    let mut resp = ureq::get(&url)
-        .config()
-        .timeout_global(Some(std::time::Duration::from_secs(20)))
-        .build()
-        .header("Authorization", &format!("Bearer {token}"))
-        .call()
-        .map_err(|e| registry_error(e, repo))?;
-    let v: Value = resp.body_mut().read_json().map_err(|e| format!("registry: {e}"))?;
-    Ok(parse_tag_list(&v))
+    let mut url = Some(format!("https://registry-1.docker.io/v2/{repo}/tags/list?n=200"));
+    let mut out: Vec<HubTag> = Vec::new();
+    let mut truncated = false;
+    for page in 0..PAGE_CAP {
+        let Some(next) = url.take() else { break };
+        let resp = ureq::get(&next)
+            .config()
+            .timeout_global(Some(std::time::Duration::from_secs(20)))
+            .build()
+            .header("Authorization", &format!("Bearer {token}"))
+            .call()
+            .map_err(|e| registry_error(e, repo))?;
+        // The registry paginates with a `Link` header, so the answer is read
+        // BEFORE the body: a repository with hundreds of tags would otherwise show
+        // an alphabetically early slice and call it the tag list.
+        let link = resp
+            .headers()
+            .get("link")
+            .and_then(|h| h.to_str().ok())
+            .map(str::to_string);
+        let mut resp = resp;
+        let v: Value = resp.body_mut().read_json().map_err(|e| format!("registry: {e}"))?;
+        out.extend(parse_tag_list(&v));
+        url = link.as_deref().and_then(next_link);
+        truncated = url.is_some() && page + 1 == PAGE_CAP;
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out.dedup_by(|a, b| a.name == b.name);
+    Ok((out, truncated))
+}
+
+/// The `next` URL out of a registry `Link` header, made absolute.
+pub fn next_link(link: &str) -> Option<String> {
+    let part = link.split(',').find(|p| p.contains("rel=\"next\""))?;
+    let start = part.find('<')? + 1;
+    let end = part[start..].find('>')? + start;
+    let path = &part[start..end];
+    Some(match path.starts_with("http") {
+        true => path.to_string(),
+        false => format!("https://registry-1.docker.io{path}"),
+    })
 }
 
 pub fn parse_tag_list(v: &Value) -> Vec<HubTag> {

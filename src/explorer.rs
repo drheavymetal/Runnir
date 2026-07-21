@@ -143,11 +143,16 @@ impl Badge {
             'M' => Badge::Modified,
             'D' => Badge::Deleted,
             'A' => Badge::Added,
-            _ => match index {
+            // `.` is the only letter that means "nothing in the worktree". Anything
+            // else — `T` for a typechange, or a letter git adds later — is an
+            // unstaged change, and falling through to the index badges it green as
+            // staged, which is the one thing it is not.
+            '.' => match index {
                 'A' => Badge::Added,
                 'D' => Badge::Deleted,
                 _ => Badge::Staged,
             },
+            _ => Badge::Modified,
         }
     }
 
@@ -326,7 +331,10 @@ impl Explorer {
     /// The badge a row gets: its own for a file, the folded one for a directory.
     fn badge_for(&self, entry: &Entry) -> Option<Badge> {
         if entry.dir {
-            self.git_dirs.get(&entry.path).copied()
+            // Its OWN status first: `git status` collapses an untracked directory to
+            // one entry (`? newdir/`) and reports a dirty submodule on the directory
+            // path itself, so a directory is not always just a container of changes.
+            self.git.get(&entry.path).copied().or_else(|| self.git_dirs.get(&entry.path).copied())
         } else {
             self.git.get(&entry.path).copied()
         }
@@ -736,6 +744,9 @@ const SNIFF_BYTES: usize = 8192;
 
 /// The longest side a viewer texture is allowed to have, in pixels.
 const MAX_TEXTURE_PX: u32 = 2048;
+
+/// The largest image FILE the viewer will decode.
+const IMAGE_LIMIT: u64 = 64 * 1024 * 1024;
 pub const VIEW_LIMIT: u64 = 4 * 1024 * 1024;
 
 /// Decides what a path is by looking at it, not at its name.
@@ -805,6 +816,11 @@ pub struct ViewRead {
 pub fn read_for_view(path: &Path, cols: usize, rows: usize, cell: (f32, f32)) -> ViewRead {
     let bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
     let body = match kind_of(path) {
+        // The same ceiling text gets. Decoding a 400 MB tiff costs the decode, an
+        // RGBA copy and a resample before anything can be said about it.
+        Kind::Image if bytes > IMAGE_LIMIT => {
+            Err(format!("image is larger than {} MB", IMAGE_LIMIT / (1024 * 1024)))
+        }
         Kind::Image => decode_image(path, cols, rows, cell),
         Kind::Binary => Err("binary file".to_string()),
         Kind::Directory => Err("that is a directory".to_string()),
@@ -847,6 +863,12 @@ fn decode_image(
     // ...and the same picture as pixels, scaled to the box it will occupy. A cell is
     // ten by twenty-odd pixels, so this is a small texture even for a big photo, and
     // it is the worker that pays for the resampling rather than the frame.
+    // `clamp(1, w)` with a zero-sized decode is `clamp(1, 0)`, which PANICS — on a
+    // worker, so the viewer would simply never open and never say why. `fit_cells`
+    // already treats a zero dimension as a real input; so does this.
+    if w == 0 || h == 0 {
+        return Err("that image has no pixels".to_string());
+    }
     let (mut tw, mut th) = (
         ((c as f32 * cell.0).round() as u32).clamp(1, w),
         ((r as f32 * cell.1).round() as u32).clamp(1, h),
@@ -1459,6 +1481,11 @@ mod tests {
         assert_eq!(Badge::from_status('.', 'D'), Badge::Deleted);
         assert_eq!(Badge::from_status('R', '.'), Badge::Staged);
         assert_eq!(Badge::Dirty.letter(), '\u{b7}');
+        // `.T` — a committed symlink replaced by a plain file. NOTHING is staged,
+        // and falling through to the index badged it green as if something were.
+        assert_eq!(Badge::from_status('.', 'T'), Badge::Modified);
+        // Any letter git adds later takes the same branch.
+        assert_eq!(Badge::from_status('.', 'X'), Badge::Modified);
     }
 
     #[test]
@@ -1478,6 +1505,12 @@ mod tests {
         assert_eq!(row(&e, "main.rs").badge, Some(Badge::Modified));
         assert_eq!(row(&e, "src").badge, Some(Badge::Dirty), "a folder is not itself modified");
         assert_eq!(row(&e, "README").badge, None);
+
+        // A directory can have a status of its OWN: `git status` collapses an
+        // untracked directory to one entry, and a submodule is reported on the
+        // directory path. Reading only the folded map left those rows blank.
+        e.set_git(vec![(PathBuf::from("/r/src"), Badge::Untracked)], HashSet::new());
+        assert_eq!(row(&e, "src").badge, Some(Badge::Untracked));
 
         // A conflict is the one state a directory repeats, because it is the one
         // where a stray keystroke loses a merge.

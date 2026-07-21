@@ -326,13 +326,25 @@ impl Renderer {
         queue: &wgpu::Queue,
         panes: &[PaneDraw],
         overlay: Option<&Overlay>,
+        hide_pane_images: bool,
         screen: (f32, f32),
     ) -> usize {
         let (cw, ch) = (self.font.cell_w, self.font.cell_h);
         let mut quads: Vec<ImageQuad> = Vec::new();
         let mut seen = std::collections::HashSet::new();
-        let behind: &[PaneDraw] = if overlay.is_some() { &[] } else { panes };
+        let hidden = overlay.is_some() || hide_pane_images;
+        let behind: &[PaneDraw] = if hidden { &[] } else { panes };
         let over = overlay.map(|o| o.panels.as_slice()).unwrap_or(&[]);
+        // A pane image that is not DRAWN this frame still keeps its texture: an
+        // overlay opening and closing would otherwise destroy and re-upload every
+        // inline image in the window, twice per toggle.
+        if hidden {
+            for pane in panes {
+                for (img, _) in pane.grid.images() {
+                    seen.insert(img.serial);
+                }
+            }
+        }
         for pane in behind.iter().chain(over) {
             let pane_rect = [
                 pane.origin.0,
@@ -388,6 +400,11 @@ impl Renderer {
         overlay: Option<&Overlay>,
         flash: f32,
         screen: (f32, f32),
+        // Holds the panes' inline images back even though no overlay is drawn.
+        // Hint labels and the search bar are CHROME, so they reach the renderer as
+        // ordinary panes with no `Overlay` behind them — and images are recorded
+        // last, so an image would draw straight over the labels that annotate it.
+        hide_pane_images: bool,
     ) {
         // Build instances first: rasterizing a new glyph marks the atlas dirty, so
         // the upload must come after, or a glyph's first frame samples an empty
@@ -441,7 +458,7 @@ impl Renderer {
 
         // Upload/refresh image textures and build their quads before the pass;
         // resources cannot be created while a pass is recording.
-        self.prepare_images(device, queue, panes, overlay, screen);
+        self.prepare_images(device, queue, panes, overlay, hide_pane_images, screen);
         // Update the background's cover-crop scale (also a pre-pass write).
         self.background.prepare(queue, screen);
 
@@ -909,7 +926,7 @@ pub fn offscreen_scene(
                 })
                 .collect(),
         });
-        renderer.render(&device, &queue, &mut encoder, &view, &panes, &[], overlay.as_ref(), 0.0, (width as f32, height as f32));
+        renderer.render(&device, &queue, &mut encoder, &view, &panes, &[], overlay.as_ref(), 0.0, (width as f32, height as f32), false);
     }
     encoder.copy_texture_to_buffer(
         wgpu::TexelCopyTextureInfo {
@@ -1024,6 +1041,7 @@ pub fn offscreen(path: &str, cmd: &str, font_px: f32, delay_ms: Option<u64>) {
             None,
             0.0,
             (width as f32, height as f32),
+            false,
         );
     }
     encoder.copy_texture_to_buffer(
@@ -1213,9 +1231,12 @@ impl ImageLayer {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            // Non-srgb: image data is passed through untouched (the sampler feeds
-            // the fragment which returns it directly).
-            format: wgpu::TextureFormat::Rgba8Unorm,
+            // sRGB, like every other texture here. Image bytes are sRGB-encoded,
+            // the surface is `*UnormSrgb` and encodes again on write, so a
+            // non-sRGB format hands the shader encoded values it treats as linear
+            // and every picture comes out washed out — the same double-encoding
+            // `to_linear` exists to avoid for text.
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });

@@ -518,7 +518,10 @@ pub fn parse_status_files(text: &str) -> Vec<FileEntry> {
                 }
             }
             Some("?") => {
-                let path: String = line[1..].trim().to_string();
+                // Exactly the one space git puts after the marker: `trim` would eat
+                // the leading and trailing spaces of a filename that has them, and
+                // the path would then match nothing on disk.
+                let path: String = line.strip_prefix("? ").unwrap_or("").to_string();
                 if !path.is_empty() {
                     out.push(FileEntry { path, index: '?', worktree: '?' });
                 }

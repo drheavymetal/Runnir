@@ -658,7 +658,10 @@ struct Gpu {
     /// What the explorer's marks were read at: the root, the repository stamp and
     /// the pane's command counter. Unchanged means there is nothing to re-read —
     /// the same two triggers the status bar uses, for the same reason.
-    explorer_git_at: Option<(PathBuf, u64, u64)>,
+    explorer_git_at: Option<(usize, PathBuf, u64, u64)>,
+    /// The file the viewer is waiting for. A read that is no longer this one is
+    /// dropped rather than drawn over whatever is on screen by the time it lands.
+    pending_view: Option<PathBuf>,
     /// Permission bits waiting on a recursive-chmod confirm, since the confirm
     /// replaces the panel that was holding them.
     pending_mode: Option<u32>,
@@ -930,6 +933,7 @@ impl App {
             explorer_git_pending: false,
             docker_gen: 0,
             explorer_git_at: None,
+            pending_view: None,
             pending_mode: None,
             pending_docker: None,
             pending_docker_cmd: None,

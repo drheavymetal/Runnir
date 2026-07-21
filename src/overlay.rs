@@ -1538,14 +1538,26 @@ fn first_line(s: &str) -> String {
 /// Clips to `width` columns, marking the cut, so a truncated path is never mistaken
 /// for a shorter one.
 pub fn elide(s: &str, width: usize) -> String {
+    use unicode_width::UnicodeWidthChar;
     if width == 0 {
         return String::new();
     }
-    let n = s.chars().count();
-    if n <= width {
+    // In CELLS: `write` advances by display width, so a char budget lets wide
+    // characters spill past the box they were cut for.
+    let total: usize = s.chars().map(|c| c.width().unwrap_or(0)).sum();
+    if total <= width {
         return s.to_string();
     }
-    let mut out: String = s.chars().take(width.saturating_sub(1)).collect();
+    let mut out = String::new();
+    let mut used = 0usize;
+    for c in s.chars() {
+        let w = c.width().unwrap_or(0);
+        if used + w > width.saturating_sub(1) {
+            break;
+        }
+        used += w;
+        out.push(c);
+    }
     out.push('\u{2026}');
     out
 }
@@ -1574,15 +1586,30 @@ fn elide_left(s: &str, width: usize) -> String {
 /// that clips the tail hides the character you just typed, which is the one thing a
 /// text input may never do. When text is cut, a leading ellipsis says so.
 pub fn field_view(text: &str, width: usize) -> String {
+    use unicode_width::UnicodeWidthChar;
     if width == 0 {
         return String::new();
     }
-    let n = text.chars().count();
-    if n <= width {
+    // Budgeted in CELLS, not in chars. A CJK or emoji name counts one char and
+    // takes two columns, so a char budget lets a name run under whatever was
+    // written to the right of it — the badge column, the symlink arrow.
+    let total: usize = text.chars().map(|c| c.width().unwrap_or(0)).sum();
+    if total <= width {
         return text.to_string();
     }
     let keep = width.saturating_sub(1);
-    let tail: String = text.chars().skip(n - keep).collect();
+    let mut tail: Vec<char> = Vec::new();
+    let mut used = 0usize;
+    for c in text.chars().rev() {
+        let w = c.width().unwrap_or(0);
+        if used + w > keep {
+            break;
+        }
+        used += w;
+        tail.push(c);
+    }
+    tail.reverse();
+    let tail: String = tail.into_iter().collect();
     format!("\u{2026}{tail}")
 }
 
@@ -3342,9 +3369,10 @@ mod docker_tests {
         assert!(!p.on_hub());
         p.host_cursor = 1;
         assert!(p.on_hub());
-        // No strip means nothing to hit in the header: a click there must not
-        // switch to a kind that does not exist on hub.
-        assert_eq!(p.hit(120, 30, 4, 2), None);
+        // No strip means no kind to hit in the header — but the header is still
+        // INSIDE the panel, and a click inside it must not put the panel away.
+        assert_eq!(p.hit(120, 30, 4, 2), Some(DockerHit::Inside));
+        assert_eq!(p.hit(120, 30, 0, 0), None, "outside is still outside");
     }
 
     #[test]
@@ -3369,14 +3397,40 @@ mod docker_tests {
         assert_eq!(crate::docker::cli_prefix(&remote), ["docker", "-c", "cloudmax"]);
 
         let files = vec!["/srv/app/docker-compose.yml".to_string()];
-        let cmd = crate::docker::compose_command(&remote, "qlaios", &files, &["up", "-d"]);
+        // Locally, the CLI with the context flag.
         assert_eq!(
-            cmd,
+            crate::docker::compose_command(&local, "qlaios", &files, &["up", "-d"]),
+            ["docker", "compose", "-p", "qlaios", "-f", "/srv/app/docker-compose.yml", "up", "-d"]
+        );
+        // Over ssh, the whole compose runs THERE: `-c` would redirect only the
+        // daemon connection while the local client read `-f` off the local disk,
+        // and those paths came off labels written on the remote machine.
+        assert_eq!(
+            crate::docker::compose_command(&remote, "qlaios", &files, &["up", "-d"]),
             [
-                "docker", "-c", "cloudmax", "compose", "-p", "qlaios", "-f",
-                "/srv/app/docker-compose.yml", "up", "-d"
+                "ssh",
+                "-t",
+                "root@cloudmax",
+                "docker compose -p qlaios -f /srv/app/docker-compose.yml up -d"
             ]
         );
+
+        // A deploy is a CHAIN, so it has to reach a shell: as argv with a bare `&&`
+        // in the middle the shell would look for a program named after the whole
+        // first command.
+        let deploy = crate::docker::deploy_command(&local, "qlaios", &files);
+        assert_eq!(&deploy[..2], ["sh", "-c"]);
+        assert!(deploy[2].contains("pull && "), "{deploy:?}");
+        let remote_deploy = crate::docker::deploy_command(&remote, "qlaios", &files);
+        assert_eq!(remote_deploy[0], "ssh");
+        assert!(remote_deploy.last().unwrap().contains("pull && "), "{remote_deploy:?}");
+
+        // A port in the context endpoint is a `-p`, never part of the hostname.
+        assert_eq!(
+            crate::docker::ssh_destination("root@host:2222"),
+            ("root@host".to_string(), Some("2222".to_string()))
+        );
+        assert_eq!(crate::docker::ssh_destination("root@host"), ("root@host".to_string(), None));
         // The shell is picked INSIDE the container: plenty of images have no bash.
         let exec = crate::docker::exec_command(&local, "abc");
         assert_eq!(&exec[..4], ["docker", "exec", "-it", "abc"]);
@@ -4104,9 +4158,12 @@ pub struct DockerPanel {
     pub detail: DockerDetail,
     pub detail_lines: Vec<String>,
     pub detail_scroll: usize,
-    /// What the detail column is describing, so an answer that arrives after the
-    /// cursor moved can be dropped instead of drawn under the wrong row.
-    pub detail_for: Option<String>,
+    /// What the detail column is describing — the object AND the mode, so an answer
+    /// that arrives after the cursor moved (or after the mode changed) is dropped
+    /// instead of drawn under the wrong title. Logs of a chatty container come back
+    /// slower than its inspect, and log lines under the word "inspect" are exactly
+    /// the confusion the title was added to prevent.
+    pub detail_for: Option<(String, DockerDetail)>,
     /// Docker Hub: the repositories, the one drilled into, and its tags.
     pub repos: Vec<crate::docker::HubRepo>,
     pub open_repo: Option<String>,
@@ -4431,18 +4488,45 @@ impl DockerPanel {
     /// Moves the keyboard between columns. The detail is only reachable when there
     /// is something in it — a focus on an empty column is a focus that swallows
     /// j/k for no reason.
-    pub fn cycle_focus(&mut self, forward: bool) {
+    pub fn cycle_focus(&mut self, forward: bool, cols: usize, rows: usize) {
+        let l = self.layout(cols, rows);
         let order = [DockerFocus::Hosts, DockerFocus::Objects, DockerFocus::Detail];
+        // A column that is not DRAWN cannot take the keyboard: the hosts column is
+        // dropped in a narrow window and both are dropped by zoom, and j/k there
+        // would move an invisible selection — with Enter on it opening an ssh
+        // connection to a host nobody could see.
+        let usable = |f: DockerFocus| match f {
+            DockerFocus::Hosts => l.hosts_w > 0,
+            DockerFocus::Objects => l.objects_w > 0,
+            DockerFocus::Detail => true,
+        };
         let i = order.iter().position(|f| *f == self.focus).unwrap_or(1);
         let n = order.len();
         let mut next = i;
         for _ in 0..n {
             next = if forward { (next + 1) % n } else { (next + n - 1) % n };
-            if order[next] != DockerFocus::Detail || !self.detail_lines.is_empty() {
+            if usable(order[next]) {
                 break;
             }
         }
-        self.focus = order[next];
+        if usable(order[next]) {
+            self.focus = order[next];
+        }
+    }
+
+    /// Puts the keyboard somewhere that exists, after a layout change (a zoom, a
+    /// resize) took the focused column away.
+    pub fn sync_focus(&mut self, cols: usize, rows: usize) {
+        let l = self.layout(cols, rows);
+        let gone = match self.focus {
+            DockerFocus::Hosts => l.hosts_w == 0,
+            DockerFocus::Objects => l.objects_w == 0,
+            DockerFocus::Detail => false,
+        };
+        if gone {
+            self.focus =
+                if l.objects_w > 0 { DockerFocus::Objects } else { DockerFocus::Detail };
+        }
     }
 
     pub fn scroll_detail(&mut self, delta: i32) {
@@ -4900,6 +4984,10 @@ pub enum DockerHit {
     /// A column separator, by index: 0 = hosts/objects, 1 = objects/detail.
     Separator(usize),
     Detail,
+    /// Inside the panel but on nothing in particular: the header, the footer, the
+    /// blank below a short list. NOT the same as missing the panel, which is what
+    /// closes it — a click on the empty half of a column must not put it away.
+    Inside,
 }
 
 impl DockerPanel {
@@ -4914,7 +5002,7 @@ impl DockerPanel {
         // The header carries the kind strip, at the same columns it is drawn at.
         if y == 0 {
             if self.on_hub() {
-                return None;
+                return Some(DockerHit::Inside);
             }
             let mut at = 2;
             for k in crate::docker::Kind::ALL {
@@ -4923,7 +5011,7 @@ impl DockerPanel {
                 }
                 at += 3;
             }
-            return None;
+            return Some(DockerHit::Inside);
         }
         // A separator wins over the columns it sits between: it is one cell wide and
         // the thing you are aiming at when you are near it.
@@ -4932,17 +5020,20 @@ impl DockerPanel {
                 return Some(DockerHit::Separator(i));
             }
         }
-        let line = y.checked_sub(2)?;
+        let Some(line) = y.checked_sub(2) else { return Some(DockerHit::Inside) };
         if line >= l.body_rows {
-            return None;
+            return Some(DockerHit::Inside);
         }
         if l.hosts_w > 0 && x < l.hosts_w {
-            return (line < self.hosts.len()).then_some(DockerHit::HostRow(line));
+            return Some(match self.hosts.get(line) {
+                Some(_) => DockerHit::HostRow(line),
+                None => DockerHit::Inside,
+            });
         }
         if l.objects_w > 0 && x < l.sep2() {
             let scroll = self.cursor().saturating_sub(l.body_rows.saturating_sub(1));
             let i = scroll + line;
-            return (i < self.rows.len()).then_some(DockerHit::Row(i));
+            return Some(if i < self.rows.len() { DockerHit::Row(i) } else { DockerHit::Inside });
         }
         Some(DockerHit::Detail)
     }
@@ -5027,7 +5118,7 @@ pub static DOCKER_LEADER: &[DockerEntry] = &[
             dleaf('p', "pause / unpause", OnContainer(DCh('p'))),
             dleaf('e', "shell inside it", OnContainer(DCh('e'))),
             dleaf('w', "open its port in the browser", OnContainer(DCh('w'))),
-            dleaf('d', "remove it (asks)", DKey(DCh('d'))),
+            dleaf('d', "remove it (asks)", OnContainer(DCh('d'))),
         ]),
     },
     DockerEntry {
@@ -5051,6 +5142,7 @@ pub static DOCKER_LEADER: &[DockerEntry] = &[
             dleaf('n', "networks", DKey(DCh('N'))),
             dleaf('r', "reread this host", DKey(DCh('r'))),
             dleaf('p', "publish this image (push)", DKey(DCh('>'))),
+            dleaf('d', "remove what is selected (asks)", DKey(DCh('d'))),
             dleaf('z', "zoom the detail", DKey(DCh('z'))),
         ]),
     },
