@@ -27,6 +27,8 @@ pub enum Overlay {
     Git(GitPanel),
     /// A file being read from the explorer sidebar: text or an image, never edited.
     Viewer(FileViewer),
+    /// One path's properties, with its permission bits editable.
+    Props(PropsPanel),
 }
 
 impl Overlay {
@@ -47,6 +49,7 @@ impl Overlay {
             Overlay::Media(m) => m.render(cols, rows, theme),
             Overlay::Git(p) => p.render(cols, rows, theme),
             Overlay::Viewer(v) => v.render(cols, rows, theme),
+            Overlay::Props(p) => p.render(cols, rows, theme),
         }
     }
 }
@@ -2497,6 +2500,148 @@ pub fn human(bytes: u64) -> String {
     if u == 0 { format!("{bytes} B") } else { format!("{n:.1}{}", UNITS[u]) }
 }
 
+// ---- properties panel ------------------------------------------------------
+
+/// One path's properties, with its permission bits editable in place.
+///
+/// The bits are a 3x3 grid because that is what they are — owner/group/other by
+/// read/write/execute — and a grid you move around in is the one shape where you
+/// can see what you are about to change. Nothing is written until Enter.
+pub struct PropsPanel {
+    pub props: crate::explorer::Props,
+    /// The mode being edited; `props.mode` is what is on disk.
+    pub mode: u32,
+    /// Which of the nine bits the cursor is on, 0 = owner-read.
+    pub bit: usize,
+    /// Apply to everything inside, for a directory. Off by default, and the confirm
+    /// names the count before it happens.
+    pub recursive: bool,
+    pub message: Option<String>,
+}
+
+impl PropsPanel {
+    pub fn new(props: crate::explorer::Props) -> Self {
+        let mode = props.mode.unwrap_or(0o644) & 0o777;
+        Self { props, mode, bit: 0, recursive: false, message: None }
+    }
+
+    pub fn move_bit(&mut self, delta: i32) {
+        self.bit = (self.bit as i32 + delta).rem_euclid(9) as usize;
+    }
+
+    /// Flips the bit under the cursor. Bit 0 is owner-read, which is the high bit
+    /// of the nine — the same order `rwxrwxrwx` reads in.
+    pub fn toggle_bit(&mut self) {
+        self.mode ^= 1 << (8 - self.bit);
+    }
+
+    pub fn dirty(&self) -> bool {
+        self.props.mode.map(|m| m & 0o777) != Some(self.mode & 0o777)
+    }
+
+    fn render(&self, cols: usize, rows: usize, theme: &Theme) -> Vec<Panel> {
+        let w = cols.saturating_sub(6).clamp(44, 78);
+        let h = 16usize.min(rows.saturating_sub(4)).max(12);
+        let mut g = panel_grid(w, h, theme);
+
+        let name = self
+            .props
+            .path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| self.props.path.display().to_string());
+        write(&mut g, 0, 2, &elide(&name, w.saturating_sub(4)), accent());
+        write(&mut g, 1, 2, &elide_left(&self.props.path.display().to_string(), w.saturating_sub(4)), dim());
+
+        let kind = if self.props.dir { "directory" } else { "file" };
+        let line = match self.props.contents {
+            Some((files, dirs)) => {
+                format!("{kind} \u{b7} {files} files, {dirs} directories inside")
+            }
+            None => format!("{kind} \u{b7} {}", human(self.props.size)),
+        };
+        write(&mut g, 3, 2, &elide(&line, w.saturating_sub(4)), normal());
+        write(&mut g, 4, 2, &format!("modified {}", stamp(self.props.mtime)), dim());
+
+        // A symlink says, before anything is changed, that the change lands on the
+        // target: `set_permissions` follows links and there is no portable way not
+        // to, so the only honest thing is to name what will actually be touched.
+        if let Some(target) = &self.props.link_target {
+            write(
+                &mut g,
+                5,
+                2,
+                &elide(
+                    &format!("symlink \u{2192} {} (permissions apply THERE)", target.display()),
+                    w.saturating_sub(4),
+                ),
+                Pen { fg: Color::Rgb(0xf5, 0xd5, 0x43), bg: bg(), ..Pen::default() },
+            );
+        }
+
+        // The bit grid: three groups of three, the cursor boxed.
+        let y = 7;
+        write(&mut g, y, 2, "permissions", dim());
+        let labels = ["owner", "group", "other"];
+        let letters = ['r', 'w', 'x'];
+        for (gi, label) in labels.iter().enumerate() {
+            let row = y + 1 + gi;
+            write(&mut g, row, 4, label, dim());
+            for (li, letter) in letters.iter().enumerate() {
+                let idx = gi * 3 + li;
+                let on = self.mode >> (8 - idx) & 1 == 1;
+                let text = if on { letter.to_string() } else { "-".to_string() };
+                let pen = if idx == self.bit {
+                    selected()
+                } else if on {
+                    Pen { fg: Color::Rgb(0x7a, 0xc0, 0x7a), bg: bg(), ..Pen::default() }
+                } else {
+                    dim()
+                };
+                write(&mut g, row, 12 + li * 4, &format!(" {text} "), pen);
+            }
+        }
+        let octal = format!("{:o}  {}", self.mode & 0o777, crate::explorer::mode_string(self.mode));
+        write(&mut g, y + 1, 28, &octal, if self.dirty() { accent() } else { dim() });
+        if self.props.dir {
+            let mark = if self.recursive { "[x]" } else { "[ ]" };
+            write(&mut g, y + 2, 28, &format!("{mark} everything inside (R)"), dim());
+        }
+
+        let foot = match &self.message {
+            Some(m) => m.clone(),
+            None => {
+                "hjkl move \u{b7} space toggle \u{b7} enter apply \u{b7} r rename \u{b7} d delete \u{b7} esc back"
+                    .to_string()
+            }
+        };
+        write(&mut g, h - 1, 2, &elide(&foot, w.saturating_sub(4)), dim());
+
+        let col = (cols.saturating_sub(w)) / 2;
+        let row = (rows.saturating_sub(h)) / 3;
+        vec![Panel { grid: g, col, row }]
+    }
+}
+
+/// A unix timestamp as a local date and time.
+fn stamp(secs: u64) -> String {
+    // No chrono in the tree, and a date is not worth one: this is the civil-date
+    // algorithm (Howard Hinnant's days_from_civil, inverted), in UTC.
+    let days = (secs / 86_400) as i64;
+    let rem = secs % 86_400;
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02} {:02}:{:02} UTC", rem / 3600, (rem % 3600) / 60)
+}
+
 pub struct Docs {
     lines: Vec<(String, Pen)>,
     scroll: usize,
@@ -2594,6 +2739,14 @@ pub enum PromptKind {
     /// Confirmation before something that RUNS is run: an executable binary, or a
     /// `.desktop` file whose handler `xdg-open` would execute.
     ExplorerRun,
+    /// A new name for the path under the tree's cursor.
+    ExplorerRename,
+    /// A name to create beside it; a trailing `/` makes a directory.
+    ExplorerCreate,
+    /// Confirmation before deleting, naming what is inside when it is a directory.
+    ExplorerDelete,
+    /// Confirmation before a recursive permission change, naming the count.
+    ExplorerChmod,
     /// Closing the window (or the last pane) while something is still running.
     /// Answered with y/n, never with typing: the question is whether to kill work,
     /// and a text field would invite Enter — the one key most likely to be pressed
@@ -2605,13 +2758,25 @@ impl PromptKind {
     /// Whether this prompt is a yes/no question rather than a field to type in.
     /// A confirm draws no input line and takes no characters.
     pub fn is_confirm(self) -> bool {
-        matches!(self, PromptKind::ConfirmQuit | PromptKind::ExplorerRun)
+        matches!(
+            self,
+            PromptKind::ConfirmQuit
+                | PromptKind::ExplorerRun
+                | PromptKind::ExplorerDelete
+                | PromptKind::ExplorerChmod
+        )
     }
 }
 
 impl Prompt {
     pub fn new(kind: PromptKind, label: &str, suggestions: Vec<String>) -> Self {
         Self { kind, label: label.into(), input: String::new(), suggestions, cursor: 0 }
+    }
+
+    /// A prompt that starts with text already in it — a rename box that made you
+    /// retype the name would be a worse way to change one letter of it.
+    pub fn with_input(kind: PromptKind, label: &str, input: String) -> Self {
+        Self { kind, label: label.into(), input, suggestions: Vec::new(), cursor: 0 }
     }
 
     pub fn input_char(&mut self, c: char) {

@@ -976,6 +976,10 @@ impl Gpu {
         let mut copy: Option<String> = None;
         let mut edit: Option<std::path::PathBuf> = None;
         let mut system: Option<std::path::PathBuf> = None;
+        let mut rename = false;
+        let mut create = false;
+        let mut delete = false;
+        let mut props = false;
         let mut unfocus = false;
         {
             let Some(e) = self.tabs[self.active].explorer.as_mut() else { return false };
@@ -1030,7 +1034,14 @@ impl Gpu {
                         e.show_hidden = !e.show_hidden;
                         refresh = true;
                     }
-                    "r" => refresh = true,
+                    // `r` renames, as in every file manager. Re-reading the tree is
+                    // `R`: the destructive-looking letter goes to the safe verb, not
+                    // the other way round.
+                    "R" => refresh = true,
+                    "r" => rename = true,
+                    "a" => create = true,
+                    "d" => delete = true,
+                    "p" => props = true,
                     "e" => edit = selected.as_ref().filter(|r| r.more.is_none()).map(|r| r.entry.path.clone()),
                     "o" => system = selected.as_ref().filter(|r| r.more.is_none()).map(|r| r.entry.path.clone()),
                     "y" => copy = selected.map(|r| r.entry.path.display().to_string()),
@@ -1045,7 +1056,15 @@ impl Gpu {
                 e.focused = false;
             }
         }
-        if open {
+        if rename {
+            self.explorer_rename_prompt();
+        } else if create {
+            self.explorer_create_prompt();
+        } else if delete {
+            self.explorer_delete_prompt();
+        } else if props {
+            self.explorer_props();
+        } else if open {
             self.explorer_open(config);
         } else if refresh {
             self.explorer_refresh();
@@ -1261,6 +1280,166 @@ impl Gpu {
         self.window.request_redraw();
     }
 
+    /// Leaves a message in the sidebar's footer.
+    fn explorer_note(&mut self, text: &str) {
+        if let Some(e) = self.tabs[self.active].explorer.as_mut() {
+            e.message = Some(text.to_string());
+        }
+        self.window.request_redraw();
+    }
+
+    /// After an operation: re-read the tree, put the keyboard back in it, and land
+    /// the cursor on what the operation produced when there is one.
+    fn explorer_after_op(&mut self, land_on: Option<std::path::PathBuf>, what: &str) {
+        self.overlay = None;
+        if let Some(e) = self.tabs[self.active].explorer.as_mut() {
+            e.focused = true;
+            e.message = Some(what.to_string());
+            e.pending_cursor = land_on;
+        }
+        self.explorer_refresh();
+    }
+
+    /// Asks for a new name, pre-filled with the current one. Retyping a name to
+    /// change one letter of it is not a rename box, it is a spelling test.
+    fn explorer_rename_prompt(&mut self) {
+        let Some(path) = self.explorer_selected_path() else { return };
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        self.overlay = Some(Overlay::Prompt(Prompt::with_input(
+            PromptKind::ExplorerRename,
+            "Rename to",
+            name,
+        )));
+        self.window.request_redraw();
+    }
+
+    /// Asks for a name to create. A trailing `/` makes a directory.
+    fn explorer_create_prompt(&mut self) {
+        if self.explorer_selected_path().is_none() {
+            return;
+        }
+        self.overlay = Some(Overlay::Prompt(Prompt::new(
+            PromptKind::ExplorerCreate,
+            "New name (end with / for a directory)",
+            Vec::new(),
+        )));
+        self.window.request_redraw();
+    }
+
+    /// Confirms a delete, NAMING what is inside a directory.
+    ///
+    /// The count runs here on the UI thread only for a directory the tree already
+    /// has open — otherwise it goes to a worker, because counting a tree walks it
+    /// and `node_modules` is a tree.
+    fn explorer_delete_prompt(&mut self) {
+        let Some(path) = self.explorer_selected_path() else { return };
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let proxy = self.proxy.clone();
+        let tab = self.active;
+        std::thread::spawn(move || {
+            let counted = path.is_dir().then(|| crate::explorer::count_tree(&path));
+            let label = match counted {
+                Some((files, dirs)) if files + dirs > 0 => {
+                    format!("Delete {name} and the {} inside?", crate::explorer::count_words(files, dirs))
+                }
+                Some(_) => format!("Delete the empty directory {name}?"),
+                None => format!("Delete {name}?"),
+            };
+            let _ = proxy.send_event(UserEvent::ExplorerConfirm(tab, label));
+        });
+    }
+
+    /// Puts a counted confirm on screen once its worker has counted.
+    fn on_explorer_confirm(&mut self, tab: usize, label: String) {
+        if tab != self.active {
+            return;
+        }
+        self.overlay = Some(Overlay::Prompt(Prompt::new(
+            PromptKind::ExplorerDelete,
+            &label,
+            self.explorer_selected_path().map(|p| p.display().to_string()).into_iter().collect(),
+        )));
+        self.window.request_redraw();
+    }
+
+    /// Opens the properties panel for the selected row, reading it on a worker
+    /// (counting a directory's contents walks the whole tree).
+    fn explorer_props(&mut self) {
+        let Some(path) = self.explorer_selected_path() else { return };
+        let proxy = self.proxy.clone();
+        std::thread::spawn(move || {
+            let props = crate::explorer::props_of(&path);
+            let _ = proxy.send_event(UserEvent::ExplorerProps(props.map_err(|e| e.to_string())));
+        });
+    }
+
+    fn on_explorer_props(&mut self, props: Result<crate::explorer::Props, String>) {
+        match props {
+            Ok(p) => self.overlay = Some(Overlay::Props(crate::overlay::PropsPanel::new(p))),
+            Err(e) => self.explorer_note(&e),
+        }
+        self.window.request_redraw();
+    }
+
+    /// Applies the edited permission bits. A recursive change confirms first, with
+    /// the count of what it would touch — and Enter is not a yes there.
+    fn explorer_apply_mode(&mut self) {
+        let Some(Overlay::Props(p)) = &self.overlay else { return };
+        if !p.dirty() && !p.recursive {
+            self.overlay = None;
+            if let Some(e) = self.tabs[self.active].explorer.as_mut() {
+                e.focused = true;
+            }
+            self.window.request_redraw();
+            return;
+        }
+        if p.recursive {
+            let (files, dirs) = p.props.contents.unwrap_or((0, 0));
+            let mode = crate::explorer::mode_string(p.mode);
+            let label = format!(
+                "Set {mode} on this directory and the {} inside?",
+                crate::explorer::count_words(files, dirs)
+            );
+            let path = p.props.path.display().to_string();
+            // The confirm replaces the panel, and with it the bits being edited, so
+            // they are parked here until the answer comes back.
+            self.pending_mode = Some(p.mode);
+            self.overlay =
+                Some(Overlay::Prompt(Prompt::new(PromptKind::ExplorerChmod, &label, vec![path])));
+            self.window.request_redraw();
+            return;
+        }
+        self.explorer_chmod(false);
+    }
+
+    /// Writes the mode. `confirmed` says the recursive confirm has been answered,
+    /// in which case the panel is behind the prompt and its state is gone — so the
+    /// mode and the path are read back off the tree's selection.
+    fn explorer_chmod(&mut self, confirmed: bool) {
+        let (path, mode, recursive) = match &self.overlay {
+            Some(Overlay::Props(p)) => (p.props.path.clone(), p.mode, p.recursive),
+            _ if confirmed => {
+                let Some(path) = self.explorer_selected_path() else { return };
+                // The confirm replaced the panel; re-read what is on disk and apply
+                // the requested bits to the tree from there.
+                let Some(mode) = self.pending_mode.take() else { return };
+                (path, mode, true)
+            }
+            _ => return,
+        };
+        match crate::explorer::set_mode(&path, mode, recursive) {
+            Ok(n) => {
+                let what = if n == 1 {
+                    format!("permissions now {}", crate::explorer::mode_string(mode))
+                } else {
+                    format!("permissions set on {n} paths")
+                };
+                self.explorer_after_op(Some(path), &what);
+            }
+            Err(e) => self.explorer_note(&e),
+        }
+    }
+
     /// Re-anchors the tree when the focused pane moves to another REPOSITORY.
     ///
     /// Only on a change of root, never on every `cd`: re-anchoring per directory
@@ -1422,6 +1601,7 @@ impl Gpu {
             Some(Overlay::Search(_)) => "search",
             Some(Overlay::Docs(_)) => "docs",
             Some(Overlay::Viewer(_)) => "viewer",
+            Some(Overlay::Props(_)) => "props",
             Some(_) => "other",
         };
         let mut out = json!({
@@ -1430,6 +1610,22 @@ impl Gpu {
             "rows": rows,
             "leader_armed": self.leader_armed.is_some(),
         });
+        if let Some(Overlay::Props(p)) = &self.overlay {
+            out["props"] = json!({
+                "path": p.props.path.display().to_string(),
+                "dir": p.props.dir,
+                "mode": format!("{:o}", p.mode & 0o777),
+                "mode_string": crate::explorer::mode_string(p.mode),
+                "bit": p.bit,
+                "dirty": p.dirty(),
+                "recursive": p.recursive,
+                "contents": p.props.contents.map(|(f, d)| json!({"files": f, "dirs": d})),
+                "link_target": p.props.link_target.as_ref().map(|t| t.display().to_string()),
+            });
+        }
+        if let Some(Overlay::Prompt(p)) = &self.overlay {
+            out["prompt"] = json!({ "label": p.label, "input": p.input });
+        }
         if let Some(Overlay::Viewer(v)) = &self.overlay {
             out["viewer"] = json!({
                 "path": v.path.display().to_string(),
@@ -1522,6 +1718,48 @@ impl Gpu {
         }
         match self.overlay.as_mut().unwrap() {
             Overlay::Git(_) => self.git_panel_key(key, config),
+            // The properties panel: move over the nine permission bits, toggle them,
+            // and nothing touches the disk until Enter.
+            Overlay::Props(p) => {
+                let path = p.props.path.clone();
+                let mut apply = false;
+                let mut rename = false;
+                let mut delete = false;
+                match key {
+                    Key::Named(NamedKey::Escape) => {
+                        self.overlay = None;
+                        if let Some(e) = self.tabs[self.active].explorer.as_mut() {
+                            e.focused = true;
+                        }
+                    }
+                    Key::Named(NamedKey::Enter) => apply = true,
+                    Key::Named(NamedKey::Space) => p.toggle_bit(),
+                    Key::Named(NamedKey::ArrowRight) => p.move_bit(1),
+                    Key::Named(NamedKey::ArrowLeft) => p.move_bit(-1),
+                    Key::Named(NamedKey::ArrowDown) => p.move_bit(3),
+                    Key::Named(NamedKey::ArrowUp) => p.move_bit(-3),
+                    Key::Character(c) => match c.as_str() {
+                        "l" => p.move_bit(1),
+                        "h" => p.move_bit(-1),
+                        "j" => p.move_bit(3),
+                        "k" => p.move_bit(-3),
+                        "R" => p.recursive = !p.recursive,
+                        "r" => rename = true,
+                        "d" => delete = true,
+                        "q" => self.overlay = None,
+                        _ => {}
+                    },
+                    _ => {}
+                }
+                if apply {
+                    self.explorer_apply_mode();
+                } else if rename {
+                    self.explorer_rename_prompt();
+                } else if delete {
+                    self.explorer_delete_prompt();
+                }
+                let _ = path;
+            }
             // The viewer reads a file and nothing else: scroll, hand it to a real
             // editor, or leave. Escape goes back to the tree, which is where the
             // keyboard came from.
@@ -2367,6 +2605,42 @@ impl Gpu {
                     self.explorer_run(path, config);
                 }
             }
+            PromptKind::ExplorerRename => {
+                let Some(path) = self.explorer_selected_path() else { return };
+                match crate::explorer::rename(&path, &value) {
+                    Ok(to) => self.explorer_after_op(Some(to), "renamed"),
+                    Err(e) => self.explorer_note(&e),
+                }
+            }
+            PromptKind::ExplorerCreate => {
+                // Created BESIDE the selected row, or inside it when the row is an
+                // open directory: "new file here" means where you are looking.
+                let Some(path) = self.explorer_selected_path() else { return };
+                let open_dir = self
+                    .tabs
+                    .get(self.active)
+                    .and_then(|t| t.explorer.as_ref())
+                    .and_then(|e| e.selected())
+                    .is_some_and(|r| r.entry.dir && r.open);
+                let parent = if open_dir {
+                    path.clone()
+                } else {
+                    path.parent().map(|p| p.to_path_buf()).unwrap_or(path.clone())
+                };
+                match crate::explorer::create(&parent, &value) {
+                    Ok(made) => self.explorer_after_op(Some(made), "created"),
+                    Err(e) => self.explorer_note(&e),
+                }
+            }
+            PromptKind::ExplorerDelete => {
+                let Some(path) = self.explorer_selected_path() else { return };
+                let dir = path.is_dir();
+                match crate::explorer::delete(&path, dir) {
+                    Ok(()) => self.explorer_after_op(None, "deleted"),
+                    Err(e) => self.explorer_note(&e),
+                }
+            }
+            PromptKind::ExplorerChmod => self.explorer_chmod(true),
             PromptKind::GuardedCommand => {
                 // Confirmed: submit the command that was held back. The line is
                 // already typed in the shell, so this is just the Enter we withheld —

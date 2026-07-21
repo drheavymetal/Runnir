@@ -110,6 +110,9 @@ pub struct Explorer {
     /// The sidebar's own leader layer: `None` when disarmed, else the group keys
     /// pressed so far. Same shape, and the same which-key, as the git panel's.
     pub leader: Option<Vec<char>>,
+    /// A path the cursor should land on once the tree has been re-read — what an
+    /// operation just produced. Cleared when it is used.
+    pub pending_cursor: Option<PathBuf>,
 }
 
 impl Explorer {
@@ -130,6 +133,7 @@ impl Explorer {
             seq: 0,
             message: None,
             leader: None,
+            pending_cursor: None,
         };
         e.expanded.insert(root);
         e
@@ -244,6 +248,15 @@ impl Explorer {
         let mut rows = Vec::new();
         self.walk(&self.root.clone(), 0, &mut rows);
         self.rows = rows;
+        // A path an operation just produced wins: after a rename, the cursor belongs
+        // on the new name, not on where the old one used to be.
+        if let Some(want) = self.pending_cursor.clone() {
+            if let Some(i) = self.rows.iter().position(|r| r.entry.path == want) {
+                self.pending_cursor = None;
+                self.cursor = i;
+                return;
+            }
+        }
         // Keep the cursor on the same PATH across a rebuild: a tree that moves the
         // selection every time a directory finishes loading is unusable on a slow
         // filesystem, which is exactly where the reads are slow.
@@ -342,6 +355,10 @@ pub static FILE_LEADER: &[FileEntry] = &[
             fleaf('o', "open it (view, or ask)", OnFile(FEnter)),
             fleaf('e', "edit it in $EDITOR", OnFile(FCh('e'))),
             fleaf('s', "open with the system", OnFile(FCh('o'))),
+            fleaf('p', "properties & permissions", FKey(FCh('p'))),
+            fleaf('n', "new file or directory", FKey(FCh('a'))),
+            fleaf('r', "rename it", FKey(FCh('r'))),
+            fleaf('d', "delete it", FKey(FCh('d'))),
             fleaf('y', "copy the path", FKey(FCh('y'))),
         ]),
     },
@@ -351,6 +368,10 @@ pub static FILE_LEADER: &[FileEntry] = &[
         node: FileNode::Group(&[
             fleaf('o', "fold / unfold", OnDir(FEnter)),
             fleaf('u', "go to the parent", FKey(FCh('h'))),
+            fleaf('p', "properties & permissions", OnDir(FCh('p'))),
+            fleaf('n', "new file or directory inside", OnDir(FCh('a'))),
+            fleaf('r', "rename it", OnDir(FCh('r'))),
+            fleaf('d', "delete it (asks, with a count)", OnDir(FCh('d'))),
             fleaf('y', "copy the path", FKey(FCh('y'))),
         ]),
     },
@@ -359,7 +380,7 @@ pub static FILE_LEADER: &[FileEntry] = &[
         title: "View",
         node: FileNode::Group(&[
             fleaf('.', "hidden files", FKey(FCh('.'))),
-            fleaf('r', "reread the tree", FKey(FCh('r'))),
+            fleaf('r', "reread the tree", FKey(FCh('R'))),
             fleaf('t', "to the top", FKey(FCh('g'))),
             fleaf('b', "to the bottom", FKey(FCh('G'))),
         ]),
@@ -631,6 +652,220 @@ fn decode_image(
     Ok(crate::overlay::Viewed::Image { art, size: (w, h) })
 }
 
+// ---- properties and operations ---------------------------------------------
+
+/// What the properties panel shows about one path. A snapshot, read on a worker.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Props {
+    pub path: PathBuf,
+    pub dir: bool,
+    /// The path a symlink points at. Permissions apply to the TARGET, and the panel
+    /// has to say so — a `chmod` on a link silently changes something else.
+    pub link_target: Option<PathBuf>,
+    pub size: u64,
+    pub mtime: u64,
+    /// Unix permission bits (the low 9), or `None` where the platform has none.
+    pub mode: Option<u32>,
+    pub readonly: bool,
+    /// For a directory: how much is inside, counted on the worker that read this.
+    /// The count is what a delete confirm has to name.
+    pub contents: Option<(usize, usize)>,
+}
+
+/// Reads a path's properties. On a worker: counting a directory tree walks it.
+pub fn props_of(path: &Path) -> Result<Props, String> {
+    let meta = std::fs::symlink_metadata(path).map_err(|e| e.to_string())?;
+    let link_target = meta.is_symlink().then(|| std::fs::read_link(path).ok()).flatten();
+    // Everything but the link itself is asked of the TARGET, which is what opening
+    // or chmod-ing the path would act on.
+    let target = std::fs::metadata(path).ok();
+    let dir = target.as_ref().map(|m| m.is_dir()).unwrap_or(false);
+    Ok(Props {
+        path: path.to_path_buf(),
+        dir,
+        link_target,
+        size: target.as_ref().map(|m| m.len()).unwrap_or(0),
+        mtime: target
+            .as_ref()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+        mode: target.as_ref().map(mode_of),
+        readonly: target.as_ref().map(|m| m.permissions().readonly()).unwrap_or(false),
+        contents: dir.then(|| count_tree(path)),
+    })
+}
+
+#[cfg(unix)]
+fn mode_of(meta: &std::fs::Metadata) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    meta.permissions().mode() & 0o7777
+}
+
+#[cfg(not(unix))]
+fn mode_of(_meta: &std::fs::Metadata) -> u32 {
+    0
+}
+
+/// Counts a tree as `(files, directories)`, not following symlinks. Bounded by
+/// nothing but the tree: this is why it runs on a worker.
+pub fn count_tree(root: &Path) -> (usize, usize) {
+    let (mut files, mut dirs) = (0usize, 0usize);
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(iter) = std::fs::read_dir(&dir) else { continue };
+        for entry in iter.flatten() {
+            let Ok(ft) = entry.file_type() else { continue };
+            if ft.is_symlink() {
+                // A symlink is one entry, never a doorway: following them is how a
+                // count (and a delete) walks out of the tree it was given.
+                files += 1;
+            } else if ft.is_dir() {
+                dirs += 1;
+                stack.push(entry.path());
+            } else {
+                files += 1;
+            }
+        }
+    }
+    (files, dirs)
+}
+
+/// Renames a path in place. Refuses to overwrite: a rename that silently replaces
+/// another file is how work disappears with no undo anywhere.
+pub fn rename(path: &Path, new_name: &str) -> Result<PathBuf, String> {
+    let name = new_name.trim();
+    check_name(name)?;
+    let parent = path.parent().ok_or("that path has no parent")?;
+    let target = parent.join(name);
+    if target == path {
+        return Ok(target);
+    }
+    if target.exists() {
+        return Err(format!("{name} already exists"));
+    }
+    std::fs::rename(path, &target).map_err(|e| e.to_string())?;
+    Ok(target)
+}
+
+/// Creates a file, or a directory when the name ends in `/`.
+pub fn create(parent: &Path, name: &str) -> Result<PathBuf, String> {
+    let raw = name.trim();
+    let is_dir = raw.ends_with('/');
+    let name = raw.trim_end_matches('/');
+    check_name(name)?;
+    let target = parent.join(name);
+    if target.exists() {
+        return Err(format!("{name} already exists"));
+    }
+    if is_dir {
+        std::fs::create_dir(&target).map_err(|e| e.to_string())?;
+    } else {
+        // `create_new` so a race cannot truncate a file that appeared meanwhile.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&target)
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(target)
+}
+
+/// A name that is a name and not a path: no separators, no `..`, nothing empty.
+/// Typing `../x` into a rename box must not move a file out of the tree.
+fn check_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("a name is needed".into());
+    }
+    if name == "." || name == ".." {
+        return Err("that is not a name".into());
+    }
+    if name.contains('/') || name.contains('\0') {
+        return Err("a name cannot contain a path separator".into());
+    }
+    Ok(())
+}
+
+/// Deletes a path. A directory needs `recursive`, which the caller only sets after
+/// a confirm that counted what is inside.
+pub fn delete(path: &Path, recursive: bool) -> Result<(), String> {
+    let meta = std::fs::symlink_metadata(path).map_err(|e| e.to_string())?;
+    // A symlink is removed as the link, never followed: deleting the link must not
+    // delete what it points at.
+    if meta.is_symlink() || !meta.is_dir() {
+        return std::fs::remove_file(path).map_err(|e| e.to_string());
+    }
+    if recursive {
+        std::fs::remove_dir_all(path).map_err(|e| e.to_string())
+    } else {
+        std::fs::remove_dir(path).map_err(|e| e.to_string())
+    }
+}
+
+/// Sets the permission bits, optionally through a whole tree.
+///
+/// On a symlink this changes the TARGET — `set_permissions` follows links and there
+/// is no portable way not to — which is why the panel says so before it is used.
+pub fn set_mode(path: &Path, mode: u32, recursive: bool) -> Result<usize, String> {
+    #[cfg(not(unix))]
+    {
+        let _ = (path, mode, recursive);
+        return Err("permissions are a unix thing".into());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut changed = 0usize;
+        let mut stack = vec![path.to_path_buf()];
+        while let Some(p) = stack.pop() {
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode))
+                .map_err(|e| format!("{}: {e}", p.display()))?;
+            changed += 1;
+            if !recursive {
+                break;
+            }
+            let Ok(meta) = std::fs::symlink_metadata(&p) else { continue };
+            if meta.is_dir() && !meta.is_symlink() {
+                if let Ok(iter) = std::fs::read_dir(&p) {
+                    stack.extend(iter.flatten().map(|e| e.path()));
+                }
+            }
+        }
+        Ok(changed)
+    }
+}
+
+/// "2 files and 1 directory", agreeing with the counts. A confirm that says
+/// "1 directories" reads as generated text, and generated text is what people stop
+/// reading — which is the one thing a delete confirm cannot afford.
+pub fn count_words(files: usize, dirs: usize) -> String {
+    let f = format!("{files} file{}", if files == 1 { "" } else { "s" });
+    let d = format!("{dirs} director{}", if dirs == 1 { "y" } else { "ies" });
+    match (files, dirs) {
+        (0, _) => d,
+        (_, 0) => f,
+        _ => format!("{f} and {d}"),
+    }
+}
+
+/// `rwxr-xr-x`, the way `ls -l` writes it.
+pub fn mode_string(mode: u32) -> String {
+    let bit = |shift: u32, c: char| if mode >> shift & 1 == 1 { c } else { '-' };
+    format!(
+        "{}{}{}{}{}{}{}{}{}",
+        bit(8, 'r'),
+        bit(7, 'w'),
+        bit(6, 'x'),
+        bit(5, 'r'),
+        bit(4, 'w'),
+        bit(3, 'x'),
+        bit(2, 'r'),
+        bit(1, 'w'),
+        bit(0, 'x')
+    )
+}
+
 /// The tree's root for a directory: the repository it is in, else the directory
 /// itself. A project is the unit people keep a tree of, and a repo is how a project
 /// says where it ends.
@@ -777,6 +1012,83 @@ mod tests {
         let bin = dir.join("thing.bin");
         std::fs::write(&bin, [0u8, 1, 2, 3]).unwrap();
         assert!(read_for_view(&bin, 40, 20, 0.45).body.is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn operations_refuse_the_things_that_lose_work() {
+        let dir = std::env::temp_dir().join(format!("runnir-ops-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("a.txt");
+        std::fs::write(&a, "a").unwrap();
+        std::fs::write(dir.join("b.txt"), "b").unwrap();
+
+        // A rename over an existing file is refused: there is no undo anywhere for
+        // the file it would have replaced.
+        assert!(rename(&a, "b.txt").is_err());
+        // A name is a name: a rename box must not be able to move a file out of the
+        // tree, and `..` is how that would be done.
+        assert!(rename(&a, "../escaped.txt").is_err());
+        assert!(rename(&a, "..").is_err());
+        assert!(rename(&a, "  ").is_err());
+        let moved = rename(&a, "renamed.txt").unwrap();
+        assert!(moved.exists() && !a.exists());
+
+        // Creating: a trailing slash means a directory, and neither overwrites.
+        let sub = create(&dir, "sub/").unwrap();
+        assert!(sub.is_dir());
+        let made = create(&dir, "new.txt").unwrap();
+        assert!(made.is_file());
+        assert!(create(&dir, "new.txt").is_err(), "an existing name is refused");
+
+        // Counting is what a delete confirm names, and it does not follow links.
+        std::fs::write(sub.join("inner.txt"), "x").unwrap();
+        std::fs::create_dir(sub.join("deeper")).unwrap();
+        std::fs::write(sub.join("deeper/deep.txt"), "x").unwrap();
+        assert_eq!(count_tree(&sub), (2, 1));
+
+        // A non-empty directory is not deleted without the recursive flag the
+        // confirm sets.
+        assert!(delete(&sub, false).is_err());
+        assert!(delete(&sub, true).is_ok());
+        assert!(!sub.exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_confirm_counts_in_words_that_agree() {
+        assert_eq!(count_words(2, 1), "2 files and 1 directory");
+        assert_eq!(count_words(1, 3), "1 file and 3 directories");
+        assert_eq!(count_words(4, 0), "4 files");
+        assert_eq!(count_words(0, 1), "1 directory");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn permissions_read_back_the_way_they_were_written() {
+        let dir = std::env::temp_dir().join(format!("runnir-mode-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("script.sh");
+        std::fs::write(&f, "#!/bin/sh\n").unwrap();
+
+        set_mode(&f, 0o644, false).unwrap();
+        assert_eq!(props_of(&f).unwrap().mode.unwrap() & 0o777, 0o644);
+        assert_eq!(mode_string(0o644), "rw-r--r--");
+
+        set_mode(&f, 0o755, false).unwrap();
+        assert_eq!(mode_string(props_of(&f).unwrap().mode.unwrap() & 0o777), "rwxr-xr-x");
+        assert_eq!(kind_of(&f), Kind::Text, "the execute bit is not a file type");
+
+        // Recursive touches everything under the directory, and says how much.
+        std::fs::write(dir.join("one"), "1").unwrap();
+        std::fs::create_dir(dir.join("d")).unwrap();
+        std::fs::write(dir.join("d/two"), "2").unwrap();
+        let n = set_mode(&dir, 0o755, true).unwrap();
+        assert_eq!(n, 5, "the directory, script.sh, one, d and d/two");
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

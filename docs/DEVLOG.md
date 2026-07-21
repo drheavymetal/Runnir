@@ -1069,6 +1069,41 @@ handlers match on the character. Every shifted letter quietly did the unshifted
 thing. A scripted key has to be the key a hand produces, not the one the chord
 grammar names.
 
+## 2026-07-21 - File explorer: properties, permissions and the operations
+
+Step 4 of the design below: `p` properties, `a` create, `r` rename, `d` delete. The
+refresh moved off `r` to `R` — the design's key list is what a file manager's is, and
+the destructive-looking letter belongs to the safe verb, not the other way round.
+
+**Permissions are a 3x3 grid**, because that is what they are: owner/group/other by
+read/write/execute. You move around it, space flips a bit, and NOTHING is written
+until Enter. A directory can mark the change recursive, which then confirms with the
+count of what it would touch.
+
+**Every refusal is a refusal to lose work**:
+- `rename` will not overwrite an existing name, and `check_name` rejects anything
+  with a separator or `..` — a rename box must not be able to move a file out of the
+  tree it is a view of.
+- `create` uses `create_new`, so a race cannot truncate a file that appeared while
+  the prompt was open.
+- `delete` needs the recursive flag for a non-empty directory, and the flag is only
+  set by a confirm that COUNTED first. `count_tree` and `delete` both refuse to
+  follow symlinks: following one is how a count (and then a delete) walks out of the
+  tree it was handed.
+- `set_permissions` follows symlinks and there is no portable way not to, so the
+  panel says, before anything is changed, that the change lands on the target.
+
+The counting runs on a worker and the confirm goes up when it comes back
+(`UserEvent::ExplorerConfirm`): counting `node_modules` is a tree walk, and doing it
+on the UI thread is the same mistake as reading a directory there.
+
+`count_words` exists because "1 directories" reads as generated text, and generated
+text is what people stop reading — the one thing a delete confirm cannot afford.
+
+After an operation the tree re-reads and `pending_cursor` lands the selection on what
+the operation produced: after a rename you are on the new name, not on the hole where
+the old one was.
+
 ## DESIGN, NOT YET BUILT — the file explorer sidebar (decided 2026-07-21)
 
 Four sessions of design with Pedro, written down before any code so it is not

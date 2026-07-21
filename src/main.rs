@@ -104,6 +104,11 @@ pub enum UserEvent {
     /// A file the explorer asked to view, read on a worker: text, decoded image art,
     /// or why it could not be shown.
     FileRead(PathBuf, explorer::ViewRead),
+    /// A delete confirm whose label had to be counted first (a tree walk), for the
+    /// tab that asked.
+    ExplorerConfirm(usize, String),
+    /// One path's properties, read on a worker.
+    ExplorerProps(Result<explorer::Props, String>),
 }
 
 fn main() {
@@ -634,6 +639,9 @@ struct Gpu {
     /// The explorer sidebar's edge is being dragged. The panes are reflowed when it
     /// is released, not while it moves.
     explorer_resizing: bool,
+    /// Permission bits waiting on a recursive-chmod confirm, since the confirm
+    /// replaces the panel that was holding them.
+    pending_mode: Option<u32>,
     /// Whether the pointer is currently over one, so the resize cursor is set once
     /// on the way in and once on the way out rather than on every motion event.
     git_over_split: bool,
@@ -891,6 +899,7 @@ impl App {
             resizing: None,
             git_drag: None,
             explorer_resizing: false,
+            pending_mode: None,
             git_over_split: false,
             zoomed: None,
             bell_flash: None,
@@ -1072,6 +1081,8 @@ impl ApplicationHandler<UserEvent> for App {
                 gpu.on_explorer_read(tab, seq, dir, entries)
             }
             UserEvent::FileRead(path, read) => gpu.on_file_read(path, read),
+            UserEvent::ExplorerConfirm(tab, label) => gpu.on_explorer_confirm(tab, label),
+            UserEvent::ExplorerProps(props) => gpu.on_explorer_props(props),
             UserEvent::Git(root, state) => {
                 gpu.git_pending.remove(&root);
                 match state {

@@ -497,6 +497,8 @@ and it takes keys only while it has focus (Escape gives them back).
   .                 hidden files    r  reread the tree
   y                 copy the path   Esc or q     back to the pane
   Enter on a file   open it        e  $EDITOR    o  the desktop's handler
+  p properties & permissions   a new file (a/ for a directory)
+  r rename          d delete       R  reread the tree
 
 What Enter does depends on what the file IS, decided by its bytes and not by its
 name: an image opens in the viewer, text opens in the viewer, and a binary says so
@@ -509,6 +511,18 @@ a terminal, so its editor is whatever runs in a pane.
 $EDITOR (and a script you choose to run) goes to the focused pane when it is sitting
 at its prompt and to a new split when something is already running there, with the
 path shell-quoted.
+
+Properties (p) shows what a path is, how big, when it changed, and its permission
+bits as a grid you move around in: hjkl or the arrows pick a bit, space flips it,
+Enter writes it. Nothing touches the disk until Enter. On a directory, R marks the
+change as recursive and Enter then asks first, counting what it would touch. On a
+symlink the panel says out loud that permissions land on the TARGET, because
+chmod follows links and there is no portable way not to.
+
+Renaming refuses to overwrite an existing name and refuses a name that is a path,
+so a rename box can never move a file out of the tree. Deleting asks first and, for
+a directory, counts the files and directories inside by name before you answer —
+and Enter is not a yes to any of those confirms.
 
 Nothing that RUNS is ever run by one keypress. An executable text file — a script —
 is three things at once, so Enter asks which: view, edit, run, or hand it to the
