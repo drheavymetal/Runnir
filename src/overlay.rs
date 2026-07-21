@@ -25,6 +25,8 @@ pub enum Overlay {
     Media(MediaOverlay),
     /// The native git panel: status, log, branches, stashes.
     Git(GitPanel),
+    /// A file being read from the explorer sidebar: text or an image, never edited.
+    Viewer(FileViewer),
 }
 
 impl Overlay {
@@ -44,6 +46,7 @@ impl Overlay {
             Overlay::ClipHistory(p) => p.render(cols, rows, theme),
             Overlay::Media(m) => m.render(cols, rows, theme),
             Overlay::Git(p) => p.render(cols, rows, theme),
+            Overlay::Viewer(v) => v.render(cols, rows, theme),
         }
     }
 }
@@ -2323,6 +2326,177 @@ impl MediaOverlay {
 
 // ---- docs ------------------------------------------------------------------
 
+// ---- file viewer -----------------------------------------------------------
+
+/// What the viewer is showing: text lines, or an image as half-block art.
+///
+/// Read-only, and deliberately so. runnir is a terminal: its editor is whatever
+/// runs in a pane (`e` sends the path to `$EDITOR`). A real editor — undo,
+/// encodings, huge files, LSP — is a bigger project than the sidebar it hangs off,
+/// and it would compete with neovim forever.
+pub enum Viewed {
+    Text {
+        lines: Vec<String>,
+        /// The file was longer than the viewer's limit and is cut here.
+        truncated: bool,
+    },
+    Image {
+        art: Vec<Vec<HalfCell>>,
+        /// Real pixel size, which the art cannot show.
+        size: (u32, u32),
+    },
+    /// A file that is neither, or one that could not be read.
+    Note(String),
+}
+
+pub struct FileViewer {
+    pub path: std::path::PathBuf,
+    pub body: Viewed,
+    pub scroll: usize,
+    /// Wrap long lines instead of clipping them. Off by default: code reads better
+    /// clipped, and the horizontal offset says what was cut.
+    pub wrap: bool,
+    pub left: usize,
+    pub bytes: u64,
+}
+
+impl FileViewer {
+    pub fn new(path: std::path::PathBuf, body: Viewed, bytes: u64) -> Self {
+        Self { path, body, scroll: 0, wrap: false, left: 0, bytes }
+    }
+
+    pub fn len(&self) -> usize {
+        match &self.body {
+            Viewed::Text { lines, .. } => lines.len(),
+            Viewed::Image { art, .. } => art.len(),
+            Viewed::Note(_) => 1,
+        }
+    }
+
+    pub fn scroll_by(&mut self, delta: isize) {
+        let max = self.len().saturating_sub(1) as isize;
+        self.scroll = (self.scroll as isize + delta).clamp(0, max) as usize;
+    }
+
+    pub fn scroll_side(&mut self, delta: isize) {
+        self.left = (self.left as isize + delta).max(0) as usize;
+    }
+
+    pub fn to_end(&mut self) {
+        self.scroll = self.len().saturating_sub(1);
+    }
+
+    fn render(&self, cols: usize, rows: usize, theme: &Theme) -> Vec<Panel> {
+        let w = cols.saturating_sub(4).max(40);
+        let h = rows.saturating_sub(4).max(10);
+        let mut g = panel_grid(w, h, theme);
+        let body_rows = h.saturating_sub(3);
+
+        // Header: the path, elided from the LEFT so the file name survives, and the
+        // size, which is the other thing you want before reading.
+        let path = elide_left(&self.path.display().to_string(), w.saturating_sub(20));
+        write(&mut g, 0, 2, &path, accent());
+        let meta = match &self.body {
+            Viewed::Image { size, .. } => format!("{}\u{d7}{}  {}", size.0, size.1, human(self.bytes)),
+            _ => format!("{} lines  {}", self.len(), human(self.bytes)),
+        };
+        let mw = meta.chars().count();
+        if w > mw + 4 {
+            write(&mut g, 0, w - mw - 2, &meta, dim());
+        }
+
+        match &self.body {
+            Viewed::Text { lines, truncated } => {
+                let num_w = lines.len().to_string().chars().count().max(3) + 1;
+                for (i, line) in lines.iter().skip(self.scroll).take(body_rows).enumerate() {
+                    let y = 2 + i;
+                    let n = self.scroll + i + 1;
+                    write(
+                        &mut g,
+                        y,
+                        2,
+                        &format!("{n:>width$} ", width = num_w),
+                        Pen { fg: Color::Rgb(0x6a, 0x6d, 0x74), bg: bg(), ..Pen::default() },
+                    );
+                    let x = 2 + num_w + 1;
+                    let room = w.saturating_sub(x + 1);
+                    // Tabs are expanded here rather than in the file: the grid has no
+                    // tab stops, so a raw \t collapses to one cell and the column
+                    // structure of every indented file disappears.
+                    let text = expand_tabs(line);
+                    let shown: String = text.chars().skip(self.left).collect();
+                    write(&mut g, y, x, &elide(&shown, room), normal());
+                }
+                if *truncated {
+                    let y = h.saturating_sub(2);
+                    write(&mut g, y, 2, "\u{2026} file is longer than the viewer reads", dim());
+                }
+            }
+            Viewed::Image { art, .. } => {
+                // Half-block art: one cell carries two vertical pixels. The real
+                // texture path (kitty graphics) is a later step; this works today
+                // and over ssh.
+                for (r, line) in art.iter().skip(self.scroll).take(body_rows).enumerate() {
+                    for (c, cell) in line.iter().enumerate() {
+                        if 2 + c >= w {
+                            break;
+                        }
+                        let pen = Pen {
+                            fg: Color::Rgb(cell.top.0, cell.top.1, cell.top.2),
+                            bg: Color::Rgb(cell.bottom.0, cell.bottom.1, cell.bottom.2),
+                            ..Pen::default()
+                        };
+                        write(&mut g, 2 + r, 2 + c, "\u{2580}", pen);
+                    }
+                }
+            }
+            Viewed::Note(text) => {
+                write(&mut g, 2, 2, &elide(text, w.saturating_sub(4)), normal());
+            }
+        }
+
+        let legend = match &self.body {
+            Viewed::Image { .. } => "j k scroll \u{b7} e $EDITOR \u{b7} o open with the system \u{b7} esc back",
+            _ => "j k / J K scroll \u{b7} h l sideways \u{b7} e $EDITOR \u{b7} o system \u{b7} y path \u{b7} esc back",
+        };
+        write(&mut g, h - 1, 2, &elide(legend, w.saturating_sub(4)), dim());
+
+        let col = (cols.saturating_sub(w)) / 2;
+        let row = (rows.saturating_sub(h)) / 2;
+        vec![Panel { grid: g, col, row }]
+    }
+}
+
+/// Expands tabs to the next 4-column stop. The grid has no tab stops of its own, so
+/// an unexpanded `\t` eats the indentation of every file it appears in.
+fn expand_tabs(s: &str) -> String {
+    if !s.contains('\t') {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len() + 8);
+    for c in s.chars() {
+        if c == '\t' {
+            let pad = 4 - (out.chars().count() % 4);
+            out.push_str(&" ".repeat(pad));
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// A byte count a person can read at a glance.
+pub fn human(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "K", "M", "G", "T"];
+    let mut n = bytes as f64;
+    let mut u = 0;
+    while n >= 1024.0 && u + 1 < UNITS.len() {
+        n /= 1024.0;
+        u += 1;
+    }
+    if u == 0 { format!("{bytes} B") } else { format!("{n:.1}{}", UNITS[u]) }
+}
+
 pub struct Docs {
     lines: Vec<(String, Pen)>,
     scroll: usize,
@@ -2413,6 +2587,13 @@ pub enum PromptKind {
     GitTag,
     /// Text to narrow the panel's log to, matched against commit messages.
     GitLogFilter,
+    /// What to do with an executable text file from the explorer: view, edit, run,
+    /// or hand it to the desktop. A chooser rather than a guess — a script is all
+    /// of those things at once.
+    ExplorerAction,
+    /// Confirmation before something that RUNS is run: an executable binary, or a
+    /// `.desktop` file whose handler `xdg-open` would execute.
+    ExplorerRun,
     /// Closing the window (or the last pane) while something is still running.
     /// Answered with y/n, never with typing: the question is whether to kill work,
     /// and a text field would invite Enter — the one key most likely to be pressed
@@ -2424,7 +2605,7 @@ impl PromptKind {
     /// Whether this prompt is a yes/no question rather than a field to type in.
     /// A confirm draws no input line and takes no characters.
     pub fn is_confirm(self) -> bool {
-        matches!(self, PromptKind::ConfirmQuit)
+        matches!(self, PromptKind::ConfirmQuit | PromptKind::ExplorerRun)
     }
 }
 

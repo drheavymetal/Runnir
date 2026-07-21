@@ -339,7 +339,9 @@ pub static FILE_LEADER: &[FileEntry] = &[
         key: 'f',
         title: "File",
         node: FileNode::Group(&[
-            fleaf('o', "open it", OnFile(FEnter)),
+            fleaf('o', "open it (view, or ask)", OnFile(FEnter)),
+            fleaf('e', "edit it in $EDITOR", OnFile(FCh('e'))),
+            fleaf('s', "open with the system", OnFile(FCh('o'))),
             fleaf('y', "copy the path", FKey(FCh('y'))),
         ]),
     },
@@ -490,6 +492,145 @@ fn is_executable(_meta: &std::fs::Metadata) -> bool {
     false
 }
 
+// ---- what a file IS, and therefore what opening it means -------------------
+
+/// What the sidebar decided a path is. The executable BIT is deliberately not one
+/// of these: a script is text and runnable at once, so "what is it" and "may it be
+/// run" are two questions, and collapsing them loses the "edit this script" case.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Kind {
+    Directory,
+    Image,
+    Text,
+    Binary,
+}
+
+/// How much of a file is sniffed, and how much the viewer will load.
+const SNIFF_BYTES: usize = 8192;
+pub const VIEW_LIMIT: u64 = 4 * 1024 * 1024;
+
+/// Decides what a path is by looking at it, not at its name.
+///
+/// Text vs binary is decided by CONTENT (a NUL byte in the first 8 KB): a log with
+/// no extension is text and a `.dat` may well be. Images are the exception —
+/// magic bytes first, extension only as a fallback for formats whose header this
+/// does not know.
+pub fn kind_of(path: &Path) -> Kind {
+    if path.is_dir() {
+        return Kind::Directory;
+    }
+    let head = read_head(path);
+    if is_image_magic(&head) || has_image_extension(path) {
+        return Kind::Image;
+    }
+    if head.contains(&0) {
+        return Kind::Binary;
+    }
+    Kind::Text
+}
+
+fn read_head(path: &Path) -> Vec<u8> {
+    use std::io::Read;
+    let Ok(mut f) = std::fs::File::open(path) else { return Vec::new() };
+    let mut buf = vec![0u8; SNIFF_BYTES];
+    let n = f.read(&mut buf).unwrap_or(0);
+    buf.truncate(n);
+    buf
+}
+
+fn is_image_magic(head: &[u8]) -> bool {
+    head.starts_with(b"\x89PNG\r\n\x1a\n")
+        || head.starts_with(&[0xFF, 0xD8, 0xFF])
+        || head.starts_with(b"GIF87a")
+        || head.starts_with(b"GIF89a")
+        || head.starts_with(b"BM")
+        || (head.len() > 12 && &head[0..4] == b"RIFF" && &head[8..12] == b"WEBP")
+        || head.starts_with(b"qoif")
+}
+
+fn has_image_extension(path: &Path) -> bool {
+    let Some(ext) = path.extension().and_then(|e| e.to_str()) else { return false };
+    matches!(
+        ext.to_ascii_lowercase().as_str(),
+        "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp" | "ico" | "tif" | "tiff" | "avif" | "qoi"
+    )
+}
+
+/// A `.desktop` file, which `xdg-open` EXECUTES. Never opened without a confirm
+/// that names what would run: a cloned repository can carry one.
+pub fn is_desktop(path: &Path) -> bool {
+    path.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("desktop"))
+}
+
+/// What a worker read for the viewer.
+pub struct ViewRead {
+    pub body: Result<crate::overlay::Viewed, String>,
+    pub bytes: u64,
+}
+
+/// Reads a path for the viewer, on a worker. Never called on the UI thread: a file
+/// on a network mount blocks for as long as the mount feels like it.
+///
+/// `cols`/`rows` size an image's half-block art, which has to be decided where the
+/// cell size is known and is passed in rather than guessed here.
+pub fn read_for_view(path: &Path, cols: usize, rows: usize, cell_aspect: f32) -> ViewRead {
+    let bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    let body = match kind_of(path) {
+        Kind::Image => decode_image(path, cols, rows, cell_aspect),
+        Kind::Binary => Err("binary file".to_string()),
+        Kind::Directory => Err("that is a directory".to_string()),
+        Kind::Text => read_text(path, bytes),
+    };
+    ViewRead { body, bytes }
+}
+
+fn read_text(path: &Path, bytes: u64) -> Result<crate::overlay::Viewed, String> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    // Read at most the limit, rather than checking the size and refusing: /proc and
+    // other synthetic files report zero and still have content worth showing.
+    let mut buf = Vec::new();
+    let n = f
+        .by_ref()
+        .take(VIEW_LIMIT + 1)
+        .read_to_end(&mut buf)
+        .map_err(|e| e.to_string())?;
+    let truncated = n as u64 > VIEW_LIMIT || bytes > VIEW_LIMIT;
+    buf.truncate(VIEW_LIMIT as usize);
+    // Lossy on purpose: a file that is UTF-8 apart from one bad byte is still a
+    // file you want to read, and the viewer never writes anything back.
+    let text = String::from_utf8_lossy(&buf).into_owned();
+    let lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
+    Ok(crate::overlay::Viewed::Text { lines, truncated })
+}
+
+fn decode_image(
+    path: &Path,
+    cols: usize,
+    rows: usize,
+    cell_aspect: f32,
+) -> Result<crate::overlay::Viewed, String> {
+    let img = image::open(path).map_err(|e| e.to_string())?;
+    let rgba = img.to_rgba8();
+    let (w, h) = rgba.dimensions();
+    // Fit inside the box keeping the aspect ON SCREEN, which is not the aspect in
+    // cells: a cell here is 10x22 px, so a picture drawn as many rows as columns
+    // comes out twice as tall as it is wide. `cell_aspect` is cw/ch and converts
+    // between the two.
+    let (mut c, mut r) = (cols, rows);
+    if w > 0 && h > 0 {
+        let want = (cols as f32 * h as f32 / w as f32 * cell_aspect).round().max(1.0) as usize;
+        if want > rows {
+            c = (rows as f32 * w as f32 / h as f32 / cell_aspect).round().max(1.0) as usize;
+            r = rows;
+        } else {
+            r = want;
+        }
+    }
+    let art = crate::media::halfblock_art(&rgba, w, h, c.max(1), r.max(1));
+    Ok(crate::overlay::Viewed::Image { art, size: (w, h) })
+}
+
 /// The tree's root for a directory: the repository it is in, else the directory
 /// itself. A project is the unit people keep a tree of, and a repo is how a project
 /// says where it ends.
@@ -577,6 +718,66 @@ mod tests {
         e.insert_children(PathBuf::from("/r"), many);
         assert_eq!(e.rows.len(), CHILD_CAP + 1);
         assert_eq!(e.rows.last().unwrap().more, Some(7));
+    }
+
+    #[test]
+    fn what_a_file_is_comes_from_its_bytes_not_its_name() {
+        let dir = std::env::temp_dir().join(format!("runnir-kind-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let write = |name: &str, bytes: &[u8]| {
+            let p = dir.join(name);
+            std::fs::write(&p, bytes).unwrap();
+            p
+        };
+
+        // No extension at all, and still text.
+        assert_eq!(kind_of(&write("logfile", b"2026-07-21 started\nok\n")), Kind::Text);
+        // A `.dat` that happens to be text is text.
+        assert_eq!(kind_of(&write("readings.dat", b"1,2,3\n4,5,6\n")), Kind::Text);
+        // A NUL in the first block makes it binary, whatever it is called.
+        assert_eq!(kind_of(&write("notes.txt", b"header\0\x01\x02rest")), Kind::Binary);
+        // An image is caught by its magic bytes even with the wrong extension.
+        let png = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0];
+        assert_eq!(kind_of(&write("screenshot.txt", &png)), Kind::Image);
+        // ...and by extension when the header is one this does not know.
+        assert_eq!(kind_of(&write("art.avif", b"\0\0\0 ftypavif")), Kind::Image);
+        assert_eq!(kind_of(&dir), Kind::Directory);
+
+        assert!(is_desktop(Path::new("/usr/share/applications/x.desktop")));
+        assert!(!is_desktop(Path::new("/tmp/x.desktopish")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_viewer_reads_text_and_says_when_it_stopped() {
+        let dir = std::env::temp_dir().join(format!("runnir-view-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let small = dir.join("small.txt");
+        std::fs::write(&small, "one\ntwo\nthree\n").unwrap();
+        let read = read_for_view(&small, 40, 20, 0.45);
+        match read.body.expect("text") {
+            crate::overlay::Viewed::Text { lines, truncated } => {
+                assert_eq!(lines, ["one", "two", "three"]);
+                assert!(!truncated);
+            }
+            _ => panic!("a text file reads as text"),
+        }
+        assert_eq!(read.bytes, 14);
+
+        // Past the limit the viewer stops and SAYS it stopped: a file that just ends
+        // early, silently, is a file you draw the wrong conclusion from.
+        let big = dir.join("big.txt");
+        std::fs::write(&big, "x".repeat(VIEW_LIMIT as usize + 100)).unwrap();
+        match read_for_view(&big, 40, 20, 0.45).body.expect("text") {
+            crate::overlay::Viewed::Text { truncated, .. } => assert!(truncated),
+            _ => panic!("still text"),
+        }
+
+        // A binary is refused rather than shown as mojibake.
+        let bin = dir.join("thing.bin");
+        std::fs::write(&bin, [0u8, 1, 2, 3]).unwrap();
+        assert!(read_for_view(&bin, 40, 20, 0.45).body.is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

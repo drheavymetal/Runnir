@@ -971,8 +971,11 @@ impl Gpu {
         }
         let body = self.explorer_body_rows();
         let mut read = false;
+        let mut open = false;
         let mut refresh = false;
         let mut copy: Option<String> = None;
+        let mut edit: Option<std::path::PathBuf> = None;
+        let mut system: Option<std::path::PathBuf> = None;
         let mut unfocus = false;
         {
             let Some(e) = self.tabs[self.active].explorer.as_mut() else { return false };
@@ -986,23 +989,7 @@ impl Gpu {
                 Key::Named(NamedKey::PageUp) => e.move_cursor(-(body as i32) / 2, body),
                 Key::Named(NamedKey::Home) => e.set_cursor(0, body),
                 Key::Named(NamedKey::End) => e.set_cursor(usize::MAX, body),
-                Key::Named(NamedKey::Enter) | Key::Named(NamedKey::ArrowRight) => {
-                    if let Some(row) = selected {
-                        if row.more.is_some() {
-                            // The cap row is a statement, not a place to go.
-                        } else if row.entry.dir {
-                            if row.entry.link && !row.open {
-                                // Following a symlinked directory is how a tree
-                                // walks into a cycle; say so instead.
-                                e.message = Some("symlinked directory - not followed".into());
-                            } else {
-                                read = e.toggle(&row.entry.path);
-                            }
-                        } else {
-                            e.message = Some("viewer comes next; y copies the path".into());
-                        }
-                    }
-                }
+                Key::Named(NamedKey::Enter) | Key::Named(NamedKey::ArrowRight) => open = true,
                 Key::Named(NamedKey::ArrowLeft) => {
                     if let Some(row) = selected {
                         // Left on an open directory folds it; on anything else it
@@ -1044,6 +1031,8 @@ impl Gpu {
                         refresh = true;
                     }
                     "r" => refresh = true,
+                    "e" => edit = selected.as_ref().filter(|r| r.more.is_none()).map(|r| r.entry.path.clone()),
+                    "o" => system = selected.as_ref().filter(|r| r.more.is_none()).map(|r| r.entry.path.clone()),
                     "y" => copy = selected.map(|r| r.entry.path.display().to_string()),
                     "q" => unfocus = true,
                     _ => {}
@@ -1056,7 +1045,9 @@ impl Gpu {
                 e.focused = false;
             }
         }
-        if refresh {
+        if open {
+            self.explorer_open(config);
+        } else if refresh {
             self.explorer_refresh();
         } else if read {
             self.explorer_read_pending();
@@ -1067,9 +1058,207 @@ impl Gpu {
                 e.message = Some("path copied".into());
             }
         }
+        if let Some(path) = edit {
+            self.explorer_edit(path, config);
+        }
+        // `o` forces the desktop handler for ANY file — except the two that would
+        // execute something, which still ask first.
+        if let Some(path) = system {
+            if crate::explorer::is_desktop(&path) {
+                self.overlay = Some(Overlay::Prompt(Prompt::new(
+                    PromptKind::ExplorerRun,
+                    "Run the handler in this .desktop file?",
+                    vec![path.display().to_string()],
+                )));
+            } else {
+                self.explorer_xdg_open(path);
+            }
+        }
         let _ = config;
         self.window.request_redraw();
         true
+    }
+
+    /// Opens the row under the cursor: a directory folds or unfolds, a file is
+    /// opened according to what it IS.
+    ///
+    /// The type sniff and the permission check are two questions, kept apart on
+    /// purpose. A script is text and runnable at once; deciding "it is executable,
+    /// therefore run it" is how a panel loses the case where you wanted to read it.
+    fn explorer_open(&mut self, config: &Config) {
+        let Some(row) = self
+            .tabs
+            .get(self.active)
+            .and_then(|t| t.explorer.as_ref())
+            .and_then(|e| e.selected().cloned())
+        else {
+            return;
+        };
+        if row.more.is_some() {
+            return;
+        }
+        let path = row.entry.path.clone();
+        if row.entry.dir {
+            let body = self.explorer_body_rows();
+            let mut read = false;
+            if let Some(e) = self.tabs[self.active].explorer.as_mut() {
+                if row.entry.link && !row.open {
+                    e.message = Some("symlinked directory - not followed".into());
+                } else {
+                    read = e.toggle(&path);
+                }
+                let _ = body;
+            }
+            if read {
+                self.explorer_read_pending();
+            }
+            self.window.request_redraw();
+            return;
+        }
+
+        let kind = crate::explorer::kind_of(&path);
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        // Anything that RUNS when opened is never opened by one keypress.
+        if crate::explorer::is_desktop(&path) || (row.entry.exec && kind == crate::explorer::Kind::Binary) {
+            let what = if crate::explorer::is_desktop(&path) {
+                format!("Run the handler in {name}?")
+            } else {
+                format!("Run {name}?")
+            };
+            self.overlay = Some(Overlay::Prompt(Prompt::new(
+                PromptKind::ExplorerRun,
+                &what,
+                vec![path.display().to_string()],
+            )));
+            self.window.request_redraw();
+            return;
+        }
+        // An executable text file is legitimately three things. Ask which.
+        if row.entry.exec && kind == crate::explorer::Kind::Text {
+            self.overlay = Some(Overlay::Prompt(Prompt::new(
+                PromptKind::ExplorerAction,
+                &format!("{name} is executable - what with it?"),
+                vec![
+                    "view".to_string(),
+                    "edit".to_string(),
+                    "run".to_string(),
+                    "open with the system".to_string(),
+                ],
+            )));
+            self.window.request_redraw();
+            return;
+        }
+        match kind {
+            crate::explorer::Kind::Text | crate::explorer::Kind::Image => self.explorer_view(path),
+            crate::explorer::Kind::Binary => {
+                if let Some(e) = self.tabs[self.active].explorer.as_mut() {
+                    e.message = Some("binary file - o opens it with the system".into());
+                }
+                self.window.request_redraw();
+            }
+            crate::explorer::Kind::Directory => {}
+        }
+        let _ = config;
+    }
+
+    /// The path under the tree's cursor, if it is on a real row.
+    fn explorer_selected_path(&self) -> Option<std::path::PathBuf> {
+        let e = self.tabs.get(self.active)?.explorer.as_ref()?;
+        e.selected().filter(|r| r.more.is_none()).map(|r| r.entry.path.clone())
+    }
+
+    /// Reads a file on a worker and opens the viewer on it.
+    ///
+    /// On a worker because this is the other call that hangs: a file on a network
+    /// mount, or a 4 MB one, is not something the frame can wait for.
+    fn explorer_view(&mut self, path: std::path::PathBuf) {
+        let proxy = self.proxy.clone();
+        let cell = self.renderer.cell_size();
+        let screen = (self.surface_config.width as f32, self.surface_config.height as f32);
+        // The art is sized here, where the cell size is known; the worker only
+        // decodes. Half the panel's width, which is what the viewer gives an image.
+        let cols = ((screen.0 / cell.0) as usize).saturating_sub(8).clamp(20, 200);
+        let rows = ((screen.1 / cell.1) as usize).saturating_sub(8).clamp(10, 100);
+        let aspect = cell.0 / cell.1.max(1.0);
+        std::thread::spawn(move || {
+            let read = crate::explorer::read_for_view(&path, cols, rows, aspect);
+            let _ = proxy.send_event(UserEvent::FileRead(path, read));
+        });
+    }
+
+    /// A finished file read: put the viewer up.
+    fn on_file_read(&mut self, path: std::path::PathBuf, read: crate::explorer::ViewRead) {
+        let body = match read.body {
+            Ok(b) => b,
+            Err(e) => crate::overlay::Viewed::Note(e),
+        };
+        self.overlay =
+            Some(Overlay::Viewer(crate::overlay::FileViewer::new(path, body, read.bytes)));
+        self.window.request_redraw();
+    }
+
+    /// Hands a path to `$EDITOR`, in the focused pane when it is idle and in a new
+    /// split when it is not — the same "is anything running here" question the close
+    /// confirm asks. The path is shell-quoted: a filename with a space or a `$` is
+    /// otherwise an injection into the user's own shell.
+    fn explorer_edit(&mut self, path: std::path::PathBuf, config: &Config) {
+        let cmd = vec![editor_cmd(), path.display().to_string()];
+        self.run_in_pane_or_split(cmd, config);
+    }
+
+    /// Runs a path as a command, with the same placement rule.
+    fn explorer_run(&mut self, path: std::path::PathBuf, config: &Config) {
+        self.run_in_pane_or_split(vec![path.display().to_string()], config);
+    }
+
+    /// Sends a command to the focused pane if it is sitting at its prompt, and to a
+    /// new split if something is already running there. Typing a command into a pane
+    /// that is running vim would type it INTO vim.
+    fn run_in_pane_or_split(&mut self, cmd: Vec<String>, config: &Config) {
+        let busy = self
+            .tab()
+            .focused_ref()
+            .pty
+            .foreground()
+            .is_some_and(|fg| !is_shell(&fg.name));
+        self.overlay = None;
+        if let Some(e) = self.tabs[self.active].explorer.as_mut() {
+            e.focused = false;
+        }
+        if busy {
+            self.split_running(config, cmd);
+            return;
+        }
+        let line = cmd.iter().map(|a| shell_quote(a)).collect::<Vec<_>>().join(" ");
+        self.tab().focused().write(format!("{line}\r").as_bytes());
+        self.window.request_redraw();
+    }
+
+    /// Opens a path with the desktop's handler, detached and with its output thrown
+    /// away: `xdg-open` outlives the call, and over ssh or with no portal it fails
+    /// slowly and noisily into whatever terminal it inherited.
+    fn explorer_xdg_open(&mut self, path: std::path::PathBuf) {
+        let msg = match std::process::Command::new("xdg-open")
+            .arg(&path)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(mut child) => {
+                // Reaped on a thread: nothing else ever waits on it, and an unreaped
+                // handler is a zombie for the life of the terminal.
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                });
+                "handed to the desktop".to_string()
+            }
+            Err(e) => format!("xdg-open: {e}"),
+        };
+        if let Some(ex) = self.tabs[self.active].explorer.as_mut() {
+            ex.message = Some(msg);
+        }
+        self.window.request_redraw();
     }
 
     /// Re-anchors the tree when the focused pane moves to another REPOSITORY.
@@ -1232,6 +1421,7 @@ impl Gpu {
             Some(Overlay::Palette(_)) => "palette",
             Some(Overlay::Search(_)) => "search",
             Some(Overlay::Docs(_)) => "docs",
+            Some(Overlay::Viewer(_)) => "viewer",
             Some(_) => "other",
         };
         let mut out = json!({
@@ -1240,6 +1430,19 @@ impl Gpu {
             "rows": rows,
             "leader_armed": self.leader_armed.is_some(),
         });
+        if let Some(Overlay::Viewer(v)) = &self.overlay {
+            out["viewer"] = json!({
+                "path": v.path.display().to_string(),
+                "kind": match &v.body {
+                    crate::overlay::Viewed::Text { .. } => "text",
+                    crate::overlay::Viewed::Image { .. } => "image",
+                    crate::overlay::Viewed::Note(_) => "note",
+                },
+                "lines": v.len(),
+                "scroll": v.scroll,
+                "bytes": v.bytes,
+            });
+        }
         if let Some(e) = self.tabs.get(self.active).and_then(|t| t.explorer.as_ref()) {
             out["explorer"] = json!({
                 "open": e.open,
@@ -1319,6 +1522,56 @@ impl Gpu {
         }
         match self.overlay.as_mut().unwrap() {
             Overlay::Git(_) => self.git_panel_key(key, config),
+            // The viewer reads a file and nothing else: scroll, hand it to a real
+            // editor, or leave. Escape goes back to the tree, which is where the
+            // keyboard came from.
+            Overlay::Viewer(v) => {
+                let path = v.path.clone();
+                let mut edit = false;
+                let mut open = false;
+                let mut copy = false;
+                match key {
+                    Key::Named(NamedKey::Escape) => {
+                        self.overlay = None;
+                        if let Some(e) = self.tabs[self.active].explorer.as_mut() {
+                            e.focused = true;
+                        }
+                    }
+                    Key::Named(NamedKey::ArrowDown) => v.scroll_by(1),
+                    Key::Named(NamedKey::ArrowUp) => v.scroll_by(-1),
+                    Key::Named(NamedKey::ArrowRight) => v.scroll_side(4),
+                    Key::Named(NamedKey::ArrowLeft) => v.scroll_side(-4),
+                    Key::Named(NamedKey::PageDown) => v.scroll_by(20),
+                    Key::Named(NamedKey::PageUp) => v.scroll_by(-20),
+                    Key::Named(NamedKey::Home) => v.scroll = 0,
+                    Key::Named(NamedKey::End) => v.to_end(),
+                    Key::Character(c) => match c.as_str() {
+                        "j" => v.scroll_by(1),
+                        "k" => v.scroll_by(-1),
+                        "J" => v.scroll_by(20),
+                        "K" => v.scroll_by(-20),
+                        "l" => v.scroll_side(4),
+                        "h" => v.scroll_side(-4),
+                        "g" => v.scroll = 0,
+                        "G" => v.to_end(),
+                        "w" => v.wrap = !v.wrap,
+                        "e" => edit = true,
+                        "o" => open = true,
+                        "y" => copy = true,
+                        "q" => self.overlay = None,
+                        _ => {}
+                    },
+                    _ => {}
+                }
+                if edit {
+                    self.explorer_edit(path, config);
+                } else if open {
+                    self.overlay = None;
+                    self.explorer_xdg_open(path);
+                } else if copy {
+                    self.set_clipboard(path.display().to_string());
+                }
+            }
             Overlay::Palette(p) => match key {
                 Key::Named(NamedKey::Escape) => self.overlay = None,
                 Key::Named(NamedKey::ArrowUp) => p.up(),
@@ -2092,6 +2345,27 @@ impl Gpu {
             PromptKind::ConfirmQuit => {
                 self.save_session(config);
                 std::process::exit(0);
+            }
+            // The chooser for an executable text file. The path is the prompt's one
+            // suggestion; the answer is the verb.
+            PromptKind::ExplorerAction => {
+                let Some(path) = self.explorer_selected_path() else { return };
+                match value.as_str() {
+                    "view" => self.explorer_view(path),
+                    "edit" => self.explorer_edit(path, config),
+                    "run" => self.explorer_run(path, config),
+                    _ => self.explorer_xdg_open(path),
+                }
+            }
+            // Confirmed running something that runs. `value` is empty (a y/n
+            // confirm carries no text), so the path comes from the tree.
+            PromptKind::ExplorerRun => {
+                let Some(path) = self.explorer_selected_path() else { return };
+                if crate::explorer::is_desktop(&path) {
+                    self.explorer_xdg_open(path);
+                } else {
+                    self.explorer_run(path, config);
+                }
             }
             PromptKind::GuardedCommand => {
                 // Confirmed: submit the command that was held back. The line is

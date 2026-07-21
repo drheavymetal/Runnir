@@ -1109,6 +1109,15 @@ mod chord_roundtrip_tests {
             );
         }
         assert!(chord_to_key("not+a+key").is_none());
+
+        // A shifted letter has to arrive as the UPPERCASE character, because that is
+        // what a keyboard sends and what `"G"`-style arms match. Sending "g" with a
+        // shift modifier made every shifted letter do the unshifted thing.
+        let (key, mods) = chord_to_key("shift+g").unwrap();
+        assert_eq!(key, Key::Character("G".into()));
+        assert!(mods.shift_key());
+        let (key, _) = chord_to_key("shift+]").unwrap();
+        assert_eq!(key, Key::Character("]".into()), "punctuation is not upper-cased");
     }
 }
 
@@ -1121,6 +1130,13 @@ mod chord_roundtrip_tests {
 pub fn chord_to_key(spec: &str) -> Option<(Key, ModifiersState)> {
     let chord = Chord::parse(spec)?;
     let key = match chord.key {
+        // With shift held, a keyboard delivers the UPPERCASE character, and the
+        // handlers match on it (`"G"` is a different binding from `"g"`). Sending
+        // the lowercase one with a shift modifier is not what a hand produces, and
+        // every shifted letter would quietly do the unshifted thing.
+        ChordKey::Char(c) if chord.shift && c.is_alphabetic() => Key::Character(
+            winit::keyboard::SmolStr::new(c.to_uppercase().collect::<String>()),
+        ),
         ChordKey::Char(c) => Key::Character(winit::keyboard::SmolStr::new(c.to_string())),
         ChordKey::Named(id) => Key::Named(named_key(id)?),
     };

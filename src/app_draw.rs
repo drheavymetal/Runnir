@@ -662,7 +662,7 @@ impl Gpu {
         // Footer: what a key does here, or the last thing that happened.
         let foot = match &e.message {
             Some(m) => m.clone(),
-            None if e.focused => "enter open \u{b7} h l fold \u{b7} . hidden \u{b7} esc pane".to_string(),
+            None if e.focused => "enter open \u{b7} e edit \u{b7} o system \u{b7} . hidden \u{b7} esc".to_string(),
             None => format!("{} items \u{b7} leader e", e.rows.len()),
         };
         g.write_str(

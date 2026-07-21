@@ -1030,6 +1030,45 @@ Two bugs the remote control caught immediately, both invisible to the tests:
 Still to come, in the design's order: the viewer, `$EDITOR`, properties and
 operations, git badges and mtime sort, real images.
 
+## 2026-07-21 - File explorer: the viewer, $EDITOR, and what opening a file means
+
+Steps 2 and 3 of the design below. `Enter` on a file now does something, and what it
+does comes from what the file IS.
+
+**The type sniff is content, not name.** `kind_of` reads the first 8 KB: image by
+magic bytes (extension only as a fallback for headers it does not know), then binary
+if there is a NUL, else text. A log with no extension is text; a `.dat` may be too; a
+PNG called `.txt` is still a PNG. Tests pin all four.
+
+**The viewer is read-only and says so.** Text with line numbers, tabs expanded to
+4-column stops (the grid has no tab stops, so a raw `\t` eats every indented file's
+structure), horizontal scroll, and a limit of 4 MB with a line that SAYS it stopped.
+It reads at most the limit rather than checking the size first: `/proc` files report
+zero bytes and still have content worth reading. Images render as half-block art.
+
+**The image aspect bug worth remembering**: half-block art packs two vertical pixels
+per cell, so a cell is square in IMAGE terms — but not on screen, where a cell is
+10x22 px. Fitting by image aspect alone drew a square logo twice as tall as it was
+wide. The fit needs `cw/ch` passed in from where the cell size is known.
+
+**Nothing that runs is run by a keypress.** An executable text file raises a chooser
+(view / edit / run / open with the system) because a script is legitimately all of
+those; an executable binary or a `.desktop` file gets a y/n confirm naming what would
+launch, since `xdg-open` on those executes a handler and a cloned repo can carry one.
+`$EDITOR` and a chosen `run` go to the focused pane when it is at its prompt and to a
+split when it is busy — the same foreground-minus-shells predicate `confirm_close`
+uses — with the path shell-quoted.
+
+`xdg-open` is spawned detached with its output to `/dev/null` and reaped on a thread:
+nothing else waits on it, and an unreaped handler is a zombie for the life of the
+terminal.
+
+One more remote-control fidelity bug, found the same way as the last two:
+`chord_to_key` built `"g"` + SHIFT for `shift+g`, but a keyboard sends `"G"` and the
+handlers match on the character. Every shifted letter quietly did the unshifted
+thing. A scripted key has to be the key a hand produces, not the one the chord
+grammar names.
+
 ## DESIGN, NOT YET BUILT — the file explorer sidebar (decided 2026-07-21)
 
 Four sessions of design with Pedro, written down before any code so it is not
@@ -1186,6 +1225,8 @@ leader and descend into a group — each step asserted on the JSON that came bac
 
 ## Gotchas (do not re-learn)
 
+- Half-block art is square per CELL, not on screen. Any image fit needs the cell
+  aspect (`cw/ch`) or it comes out twice as tall as it should.
 - A scripted input path must mirror the real one's ORDER, not only its handlers.
   `press_key` had every handler and the wrong order, and a whole panel was unreachable.
 - Handlers that take a `winit::event::KeyEvent` cannot be called by anything but

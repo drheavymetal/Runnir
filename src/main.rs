@@ -101,6 +101,9 @@ pub enum UserEvent {
     /// tree generation that asked, the directory, and its entries. Off the UI
     /// thread because `read_dir` of a huge or networked directory drops frames.
     Explorer(usize, u64, PathBuf, Vec<explorer::Entry>),
+    /// A file the explorer asked to view, read on a worker: text, decoded image art,
+    /// or why it could not be shown.
+    FileRead(PathBuf, explorer::ViewRead),
 }
 
 fn main() {
@@ -1068,6 +1071,7 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::Explorer(tab, seq, dir, entries) => {
                 gpu.on_explorer_read(tab, seq, dir, entries)
             }
+            UserEvent::FileRead(path, read) => gpu.on_file_read(path, read),
             UserEvent::Git(root, state) => {
                 gpu.git_pending.remove(&root);
                 match state {

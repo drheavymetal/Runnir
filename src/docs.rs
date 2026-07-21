@@ -496,6 +496,25 @@ and it takes keys only while it has focus (Escape gives them back).
   h                 fold, or go to the parent    g G   top, bottom
   .                 hidden files    r  reread the tree
   y                 copy the path   Esc or q     back to the pane
+  Enter on a file   open it        e  $EDITOR    o  the desktop's handler
+
+What Enter does depends on what the file IS, decided by its bytes and not by its
+name: an image opens in the viewer, text opens in the viewer, and a binary says so
+rather than being shown as mojibake. The viewer is read-only on purpose — runnir is
+a terminal, so its editor is whatever runs in a pane.
+
+  In the viewer: j k J K scroll, h l sideways, g G ends, e $EDITOR, o the desktop,
+  y copy the path, Esc back to the tree.
+
+$EDITOR (and a script you choose to run) goes to the focused pane when it is sitting
+at its prompt and to a new split when something is already running there, with the
+path shell-quoted.
+
+Nothing that RUNS is ever run by one keypress. An executable text file — a script —
+is three things at once, so Enter asks which: view, edit, run, or hand it to the
+system. An executable binary or a .desktop file has no default action at all: it
+asks first, naming what would be launched, because xdg-open on those executes a
+handler and a cloned repository can carry one.
 
 The root is the git repository of the focused pane's directory, or that directory
 when it is not a repo. It follows the shell into another REPOSITORY, not into every
