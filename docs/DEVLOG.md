@@ -992,6 +992,94 @@ which renders the real `GitPanel` over the real repository through the same
 `overlay.render` the app uses — a three-column layout cannot be checked from a unit
 test, and this cannot drift from what the app draws.
 
+## DESIGN, NOT YET BUILT — the file explorer sidebar (decided 2026-07-21)
+
+Four sessions of design with Pedro, written down before any code so it is not
+re-litigated from zero next time. Rewrite this section as a normal entry once built.
+
+**What it is.** A VS Code-style file explorer: a persistent sidebar with a tree,
+opening a file to view or edit, and changing its properties (rename, permissions,
+delete). NOT a `cd`-the-shell navigator, and NOT a "what is Claude touching now"
+activity feed — both were considered and rejected as the framing. The activity view
+survives as a *sort mode* (by mtime) plus git badges on the rows, not as its own
+feature.
+
+**Decided, with the reasoning that produced it:**
+
+- **Chrome, not an `Overlay`.** An overlay captures input by design and covers the
+  pane; this sidebar has to stay up while you work in the pane beside it. Same call
+  the hints layer already makes.
+- **Not a `Pane` either.** `Pane` owns a non-optional `pty: Pty`; making it an enum
+  to hold a non-PTY widget would touch everything. Unnecessary: `Tab::reflow(area)`
+  already takes the area, so the sidebar simply reserves columns out of it and the
+  whole layout tree is untouched.
+- **Per tab**, state on `Tab`.
+- **Root = the git root of the focused pane's cwd**, falling back to the cwd when
+  that is not a repo. Re-anchored **only when the git root changes**, never on every
+  `cd`: re-anchoring per `cd` collapses the tree while you navigate inside one repo.
+- **No built-in editor.** In VS Code the explorer opens VS Code's editor because
+  VS Code *is* the editor; runnir is a terminal, so its editor is whatever runs in a
+  pane. `Enter` opens a built-in read-only viewer, `e` runs `$EDITOR <path>`. A real
+  editor (undo, encodings, huge files, LSP) is a bigger project than the sidebar and
+  would compete with neovim forever.
+- **Where `$EDITOR` lands**: reuse the focused pane when it sits at its prompt, split
+  when something is already running in it — the same foreground-process-minus-shells
+  predicate `confirm_close` uses. Prefer the OSC 133 prompt state over the foreground
+  process where marks are available.
+- **Opening by type**: image → the inline viewer (this is what makes the panel worth
+  the inline-image work); text → viewer/`$EDITOR`; anything else → `xdg-open`, with
+  `o` forcing `xdg-open` for any file. Text vs binary is decided by **content** (NUL
+  bytes in the first 8 KB), not by extension.
+- **An executable is never opened on a single keypress; it asks.** Two cases, and they
+  are not the same question:
+  - *Executable text* (a `.sh`, a shebang) is legitimately three things — read it,
+    edit it, run it — and the panel must let you **pick**, not guess. `Enter` raises a
+    chooser: view / edit / run / xdg-open. Running goes to the focused pane when it is
+    at its prompt and to a new split otherwise, the same rule as `$EDITOR`, with the
+    path shell-quoted.
+  - *Executable binary* (ELF) and `.desktop` files: no default action at all. A
+    confirm that names exactly what would be launched, because `xdg-open` on them
+    **executes a handler** and a cloned repo can carry one.
+- **Left by default, `explorer.side` in config** — and the setting must be read by
+  code AND shown in the settings panel. All three or none.
+- **Width in columns** (default 30, clamped `[18, 40% of the window]`), not a
+  fraction: a fraction on an ultrawide gives a 90-column tree. Resizable by mouse
+  (divider drag, same tolerance as `Layout::divider_at`) and by `H`/`L` when the
+  sidebar has focus. Reflow **on release**, with a preview line while dragging: a
+  reflow per frame resizes the PTY per frame and TUIs do not survive it.
+- **Keys**: `<leader>e` toggles and focuses (the letter is free, and it is LazyVim's),
+  symmetric with `<leader>g` for git. Inside: `j/k` move, `h/l` fold, `Enter` view,
+  `e` edit, `o` xdg-open, `p` properties, `a` create, `r` rename, `d` delete, `y` copy
+  path, `s` sort, `.` hidden, `I` ignore, `Esc` back to the pane.
+
+**Traps identified up front:**
+
+- Directory reads go on a thread with a `seq`, like the git panel. A synchronous
+  `read_dir` of `node_modules` or an NFS mount freezes the frame.
+- Cap children per directory (~2000) with a visible `… N more` row. Never a silent cap.
+- Do not follow symlinked directories when expanding — cycles.
+- `chmod` on a symlink acts on its target. Say so in the UI.
+- Deleting a non-empty directory or a recursive `chmod` confirms while **counting the
+  affected files**, and Enter is not a yes.
+- The path handed to `$EDITOR` through the PTY must be shell-quoted: a filename with
+  a space or a `$` otherwise injects into the user's shell.
+- `xdg-open` must be spawned detached with stdout/stderr to `/dev/null` and reaped,
+  and it fails silently (or hangs) over SSH or with no portal — needs a timeout and a
+  message. It also **executes a handler**: never open a `.desktop` file or an
+  executable automatically (see the chooser above), confirm and show what would launch.
+- The executable bit is not a file *type*. A script is text AND runnable, so the type
+  sniff (`is_image` / `is_text` / else) and the permission check are two independent
+  questions; collapsing them into one match arm loses the "edit this script" case.
+- Persistence has to pick one of `session.rs` (`data_dir()`) or `project_session.rs`
+  (`config_dir()`); they disagree on the directory (see Gotchas). Store only width and
+  open/closed until they agree.
+- Real images inside the sidebar need `prepare_images` (`render.rs`) to walk overlay
+  grids too, not only panes. `Grid::place_image` already exists; half-block art
+  (`media.rs`) is the tier-1 fallback that works today.
+
+Build order: sidebar+tree+focus → viewer → `$EDITOR` → properties+ops → git badges and
+mtime sort → real images. Roughly 1300 lines; the first two steps are usable alone.
+
 ## Gotchas (do not re-learn)
 
 - Two accessors that switch meaning by mode (`len()` = list OR commit files) will
