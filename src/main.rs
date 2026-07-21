@@ -495,6 +495,11 @@ struct Gpu {
     active: usize,
     next_pane_seed: u64,
     overlay: Option<Overlay>,
+    /// The overlay the close confirm displaced, put back when the confirm is
+    /// dismissed. The question has to be asked over whatever is up — it is about
+    /// the whole window — but answering "no" must leave the screen as it was, with
+    /// a half-typed prompt or a mid-edit settings panel still there.
+    overlay_under_confirm: Option<Overlay>,
     /// Tabs closed this session, most recent last, so `ReopenClosed` can bring the
     /// last one back with its layout and scrollback.
     closed_tabs: Vec<session::TabState>,
@@ -817,6 +822,7 @@ impl App {
             active,
             next_pane_seed: next_seed,
             overlay: None,
+            overlay_under_confirm: None,
             closed_tabs: Vec::new(),
             cursor_px: PhysicalPosition::new(0.0, 0.0),
             clipboard: clipboard::Clipboard::new(),

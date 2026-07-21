@@ -49,6 +49,11 @@ impl Gpu {
         } else {
             format!("Close runnir? {} commands are still running", running.len())
         };
+        // Asked over whatever else is open — the question is about the window, not
+        // about that overlay — but the displaced one is kept rather than dropped:
+        // answering "no" has to leave the screen as it was, and a settings panel
+        // mid-edit or a half-typed prompt is work too.
+        self.overlay_under_confirm = self.overlay.take();
         self.overlay = Some(Overlay::Prompt(Prompt::new(
             PromptKind::ConfirmQuit,
             &label,
@@ -56,6 +61,11 @@ impl Gpu {
         )));
         self.window.request_redraw();
         false
+    }
+
+    /// Puts a confirm away, restoring whatever it was asked over.
+    fn dismiss_confirm(&mut self) {
+        self.overlay = self.overlay_under_confirm.take();
     }
 
     fn on_wheel(&mut self, delta: MouseScrollDelta, config: &Config, mods: ModifiersState) {
@@ -929,13 +939,14 @@ impl Gpu {
             Overlay::Prompt(p) if p.kind.is_confirm() => {
                 let kind = p.kind;
                 match key {
-                    Key::Named(NamedKey::Escape) => self.overlay = None,
+                    Key::Named(NamedKey::Escape) => self.dismiss_confirm(),
                     Key::Character(s) => match s.to_lowercase().as_str() {
                         "y" => {
                             self.overlay = None;
+                            self.overlay_under_confirm = None;
                             self.confirm_prompt(kind, String::new(), config);
                         }
-                        "n" | "q" => self.overlay = None,
+                        "n" | "q" => self.dismiss_confirm(),
                         _ => {}
                     },
                     _ => {}
@@ -2153,6 +2164,18 @@ impl Gpu {
         matches!(p.hit(cols, rows, col, row), Some(crate::overlay::GitHit::FileRow(_)))
     }
 
+    /// Drops the column-resize pointer once the panel that owned it is gone.
+    ///
+    /// The pointer is otherwise only reconciled on motion, so closing the panel with
+    /// `q` while hovering a separator left the resize arrow over the terminal until
+    /// the mouse happened to move.
+    fn sync_git_cursor(&mut self) {
+        if self.git_over_split && !matches!(self.overlay, Some(Overlay::Git(_))) {
+            self.git_over_split = false;
+            self.window.set_cursor(winit::window::CursorIcon::Default);
+        }
+    }
+
     /// Drags a column separator to the pointer. Called from the motion handler for
     /// as long as the button is down, exactly like a pane divider.
     fn git_drag_split(&mut self, pos: PhysicalPosition<f64>) {
@@ -2174,16 +2197,14 @@ impl Gpu {
         let Some(hit) = p.hit(cols, rows, col, row) else {
             // Outside the panel entirely reads as "put this away".
             self.overlay = None;
+            self.sync_git_cursor();
             self.window.request_redraw();
             return;
         };
         let mut activate = false;
         let mut zoom = false;
         match hit {
-            crate::overlay::GitHit::View(v) => {
-                p.leave_commit();
-                p.set_view(v);
-            }
+            crate::overlay::GitHit::View(v) => p.set_view(v),
             crate::overlay::GitHit::Row(i) => {
                 if i >= p.len() {
                     return;
@@ -2246,8 +2267,12 @@ impl Gpu {
         if p.rebase.is_some() {
             return false;
         }
-        // Armed by the configured leader chord, so rebinding it rebinds this too.
-        let is_leader = match (Chord::parse(&config.leader), Chord::from_event(&event.logical_key, mods)) {
+        // Armed by the configured leader chord, so rebinding it rebinds this too —
+        // resolved through `leader_chord`, the same fallback the global layer uses.
+        // Parsing it raw here left an unparseable value with a working global layer
+        // and an unreachable panel one.
+        let configured = crate::actions::leader_chord(&config.leader);
+        let is_leader = match (configured, Chord::from_event(&event.logical_key, mods)) {
             (Some(l), Some(c)) => l == c,
             _ => false,
         };
@@ -2262,6 +2287,15 @@ impl Gpu {
             return true;
         }
         if p.leader.is_none() {
+            return false;
+        }
+        // A character held with ctrl/alt/super is a shortcut attempt, not a choice
+        // on this layer: Ctrl+C with the menu up must not descend into Commit. This
+        // runs before `overlay_key`'s own modifier filter, so it has to repeat it —
+        // and it has to come after the leader chord, which is a modifier chord.
+        if matches!(event.logical_key, Key::Character(_))
+            && (mods.control_key() || mods.alt_key() || mods.super_key())
+        {
             return false;
         }
         let press = match &event.logical_key {
@@ -2292,17 +2326,17 @@ impl Gpu {
         match press {
             crate::overlay::GitPress::View(v) => {
                 if let Some(Overlay::Git(p)) = &mut self.overlay {
-                    p.leave_commit();
                     p.set_view(v);
                 }
                 self.git_preview();
                 self.window.request_redraw();
             }
-            GitPress::Key(k) | GitPress::In(_, k) => self.git_panel_key(&as_key(k), config),
+            GitPress::Key(k) | GitPress::In(_, k) | GitPress::InDiff(k) => {
+                self.git_panel_key(&as_key(k), config)
+            }
             GitPress::Then(v, k) => {
                 if let Some(Overlay::Git(p)) = &mut self.overlay {
                     if p.view != v {
-                        p.leave_commit();
                         p.set_view(v);
                     }
                 }
@@ -2469,10 +2503,17 @@ impl Gpu {
                     p.blame = rows;
                     preview = true;
                 }
+                // Guarded like the preview, and for a worse failure than a stale
+                // diff: a slow commit's file list landing under a different sha
+                // makes every preview after it ask that commit for a path it does
+                // not have. A list for a commit that has since been closed is
+                // dropped outright, or it would repopulate a column nobody opened.
                 crate::git::PanelMsg::CommitFiles(f) => {
-                    p.commit_files = f;
-                    p.commit_cursor = 0;
-                    preview = true;
+                    if seq == current && p.in_commit() {
+                        p.commit_files = f;
+                        p.commit_cursor = 0;
+                        preview = true;
+                    }
                 }
                 crate::git::PanelMsg::Tags(t) => p.tags = t,
                 crate::git::PanelMsg::Reflog(r) => p.reflog = r,
@@ -2549,17 +2590,11 @@ impl Gpu {
             // Escape backs out of an open commit before it closes the panel: the
             // drill-down is a place you are in, not a mode you toggled.
             Key::Named(NamedKey::Escape) => {
-                // Peel one layer at a time: the zoom, then the diff focus, then an
-                // open commit, then the blame view, and only then the panel itself.
-                if p.zoom {
-                    // Back to the columns, in the one that chose this file.
-                    p.zoom = false;
-                    p.focus = if p.in_commit() {
-                        crate::overlay::GitFocus::Files
-                    } else {
-                        crate::overlay::GitFocus::List
-                    };
-                } else if p.diff_focus() {
+                // Peel one layer at a time: the zoom and the diff focus (both undone
+                // by `leave_diff`, which puts the keyboard back in the column that
+                // chose this file), then an open commit, then the blame view, and
+                // only then the panel itself.
+                if p.zoom || p.diff_focus() {
                     p.leave_diff();
                 } else if p.leave_commit() {
                     moved = true;
@@ -2574,6 +2609,11 @@ impl Gpu {
                 p.cycle_view();
                 moved = true;
             }
+            // The arrows are j/k, focus guard included: with the diff focused they
+            // walk the DIFF. Moving the list from there would drop the zoom, close
+            // the commit and change the selection, all on one keypress.
+            Key::Named(NamedKey::ArrowDown) if p.diff_focus() => p.step_diff(1),
+            Key::Named(NamedKey::ArrowUp) if p.diff_focus() => p.step_diff(-1),
             Key::Named(NamedKey::ArrowDown) => {
                 p.down();
                 moved = true;
@@ -2596,6 +2636,11 @@ impl Gpu {
             }
             Key::Named(NamedKey::PageDown) => p.scroll_preview(10),
             Key::Named(NamedKey::PageUp) => p.scroll_preview(-10),
+            // Zoomed, Enter is the way back, exactly like Escape. It cannot mean
+            // anything else: the columns the other Enter arms act on are the ones
+            // the zoom hid, and zooming leaves the keyboard in the diff, so without
+            // this Enter re-entered the commit it was already reading.
+            Key::Named(NamedKey::Enter) if p.zoom => p.leave_diff(),
             // In the open commit's file column, Enter opens that file's diff full
             // width. The columns are for finding the change; reading it wants the
             // width back, and Escape brings the columns straight back.
@@ -2911,6 +2956,7 @@ impl Gpu {
         } else if moved {
             self.git_preview();
         }
+        self.sync_git_cursor();
         self.window.request_redraw();
     }
 
@@ -3806,7 +3852,7 @@ fn is_shell(name: &str) -> bool {
     matches!(
         name,
         "sh" | "bash" | "zsh" | "fish" | "dash" | "ksh" | "csh" | "tcsh" | "nu" | "elvish"
-            | "xonsh" | "ash" | "busybox"
+            | "xonsh" | "ash" | "busybox" | "pwsh" | "powershell" | "ion" | "osh"
     )
 }
 

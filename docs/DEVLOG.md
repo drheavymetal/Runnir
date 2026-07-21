@@ -1080,8 +1080,45 @@ feature.
 Build order: sidebar+tree+focus → viewer → `$EDITOR` → properties+ops → git badges and
 mtime sort → real images. Roughly 1300 lines; the first two steps are usable alone.
 
+## 2026-07-21 - Bug audit of the two commits above (Fable found, Opus fixed)
+
+A read-only agent audited `657c7e9` + `b86227d` and found 11 real bugs; a second
+agent fixed them. No panics: every `clamp` in `layout` was safe because each max
+argument carried its own `.max(MIN_COL)`. What it did find was state desync.
+
+Four mattered. **Switching view by keyboard** (`1`..`7`, Tab) left the open commit
+and the zoom attached to the view you left — the mouse and leader paths called
+`leave_commit()` first and the keyboard did not, so the rule moved INTO `set_view`
+and the three call sites lost their copy. **`PanelMsg::CommitFiles` had no
+generation guard** (`Preview`, three lines below it, did): a slow commit's file list
+landed under another sha and every preview after it asked that commit for a path it
+does not have. **The arrows moved the list from inside the diff** (`j`/`k` were
+guarded, the arrows were not), so one arrow in a zoom dropped the zoom, closed the
+commit and moved the log. **Enter while zoomed re-drilled the commit** it was already
+reading, ending with `zoom` set and the keyboard on an invisible column, because
+`toggle_zoom` goes through `enter_diff` and leaves the focus on `Diff`, not `Files`.
+
+The rest: a leader entry (`d v`) that pressed a key only bound with the diff focused
+(new `GitPress::InDiff`, since `leader_applies` only knew about views); Ctrl+C
+descending into the Commit group, because the panel's leader runs BEFORE
+`overlay_key`'s modifier filter and has to repeat it; `config.leader` parsed raw in
+the panel while `Keymap` falls back to the default, so a typo left a working global
+layer and an unreachable panel one (now both go through `actions::leader_chord`);
+three columns each under their minimum below ~52 cols (the file column is dropped
+instead); the `ColResize` pointer outliving the panel; `is_shell` missing pwsh and
+friends; and the close confirm destroying the overlay it was asked over — it now
+stashes it and puts it back on "no".
+
+The split is the point: one agent that may only READ and must verify each claim in
+the source, then a second that fixes with the list in hand. The finder cannot talk
+itself into its own fix.
+
 ## Gotchas (do not re-learn)
 
+- One guard on `j`/`k` is half a guard: the arrows are the same motion and get
+  reached by reflex. Bind them in the same arm or they will diverge.
+- A worker message that mutates panel state needs the SAME `seq == current` guard the
+  preview has. Anything slower than the user is a race.
 - Two accessors that switch meaning by mode (`len()` = list OR commit files) will
   eventually be read in the wrong mode. Give the second thing its own pair.
 - A setting that exists in `config.rs` and in the settings panel is NOT a feature.

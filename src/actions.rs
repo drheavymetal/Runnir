@@ -625,6 +625,20 @@ pub const DEFAULT_LEADER: &str = "alt+shift+space";
 /// Prefix marking a user binding as living on the leader layer: `"leader+v"`.
 const LEADER_PREFIX: &str = "leader+";
 
+/// The chord that arms the leader layer for a config value: none when it is empty
+/// (which is how the layer is turned off, rather than binding some fallback chord
+/// the user never asked for), the default when it does not parse.
+///
+/// Shared with the git panel's own leader, which cannot see the `Keymap` and has to
+/// resolve the same value the same way — parsing it raw there left a typo with a
+/// working global layer and an unreachable panel one.
+pub fn leader_chord(spec: &str) -> Option<Chord> {
+    if spec.trim().is_empty() {
+        return None;
+    }
+    Chord::parse(spec).or_else(|| Chord::parse(DEFAULT_LEADER))
+}
+
 /// User chords resolved against the built-in defaults.
 pub struct Keymap {
     bindings: HashMap<Chord, Action>,
@@ -664,16 +678,13 @@ impl Keymap {
                 },
             }
         }
-        // An empty leader spec disables the layer rather than binding some fallback
-        // chord the user never asked for.
-        let leader = if leader.trim().is_empty() {
-            None
-        } else {
-            Chord::parse(leader).or_else(|| {
-                eprintln!("runnir: unparseable leader key {leader:?}, using {DEFAULT_LEADER}");
-                Chord::parse(DEFAULT_LEADER)
-            })
-        };
+        // The warning belongs here and not in `leader_chord`: the git panel resolves
+        // the same value on every keypress, and a fallback that printed there would
+        // print for as long as the panel is open.
+        if !leader.trim().is_empty() && Chord::parse(leader).is_none() {
+            eprintln!("runnir: unparseable leader key {leader:?}, using {DEFAULT_LEADER}");
+        }
+        let leader = leader_chord(leader);
         Self { bindings, leader, leader_bindings }
     }
 

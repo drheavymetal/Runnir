@@ -320,6 +320,7 @@ impl GitPanel {
     fn leader_applies(&self, press: GitPress) -> bool {
         match press {
             GitPress::In(v, _) => self.view == v && !self.in_commit(),
+            GitPress::InDiff(_) => self.diff_focus(),
             _ => true,
         }
     }
@@ -408,7 +409,12 @@ impl GitPanel {
             return base;
         }
         let at = |f: f32| (w as f32 * f).round() as usize;
-        if !self.in_commit() {
+        // Three columns need room for both minimums plus the diff's; a window too
+        // narrow for that drops the FILE column rather than drawing three columns
+        // that are each less than the panel promises. The commit stays open — only
+        // its column is gone, and the diff it feeds is still what you came to read.
+        let three = self.in_commit() && w >= MIN_COL * 2 + MIN_DIFF + 4;
+        if !three {
             // Two columns: one separator, and the diff takes the rest.
             let list_w = at(self.split[0]).clamp(MIN_COL, w.saturating_sub(MIN_DIFF + 2).max(MIN_COL));
             return GitLayout { list_w, ..base };
@@ -483,6 +489,9 @@ impl GitPanel {
         self.commit_files.clear();
         self.commit_cursor = 0;
         self.preview_scroll = 0;
+        // A zoom carried in from the previous selection would hide the very column
+        // this opens, and the keyboard would be driving one nobody can see.
+        self.zoom = false;
         self.focus = GitFocus::Files;
     }
 
@@ -596,11 +605,15 @@ impl GitPanel {
     }
 
     pub fn cycle_view(&mut self) {
-        self.view = self.view.next();
-        self.preview_scroll = 0;
+        self.set_view(self.view.next());
     }
 
+    /// Switches view, which also leaves any open commit — its file column and the
+    /// zoom over one of its files belong to a list that is no longer on screen.
+    /// Done here rather than at every call site: the keyboard paths used to switch
+    /// bare and left the columns attached to the wrong view.
     pub fn set_view(&mut self, v: GitView) {
+        self.leave_commit();
         self.view = v;
         self.preview_scroll = 0;
     }
@@ -1311,6 +1324,10 @@ pub enum GitPress {
     /// Only offered while that view is up, because it acts on ITS selection:
     /// "merge this branch" means nothing from the stash list.
     In(GitView, GitKey),
+    /// Only offered while the keyboard is in the DIFF column, because that is the
+    /// only place the panel binds it. A view is not enough of a guard for these:
+    /// `v` anchors a line selection and is ignored from a list column.
+    InDiff(GitKey),
     /// Go to a view and stop, so the next choice is made looking at it.
     View(GitView),
 }
@@ -1331,7 +1348,7 @@ const fn leaf(key: char, title: &'static str, press: GitPress) -> GitEntry {
 }
 
 use GitKey::{Ch, Enter as En, Space as Sp};
-use GitPress::{In, Key, Then, View};
+use GitPress::{In, InDiff, Key, Then, View};
 
 /// The panel's leader tree: the nouns at the root, the verbs under them.
 ///
@@ -1361,7 +1378,7 @@ pub static GIT_LEADER: &[GitEntry] = &[
             leaf(']', "next hunk", Key(Ch(']'))),
             leaf('[', "previous hunk", Key(Ch('['))),
             leaf('l', "line cursor in the diff", In(GitView::Status, Ch('l'))),
-            leaf('v', "start a line selection", In(GitView::Status, Ch('v'))),
+            leaf('v', "start a line selection", InDiff(Ch('v'))),
             leaf('s', "stage hunk / lines", In(GitView::Status, Ch('s'))),
             leaf('u', "unstage hunk / lines", In(GitView::Status, Ch('u'))),
             leaf('t', "staged or worktree", In(GitView::Status, Ch('t'))),
@@ -2966,7 +2983,10 @@ mod tests {
         for (key, press) in leaves {
             let k = match press {
                 GitPress::View(_) => continue,
-                GitPress::Key(k) | GitPress::Then(_, k) | GitPress::In(_, k) => k,
+                GitPress::Key(k)
+                | GitPress::Then(_, k)
+                | GitPress::In(_, k)
+                | GitPress::InDiff(k) => k,
             };
             if let GitKey::Ch(c) = k {
                 assert!(BOUND.contains(c), "leader {key:?} presses {c:?}, which the panel ignores");
@@ -2991,6 +3011,146 @@ mod tests {
         p.down();
         assert!(!p.in_commit(), "the log moved: those files were the other commit's");
         assert_eq!(p.focus, GitFocus::List);
+    }
+
+    /// A panel with one commit open on one file, its diff loaded and zoomed.
+    fn zoomed_on_a_commit_file() -> GitPanel {
+        use crate::git::FileEntry;
+        let mut p = GitPanel::new(std::path::PathBuf::from("/tmp/repo"));
+        p.view = GitView::Log;
+        p.log = (0..5)
+            .map(|i| crate::git::Commit { sha: format!("sha{i}"), ..Default::default() })
+            .collect();
+        p.enter_commit("sha0".into());
+        p.commit_files = vec![FileEntry { path: "a.rs".into(), index: 'M', worktree: '.' }];
+        p.set_preview("diff --git a/x b/x\n@@ -1 +1,2 @@\n one\n+two\n".into());
+        p.toggle_zoom();
+        p
+    }
+
+    #[test]
+    fn switching_view_takes_the_open_commit_and_its_zoom_with_it() {
+        let mut p = zoomed_on_a_commit_file();
+        assert!(p.zoom && p.in_commit());
+
+        // The keyboard paths (1..7 and Tab) used to switch bare, which left a
+        // commit from the log open beside the status list, zoom and all.
+        p.set_view(GitView::Status);
+        assert!(!p.in_commit(), "the commit belonged to the view we left");
+        assert!(!p.zoom, "and so did the zoom over one of its files");
+        assert!(p.commit_files.is_empty());
+        assert_eq!(p.focus, GitFocus::List);
+
+        let mut p = zoomed_on_a_commit_file();
+        p.cycle_view();
+        assert!(!p.in_commit() && !p.zoom, "Tab is the same switch");
+        assert_eq!(p.focus, GitFocus::List);
+    }
+
+    #[test]
+    fn leaving_a_zoomed_diff_lands_in_the_column_that_chose_it() {
+        let mut p = zoomed_on_a_commit_file();
+        assert!(p.diff_focus(), "zoom hands the keyboard to the diff");
+
+        // What Escape does from a zoom, and what Enter has to do too: Enter used to
+        // fall through to the Log arm and re-enter the commit it was reading, ending
+        // full width with the keyboard driving a column that is not on screen.
+        p.leave_diff();
+        assert!(!p.zoom);
+        assert!(p.in_commit(), "backing out of the zoom is not backing out of the commit");
+        assert_eq!(p.focus, GitFocus::Files);
+
+        // With no commit open, the column that chose the file is the list.
+        p.leave_commit();
+        p.toggle_zoom();
+        p.leave_diff();
+        assert!(!p.zoom);
+        assert_eq!(p.focus, GitFocus::List);
+
+        // A commit opened while a zoom is still set does not inherit it: the zoom
+        // hides the very column being opened.
+        p.zoom = true;
+        p.enter_commit("sha1".into());
+        assert!(!p.zoom);
+        assert_eq!(p.focus, GitFocus::Files);
+    }
+
+    #[test]
+    fn the_focused_diff_is_what_a_step_moves() {
+        let mut p = zoomed_on_a_commit_file();
+        assert!(p.diff_focus());
+        p.step_diff(1);
+        assert!(p.zoom && p.in_commit(), "stepping the diff leaves the columns alone");
+
+        // `down()` does not consult the focus for the list: it moves the list from
+        // anywhere but the file column. That is why j/k and the arrows are both
+        // guarded on `diff_focus()` — one unguarded arrow drops the zoom, closes the
+        // commit and moves the log, all at once.
+        p.down();
+        assert!(!p.in_commit() && !p.zoom, "the list moved, and took the rest with it");
+    }
+
+    #[test]
+    fn no_column_is_ever_drawn_narrower_than_its_minimum() {
+        use crate::git::FileEntry;
+        let file = |n: &str| FileEntry { path: n.into(), index: 'M', worktree: '.' };
+        let mut p = GitPanel::new(std::path::PathBuf::from("/tmp/repo"));
+        p.files = vec![file("a.rs")];
+        let check = |p: &GitPanel, cols: usize| {
+            let l = p.layout(cols, 40);
+            assert!(l.list_w >= MIN_COL, "list {} at {cols} cols", l.list_w);
+            assert!(l.files_w == 0 || l.files_w >= MIN_COL, "files {} at {cols}", l.files_w);
+            assert!(l.prev_w() >= MIN_DIFF, "diff {} at {cols} cols", l.prev_w());
+            l
+        };
+        for cols in 20..=200 {
+            assert_eq!(check(&p, cols).files_w, 0, "no commit open, no file column");
+        }
+
+        // Three columns, at every width and wherever the separators were dragged to.
+        p.enter_commit("abc1234".into());
+        p.commit_files = vec![file("a.rs")];
+        for cols in 20..=200 {
+            for first in [0.05f32, 0.2, 0.34, 0.6, 0.95] {
+                p.split = [first, (first + 0.24).min(0.95)];
+                check(&p, cols);
+            }
+        }
+
+        // Too narrow for three, the FILE column is the one that goes: the diff is
+        // what the panel promises, and 12 + 12 + 20 plus the rules does not fit.
+        p.split = [0.34, 0.58];
+        assert_eq!(p.layout(51, 40).files_w, 0, "three would each be under their minimum");
+        assert!(p.layout(52, 40).files_w >= MIN_COL, "and the first width that fits draws it");
+    }
+
+    #[test]
+    fn the_diff_group_offers_the_line_selection_only_where_it_works() {
+        let mut p = GitPanel::new(std::path::PathBuf::from("/tmp/repo"));
+        p.view = GitView::Status;
+        p.arm_leader();
+        p.leader_key('d');
+        let from_list = p.leader_entries();
+        assert!(
+            !from_list.iter().any(|(k, _, _)| k == "v"),
+            "`v` is bound only inside the diff: {from_list:?}"
+        );
+        assert!(
+            from_list.iter().any(|(k, _, _)| k == "l"),
+            "the way into the diff is what this column can do: {from_list:?}"
+        );
+        assert_eq!(p.leader_key('v'), None, "pressing it anyway ends the sequence");
+
+        p.set_preview("diff --git a/x b/x\n@@ -1 +1,2 @@\n one\n+two\n".into());
+        p.enter_diff();
+        p.arm_leader();
+        p.leader_key('d');
+        let from_diff = p.leader_entries();
+        assert!(
+            from_diff.iter().any(|(k, _, _)| k == "v"),
+            "with the diff focused it is a real verb: {from_diff:?}"
+        );
+        assert_eq!(p.leader_key('v'), Some(GitPress::InDiff(GitKey::Ch('v'))));
     }
 
     #[test]
