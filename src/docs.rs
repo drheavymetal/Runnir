@@ -300,8 +300,11 @@ status   space stages or unstages the file, a stages everything, ] [ pick a hunk
          v starts a selection, and s and u stage or unstage EXACTLY those lines -
          the working tree never moves, only the index. A blue bar marks the
          selection and an arrow the line under the cursor.
-log      drawn with the branch graph down the left. Enter opens the commit's
-         FILES, and picking one shows just that file's diff - Escape goes back.
+log      drawn with the branch graph down the left. Enter opens the commit's FILES
+         in a THIRD column beside the log, and the file selected there is the diff
+         on the right. h and l walk the columns, Enter on a file gives it the whole
+         panel, Escape backs out one step at a time. Moving the log closes the file
+         column, since those files were the other commit's.
          x checks the commit out, c cherry-picks it, o opens it in a split,
          / filters by message, i plans an interactive rebase of everything above
          the selected commit.
@@ -326,6 +329,19 @@ The mouse works too: click a view name to switch to it, click a row to select it
 click it again to open it, click a line of the diff to pick that hunk, and the
 wheel moves the selection over the list or scrolls the diff over the diff. A click
 outside the panel closes it.
+
+Drag the rule between two columns to resize them; the pointer turns into a resize
+cursor over one. The widths are kept while the panel is open, and no column can be
+dragged to nothing.
+
+z gives the selected file's diff the whole panel and takes it back - the columns
+find the change, the width reads it. Escape leaves the zoom before it leaves
+anything else.
+
+The leader key opens a menu INSIDE the panel: the same which-key, but of git verbs
+(f file, d diff, c commit, b branch, s stash, t tag, r remote, v view). It only
+offers what the view you are in can actually do, and every entry presses a key the
+panel already has, so the letters and the menu can never mean different things.
 
 Every key acts at once, with no confirmation, so nothing that can lose uncommitted
 work is bound here at all - no reset --hard, no clean, no discard, no stash drop,

@@ -127,6 +127,12 @@ fn main() {
             // for: "" is the root, "t" the tabs group, and so on. Without it the
             // scene is the plain multi-pane one with the palette open.
             return match args.get(3).map(String::as_str) {
+                // `git[:state]` draws the git panel over a real repository (the cwd)
+                // instead of the leader layer, so its three columns can be looked at
+                // without driving a window.
+                Some(s) if s.starts_with("git") => {
+                    git_scene(path, s.strip_prefix("git:").unwrap_or(""))
+                }
                 Some(level) => leader_scene(path, level),
                 None => demo_scene(path),
             };
@@ -250,6 +256,73 @@ fn demo_scene(path: &str) {
             .collect();
 
         (panes, Some(overlay_specs))
+    });
+}
+
+/// Renders the git panel over the repository in the current directory, exactly as
+/// the app draws it — same layout, same hit geometry, same data.
+///
+/// `state` picks what to show: `""` the log, `commit` a commit open with its file
+/// column, `zoom` one file full width, `leader` the panel's menu, `leader f` one of
+/// its groups. Used to look at the panel without driving a window, which is the
+/// only way to check a three-column layout in a test run.
+fn git_scene(path_out: &str, state: &str) {
+    use crate::render::Rect;
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let Some(root) = git::repo_root(&cwd) else {
+        eprintln!("runnir: --demo git needs to run inside a git repository");
+        return;
+    };
+    let mut p = overlay::GitPanel::new(root.clone());
+    p.log = git::log(&root, 60);
+    p.files = git::status_files(&root);
+    p.current_branch = git::head_branch(&root).unwrap_or_default();
+    p.set_view(overlay::GitView::Log);
+
+    let (want_commit, want_zoom) = (state.starts_with("commit"), state.starts_with("zoom"));
+    if want_commit || want_zoom {
+        // The newest commit that actually has a sha (graph-art rows do not).
+        if let Some(sha) = p.log.iter().find(|c| !c.sha.is_empty()).map(|c| c.sha.clone()) {
+            p.commit_files = git::commit_files(&root, &sha);
+            p.enter_commit(sha.clone());
+            p.commit_files = git::commit_files(&root, &sha);
+            if let Some(f) = p.selected_commit_file().map(|f| f.path.clone()) {
+                p.set_preview(git::show_file(&root, &sha, &f));
+            }
+            if want_zoom {
+                p.toggle_zoom();
+            }
+        }
+    } else if let Some(sha) = p.log.first().map(|c| c.sha.clone()) {
+        p.set_preview(git::show(&root, &sha));
+    }
+    if let Some(rest) = state.strip_prefix("leader") {
+        p.arm_leader();
+        for c in rest.trim().chars() {
+            p.leader_key(c);
+        }
+    }
+
+    const WIDTH: u32 = 1400;
+    const HEIGHT: u32 = 820;
+    let overlay = Overlay::Git(p);
+    render::offscreen_scene(path_out, WIDTH, HEIGHT, 16.0, |r| {
+        let (cw, ch) = r.cell_size();
+        let cols = (WIDTH as f32 / cw) as usize;
+        let rows = (HEIGHT as f32 / ch) as usize;
+        // A plain terminal behind it, so the panel is seen the way it is used:
+        // over something, dimmed.
+        let pen = Pen { fg: Color::Rgb(0xd4, 0xd6, 0xd9), ..Pen::default() };
+        let mut g = Grid::new(cols, rows);
+        g.write_str(0, 0, "~/projects/runnir ❯ ", pen);
+        let panes = vec![(g, Rect { x: 0.0, y: 0.0, w: WIDTH as f32, h: HEIGHT as f32 }, None, true)];
+
+        let panels = overlay.render(cols, rows, &config::Theme::default());
+        let specs: Vec<(Grid, Rect)> = panels
+            .into_iter()
+            .map(|p| (p.grid, Rect { x: p.col as f32 * cw, y: p.row as f32 * ch, w: 0.0, h: 0.0 }))
+            .collect();
+        (panes, Some(specs))
     });
 }
 
@@ -539,6 +612,11 @@ struct Gpu {
     mouse_down: Option<mouse::Button>,
     /// A divider being dragged with the mouse to resize panes.
     resizing: Option<crate::layout::DividerHit>,
+    /// A git panel column separator being dragged (0 = list/files, 1 = files/diff).
+    git_drag: Option<usize>,
+    /// Whether the pointer is currently over one, so the resize cursor is set once
+    /// on the way in and once on the way out rather than on every motion event.
+    git_over_split: bool,
     /// When set, the focused pane of the active tab fills the whole area (zoom).
     zoomed: Option<u64>,
     /// Until when a bell flash is drawn over the panes.
@@ -790,6 +868,8 @@ impl App {
             click_count: 0,
             mouse_down: None,
             resizing: None,
+            git_drag: None,
+            git_over_split: false,
             zoomed: None,
             bell_flash: None,
             status: None,

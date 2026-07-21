@@ -116,7 +116,7 @@ impl Search {
 /// Which list the git panel is showing. The preview pane on the right always shows
 /// what the selection in the current list means: a file's diff, a commit's diff, a
 /// branch's log, a stash's contents.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum GitView {
     Status,
     Log,
@@ -163,6 +163,25 @@ impl GitView {
     }
 }
 
+/// Which of the panel's columns the keyboard drives.
+///
+/// The columns are a hierarchy — a list, the files of what it selects, the diff of
+/// the selected file — so `h`/`l` walk them the way they read.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GitFocus {
+    List,
+    /// The files of an open commit. Only reachable while `open_commit` is set.
+    Files,
+    Diff,
+}
+
+/// The narrowest a column may be dragged to. Below this a path column shows nothing
+/// but ellipses, which is not a column, it is a hint that one is missing.
+const MIN_COL: usize = 12;
+/// The diff keeps more, because a diff clipped to nothing is the thing you opened
+/// the panel to read.
+const MIN_DIFF: usize = 20;
+
 /// The native git panel: a list on the left, the selection's diff on the right.
 ///
 /// It holds only DATA. Every read and every command runs on a worker and comes back
@@ -185,9 +204,15 @@ pub struct GitPanel {
     /// Blame rows for `blame_path`, when the blame view is up.
     pub blame: Vec<crate::git::BlameLine>,
     pub blame_path: String,
-    /// Which half of the panel the keyboard is driving. Line-level staging needs a
-    /// cursor INSIDE the diff, and one set of j/k cannot mean two things.
-    pub diff_focus: bool,
+    /// Which column the keyboard is driving. Line-level staging needs a cursor
+    /// INSIDE the diff, and one set of j/k cannot mean two things.
+    pub focus: GitFocus,
+    /// Where the two column separators sit, as fractions of the panel's width.
+    /// Dragged with the mouse; `split[1]` only matters while a commit is open.
+    pub split: [f32; 2],
+    /// One file's diff, filling the whole panel. A three-column layout is for
+    /// finding the change; reading it wants the width back.
+    pub zoom: bool,
     /// Cursor and selection anchor within `preview_rows`, for staging by line.
     pub diff_cursor: usize,
     pub diff_anchor: Option<usize>,
@@ -222,6 +247,9 @@ pub struct GitPanel {
     /// A command is in flight: the footer says so and the keys that start another
     /// are ignored, so a double tap cannot fire two pushes.
     pub busy: bool,
+    /// The panel's own leader layer: `None` when disarmed, else the group keys
+    /// pressed so far (empty at the root).
+    pub leader: Option<Vec<char>>,
 }
 
 impl GitPanel {
@@ -239,7 +267,9 @@ impl GitPanel {
             worktrees: Vec::new(),
             blame: Vec::new(),
             blame_path: String::new(),
-            diff_focus: false,
+            focus: GitFocus::List,
+            split: [0.34, 0.58],
+            zoom: false,
             diff_cursor: 0,
             diff_anchor: None,
             rebase: None,
@@ -256,6 +286,95 @@ impl GitPanel {
             hunk: 0,
             message: Ok(String::new()),
             busy: false,
+            leader: None,
+        }
+    }
+
+    /// Arms the panel's leader layer at the root.
+    pub fn arm_leader(&mut self) {
+        self.leader = Some(Vec::new());
+    }
+
+    pub fn cancel_leader(&mut self) {
+        self.leader = None;
+    }
+
+    /// The level the leader layer is at now, or `None` when it is disarmed.
+    fn leader_level(&self) -> Option<&'static [GitEntry]> {
+        let path = self.leader.as_ref()?;
+        let mut level: &'static [GitEntry] = GIT_LEADER;
+        for key in path {
+            match level.iter().find(|e| e.key == *key) {
+                Some(GitEntry { node: GitNode::Group(next), .. }) => level = next,
+                // A path that no longer resolves (the tree changed under it) shows
+                // the root rather than nothing at all.
+                _ => return Some(GIT_LEADER),
+            }
+        }
+        Some(level)
+    }
+
+    /// Whether a leaf can act on what is on screen right now. A verb bound to
+    /// another view's selection is not offered from here: showing it and then doing
+    /// nothing is worse than not showing it.
+    fn leader_applies(&self, press: GitPress) -> bool {
+        match press {
+            GitPress::In(v, _) => self.view == v && !self.in_commit(),
+            _ => true,
+        }
+    }
+
+    /// What this level offers, as `(key, title, is_group)` — the shape the which-key
+    /// panel already draws for the global leader.
+    pub fn leader_entries(&self) -> Vec<(String, String, bool)> {
+        let Some(level) = self.leader_level() else { return Vec::new() };
+        let mut out: Vec<(String, String, bool)> = level
+            .iter()
+            .filter(|e| match &e.node {
+                GitNode::Leaf(p) => self.leader_applies(*p),
+                GitNode::Group(_) => true,
+            })
+            .map(|e| {
+                let key = if e.key == ' ' { "space".to_string() } else { e.key.to_string() };
+                (key, e.title.to_string(), matches!(e.node, GitNode::Group(_)))
+            })
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    /// The keys pressed since the layer was armed, for the which-key header.
+    pub fn leader_path(&self) -> Vec<String> {
+        self.leader
+            .as_ref()
+            .map(|p| p.iter().map(|c| c.to_string()).collect())
+            .unwrap_or_default()
+    }
+
+    /// Feeds a key to the leader layer. `Some` is a verb to run; `None` means the
+    /// layer either descended into a group or gave up — either way the key is
+    /// consumed, because falling through would fire an unrelated panel binding
+    /// after a mistyped sequence.
+    pub fn leader_key(&mut self, c: char) -> Option<GitPress> {
+        let level = self.leader_level()?;
+        match level.iter().find(|e| e.key == c) {
+            Some(GitEntry { node: GitNode::Group(_), .. }) => {
+                if let Some(path) = &mut self.leader {
+                    path.push(c);
+                }
+                None
+            }
+            Some(GitEntry { node: GitNode::Leaf(p), .. }) if self.leader_applies(*p) => {
+                let press = *p;
+                self.leader = None;
+                Some(press)
+            }
+            // A miss, or a verb this view cannot do: end the sequence rather than
+            // leave the layer armed on a key the user thinks did something.
+            _ => {
+                self.leader = None;
+                None
+            }
         }
     }
 
@@ -274,17 +393,34 @@ impl GitPanel {
 
     /// Where the panel's parts sit, in cells. Shared by the renderer and the mouse,
     /// so a click can never land somewhere other than what it looks like it hit.
+    ///
+    /// Two columns normally; three while a commit is open (list, its files, the
+    /// selected file's diff); one while zoomed. The widths come from `split`, which
+    /// the mouse drags, and are clamped here rather than at drag time so a window
+    /// resize can never leave a column at zero.
     pub fn layout(&self, cols: usize, rows: usize) -> GitLayout {
         let w = cols.saturating_sub(4).max(40);
         let h = rows.saturating_sub(4).max(12);
-        GitLayout {
-            col: 2,
-            row: 2,
-            w,
-            h,
-            list_w: (w * 2 / 5).clamp(24, 64).min(w.saturating_sub(10)),
-            body_rows: h.saturating_sub(3),
+        let body_rows = h.saturating_sub(3);
+        let base = GitLayout { col: 2, row: 2, w, h, list_w: 0, files_w: 0, body_rows };
+        // Zoom gives the whole box to the diff: no columns, nothing to hit but it.
+        if self.zoom {
+            return base;
         }
+        let at = |f: f32| (w as f32 * f).round() as usize;
+        if !self.in_commit() {
+            // Two columns: one separator, and the diff takes the rest.
+            let list_w = at(self.split[0]).clamp(MIN_COL, w.saturating_sub(MIN_DIFF + 2).max(MIN_COL));
+            return GitLayout { list_w, ..base };
+        }
+        // Three. The list is clamped first, then the files column against what the
+        // list left, so dragging one never squeezes the diff out of existence.
+        let room = w.saturating_sub(MIN_DIFF + MIN_COL + 4).max(MIN_COL);
+        let list_w = at(self.split[0]).clamp(MIN_COL, room);
+        let files_w = at(self.split[1])
+            .saturating_sub(list_w + 2)
+            .clamp(MIN_COL, w.saturating_sub(list_w + MIN_DIFF + 4).max(MIN_COL));
+        GitLayout { list_w, files_w, ..base }
     }
 
     /// Whether the list is showing one commit's files rather than the view's own
@@ -293,10 +429,9 @@ impl GitPanel {
         self.open_commit.is_some()
     }
 
+    /// How many rows the LIST column holds. An open commit does not change this:
+    /// its files are a column of their own, and the list stays where it was.
     pub fn len(&self) -> usize {
-        if self.in_commit() {
-            return self.commit_files.len();
-        }
         match self.view {
             GitView::Status => self.files.len(),
             GitView::Log => self.log.len(),
@@ -310,54 +445,154 @@ impl GitPanel {
     }
 
     pub fn cursor(&self) -> usize {
-        if self.in_commit() {
-            return self.commit_cursor.min(self.len().saturating_sub(1));
-        }
         self.cursors[self.view_index()].min(self.len().saturating_sub(1))
     }
 
     pub fn set_cursor(&mut self, n: usize) {
         let n = n.min(self.len().saturating_sub(1));
-        if self.in_commit() {
-            self.commit_cursor = n;
-        } else {
-            let i = self.view_index();
-            self.cursors[i] = n;
+        let i = self.view_index();
+        let moved = self.cursors[i] != n;
+        self.cursors[i] = n;
+        self.preview_scroll = 0;
+        // Moving the list closes an open commit: its file column belongs to the row
+        // you just left, and a column of another commit's files beside a different
+        // selection is a lie the panel would keep telling until Escape.
+        if moved && self.in_commit() {
+            self.leave_commit();
         }
+    }
+
+    pub fn files_len(&self) -> usize {
+        self.commit_files.len()
+    }
+
+    pub fn files_cursor(&self) -> usize {
+        self.commit_cursor.min(self.files_len().saturating_sub(1))
+    }
+
+    pub fn set_files_cursor(&mut self, n: usize) {
+        self.commit_cursor = n.min(self.files_len().saturating_sub(1));
         self.preview_scroll = 0;
     }
 
-    /// Drills into a commit: the list becomes its files. `leave_commit` backs out,
+    /// Opens a commit: its files appear in a column of their own, beside the list
+    /// that selected it, and the keyboard moves there. `leave_commit` backs out,
     /// which is also what Escape does before it will close the panel.
     pub fn enter_commit(&mut self, sha: String) {
         self.open_commit = Some(sha);
         self.commit_files.clear();
         self.commit_cursor = 0;
         self.preview_scroll = 0;
+        self.focus = GitFocus::Files;
     }
 
     pub fn leave_commit(&mut self) -> bool {
         let was = self.open_commit.take().is_some();
         self.commit_files.clear();
         self.preview_scroll = 0;
+        self.zoom = false;
+        self.focus = GitFocus::List;
         was
     }
 
     /// The file selected inside an open commit.
     pub fn selected_commit_file(&self) -> Option<&crate::git::FileEntry> {
-        self.commit_files.get(self.cursor())
+        self.commit_files.get(self.files_cursor())
     }
 
+    /// Whether the keyboard is inside the diff, where staging acts on lines.
+    pub fn diff_focus(&self) -> bool {
+        self.focus == GitFocus::Diff
+    }
+
+    /// Moves the cursor of whichever column has the keyboard.
     pub fn down(&mut self) {
-        let c = self.cursor();
-        if c + 1 < self.len() {
-            self.set_cursor(c + 1);
+        match self.focus {
+            GitFocus::Files => {
+                let c = self.files_cursor();
+                if c + 1 < self.files_len() {
+                    self.set_files_cursor(c + 1);
+                }
+            }
+            _ => {
+                let c = self.cursor();
+                if c + 1 < self.len() {
+                    self.set_cursor(c + 1);
+                }
+            }
         }
     }
 
     pub fn up(&mut self) {
-        let c = self.cursor();
-        self.set_cursor(c.saturating_sub(1));
+        match self.focus {
+            GitFocus::Files => {
+                let c = self.files_cursor();
+                self.set_files_cursor(c.saturating_sub(1));
+            }
+            _ => {
+                let c = self.cursor();
+                self.set_cursor(c.saturating_sub(1));
+            }
+        }
+    }
+
+    /// Walks the columns left/right. The columns are a hierarchy, so this is the
+    /// same motion as drilling in and backing out — `h` from the diff of an open
+    /// commit lands on its files, not on the list behind them.
+    pub fn focus_right(&mut self) {
+        self.focus = match self.focus {
+            GitFocus::List if self.in_commit() => GitFocus::Files,
+            GitFocus::List => GitFocus::Diff,
+            GitFocus::Files => GitFocus::Diff,
+            GitFocus::Diff => GitFocus::Diff,
+        };
+        if self.focus == GitFocus::Diff {
+            self.enter_diff();
+        }
+    }
+
+    pub fn focus_left(&mut self) {
+        if self.focus == GitFocus::Diff {
+            self.diff_anchor = None;
+        }
+        self.focus = match self.focus {
+            GitFocus::Diff if self.in_commit() => GitFocus::Files,
+            GitFocus::Diff => GitFocus::List,
+            GitFocus::Files => GitFocus::List,
+            GitFocus::List => GitFocus::List,
+        };
+    }
+
+    /// Fills the panel with the selected file's diff, and back. Zooming with the
+    /// keyboard in a list column moves it to the diff: there is nothing else on
+    /// screen to drive.
+    pub fn toggle_zoom(&mut self) {
+        self.zoom = !self.zoom;
+        if self.zoom {
+            // Through `enter_diff` so the line cursor lands on the first CHANGED
+            // line: setting the focus alone leaves it on row 0, which is the `diff
+            // --git` header, and the cursor marks a line nobody can stage.
+            self.enter_diff();
+        }
+    }
+
+    /// Moves a column separator to a pointer position, as a fraction of the panel
+    /// width. `sep` is 0 for the list/files edge and 1 for the files/diff edge; the
+    /// clamping that keeps every column usable happens in `layout`.
+    pub fn drag_split(&mut self, sep: usize, x: usize, w: usize) {
+        if w == 0 || sep > 1 {
+            return;
+        }
+        let f = (x as f32 / w as f32).clamp(0.05, 0.95);
+        self.split[sep] = f;
+        // The separators may not cross: dragging the first past the second takes the
+        // second with it, which is what a column being pushed looks like.
+        if sep == 0 && self.split[0] > self.split[1] {
+            self.split[1] = self.split[0];
+        }
+        if sep == 1 && self.split[1] < self.split[0] {
+            self.split[0] = self.split[1];
+        }
     }
 
     pub fn cycle_view(&mut self) {
@@ -436,13 +671,16 @@ impl GitPanel {
             })
             .unwrap_or(0);
         self.diff_anchor = None;
-        self.diff_focus = true;
+        self.focus = GitFocus::Diff;
         self.scroll_to_diff_cursor();
     }
 
+    /// Leaves the diff for the column that fed it: an open commit's files, else the
+    /// list. Zoom hides those columns, so it ends too.
     pub fn leave_diff(&mut self) {
-        self.diff_focus = false;
+        self.focus = if self.in_commit() { GitFocus::Files } else { GitFocus::List };
         self.diff_anchor = None;
+        self.zoom = false;
     }
 
     /// Moves the line cursor, keeping it on screen and keeping `hunk` in step so the
@@ -526,22 +764,28 @@ impl GitPanel {
         self.preview_scroll = next.clamp(0, (lines - 1).max(0)) as usize;
     }
 
+    /// One row of the open commit's file column: its status letter, then the path
+    /// with the DIRECTORY elided rather than the name — which file it is lives at
+    /// the end of a path, and a column narrow enough to clip shows the wrong half.
+    fn file_row_text(&self, i: usize, width: usize) -> (String, Pen) {
+        let green = Pen { fg: Color::Rgb(0x7a, 0xc0, 0x7a), bg: bg(), ..Pen::default() };
+        let red = Pen { fg: Color::Rgb(0xe0, 0x60, 0x60), bg: bg(), ..Pen::default() };
+        match self.commit_files.get(i) {
+            Some(f) => {
+                let pen = match f.index {
+                    'A' => green,
+                    'D' => red,
+                    _ => normal(),
+                };
+                (format!("{} {}", f.index, elide_left(&f.path, width.saturating_sub(2))), pen)
+            }
+            None => (String::new(), normal()),
+        }
+    }
+
     fn row_text(&self, i: usize, width: usize) -> (String, Pen) {
         let green = Pen { fg: Color::Rgb(0x7a, 0xc0, 0x7a), bg: bg(), ..Pen::default() };
         let red = Pen { fg: Color::Rgb(0xe0, 0x60, 0x60), bg: bg(), ..Pen::default() };
-        if self.in_commit() {
-            return match self.commit_files.get(i) {
-                Some(f) => {
-                    let pen = match f.index {
-                        'A' => green,
-                        'D' => red,
-                        _ => normal(),
-                    };
-                    (format!("{} {}", f.index, elide(&f.path, width.saturating_sub(2))), pen)
-                }
-                None => (String::new(), normal()),
-            };
-        }
         match self.view {
             GitView::Status => match self.files.get(i) {
                 Some(f) => {
@@ -640,14 +884,17 @@ impl GitPanel {
     /// every one of these acts immediately, so the user has to be able to read what
     /// a key does before pressing it.
     fn keys_legend(&self) -> &'static str {
+        if self.zoom {
+            return "one file, full width · J K scroll · z or esc back to the columns";
+        }
         if self.in_commit() {
-            return "one commit's files · j k move · esc back to the list · y copy path";
+            return "this commit's files · j k move · h l column · enter full width · esc back";
         }
         match self.view {
             GitView::Status => {
                 "space stage · a all · ]/[ hunk · s/u stage hunk · c commit · P push · p pull · S stash"
             }
-            GitView::Log => "enter files of this commit · x checkout · c cherry-pick · / filter · y sha",
+            GitView::Log => "enter this commit's files · x checkout · c cherry-pick · / filter · y sha",
             GitView::Branches => "enter switch · n new · m merge into HEAD · R rebase onto · f fetch",
             GitView::Stashes => "enter pop · S stash push",
             GitView::Tags => "enter checkout · n new tag · P push tags",
@@ -721,38 +968,89 @@ impl GitPanel {
         if let Some(sha) = &self.open_commit {
             head = format!("{sha}  {head}");
         }
+        // Zoomed, the columns that said which file this is are gone, so the header
+        // has to say it instead.
+        if self.zoom {
+            let path = self
+                .selected_commit_file()
+                .map(|f| f.path.clone())
+                .or_else(|| self.selected_file().map(|f| f.path.clone()))
+                .unwrap_or_default();
+            if !path.is_empty() {
+                head = format!("{path}  {head}");
+            }
+        }
         let head_w = head.chars().count();
         if head_w > 0 && w > x + head_w + 2 {
             write(&mut g, 0, w - head_w - 2, &head, accent());
         }
 
-        // Left: the list. Right: the preview, with a rule between them.
+        // Left: the list. Middle (only with a commit open): its files. Right: the
+        // preview, with a rule between each pair.
         let body_rows = l.body_rows;
         let scroll = self.cursor().saturating_sub(body_rows.saturating_sub(1));
         for line in 0..body_rows {
             let i = scroll + line;
-            if i >= self.len() {
+            // Zoom leaves no list column to draw into.
+            if list_w == 0 || i >= self.len() {
                 break;
             }
             let (text, pen) = self.row_text(i, list_w.saturating_sub(2));
             let row = 2 + line;
+            // A selection in a column the keyboard has left is still the selection —
+            // it just is not the cursor. Dimming it says which column j/k drives
+            // without hiding what the other columns are showing.
             if i == self.cursor() {
-                write(&mut g, row, 0, &" ".repeat(list_w), selected());
-                write(&mut g, row, 1, &text, selected());
+                let pen = if self.focus == GitFocus::List { selected() } else { inactive() };
+                write(&mut g, row, 0, &" ".repeat(list_w), pen);
+                write(&mut g, row, 1, &text, pen);
             } else {
                 write(&mut g, row, 1, &text, pen);
             }
         }
-        for line in 0..body_rows {
-            write(&mut g, 2 + line, list_w, "\u{2502}", dim());
+        if let Some(sep) = l.sep1() {
+            for line in 0..body_rows {
+                write(&mut g, 2 + line, sep, "\u{2502}", dim());
+            }
+        }
+
+        // The open commit's files.
+        if l.files_w > 0 {
+            let fx = l.files_x();
+            let fscroll = self.files_cursor().saturating_sub(body_rows.saturating_sub(1));
+            for line in 0..body_rows {
+                let i = fscroll + line;
+                if i >= self.files_len() {
+                    break;
+                }
+                let (text, pen) = self.file_row_text(i, l.files_w.saturating_sub(1));
+                let row = 2 + line;
+                if i == self.files_cursor() {
+                    let pen = if self.focus == GitFocus::Files { selected() } else { inactive() };
+                    write(&mut g, row, fx, &" ".repeat(l.files_w), pen);
+                    write(&mut g, row, fx, &text, pen);
+                } else {
+                    write(&mut g, row, fx, &text, pen);
+                }
+            }
+            // An empty column with a commit open means the files are still being
+            // read, not that the commit touched nothing.
+            if self.files_len() == 0 {
+                write(&mut g, 2, fx, "reading\u{2026}", dim());
+            }
+        }
+        if let Some(sep) = l.sep2() {
+            for line in 0..body_rows {
+                write(&mut g, 2 + line, sep, "\u{2502}", dim());
+            }
         }
 
         // The diff is drawn the way a review tool draws one: a line number, then the
         // code, on a row whose whole width is tinted. A raw `+`/`-` column makes
         // every changed line start one column further in than its neighbours, and
         // leaves you counting rows to find out which line it is.
-        let prev_x = list_w + 2;
-        let prev_w = w.saturating_sub(prev_x);
+        let prev_x = l.prev_x();
+        let prev_w = l.prev_w();
         let add_bg = Color::Rgb(0x12, 0x2c, 0x18);
         let del_bg = Color::Rgb(0x35, 0x14, 0x18);
         let num_fg = Color::Rgb(0x6a, 0x6d, 0x74);
@@ -781,7 +1079,7 @@ impl GitPanel {
             write(&mut g, y, prev_x, &num, Pen { fg: num_fg, bg: row_bg, ..Pen::default() });
             // With the diff focused, the line cursor and its selection outrank the
             // hunk bar: they are what a stage key will act on now.
-            if self.diff_focus {
+            if self.diff_focus() {
                 let (lo, hi) = self.line_range();
                 if idx >= lo && idx <= hi {
                     write(
@@ -842,9 +1140,34 @@ impl GitPanel {
                 _ => (self.keys_legend().to_string(), dim()),
             }
         };
-        write(&mut g, h - 1, 2, &elide(&foot, w.saturating_sub(4)), pen);
+        // The hint that there IS a menu goes right of the legend, always: a leader
+        // layer nobody knows about is a layer nobody uses.
+        let hint = "leader \u{2192} menu";
+        let hint_w = hint.chars().count();
+        let foot_w = w.saturating_sub(hint_w + 6);
+        write(&mut g, h - 1, 2, &elide(&foot, foot_w), pen);
+        if w > hint_w + 4 {
+            write(&mut g, h - 1, w - hint_w - 2, hint, dim());
+        }
 
-        vec![Panel { grid: g, col: l.col, row: l.row }]
+        let mut out = vec![Panel { grid: g, col: l.col, row: l.row }];
+        // The leader layer's which-key, drawn as a panel of its own along the bottom
+        // of the box. It has to be part of the OVERLAY, not the screen chrome the
+        // global leader uses: chrome is drawn under the overlay's dimmed backdrop,
+        // which is exactly where you cannot read it.
+        if self.leader.is_some() {
+            let entries = self.leader_entries();
+            if !entries.is_empty() {
+                let wk = crate::whichkey_grid(&entries, &self.leader_path(), l.w);
+                let rows = wk.rows();
+                out.push(Panel {
+                    grid: wk,
+                    col: l.col,
+                    row: (l.row + l.h).saturating_sub(rows),
+                });
+            }
+        }
+        out
     }
 
     /// Where a click landed inside the panel, in panel-local cells. `None` when the
@@ -871,11 +1194,36 @@ impl GitPanel {
             return Some(GitHit::Header);
         }
         let line = lr - 2;
-        if lc < l.list_w {
+        // The separators are checked first and are one cell wider than they are
+        // drawn: a one-cell drag target is a target you miss.
+        if let Some(sep) = l.sep1() {
+            if lc + 1 >= sep && lc <= sep + 1 {
+                return Some(GitHit::Separator(0));
+            }
+        }
+        if let Some(sep) = l.sep2() {
+            if lc + 1 >= sep && lc <= sep + 1 {
+                return Some(GitHit::Separator(1));
+            }
+        }
+        if l.list_w > 0 && lc < l.list_w {
             let scroll = self.cursor().saturating_sub(l.body_rows.saturating_sub(1));
             return Some(GitHit::Row(scroll + line));
         }
+        if l.files_w > 0 && lc >= l.files_x() && lc < l.files_x() + l.files_w {
+            let scroll = self.files_cursor().saturating_sub(l.body_rows.saturating_sub(1));
+            return Some(GitHit::FileRow(scroll + line));
+        }
         Some(GitHit::PreviewLine(self.preview_scroll + line))
+    }
+
+    /// The separator under a pointer, if any — for the resize cursor and for
+    /// starting a drag. Same geometry as the hit test, deliberately.
+    pub fn separator_at(&self, cols: usize, rows: usize, col: usize, row: usize) -> Option<usize> {
+        match self.hit(cols, rows, col, row) {
+            Some(GitHit::Separator(i)) => Some(i),
+            _ => None,
+        }
     }
 
     /// The hunk containing a preview row, for click-to-select-hunk.
@@ -939,6 +1287,164 @@ impl RebasePlan {
     }
 }
 
+// ---- the git panel's own leader layer --------------------------------------
+
+/// A key the panel already understands. The leader layer does not reimplement the
+/// panel's verbs — it presses their keys — so a verb can never behave one way from
+/// a letter and another way from the leader.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GitKey {
+    Ch(char),
+    Space,
+    Enter,
+}
+
+/// What a leader leaf does.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GitPress {
+    /// Press it in whatever view is up.
+    Key(GitKey),
+    /// Switch to a view first. Only for verbs that do not depend on what is
+    /// selected there — a new branch, a new tag — since switching moves the
+    /// selection.
+    Then(GitView, GitKey),
+    /// Only offered while that view is up, because it acts on ITS selection:
+    /// "merge this branch" means nothing from the stash list.
+    In(GitView, GitKey),
+    /// Go to a view and stop, so the next choice is made looking at it.
+    View(GitView),
+}
+
+pub enum GitNode {
+    Leaf(GitPress),
+    Group(&'static [GitEntry]),
+}
+
+pub struct GitEntry {
+    pub key: char,
+    pub title: &'static str,
+    pub node: GitNode,
+}
+
+const fn leaf(key: char, title: &'static str, press: GitPress) -> GitEntry {
+    GitEntry { key, title, node: GitNode::Leaf(press) }
+}
+
+use GitKey::{Ch, Enter as En, Space as Sp};
+use GitPress::{In, Key, Then, View};
+
+/// The panel's leader tree: the nouns at the root, the verbs under them.
+///
+/// It is a discovery layer, not a second set of bindings — every leaf presses a key
+/// the panel already has, and the single letters keep working untouched.
+pub static GIT_LEADER: &[GitEntry] = &[
+    GitEntry {
+        key: 'f',
+        title: "File",
+        node: GitNode::Group(&[
+            leaf(' ', "stage / unstage file", In(GitView::Status, Sp)),
+            leaf('a', "stage everything", In(GitView::Status, Ch('a'))),
+            leaf('t', "show the other diff", In(GitView::Status, Ch('t'))),
+            leaf('e', "open in the editor", In(GitView::Status, Ch('e'))),
+            leaf('b', "blame", In(GitView::Status, Ch('b'))),
+            leaf('l', "history of this file", In(GitView::Status, Ch('L'))),
+            leaf('o', "take ours (conflict)", In(GitView::Status, Ch('O'))),
+            leaf('T', "take theirs (conflict)", In(GitView::Status, Ch('T'))),
+            leaf('y', "copy path / sha", Key(Ch('y'))),
+            leaf('z', "full width, and back", Key(Ch('z'))),
+        ]),
+    },
+    GitEntry {
+        key: 'd',
+        title: "Diff",
+        node: GitNode::Group(&[
+            leaf(']', "next hunk", Key(Ch(']'))),
+            leaf('[', "previous hunk", Key(Ch('['))),
+            leaf('l', "line cursor in the diff", In(GitView::Status, Ch('l'))),
+            leaf('v', "start a line selection", In(GitView::Status, Ch('v'))),
+            leaf('s', "stage hunk / lines", In(GitView::Status, Ch('s'))),
+            leaf('u', "unstage hunk / lines", In(GitView::Status, Ch('u'))),
+            leaf('t', "staged or worktree", In(GitView::Status, Ch('t'))),
+        ]),
+    },
+    GitEntry {
+        key: 'c',
+        title: "Commit",
+        node: GitNode::Group(&[
+            leaf('c', "commit the staged set", Then(GitView::Status, Ch('c'))),
+            leaf('e', "commit in a pane (editor)", Then(GitView::Status, Ch('C'))),
+            leaf('a', "amend, keeping the message", Then(GitView::Status, Ch('A'))),
+            leaf('l', "the log\u{2026}", View(GitView::Log)),
+            leaf('p', "cherry-pick this one", In(GitView::Log, Ch('c'))),
+            leaf('x', "check this one out", In(GitView::Log, Ch('x'))),
+            leaf('i', "interactive rebase from here", In(GitView::Log, Ch('i'))),
+            leaf('o', "open it in a pane", In(GitView::Log, Ch('o'))),
+            leaf('/', "filter the log", In(GitView::Log, Ch('/'))),
+        ]),
+    },
+    GitEntry {
+        key: 'b',
+        title: "Branch",
+        node: GitNode::Group(&[
+            leaf('b', "branches\u{2026}", View(GitView::Branches)),
+            leaf('n', "new branch", Then(GitView::Branches, Ch('n'))),
+            leaf('s', "switch to this one", In(GitView::Branches, En)),
+            leaf('m', "merge it into HEAD", In(GitView::Branches, Ch('m'))),
+            leaf('r', "rebase HEAD onto it", In(GitView::Branches, Ch('R'))),
+            leaf('f', "fetch --all --prune", Key(Ch('f'))),
+            leaf('p', "pull --ff-only", Key(Ch('p'))),
+            leaf('P', "push", Key(Ch('P'))),
+        ]),
+    },
+    GitEntry {
+        key: 's',
+        title: "Stash",
+        node: GitNode::Group(&[
+            leaf('s', "stash everything", Key(Ch('S'))),
+            leaf('l', "stashes\u{2026}", View(GitView::Stashes)),
+            leaf('p', "pop this one", In(GitView::Stashes, En)),
+        ]),
+    },
+    GitEntry {
+        key: 't',
+        title: "Tag",
+        node: GitNode::Group(&[
+            leaf('t', "tags\u{2026}", View(GitView::Tags)),
+            leaf('n', "new tag", Then(GitView::Tags, Ch('n'))),
+            leaf('x', "check this tag out", In(GitView::Tags, En)),
+            leaf('P', "push --tags", Then(GitView::Tags, Ch('P'))),
+        ]),
+    },
+    GitEntry {
+        key: 'r',
+        title: "Remote & repo",
+        node: GitNode::Group(&[
+            leaf('f', "fetch --all --prune", Key(Ch('f'))),
+            leaf('p', "pull --ff-only", Key(Ch('p'))),
+            leaf('P', "push", Key(Ch('P'))),
+            leaf('t', "push --tags", Then(GitView::Tags, Ch('P'))),
+            leaf('r', "reread everything", Key(Ch('r'))),
+            leaf('w', "worktrees\u{2026}", View(GitView::Worktrees)),
+            leaf('l', "reflog\u{2026}", View(GitView::Reflog)),
+        ]),
+    },
+    GitEntry {
+        key: 'v',
+        title: "View",
+        node: GitNode::Group(&[
+            leaf('1', "status", View(GitView::Status)),
+            leaf('2', "log", View(GitView::Log)),
+            leaf('3', "branches", View(GitView::Branches)),
+            leaf('4', "stashes", View(GitView::Stashes)),
+            leaf('5', "tags", View(GitView::Tags)),
+            leaf('6', "reflog", View(GitView::Reflog)),
+            leaf('7', "worktrees", View(GitView::Worktrees)),
+        ]),
+    },
+    leaf('z', "Full width, and back", Key(Ch('z'))),
+    leaf('q', "Close the panel", Key(Ch('q'))),
+];
+
 /// The panel's geometry in cells, produced once and used by both the renderer and
 /// the hit test.
 pub struct GitLayout {
@@ -946,8 +1452,41 @@ pub struct GitLayout {
     pub row: usize,
     pub w: usize,
     pub h: usize,
+    /// Width of the list column. Zero while zoomed.
     pub list_w: usize,
+    /// Width of the open commit's file column. Zero unless a commit is open.
+    pub files_w: usize,
     pub body_rows: usize,
+}
+
+impl GitLayout {
+    /// The column the first separator is drawn in, if there is one.
+    pub fn sep1(&self) -> Option<usize> {
+        (self.list_w > 0).then_some(self.list_w)
+    }
+
+    /// Where the file column starts.
+    pub fn files_x(&self) -> usize {
+        self.list_w + 2
+    }
+
+    /// The column the second separator is drawn in, if there is one.
+    pub fn sep2(&self) -> Option<usize> {
+        (self.files_w > 0).then_some(self.files_x() + self.files_w)
+    }
+
+    /// Where the diff starts, and how wide it is.
+    pub fn prev_x(&self) -> usize {
+        match self.sep2() {
+            Some(s) => s + 2,
+            None if self.list_w > 0 => self.list_w + 2,
+            None => 0,
+        }
+    }
+
+    pub fn prev_w(&self) -> usize {
+        self.w.saturating_sub(self.prev_x())
+    }
 }
 
 /// What a click landed on.
@@ -955,8 +1494,13 @@ pub enum GitHit {
     View(GitView),
     /// A row of the list, by index into whatever the list is showing.
     Row(usize),
+    /// A row of the open commit's file column, by index into `commit_files`.
+    FileRow(usize),
     /// A row of the preview, by index into `preview_rows`.
     PreviewLine(usize),
+    /// A column separator, by index (0 = list/files, 1 = files/diff). Dragging it
+    /// resizes the columns either side.
+    Separator(usize),
     Header,
 }
 
@@ -978,6 +1522,22 @@ fn elide(s: &str, width: usize) -> String {
     let mut out: String = s.chars().take(width.saturating_sub(1)).collect();
     out.push('\u{2026}');
     out
+}
+
+/// Clips to `width` columns from the LEFT, keeping the end. For a path that is the
+/// file name, which is the part that says which file this is; clipping the tail
+/// instead leaves a column of identical directory prefixes.
+fn elide_left(s: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let n = s.chars().count();
+    if n <= width {
+        return s.to_string();
+    }
+    let keep = width.saturating_sub(1);
+    let tail: String = s.chars().skip(n - keep).collect();
+    format!("\u{2026}{tail}")
 }
 
 
@@ -1037,6 +1597,11 @@ fn normal() -> Pen {
 }
 fn selected() -> Pen {
     Pen { fg: Color::Rgb(0x0d, 0x0d, 0x0f), bg: Color::Rgb(ACCENT.0, ACCENT.1, ACCENT.2), ..Pen::default() }
+}
+/// The selected row of a column the keyboard is NOT driving. Still a selection —
+/// it decides what the columns to its right show — but visibly not the cursor.
+fn inactive() -> Pen {
+    Pen { fg: Color::Rgb(0xd4, 0xd6, 0xd9), bg: Color::Rgb(0x30, 0x33, 0x3c), ..Pen::default() }
 }
 fn bg() -> Color {
     Color::Rgb(PANEL_BG.0, PANEL_BG.1, PANEL_BG.2)
@@ -2295,12 +2860,137 @@ mod tests {
             Some(GitHit::PreviewLine(0))
         ));
 
-        // Drilled into a commit, the rows are that commit's files.
+        // A commit opens a THIRD column beside the list, which keeps its own rows.
+        p.set_cursor(0);
         p.enter_commit("abc1234".into());
-        p.commit_files = vec![FileEntry { path: "a.rs".into(), index: 'M', worktree: '.' }];
-        assert_eq!(p.len(), 1);
-        assert!(matches!(p.hit(cols, rows, l.col + 1, l.row + 2), Some(GitHit::Row(0))));
+        p.commit_files = vec![
+            FileEntry { path: "a.rs".into(), index: 'M', worktree: '.' },
+            FileEntry { path: "b.rs".into(), index: 'A', worktree: '.' },
+        ];
+        assert_eq!(p.len(), 40, "the list is still the list");
+        assert_eq!(p.files_len(), 2);
+        let l3 = p.layout(cols, rows);
+        assert!(l3.files_w >= MIN_COL && l3.prev_w() >= MIN_DIFF, "three usable columns");
+        assert!(matches!(p.hit(cols, rows, l3.col + 1, l3.row + 2), Some(GitHit::Row(0))));
+        assert!(matches!(
+            p.hit(cols, rows, l3.col + l3.files_x() + 1, l3.row + 3),
+            Some(GitHit::FileRow(1))
+        ));
+        assert!(matches!(
+            p.hit(cols, rows, l3.col + l3.prev_x() + 1, l3.row + 2),
+            Some(GitHit::PreviewLine(0))
+        ));
+        // Both separators are hittable, or a column cannot be dragged.
+        for (i, sep) in [l3.sep1(), l3.sep2()].into_iter().enumerate() {
+            let sep = sep.expect("three columns means two separators");
+            assert!(
+                matches!(p.hit(cols, rows, l3.col + sep, l3.row + 4), Some(GitHit::Separator(n)) if n == i),
+                "separator {i} at {sep}"
+            );
+        }
+
+        // Dragging the first separator moves it, and the layout follows.
+        let before = p.layout(cols, rows).list_w;
+        p.drag_split(0, 20, l3.w);
+        let after = p.layout(cols, rows).list_w;
+        assert!(after < before, "dragging left narrows the list: {before} -> {after}");
+        // ...but never past the point where a column stops being one.
+        p.drag_split(0, 0, l3.w);
+        let l4 = p.layout(cols, rows);
+        assert!(l4.list_w >= MIN_COL && l4.files_w >= MIN_COL && l4.prev_w() >= MIN_DIFF);
+
+        // Zoomed, the diff is the only column, and it starts at the left edge.
+        p.toggle_zoom();
+        let lz = p.layout(cols, rows);
+        assert_eq!((lz.list_w, lz.files_w, lz.prev_x()), (0, 0, 0));
+        assert_eq!(lz.prev_w(), lz.w);
+        assert!(matches!(p.hit(cols, rows, lz.col + 1, lz.row + 2), Some(GitHit::PreviewLine(0))));
         let _ = Commit::default();
+    }
+
+    #[test]
+    fn the_panel_leader_descends_and_only_offers_what_this_view_can_do() {
+        let mut p = GitPanel::new(std::path::PathBuf::from("/tmp/repo"));
+        p.view = GitView::Status;
+        assert!(p.leader_entries().is_empty(), "disarmed shows nothing");
+
+        p.arm_leader();
+        let root = p.leader_entries();
+        assert!(root.iter().any(|(k, _, group)| k == "c" && *group), "Commit is a group");
+        assert!(root.iter().any(|(k, _, group)| k == "q" && !*group), "close is a leaf");
+
+        // Descending into a group keeps the layer armed and shows its verbs.
+        assert!(p.leader_key('f').is_none(), "a group does not run anything");
+        assert_eq!(p.leader_path(), vec!["f".to_string()]);
+        let files = p.leader_entries();
+        assert!(files.iter().any(|(k, _, _)| k == "space"), "stage is on space: {files:?}");
+        assert!(files.iter().any(|(k, _, _)| k == "b"), "blame belongs to the status view");
+
+        // In the log view the status-only verbs are not offered, and pressing one
+        // ends the sequence instead of doing something unrelated.
+        p.cancel_leader();
+        p.view = GitView::Log;
+        p.arm_leader();
+        p.leader_key('f');
+        let files = p.leader_entries();
+        assert!(!files.iter().any(|(k, _, _)| k == "b"), "blame needs the status view: {files:?}");
+        assert_eq!(p.leader_key('b'), None);
+        assert!(p.leader.is_none(), "a miss disarms rather than waiting for another key");
+
+        // A verb that stands on its own runs from anywhere.
+        p.arm_leader();
+        p.leader_key('c');
+        assert_eq!(p.leader_key('l'), Some(GitPress::View(GitView::Log)));
+        assert!(p.leader.is_none(), "running a leaf disarms");
+    }
+
+    #[test]
+    fn every_leader_leaf_presses_a_key_the_panel_answers() {
+        // The tree is a discovery layer over the panel's own keys. A leaf whose key
+        // the panel does not handle would be a menu entry that does nothing.
+        fn walk(level: &'static [GitEntry], out: &mut Vec<(char, GitPress)>) {
+            for e in level {
+                match &e.node {
+                    GitNode::Leaf(p) => out.push((e.key, *p)),
+                    GitNode::Group(g) => walk(g, out),
+                }
+            }
+        }
+        let mut leaves = Vec::new();
+        walk(GIT_LEADER, &mut leaves);
+        assert!(leaves.len() > 30, "the tree should cover the panel: {}", leaves.len());
+
+        // Keys the panel binds, as characters. Kept beside `git_panel_key`: adding a
+        // leaf for a key that is not here is the mistake this catches.
+        const BOUND: &str = "qjklhzvJK][su1234567taACOTeLbmRxicnPpfyor/S";
+        for (key, press) in leaves {
+            let k = match press {
+                GitPress::View(_) => continue,
+                GitPress::Key(k) | GitPress::Then(_, k) | GitPress::In(_, k) => k,
+            };
+            if let GitKey::Ch(c) = k {
+                assert!(BOUND.contains(c), "leader {key:?} presses {c:?}, which the panel ignores");
+            }
+        }
+    }
+
+    #[test]
+    fn moving_the_list_closes_the_commit_column_it_no_longer_matches() {
+        use crate::git::FileEntry;
+        let mut p = GitPanel::new(std::path::PathBuf::from("/tmp/repo"));
+        p.view = GitView::Log;
+        p.log = (0..5).map(|i| crate::git::Commit { sha: format!("sha{i}"), ..Default::default() }).collect();
+        p.enter_commit("sha0".into());
+        p.commit_files = vec![FileEntry { path: "a.rs".into(), index: 'M', worktree: '.' }];
+        assert_eq!(p.focus, GitFocus::Files, "opening a commit moves the keyboard into it");
+
+        p.down();
+        assert!(p.in_commit(), "j in the file column moves files, not the log");
+
+        p.focus = GitFocus::List;
+        p.down();
+        assert!(!p.in_commit(), "the log moved: those files were the other commit's");
+        assert_eq!(p.focus, GitFocus::List);
     }
 
     #[test]

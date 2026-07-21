@@ -68,11 +68,15 @@ impl Gpu {
             // scrolls the diff. Which one you get follows the pointer, the only
             // reading that matches what is under it.
             let over_list = self.git_pointer_over_list(self.cursor_px);
+            let over_files = self.git_pointer_over_files(self.cursor_px);
             match self.overlay.as_mut() {
                 Some(Overlay::Docs(d)) => d.scroll(-lines.round() as isize),
                 Some(Overlay::Git(p)) => {
                     let step = -lines.round() as i32;
-                    if over_list {
+                    if over_files {
+                        let cur = p.files_cursor() as i32 + step;
+                        p.set_files_cursor(cur.max(0) as usize);
+                    } else if over_list {
                         let cur = p.cursor() as i32 + step;
                         p.set_cursor(cur.max(0) as usize);
                     } else {
@@ -120,6 +124,32 @@ impl Gpu {
             self.window.request_redraw();
             return;
         }
+        // A git panel column separator being dragged, for as long as the button is
+        // held — the same contract the pane dividers have.
+        if self.git_drag.is_some() {
+            self.git_drag_split(position);
+            return;
+        }
+        // Over a git panel separator the pointer says so: a column you can drag with
+        // no sign that you can is a column nobody ever drags.
+        {
+            let (cols, rows, col, row) = self.cell_at(position);
+            // Closing the panel counts as "not over one", or the resize cursor
+            // outlives the thing it was pointing at.
+            let over = match &self.overlay {
+                Some(Overlay::Git(p)) => p.separator_at(cols, rows, col, row).is_some(),
+                _ => false,
+            };
+            if over != self.git_over_split {
+                self.git_over_split = over;
+                let icon = if over {
+                    winit::window::CursorIcon::ColResize
+                } else {
+                    winit::window::CursorIcon::Default
+                };
+                self.window.set_cursor(icon);
+            }
+        }
         if self.overlay.is_some() {
             return;
         }
@@ -149,6 +179,7 @@ impl Gpu {
         // Left release always ends a divider drag, even over an overlay.
         if state == ElementState::Released && button == MouseButton::Left {
             self.resizing = None;
+            self.git_drag = None;
         }
         // The git panel takes the mouse: it is a list and a diff, and both are
         // things people point at. Every other overlay still swallows clicks.
@@ -700,6 +731,14 @@ impl Gpu {
 
     fn overlay_key(&mut self, event: &winit::event::KeyEvent, mods: ModifiersState, config: &Config) {
         let key = &event.logical_key;
+
+        // The git panel has a leader layer of its own, armed by the same chord as
+        // the global one and drawn with the same which-key. It is checked before
+        // everything else here, including the modifier filter below: the leader
+        // chord is a modifier chord by definition.
+        if self.git_leader_key(event, mods, config) {
+            return;
+        }
 
         // A character typed with ctrl/alt/super is a shortcut attempt, not text —
         // ignore it so Ctrl+V inside a prompt does not insert a literal 'v'. Named
@@ -2096,16 +2135,39 @@ impl Gpu {
         (cols, rows, col, row)
     }
 
-    /// Whether the pointer is over the panel's list column rather than its diff.
+    /// Whether the pointer is over one of the panel's LIST columns rather than its
+    /// diff — which decides whether the wheel moves a selection or scrolls a diff.
     fn git_pointer_over_list(&self, pos: PhysicalPosition<f64>) -> bool {
         let Some(Overlay::Git(p)) = &self.overlay else { return false };
         let (cols, rows, col, row) = self.cell_at(pos);
-        matches!(p.hit(cols, rows, col, row), Some(crate::overlay::GitHit::Row(_)))
+        matches!(
+            p.hit(cols, rows, col, row),
+            Some(crate::overlay::GitHit::Row(_) | crate::overlay::GitHit::FileRow(_))
+        )
+    }
+
+    /// Whether the pointer is over the open commit's file column.
+    fn git_pointer_over_files(&self, pos: PhysicalPosition<f64>) -> bool {
+        let Some(Overlay::Git(p)) = &self.overlay else { return false };
+        let (cols, rows, col, row) = self.cell_at(pos);
+        matches!(p.hit(cols, rows, col, row), Some(crate::overlay::GitHit::FileRow(_)))
+    }
+
+    /// Drags a column separator to the pointer. Called from the motion handler for
+    /// as long as the button is down, exactly like a pane divider.
+    fn git_drag_split(&mut self, pos: PhysicalPosition<f64>) {
+        let Some(sep) = self.git_drag else { return };
+        let (cols, rows, col, _) = self.cell_at(pos);
+        let Some(Overlay::Git(p)) = &mut self.overlay else { return };
+        let l = p.layout(cols, rows);
+        p.drag_split(sep, col.saturating_sub(l.col), l.w);
+        self.window.request_redraw();
     }
 
     /// A left click inside the git panel: a view tab switches view, a list row
     /// selects it — and a click on the row that is already selected opens it, the
-    /// way a file manager works — and a diff row picks the hunk a stage key acts on.
+    /// way a file manager works — a separator starts a resize, and a diff row picks
+    /// the hunk a stage key acts on.
     fn git_panel_click(&mut self, pos: PhysicalPosition<f64>, config: &Config) {
         let (cols, rows, col, row) = self.cell_at(pos);
         let Some(Overlay::Git(p)) = &mut self.overlay else { return };
@@ -2116,6 +2178,7 @@ impl Gpu {
             return;
         };
         let mut activate = false;
+        let mut zoom = false;
         match hit {
             crate::overlay::GitHit::View(v) => {
                 p.leave_commit();
@@ -2125,8 +2188,26 @@ impl Gpu {
                 if i >= p.len() {
                     return;
                 }
-                activate = p.cursor() == i;
+                // Clicking a column also moves the keyboard into it: the cursor and
+                // the pointer disagreeing about which column is live is how a later
+                // j/k lands somewhere nobody was looking.
+                activate = p.cursor() == i && p.focus == crate::overlay::GitFocus::List;
+                p.focus = crate::overlay::GitFocus::List;
                 p.set_cursor(i);
+            }
+            crate::overlay::GitHit::FileRow(i) => {
+                if i >= p.files_len() {
+                    return;
+                }
+                // A second click on the file already selected opens it full width —
+                // the same "click what is selected to open it" as the list.
+                zoom = p.files_cursor() == i && p.focus == crate::overlay::GitFocus::Files;
+                p.focus = crate::overlay::GitFocus::Files;
+                p.set_files_cursor(i);
+            }
+            crate::overlay::GitHit::Separator(i) => {
+                self.git_drag = Some(i);
+                return;
             }
             crate::overlay::GitHit::PreviewLine(line) => {
                 if let Some(h) = p.hunk_at(line) {
@@ -2135,12 +2216,99 @@ impl Gpu {
             }
             crate::overlay::GitHit::Header => {}
         }
+        if zoom {
+            p.toggle_zoom();
+            self.window.request_redraw();
+            return;
+        }
         if activate {
             self.git_panel_key(&Key::Named(NamedKey::Enter), config);
             return;
         }
         self.git_preview();
         self.window.request_redraw();
+    }
+
+    /// The git panel's leader layer. Returns whether it consumed the key.
+    ///
+    /// The panel gets its own tree rather than the global one: with it open, the
+    /// keyboard is for git, and "new tab" or "split pane" under the same letters
+    /// would be a different meaning for the same muscle memory. Every leaf presses
+    /// a key the panel already has, so the letters and the leader can never drift.
+    fn git_leader_key(
+        &mut self,
+        event: &winit::event::KeyEvent,
+        mods: ModifiersState,
+        config: &Config,
+    ) -> bool {
+        let Some(Overlay::Git(p)) = &mut self.overlay else { return false };
+        // A rebase being planned owns the keyboard, leader included.
+        if p.rebase.is_some() {
+            return false;
+        }
+        // Armed by the configured leader chord, so rebinding it rebinds this too.
+        let is_leader = match (Chord::parse(&config.leader), Chord::from_event(&event.logical_key, mods)) {
+            (Some(l), Some(c)) => l == c,
+            _ => false,
+        };
+        if is_leader {
+            // Pressing it again puts the layer away, the way it opened it.
+            if p.leader.is_some() {
+                p.cancel_leader();
+            } else {
+                p.arm_leader();
+            }
+            self.window.request_redraw();
+            return true;
+        }
+        if p.leader.is_none() {
+            return false;
+        }
+        let press = match &event.logical_key {
+            Key::Named(NamedKey::Escape) => {
+                p.cancel_leader();
+                None
+            }
+            Key::Named(NamedKey::Space) => p.leader_key(' '),
+            Key::Character(s) => s.chars().next().and_then(|c| p.leader_key(c)),
+            // A bare modifier on the way to the next key must not end the sequence.
+            _ => None,
+        };
+        if let Some(press) = press {
+            self.run_git_press(press, config);
+        }
+        self.window.request_redraw();
+        true
+    }
+
+    /// Runs a leader leaf by pressing the panel key it stands for.
+    fn run_git_press(&mut self, press: crate::overlay::GitPress, config: &Config) {
+        use crate::overlay::{GitKey, GitPress};
+        let as_key = |k: GitKey| match k {
+            GitKey::Ch(c) => Key::Character(winit::keyboard::SmolStr::new(c.to_string())),
+            GitKey::Space => Key::Named(NamedKey::Space),
+            GitKey::Enter => Key::Named(NamedKey::Enter),
+        };
+        match press {
+            crate::overlay::GitPress::View(v) => {
+                if let Some(Overlay::Git(p)) = &mut self.overlay {
+                    p.leave_commit();
+                    p.set_view(v);
+                }
+                self.git_preview();
+                self.window.request_redraw();
+            }
+            GitPress::Key(k) | GitPress::In(_, k) => self.git_panel_key(&as_key(k), config),
+            GitPress::Then(v, k) => {
+                if let Some(Overlay::Git(p)) = &mut self.overlay {
+                    if p.view != v {
+                        p.leave_commit();
+                        p.set_view(v);
+                    }
+                }
+                self.git_panel_key(&as_key(k), config);
+            }
+        }
     }
 
     /// Loads blame for a file and switches to the blame view.
@@ -2381,9 +2549,17 @@ impl Gpu {
             // Escape backs out of an open commit before it closes the panel: the
             // drill-down is a place you are in, not a mode you toggled.
             Key::Named(NamedKey::Escape) => {
-                // Peel one layer at a time: the diff focus, then an open commit,
-                // then the blame view, and only then the panel itself.
-                if p.diff_focus {
+                // Peel one layer at a time: the zoom, then the diff focus, then an
+                // open commit, then the blame view, and only then the panel itself.
+                if p.zoom {
+                    // Back to the columns, in the one that chose this file.
+                    p.zoom = false;
+                    p.focus = if p.in_commit() {
+                        crate::overlay::GitFocus::Files
+                    } else {
+                        crate::overlay::GitFocus::List
+                    };
+                } else if p.diff_focus() {
                     p.leave_diff();
                 } else if p.leave_commit() {
                     moved = true;
@@ -2420,6 +2596,14 @@ impl Gpu {
             }
             Key::Named(NamedKey::PageDown) => p.scroll_preview(10),
             Key::Named(NamedKey::PageUp) => p.scroll_preview(-10),
+            // In the open commit's file column, Enter opens that file's diff full
+            // width. The columns are for finding the change; reading it wants the
+            // width back, and Escape brings the columns straight back.
+            Key::Named(NamedKey::Enter) if p.focus == crate::overlay::GitFocus::Files => {
+                if p.selected_commit_file().is_some() {
+                    p.toggle_zoom();
+                }
+            }
             Key::Named(NamedKey::Enter) => match view {
                 GitView::Branches => {
                     if let Some((b, remote)) = p.selected_branch() {
@@ -2479,8 +2663,8 @@ impl Gpu {
                 // With the diff focused, j/k walk the DIFF, not the list: that is
                 // the cursor line staging needs, and one pair of keys cannot mean
                 // two things at once.
-                "j" if p.diff_focus => p.step_diff(1),
-                "k" if p.diff_focus => p.step_diff(-1),
+                "j" if p.diff_focus() => p.step_diff(1),
+                "k" if p.diff_focus() => p.step_diff(-1),
                 "j" => {
                     p.down();
                     moved = true;
@@ -2489,14 +2673,19 @@ impl Gpu {
                     p.up();
                     moved = true;
                 }
+                // Focus walks the columns, in the order they read.
+                "l" if p.in_commit() => p.focus_right(),
+                "h" if p.in_commit() => p.focus_left(),
+                // Full width for the selected file's diff, and back.
+                "z" => p.toggle_zoom(),
                 // Focus follows the vim direction keys: l moves into the diff, h
                 // back to the list.
-                "l" if view == GitView::Status && !p.diff_focus => {
+                "l" if view == GitView::Status && !p.diff_focus() => {
                     p.enter_diff();
                 }
-                "h" if p.diff_focus => p.leave_diff(),
+                "h" if p.diff_focus() => p.leave_diff(),
                 // v marks the start of a line selection, the way copy mode does.
-                "v" if p.diff_focus => p.toggle_anchor(),
+                "v" if p.diff_focus() => p.toggle_anchor(),
                 "J" => p.scroll_preview(5),
                 "K" => p.scroll_preview(-5),
                 // Hunk selection. `body_rows` is approximated from the panel's own
@@ -2509,7 +2698,7 @@ impl Gpu {
                     // Focused on the diff, s and u act on the SELECTED LINES; on the
                     // list they act on the whole hunk. Same keys, and the focus says
                     // which, so there is nothing extra to remember.
-                    patch = if p.diff_focus {
+                    patch = if p.diff_focus() {
                         p.line_patch().map(|text| (text, reverse))
                     } else {
                         p.hunk_patch().map(|text| (text, reverse))

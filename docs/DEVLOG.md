@@ -950,8 +950,52 @@ stay. Verified on a real instance on DP-6: `SHELL=/usr/bin/cat` (a non-shell
 foreground) + `hyprctl dispatch closewindow` leaves the window up with the prompt;
 with a normal shell idle, the same dispatch closes it at once.
 
+## 2026-07-21 - Git panel: a column per level, dragged, zoomed, and a leader of its own
+
+Pedro, on a commit with five files: "los veo todos uno encima de otro, me falta un
+subnivel más de fichero modificado". The drill-down existed but REPLACED the list,
+so the hierarchy was never on screen at once.
+
+**Three columns.** `open_commit` no longer swaps what the list shows: the commit's
+files get a column of their own between the list and the diff. `len()`/`cursor()` are
+the list's again and `files_len()`/`files_cursor()` are the new column's — one pair of
+accessors that meant two different lists was what made the old code fight itself.
+`GitFocus{List,Files,Diff}` says which column j/k drives, and the selected row of an
+unfocused column is drawn dimmed (`inactive()`), because it is still the selection
+that decides what the columns to its right show. Moving the LIST closes the file
+column: those files belonged to the row you just left.
+
+**Columns drag.** `split: [f32; 2]` holds the separators as fractions; `layout`
+clamps them (MIN_COL 12, MIN_DIFF 20) so a window resize can never leave a column at
+zero, and `drag_split` only stores. A press on a separator sets `Gpu::git_drag` and
+motion drags it — the same shape as the pane dividers, including that the motion
+handler has to run BEFORE the `overlay.is_some()` early return. The pointer turns
+into `ColResize` over one; without that nobody discovers the drag.
+
+**Zoom.** `z`, or Enter on a file, gives the diff the whole box; the header then
+carries the path, since the columns that said which file it was are gone. It goes
+through `enter_diff`, so the line cursor lands on the first changed line rather than
+on the `diff --git` header.
+
+**A leader layer inside the panel.** Same chord as the global one, same which-key
+grid, but a tree of git verbs (`GIT_LEADER`). Two things keep it honest: every leaf
+PRESSES a key the panel already has (`GitPress::Key/Then/In` → `git_panel_key`), so a
+verb cannot behave differently from its letter, and `In(view, key)` entries are hidden
+unless that view is up, so the menu never offers something that would do nothing. A
+test walks the tree and asserts every leaf's key is one the panel binds.
+
+The which-key had to be drawn as a PANEL of the overlay, not as screen chrome like
+the global leader's: chrome is drawn under the overlay's dimmed backdrop.
+
+Verified with a new headless scene, `runnir --demo out.png git:commit|zoom|leader[keys]`,
+which renders the real `GitPanel` over the real repository through the same
+`overlay.render` the app uses — a three-column layout cannot be checked from a unit
+test, and this cannot drift from what the app draws.
+
 ## Gotchas (do not re-learn)
 
+- Two accessors that switch meaning by mode (`len()` = list OR commit files) will
+  eventually be read in the wrong mode. Give the second thing its own pair.
 - A setting that exists in `config.rs` and in the settings panel is NOT a feature.
   `confirm_close` was both, and read by nobody, for months. Grep for every field of
   `Behaviour` before trusting one.
