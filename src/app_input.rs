@@ -6,10 +6,27 @@ impl Gpu {
         let cell_h = self.renderer.cell_size().1;
         // While an overlay owns input, the wheel scrolls it, not the terminal. Use
         // the real cell height so a touchpad's pixel deltas map to sane line counts.
-        if let Some(ov) = self.overlay.as_mut() {
+        if self.overlay.is_some() {
             let lines = wheel_lines(delta, config.behaviour.wheel_lines, cell_h);
-            if let Overlay::Docs(d) = ov {
-                d.scroll(-lines.round() as isize);
+            // Over the panel's list the wheel moves the selection; over its diff it
+            // scrolls the diff. Which one you get follows the pointer, the only
+            // reading that matches what is under it.
+            let over_list = self.git_pointer_over_list(self.cursor_px);
+            match self.overlay.as_mut() {
+                Some(Overlay::Docs(d)) => d.scroll(-lines.round() as isize),
+                Some(Overlay::Git(p)) => {
+                    let step = -lines.round() as i32;
+                    if over_list {
+                        let cur = p.cursor() as i32 + step;
+                        p.set_cursor(cur.max(0) as usize);
+                    } else {
+                        p.scroll_preview(step);
+                    }
+                }
+                _ => {}
+            }
+            if over_list {
+                self.git_preview();
             }
             self.window.request_redraw();
             return;
@@ -76,6 +93,14 @@ impl Gpu {
         // Left release always ends a divider drag, even over an overlay.
         if state == ElementState::Released && button == MouseButton::Left {
             self.resizing = None;
+        }
+        // The git panel takes the mouse: it is a list and a diff, and both are
+        // things people point at. Every other overlay still swallows clicks.
+        if matches!(self.overlay, Some(Overlay::Git(_))) {
+            if state == ElementState::Pressed && button == MouseButton::Left {
+                self.git_panel_click(self.cursor_px, config);
+            }
+            return;
         }
         if self.overlay.is_some() {
             return;
@@ -1849,6 +1874,18 @@ impl Gpu {
     fn git_preview(&mut self) {
         let Some(Overlay::Git(p)) = &self.overlay else { return };
         let root = p.root.clone();
+        // Inside a commit, the preview is one file's diff within that commit.
+        if let (Some(sha), Some(f)) = (p.open_commit.clone(), p.selected_commit_file().cloned()) {
+            let root = p.root.clone();
+            self.git_gen += 1;
+            let seq = self.git_gen;
+            let proxy = self.proxy.clone();
+            std::thread::spawn(move || {
+                let text = crate::git::show_file(&root, &sha, &f.path);
+                let _ = proxy.send_event(UserEvent::GitPanel(seq, crate::git::PanelMsg::Preview(text)));
+            });
+            return;
+        }
         let job = match p.view {
             overlay::GitView::Status => p
                 .selected_file()
@@ -1944,6 +1981,77 @@ impl Gpu {
         }
     }
 
+    /// Cell coordinates of a pointer position, for the panel's hit test.
+    fn cell_at(&self, pos: PhysicalPosition<f64>) -> (usize, usize, usize, usize) {
+        let (cw, ch) = self.renderer.cell_size();
+        let screen = (self.surface_config.width as f32, self.surface_config.height as f32);
+        let cols = (screen.0 / cw).floor().max(1.0) as usize;
+        let rows = (screen.1 / ch).floor().max(1.0) as usize;
+        let col = (pos.x as f32 / cw).floor().max(0.0) as usize;
+        let row = (pos.y as f32 / ch).floor().max(0.0) as usize;
+        (cols, rows, col, row)
+    }
+
+    /// Whether the pointer is over the panel's list column rather than its diff.
+    fn git_pointer_over_list(&self, pos: PhysicalPosition<f64>) -> bool {
+        let Some(Overlay::Git(p)) = &self.overlay else { return false };
+        let (cols, rows, col, row) = self.cell_at(pos);
+        matches!(p.hit(cols, rows, col, row), Some(crate::overlay::GitHit::Row(_)))
+    }
+
+    /// A left click inside the git panel: a view tab switches view, a list row
+    /// selects it — and a click on the row that is already selected opens it, the
+    /// way a file manager works — and a diff row picks the hunk a stage key acts on.
+    fn git_panel_click(&mut self, pos: PhysicalPosition<f64>, config: &Config) {
+        let (cols, rows, col, row) = self.cell_at(pos);
+        let Some(Overlay::Git(p)) = &mut self.overlay else { return };
+        let Some(hit) = p.hit(cols, rows, col, row) else {
+            // Outside the panel entirely reads as "put this away".
+            self.overlay = None;
+            self.window.request_redraw();
+            return;
+        };
+        let mut activate = false;
+        match hit {
+            crate::overlay::GitHit::View(v) => {
+                p.leave_commit();
+                p.set_view(v);
+            }
+            crate::overlay::GitHit::Row(i) => {
+                if i >= p.len() {
+                    return;
+                }
+                activate = p.cursor() == i;
+                p.set_cursor(i);
+            }
+            crate::overlay::GitHit::PreviewLine(line) => {
+                if let Some(h) = p.hunk_at(line) {
+                    p.hunk = h;
+                }
+            }
+            crate::overlay::GitHit::Header => {}
+        }
+        if activate {
+            self.git_panel_key(&Key::Named(NamedKey::Enter), config);
+            return;
+        }
+        self.git_preview();
+        self.window.request_redraw();
+    }
+
+    /// Loads the file list of the commit the panel drilled into.
+    fn git_load_commit_files(&mut self) {
+        let Some(Overlay::Git(p)) = &self.overlay else { return };
+        let (Some(sha), root) = (p.open_commit.clone(), p.root.clone()) else { return };
+        self.git_gen += 1;
+        let seq = self.git_gen;
+        let proxy = self.proxy.clone();
+        std::thread::spawn(move || {
+            let files = crate::git::commit_files(&root, &sha);
+            let _ = proxy.send_event(UserEvent::GitPanel(seq, crate::git::PanelMsg::CommitFiles(files)));
+        });
+    }
+
     /// Stages or unstages one hunk, by feeding a rebuilt patch to `git apply
     /// --cached`. Same worker + busy discipline as `git_exec`.
     fn git_apply(&mut self, patch: String, reverse: bool) {
@@ -1984,6 +2092,11 @@ impl Gpu {
                     p.branches = b;
                     p.remotes = r;
                     p.current_branch = cur;
+                }
+                crate::git::PanelMsg::CommitFiles(f) => {
+                    p.commit_files = f;
+                    p.commit_cursor = 0;
+                    preview = true;
                 }
                 crate::git::PanelMsg::Tags(t) => p.tags = t,
                 crate::git::PanelMsg::Reflog(r) => p.reflog = r,
@@ -2041,12 +2154,22 @@ impl Gpu {
         let mut close = false;
         let mut reload = false;
         let mut open_dir: Option<String> = None;
+        // A commit to drill into: the list becomes its files.
+        let mut drill: Option<String> = None;
         // A hunk patch to stage (or, reversed, unstage).
         let mut patch: Option<(String, bool)> = None;
 
         let s = |v: &str| v.to_string();
         match key {
-            Key::Named(NamedKey::Escape) => close = true,
+            // Escape backs out of an open commit before it closes the panel: the
+            // drill-down is a place you are in, not a mode you toggled.
+            Key::Named(NamedKey::Escape) => {
+                if p.leave_commit() {
+                    moved = true;
+                } else {
+                    close = true;
+                }
+            }
             Key::Named(NamedKey::Tab) => {
                 p.cycle_view();
                 moved = true;
@@ -2092,9 +2215,12 @@ impl Gpu {
                         exec = Some(vec![s("stash"), s("pop"), name]);
                     }
                 }
+                // Enter opens the commit's FILES. Checking a commit out is `x`:
+                // reading a commit is what you do constantly, and moving HEAD onto
+                // one is not.
                 GitView::Log => {
                     if let Some(c) = p.selected_commit() {
-                        exec = Some(vec![s("checkout"), c.sha.clone()]);
+                        drill = Some(c.sha.clone());
                     }
                 }
                 GitView::Tags => {
@@ -2107,7 +2233,7 @@ impl Gpu {
                 // the whole point of showing it.
                 GitView::Reflog => {
                     if let Some(c) = p.selected_reflog() {
-                        exec = Some(vec![s("checkout"), c.sha.clone()]);
+                        drill = Some(c.sha.clone());
                     }
                 }
                 // A worktree is a directory: opening it is a new tab there, which is
@@ -2234,6 +2360,15 @@ impl Gpu {
                         exec = Some(vec![s("rebase"), b.clone()]);
                     }
                 }
+                "x" if view == GitView::Log || view == GitView::Reflog => {
+                    let sha = match view {
+                        GitView::Log => p.selected_commit().map(|c| c.sha.clone()),
+                        _ => p.selected_reflog().map(|c| c.sha.clone()),
+                    };
+                    if let Some(sha) = sha {
+                        exec = Some(vec![s("checkout"), sha]);
+                    }
+                }
                 "c" if view == GitView::Log => {
                     if let Some(cm) = p.selected_commit() {
                         exec = Some(vec![s("cherry-pick"), cm.sha.clone()]);
@@ -2254,6 +2389,9 @@ impl Gpu {
                 "S" => exec = Some(vec![s("stash"), s("push"), s("-u")]),
                 "n" if view == GitView::Branches => {
                     prompt = Some((PromptKind::GitBranch, "New branch"))
+                }
+                "y" if p.in_commit() => {
+                    copy = p.selected_commit_file().map(|f| f.path.clone());
                 }
                 "y" => {
                     copy = match view {
@@ -2302,6 +2440,12 @@ impl Gpu {
         if let Some(dir) = open_dir {
             self.overlay = None;
             self.new_tab_in(config, std::path::PathBuf::from(dir));
+        }
+        if let Some(sha) = drill {
+            if let Some(Overlay::Git(p)) = &mut self.overlay {
+                p.enter_commit(sha);
+            }
+            self.git_load_commit_files();
         }
         if let Some((text, reverse)) = patch {
             self.git_apply(text, reverse);

@@ -413,6 +413,41 @@ pub fn parse_status_files(text: &str) -> Vec<FileEntry> {
     out
 }
 
+/// The files one commit touched, with git's status letter for each. This is what
+/// makes a commit readable: a 40-file diff in one scrolling pane is a wall, and the
+/// question is almost always "what did it do to THIS file".
+pub fn commit_files(root: &Path, sha: &str) -> Vec<FileEntry> {
+    let text = read_text(
+        root,
+        &["show", "--no-color", "--name-status", "--format=", "--find-renames", sha],
+    );
+    parse_name_status(&text)
+}
+
+/// The same list for a stash entry, which is a commit like any other.
+pub fn parse_name_status(text: &str) -> Vec<FileEntry> {
+    text.lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|line| {
+            let mut parts = line.split('\t');
+            let status = parts.next()?.chars().next()?;
+            // A rename is `R100 <old> <new>`; the new path is the one to show.
+            let first = parts.next()?;
+            let path = parts.next().unwrap_or(first);
+            Some(FileEntry { path: path.to_string(), index: status, worktree: '.' })
+        })
+        .collect()
+}
+
+/// One file's diff inside one commit.
+///
+/// `--format=` drops the commit header: the message is already on screen when you
+/// pick the commit, and repeating it above every file would push the diff — the
+/// thing you drilled in for — off the top.
+pub fn show_file(root: &Path, sha: &str, path: &str) -> String {
+    read_text(root, &["show", "--no-color", "--format=", "--patch", sha, "--", path])
+}
+
 /// A commit's full diff, for the panel's preview pane.
 pub fn show(root: &Path, sha: &str) -> String {
     read_text(root, &["show", "--no-color", "--stat", "--patch", sha])
@@ -885,6 +920,19 @@ mod tests {
     }
 
     #[test]
+    fn parses_the_files_a_commit_touched() {
+        let files = parse_name_status(
+            "M\tsrc/git.rs\nA\tsrc/new.rs\nD\tdocs/old.md\nR100\tdocs/a.md\tdocs/b.md\n",
+        );
+        assert_eq!(files.len(), 4);
+        assert_eq!((files[0].index, files[0].path.as_str()), ('M', "src/git.rs"));
+        assert_eq!(files[1].index, 'A');
+        assert_eq!(files[2].index, 'D');
+        // A rename reports both paths; the new one is what the diff is against.
+        assert_eq!((files[3].index, files[3].path.as_str()), ('R', "docs/b.md"));
+    }
+
+    #[test]
     fn a_submodule_row_yields_its_path_not_its_sha() {
         let line = "submodule  8f6876d1 vendor/thing (v1.2.0)";
         assert_eq!(worktree_path(line), "vendor/thing");
@@ -1071,6 +1119,8 @@ pub enum PanelMsg {
     Log(Vec<Commit>),
     /// Local branches, remote-tracking branches, and the branch checked out now.
     Branches(Vec<String>, Vec<String>, String),
+    /// The files one commit touched, after drilling into it.
+    CommitFiles(Vec<FileEntry>),
     Tags(Vec<String>),
     Reflog(Vec<Commit>),
     Worktrees(Vec<String>),

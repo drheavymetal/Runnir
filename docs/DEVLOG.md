@@ -845,6 +845,33 @@ draw path can ask "is this tab dirty" with no filesystem access at all, and spaw
 **at most one git per wake**, active tab's repository first. Eight tabs in eight
 repositories must not answer a keystroke with eight processes.
 
+## 2026-07-21 - Git: the mouse, and reading a commit one file at a time
+
+Pedro: no mouse in the panel, and a commit could only be read as one long diff.
+
+**Drill-down.** Enter on a commit (log or reflog) makes the list that commit's
+FILES - `git show --name-status` - and selecting one previews just that file's diff
+inside the commit (`git show --format= --patch <sha> -- <path>`; `--format=` drops
+the message, which is already on screen and would otherwise push the diff off the
+top). Escape backs OUT of the commit before it will close the panel. Checking a
+commit out moved to `x`: reading a commit is what you do constantly, moving HEAD
+onto one is not, and Enter should be the common one.
+
+**Mouse.** The renderer and the hit test now share `GitPanel::layout(cols, rows)`,
+so a click cannot land somewhere other than what it looks like it hit - the bug that
+would otherwise appear the first time the list width formula changed in one place.
+`hit()` returns View / Row / PreviewLine / Header; a click on the already-selected
+row does what Enter does (file-manager behaviour), a click on a diff row selects
+that HUNK (so `s` then stages exactly what you pointed at), the wheel moves the
+selection over the list and scrolls the diff over the diff, and a click outside
+closes the panel.
+
+No click injector exists on this box (no ydotool/wtype), so the mouse is covered by
+unit tests instead: `the_git_panel_hit_test_agrees_with_what_it_draws` walks the
+view labels at their drawn positions, checks row mapping including the scrolled
+case, and `a_click_on_a_diff_row_finds_its_hunk` pins hunk lookup. The drill-down
+itself was verified on screen.
+
 ## Gotchas (do not re-learn)
 
 - A binding spec and a keypress must produce the SAME `ChordKey` variant.

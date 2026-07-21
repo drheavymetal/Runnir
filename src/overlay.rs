@@ -180,6 +180,12 @@ pub struct GitPanel {
     /// Message filter for the log view, shown in the header so a narrowed list can
     /// never be mistaken for the whole history.
     pub log_filter: String,
+    /// The commit whose FILES the list is showing, if we drilled into one. A commit
+    /// of forty files read as one scrolling diff is a wall; the question is nearly
+    /// always what it did to one file.
+    pub open_commit: Option<String>,
+    pub commit_files: Vec<crate::git::FileEntry>,
+    pub commit_cursor: usize,
     pub preview: String,
     /// The preview, parsed into numbered diff rows. Kept beside the text so the
     /// draw path never re-parses on every frame.
@@ -212,6 +218,9 @@ impl GitPanel {
             cursors: [0; 7],
             show_staged: false,
             log_filter: String::new(),
+            open_commit: None,
+            commit_files: Vec::new(),
+            commit_cursor: 0,
             preview: String::new(),
             preview_rows: Vec::new(),
             preview_scroll: 0,
@@ -233,7 +242,31 @@ impl GitPanel {
         }
     }
 
+    /// Where the panel's parts sit, in cells. Shared by the renderer and the mouse,
+    /// so a click can never land somewhere other than what it looks like it hit.
+    pub fn layout(&self, cols: usize, rows: usize) -> GitLayout {
+        let w = cols.saturating_sub(4).max(40);
+        let h = rows.saturating_sub(4).max(12);
+        GitLayout {
+            col: 2,
+            row: 2,
+            w,
+            h,
+            list_w: (w * 2 / 5).clamp(24, 64).min(w.saturating_sub(10)),
+            body_rows: h.saturating_sub(3),
+        }
+    }
+
+    /// Whether the list is showing one commit's files rather than the view's own
+    /// list.
+    pub fn in_commit(&self) -> bool {
+        self.open_commit.is_some()
+    }
+
     pub fn len(&self) -> usize {
+        if self.in_commit() {
+            return self.commit_files.len();
+        }
         match self.view {
             GitView::Status => self.files.len(),
             GitView::Log => self.log.len(),
@@ -246,13 +279,42 @@ impl GitPanel {
     }
 
     pub fn cursor(&self) -> usize {
+        if self.in_commit() {
+            return self.commit_cursor.min(self.len().saturating_sub(1));
+        }
         self.cursors[self.view_index()].min(self.len().saturating_sub(1))
     }
 
     pub fn set_cursor(&mut self, n: usize) {
-        let i = self.view_index();
-        self.cursors[i] = n.min(self.len().saturating_sub(1));
+        let n = n.min(self.len().saturating_sub(1));
+        if self.in_commit() {
+            self.commit_cursor = n;
+        } else {
+            let i = self.view_index();
+            self.cursors[i] = n;
+        }
         self.preview_scroll = 0;
+    }
+
+    /// Drills into a commit: the list becomes its files. `leave_commit` backs out,
+    /// which is also what Escape does before it will close the panel.
+    pub fn enter_commit(&mut self, sha: String) {
+        self.open_commit = Some(sha);
+        self.commit_files.clear();
+        self.commit_cursor = 0;
+        self.preview_scroll = 0;
+    }
+
+    pub fn leave_commit(&mut self) -> bool {
+        let was = self.open_commit.take().is_some();
+        self.commit_files.clear();
+        self.preview_scroll = 0;
+        was
+    }
+
+    /// The file selected inside an open commit.
+    pub fn selected_commit_file(&self) -> Option<&crate::git::FileEntry> {
+        self.commit_files.get(self.cursor())
     }
 
     pub fn down(&mut self) {
@@ -360,6 +422,19 @@ impl GitPanel {
     fn row_text(&self, i: usize, width: usize) -> (String, Pen) {
         let green = Pen { fg: Color::Rgb(0x7a, 0xc0, 0x7a), bg: bg(), ..Pen::default() };
         let red = Pen { fg: Color::Rgb(0xe0, 0x60, 0x60), bg: bg(), ..Pen::default() };
+        if self.in_commit() {
+            return match self.commit_files.get(i) {
+                Some(f) => {
+                    let pen = match f.index {
+                        'A' => green,
+                        'D' => red,
+                        _ => normal(),
+                    };
+                    (format!("{} {}", f.index, elide(&f.path, width.saturating_sub(2))), pen)
+                }
+                None => (String::new(), normal()),
+            };
+        }
         match self.view {
             GitView::Status => match self.files.get(i) {
                 Some(f) => {
@@ -438,11 +513,14 @@ impl GitPanel {
     /// every one of these acts immediately, so the user has to be able to read what
     /// a key does before pressing it.
     fn keys_legend(&self) -> &'static str {
+        if self.in_commit() {
+            return "one commit's files · j k move · esc back to the list · y copy path";
+        }
         match self.view {
             GitView::Status => {
                 "space stage · a all · ]/[ hunk · s/u stage hunk · c commit · P push · p pull · S stash"
             }
-            GitView::Log => "enter checkout · c cherry-pick · / filter · o split · y sha · P push",
+            GitView::Log => "enter files of this commit · x checkout · c cherry-pick · / filter · y sha",
             GitView::Branches => "enter switch · n new · m merge into HEAD · R rebase onto · f fetch",
             GitView::Stashes => "enter pop · S stash push",
             GitView::Tags => "enter checkout · n new tag · P push tags",
@@ -452,22 +530,13 @@ impl GitPanel {
     }
 
     pub fn render(&self, cols: usize, rows: usize, theme: &Theme) -> Vec<Panel> {
-        let w = cols.saturating_sub(4).max(40);
-        let h = rows.saturating_sub(4).max(12);
+        let l = self.layout(cols, rows);
+        let (w, h, list_w) = (l.w, l.h, l.list_w);
         let mut g = panel_grid(w, h, theme);
-        let list_w = (w * 2 / 5).clamp(24, 64).min(w.saturating_sub(10));
 
         // Header: the four views, the active one reversed, then the branch.
         let mut x = 2;
-        for v in [
-            GitView::Status,
-            GitView::Log,
-            GitView::Branches,
-            GitView::Stashes,
-            GitView::Tags,
-            GitView::Reflog,
-            GitView::Worktrees,
-        ] {
+        for v in Self::VIEWS {
             let label = format!(" {} ", v.title());
             let pen = if v == self.view { selected() } else { dim() };
             write(&mut g, 0, x, &label, pen);
@@ -481,13 +550,16 @@ impl GitPanel {
         if matches!(self.view, GitView::Log) && !self.log_filter.is_empty() {
             head = format!("/{}  {head}", self.log_filter);
         }
+        if let Some(sha) = &self.open_commit {
+            head = format!("{sha}  {head}");
+        }
         let head_w = head.chars().count();
         if head_w > 0 && w > x + head_w + 2 {
             write(&mut g, 0, w - head_w - 2, &head, accent());
         }
 
         // Left: the list. Right: the preview, with a rule between them.
-        let body_rows = h.saturating_sub(3);
+        let body_rows = l.body_rows;
         let scroll = self.cursor().saturating_sub(body_rows.saturating_sub(1));
         for line in 0..body_rows {
             let i = scroll + line;
@@ -585,8 +657,75 @@ impl GitPanel {
         };
         write(&mut g, h - 1, 2, &elide(&foot, w.saturating_sub(4)), pen);
 
-        vec![Panel { grid: g, col: 2, row: 2 }]
+        vec![Panel { grid: g, col: l.col, row: l.row }]
     }
+
+    /// Where a click landed inside the panel, in panel-local cells. `None` when the
+    /// click was outside it entirely.
+    pub fn hit(&self, cols: usize, rows: usize, col: usize, row: usize) -> Option<GitHit> {
+        let l = self.layout(cols, rows);
+        let (lc, lr) = (col.checked_sub(l.col)?, row.checked_sub(l.row)?);
+        if lc >= l.w || lr >= l.h {
+            return None;
+        }
+        if lr == 0 {
+            // The view tabs, measured exactly as they are drawn.
+            let mut x = 2;
+            for v in Self::VIEWS {
+                let width = v.title().chars().count() + 2;
+                if lc >= x && lc < x + width {
+                    return Some(GitHit::View(v));
+                }
+                x += width + 1;
+            }
+            return Some(GitHit::Header);
+        }
+        if lr < 2 || lr >= 2 + l.body_rows {
+            return Some(GitHit::Header);
+        }
+        let line = lr - 2;
+        if lc < l.list_w {
+            let scroll = self.cursor().saturating_sub(l.body_rows.saturating_sub(1));
+            return Some(GitHit::Row(scroll + line));
+        }
+        Some(GitHit::PreviewLine(self.preview_scroll + line))
+    }
+
+    /// The hunk containing a preview row, for click-to-select-hunk.
+    pub fn hunk_at(&self, row: usize) -> Option<usize> {
+        self.hunks().iter().position(|&(s, e)| row >= s && row < e)
+    }
+
+    const VIEWS: [GitView; 7] = [
+        GitView::Status,
+        GitView::Log,
+        GitView::Branches,
+        GitView::Stashes,
+        GitView::Tags,
+        GitView::Reflog,
+        GitView::Worktrees,
+    ];
+}
+
+/// The panel's geometry in cells, produced once and used by both the renderer and
+/// the hit test.
+pub struct GitLayout {
+    pub col: usize,
+    pub row: usize,
+    pub w: usize,
+    pub h: usize,
+    pub list_w: usize,
+    pub body_rows: usize,
+}
+
+/// What a click landed on.
+pub enum GitHit {
+    View(GitView),
+    /// A row of the list, by index into whatever the list is showing.
+    Row(usize),
+    /// A row of the preview, by index into `preview_rows`.
+    PreviewLine(usize),
+    Header,
 }
 
 /// First non-empty line, so a multi-line git message fits a one-row footer.
@@ -1769,6 +1908,68 @@ mod tests {
         assert!(labels.iter().all(|l| l.len() == 2), "past the alphabet all are 2 chars");
         let set: std::collections::HashSet<_> = labels.iter().collect();
         assert_eq!(set.len(), 200, "labels must be unique");
+    }
+
+    #[test]
+    fn the_git_panel_hit_test_agrees_with_what_it_draws() {
+        use crate::git::{Commit, FileEntry};
+        let mut p = GitPanel::new(std::path::PathBuf::from("/tmp/repo"));
+        p.files = (0..40)
+            .map(|i| FileEntry { path: format!("src/f{i}.rs"), index: '.', worktree: 'M' })
+            .collect();
+        let (cols, rows) = (120usize, 40usize);
+        let l = p.layout(cols, rows);
+
+        // Outside the panel is not a hit, so a click there can mean "close".
+        assert!(p.hit(cols, rows, 0, 0).is_none());
+
+        // The header's view labels, measured the way they are written: two cells of
+        // padding either side of the title, one cell between.
+        let mut x = l.col + 2;
+        for v in GitPanel::VIEWS {
+            let hit = p.hit(cols, rows, x + 1, l.row);
+            assert!(matches!(hit, Some(GitHit::View(w)) if w == v), "{} at {x}", v.title());
+            x += v.title().chars().count() + 3;
+        }
+
+        // A list row maps to the entry drawn on it, including when the list has
+        // scrolled: the same `cursor - (body_rows - 1)` the renderer uses.
+        assert!(matches!(p.hit(cols, rows, l.col + 1, l.row + 2), Some(GitHit::Row(0))));
+        assert!(matches!(p.hit(cols, rows, l.col + 1, l.row + 5), Some(GitHit::Row(3))));
+        p.set_cursor(39);
+        let scrolled = p.cursor() - (l.body_rows - 1);
+        assert!(
+            matches!(p.hit(cols, rows, l.col + 1, l.row + 2), Some(GitHit::Row(i)) if i == scrolled),
+            "a scrolled list must not report the row that used to be there"
+        );
+
+        // Past the list divider is the diff, reported by row of the preview.
+        assert!(matches!(
+            p.hit(cols, rows, l.col + l.list_w + 3, l.row + 2),
+            Some(GitHit::PreviewLine(0))
+        ));
+
+        // Drilled into a commit, the rows are that commit's files.
+        p.enter_commit("abc1234".into());
+        p.commit_files = vec![FileEntry { path: "a.rs".into(), index: 'M', worktree: '.' }];
+        assert_eq!(p.len(), 1);
+        assert!(matches!(p.hit(cols, rows, l.col + 1, l.row + 2), Some(GitHit::Row(0))));
+        let _ = Commit::default();
+    }
+
+    #[test]
+    fn a_click_on_a_diff_row_finds_its_hunk() {
+        let mut p = GitPanel::new(std::path::PathBuf::from("/tmp/repo"));
+        p.set_preview(
+            "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1,2 +1,2 @@\n one\n-two\n+TWO\n@@ -9,2 +9,2 @@\n nine\n-ten\n+TEN\n"
+                .into(),
+        );
+        // Row 4 is inside the first hunk, row 9 inside the second.
+        assert_eq!(p.hunk_at(4), Some(0));
+        assert_eq!(p.hunk_at(9), Some(1));
+        // Metadata above the first @@ belongs to no hunk, so a click there stages
+        // nothing by accident.
+        assert_eq!(p.hunk_at(0), None);
     }
 
     #[test]
