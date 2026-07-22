@@ -2136,6 +2136,45 @@ Belt AND braces, both always:
 3. The worker: connect, paint, restore, and every failure mode above.
 4. Wire it to arm/descend/disarm, with `sustain` from the first paint.
 
+## 2026-07-22 - The AI assistant stops assuming a provider
+
+Reported as a gap: runnir's AI worked with Claude Code or with anything
+OpenAI-compatible, but there was no way to use **Claude over the API** — and no way
+to change provider without editing the config file by hand.
+
+**Anthropic's Messages API is not OpenAI-compatible**, which is the whole reason this
+needed a new provider kind rather than another `api` entry: `/v1/messages` instead of
+`/chat/completions`, an `x-api-key` header instead of a bearer token, a mandatory
+`anthropic-version` (pinned to a date, so a new release cannot change the response
+shape under a running client), a mandatory `max_tokens` with no server-side default,
+and an answer that arrives as a LIST of content blocks. Bending it into the existing
+`api` variant would have produced a config that looks right and fails at request time.
+
+**The response shape is the trap.** `content[0]` is not the answer — a model that
+thinks first puts a `thinking` block ahead of the text, so taking the first block
+returns reasoning or nothing. The parser joins every `text` block and skips the rest.
+A refusal is HTTP 200 with `stop_reason: "refusal"` and no text at all, which has to
+read as a refusal rather than as a malformed response, or the user is told the API is
+broken when it is working exactly as designed.
+
+**A configurator, because a config file is not one.** The settings panel
+(`Ctrl+Shift+,`) gained an AI row that cycles every configured provider and shows
+which model is behind each name — `claude-api (claude-opus-4-8)`, not just
+`claude-api`. Cycling is over a SORTED list: `providers` is a HashMap, and cycling in
+map order would send the same keypress somewhere different every session.
+
+**Verified against a mock server rather than guessed**, since there is no API key on
+this machine. A local HTTP server recorded what runnir actually sent and answered
+with a thinking-block-first response. The request came back exactly right — path
+`/v1/messages`, `x-api-key`, `anthropic-version: 2023-06-01`, `max_tokens` from the
+config — and the reply `du -sh * | sort -h` landed at the prompt with the thinking
+block correctly skipped. Recommended technique for any wire format: a mock that logs
+the request proves the headers, and a canned response proves the parser.
+
+Keys stay out of the config file: every provider names an ENVIRONMENT VARIABLE, so
+the file is safe in a dotfile repo. That was already true and is now documented in
+the manual, the README and the site, none of which said it.
+
 ## Gotchas (do not re-learn)
 
 - The board must be put back even if runnir DIES. `sustain` (ms) on every ZSA paint is
@@ -2152,6 +2191,9 @@ Belt AND braces, both always:
   desktop app: kontroll finds Keymapp's socket through it, so the usual test isolation
   silently disconnects the keyboard. Some features can only be verified in the real
   environment.
+- A local mock HTTP server is the cheapest way to verify a wire format with no
+  credentials: log the request to prove the headers, return a canned body to prove
+  the parser. Both halves fail silently otherwise.
 - A parser fixture written by hand tests the hand that wrote it. Copy the real
   output, blank lines and all — `split_once(':')?` on one blank line silently turned
   the whole keyboard feature into a no-op, with a passing test beside it.

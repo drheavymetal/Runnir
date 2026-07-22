@@ -149,6 +149,9 @@ pub fn ask(
             Provider::ClaudeCode { command, args, dangerously_skip_permissions } => {
                 run_claude_code(&command, &args, dangerously_skip_permissions, &prompt, timeout)
             }
+            Provider::Anthropic { base_url, model, api_key_env, max_tokens } => {
+                run_anthropic(&base_url, &model, &api_key_env, max_tokens, &prompt, timeout)
+            }
             Provider::Api { base_url, model, api_key_env } => {
                 run_api(&base_url, &model, &api_key_env, &prompt, timeout)
             }
@@ -275,6 +278,87 @@ fn wait_with_timeout(child: &mut std::process::Child, timeout: u64) -> Result<st
     }
 }
 
+/// Anthropic's Messages API. Separate from `run_api` because almost nothing about
+/// the wire format is shared: `/v1/messages` rather than `/chat/completions`,
+/// `x-api-key` rather than a bearer token, a mandatory version header, a mandatory
+/// `max_tokens`, and an answer that arrives as a list of content blocks.
+fn run_anthropic(
+    base_url: &str,
+    model: &str,
+    api_key_env: &str,
+    max_tokens: u32,
+    prompt: &str,
+    timeout: u64,
+) -> Result<String, String> {
+    let key = std::env::var(api_key_env)
+        .map_err(|_| format!("${api_key_env} is not set (put your key there)"))?;
+
+    let url = format!("{}/messages", base_url.trim_end_matches('/'));
+    let response = ureq::post(&url)
+        .config()
+        .timeout_global(Some(std::time::Duration::from_secs(timeout)))
+        .build()
+        .header("x-api-key", &key)
+        // Pinned, not "latest": the API is versioned by date precisely so a new
+        // release cannot change the response shape under a running client.
+        .header("anthropic-version", ANTHROPIC_VERSION)
+        .header("Content-Type", "application/json")
+        .send_json(&anthropic_body(model, prompt, max_tokens));
+
+    let mut response = match response {
+        Ok(r) => r,
+        Err(ureq::Error::StatusCode(code)) => return Err(format!("{model}: HTTP {code}")),
+        Err(e) => return Err(format!("{model}: {e}")),
+    };
+    let json: serde_json::Value =
+        response.body_mut().read_json().map_err(|e| format!("bad response: {e}"))?;
+    parse_anthropic(&json)
+}
+
+/// The API version this client is written against. Anthropic versions by date so a
+/// pinned client keeps the response shape it was built for.
+const ANTHROPIC_VERSION: &str = "2023-06-01";
+
+fn anthropic_body(model: &str, prompt: &str, max_tokens: u32) -> serde_json::Value {
+    serde_json::json!({
+        "model": model,
+        // Required by this API — unlike the OpenAI-compatible one, there is no
+        // server-side default and omitting it is a 400.
+        "max_tokens": max_tokens,
+        "messages": [{ "role": "user", "content": prompt }],
+    })
+}
+
+/// Pulls the answer out of a Messages response.
+///
+/// The content is a LIST of blocks, not a single string: a model that thinks first
+/// puts a `thinking` block before the text, so taking block 0 blindly returns
+/// nothing (or reasoning) instead of the answer. A refusal arrives as HTTP 200 with
+/// `stop_reason: "refusal"` and no text at all, which has to read as a refusal
+/// rather than as a malformed response.
+fn parse_anthropic(json: &serde_json::Value) -> Result<String, String> {
+    if json["stop_reason"] == "refusal" {
+        return Err("the model declined this request".into());
+    }
+    let text: String = json["content"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|b| b["type"] == "text")
+        .filter_map(|b| b["text"].as_str())
+        .collect::<Vec<_>>()
+        .join("");
+    if text.trim().is_empty() {
+        // An error body comes back as {"type":"error","error":{"message":...}}; say
+        // what it said rather than dumping the whole JSON at the user.
+        if let Some(msg) = json["error"]["message"].as_str() {
+            return Err(msg.to_string());
+        }
+        return Err(format!("no text in response: {json}"));
+    }
+    Ok(text.trim().to_string())
+}
+
 /// Posts to an OpenAI-compatible chat endpoint and returns the assistant text.
 fn run_api(
     base_url: &str,
@@ -320,6 +404,62 @@ fn run_api(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+
+    /// The Anthropic response is a LIST of blocks. A model that thinks first puts a
+    /// `thinking` block ahead of the text, so `content[0]` is not the answer — the
+    /// bug this test exists to prevent.
+    #[test]
+    fn the_answer_is_the_text_blocks_not_the_first_block() {
+        let json = serde_json::json!({
+            "content": [
+                {"type": "thinking", "thinking": "let me consider..."},
+                {"type": "text", "text": "ls -la"},
+            ],
+            "stop_reason": "end_turn",
+        });
+        assert_eq!(parse_anthropic(&json).unwrap(), "ls -la");
+    }
+
+    /// Text arriving split across blocks has to come back joined, not truncated to
+    /// whichever piece happened to be first.
+    #[test]
+    fn split_text_blocks_are_joined() {
+        let json = serde_json::json!({
+            "content": [{"type": "text", "text": "git "}, {"type": "text", "text": "status"}],
+        });
+        assert_eq!(parse_anthropic(&json).unwrap(), "git status");
+    }
+
+    /// A refusal is HTTP 200 with no text — it must read as a refusal, not as a
+    /// malformed response, or the user is told the API is broken when it is not.
+    #[test]
+    fn a_refusal_is_reported_as_one() {
+        let json = serde_json::json!({"stop_reason": "refusal", "content": []});
+        let err = parse_anthropic(&json).unwrap_err();
+        assert!(err.contains("declined"), "{err}");
+    }
+
+    /// An error body says why; repeating its message beats dumping the JSON.
+    #[test]
+    fn an_error_body_surfaces_its_own_message() {
+        let json = serde_json::json!({
+            "type": "error",
+            "error": {"type": "invalid_request_error", "message": "max_tokens: must be > 0"},
+        });
+        assert_eq!(parse_anthropic(&json).unwrap_err(), "max_tokens: must be > 0");
+    }
+
+    /// `max_tokens` has no server-side default on this API — omitting it is a 400,
+    /// which is exactly the kind of thing that only shows up at request time.
+    #[test]
+    fn the_request_carries_the_fields_this_api_requires() {
+        let body = anthropic_body("claude-opus-4-8", "hello", 4096);
+        assert_eq!(body["model"], "claude-opus-4-8");
+        assert_eq!(body["max_tokens"], 4096);
+        assert_eq!(body["messages"][0]["role"], "user");
+        assert_eq!(body["messages"][0]["content"], "hello");
+    }
 
     #[test]
     fn launch_command_appends_skip_flag_only_when_set() {

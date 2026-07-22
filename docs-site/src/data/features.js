@@ -489,6 +489,23 @@ export const FEATURES = [
 
   // -------------------------------------------------------------------- IA
   {
+    key: 'ai-providers', section: 'ai', status: 'shipped',
+    title: { es: 'Proveedor de IA configurable', en: 'Bring your own AI provider' },
+    natural: {
+      es: 'Ningun proveedor viene impuesto. Hay tres formas. Una CLI (kind = claude_code) lanza Claude Code contra tu suscripcion, sin clave de API. Un endpoint compatible con OpenAI (kind = api) cubre OpenAI, Gemini, DeepSeek, Z.ai o un servidor local: apuntas base_url y nombras el modelo. Y la API propia de Anthropic (kind = anthropic), que NO es compatible con OpenAI — otra ruta, cabecera x-api-key en vez de bearer, version fijada y max_tokens obligatorio — por eso es un tipo aparte y no una entrada api que pareceria correcta y fallaria al hacer la peticion. Las claves nunca se guardan en el fichero: cada proveedor nombra una VARIABLE DE ENTORNO, asi que la config es segura en un repo de dotfiles.',
+      en: 'No provider is baked in. Three shapes. A CLI (kind = claude_code) spawns Claude Code against your subscription, no API key at all. An OpenAI-compatible endpoint (kind = api) covers OpenAI, Gemini, DeepSeek, Z.ai or a local server — point base_url at it and name the model. And Anthropic’s own Messages API (kind = anthropic), which is NOT OpenAI-compatible: different path, an x-api-key header instead of a bearer token, a pinned version header and a required max_tokens — its own kind rather than an api entry that would look right and fail at request time. Keys are never stored in the file: each provider names an ENVIRONMENT VARIABLE, so the config is safe in a dotfile repo.',
+    },
+    config: [
+      { k: 'ai.default', v: '"claude"', d: { es: 'Que proveedor usar; se cicla tambien desde el panel de ajustes', en: 'Which provider to use; also cycled from the settings panel' } },
+      { k: 'ai.providers.<name>.kind', v: '"claude_code" | "api" | "anthropic"', d: { es: 'La forma del proveedor', en: 'The provider shape' } },
+      { k: 'ai.providers.<name>.api_key_env', v: '"ANTHROPIC_API_KEY"', d: { es: 'El NOMBRE de la variable de entorno, nunca la clave', en: 'The NAME of the environment variable, never the key' } },
+    ],
+    note: {
+      es: 'Cambiar de proveedor no exige editar nada: Ctrl+Shift+, y la fila de IA cicla por todos los configurados, mostrando que modelo hay detras de cada nombre.',
+      en: 'Switching provider needs no editing: Ctrl+Shift+, and the AI row cycles through everything configured, showing which model is behind each name.',
+    },
+  },
+  {
     key: 'ai-panel', section: 'ai', status: 'shipped',
     title: { es: 'Panel de asistente IA', en: 'AI assistant panel' },
     natural: {

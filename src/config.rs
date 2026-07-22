@@ -462,6 +462,34 @@ pub enum Provider {
         /// config file — that file ends up in dotfile repos.
         api_key_env: String,
     },
+    /// Anthropic's own Messages API, which is NOT OpenAI-compatible: different
+    /// path, `x-api-key` instead of a bearer token, a required version header, a
+    /// required `max_tokens`, and a different response shape. Kept as its own
+    /// variant rather than bent into `Api`, because pretending one shape fits both
+    /// is how you get a config that looks right and fails at request time.
+    Anthropic {
+        #[serde(default = "default_anthropic_url")]
+        base_url: String,
+        model: String,
+        #[serde(default = "default_anthropic_key_env")]
+        api_key_env: String,
+        /// Required by the API — there is no default on the wire. Generous by
+        /// default: a truncated answer costs a whole round trip to notice.
+        #[serde(default = "default_anthropic_max_tokens")]
+        max_tokens: u32,
+    },
+}
+
+fn default_anthropic_url() -> String {
+    "https://api.anthropic.com/v1".into()
+}
+
+fn default_anthropic_key_env() -> String {
+    "ANTHROPIC_API_KEY".into()
+}
+
+fn default_anthropic_max_tokens() -> u32 {
+    4096
 }
 
 fn default_claude_command() -> String {
@@ -497,6 +525,16 @@ impl Default for Ai {
                 command: default_claude_command(),
                 args: Vec::new(),
                 dangerously_skip_permissions: true,
+            },
+        );
+        // Claude over the API, for people who have a key rather than the CLI.
+        providers.insert(
+            "claude-api".into(),
+            Provider::Anthropic {
+                base_url: default_anthropic_url(),
+                model: "claude-opus-4-8".into(),
+                api_key_env: default_anthropic_key_env(),
+                max_tokens: default_anthropic_max_tokens(),
             },
         );
         providers.insert(

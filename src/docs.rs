@@ -224,10 +224,25 @@ link the program declared underlines on hover and opens on Ctrl+click.
 
 # AI assistant
 
-runnir talks to an assistant without leaving the terminal. Claude runs through the
-Claude Code CLI against your subscription — no API key. Other providers (OpenAI,
-Gemini, DeepSeek, Z.ai) use their HTTP APIs, with the key taken from an environment
-variable named in the config, never stored in the file.
+runnir talks to an assistant without leaving the terminal, through whichever
+provider you configure. No provider is baked in.
+
+Three shapes are supported. A CLI (kind = claude_code) spawns Claude Code against
+your subscription — no API key at all. An OpenAI-compatible endpoint (kind = api)
+covers OpenAI, Gemini, DeepSeek, Z.ai and anything else that speaks
+/chat/completions — point base_url at it and name the model. Anthropic's own
+Messages API (kind = anthropic) is its own shape: a different path, an x-api-key
+header instead of a bearer token, a pinned version header, and a required
+max_tokens — so it is a separate kind rather than an api entry that would look
+right and fail at request time.
+
+Keys are never stored in the config. Each provider names an ENVIRONMENT VARIABLE
+(api_key_env) and runnir reads the key from there, so the config file is safe to
+keep in a dotfile repo.
+
+Switch provider without editing anything: Ctrl+Shift+, opens the settings panel,
+and the AI row cycles through every provider you have configured, showing which
+model is behind each one.
 
 @ Ctrl+Shift+A     open / close the assistant panel
 @ Ctrl+Shift+G     send the last command, its output and its exit code to the model

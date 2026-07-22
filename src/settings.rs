@@ -36,6 +36,7 @@ pub enum SettingId {
     KeyboardAmbient,
     KeyboardFlashMs,
     KeyboardLeaderLights,
+    AiProvider,
 }
 
 /// How a setting is edited, which drives the key handling and the value hint.
@@ -90,6 +91,7 @@ pub fn rows() -> Vec<Row> {
         row!("Explorer", "Side", ExplorerSide, Enum),
         row!("Explorer", "Width (columns)", ExplorerWidth, Int),
         row!("Explorer", "Show hidden files", ExplorerHidden, Bool),
+        row!("AI", "Provider", AiProvider, Enum),
         row!("Keyboard", "Flash the ZSA board", KeyboardAmbient, Bool),
         row!("Keyboard", "Flash length (ms)", KeyboardFlashMs, Int),
         row!("Keyboard", "Light the leader on the keys", KeyboardLeaderLights, Bool),
@@ -130,6 +132,20 @@ pub fn value(cfg: &Config, id: SettingId) -> String {
         ExplorerSide => cfg.explorer.side.clone(),
         ExplorerWidth => cfg.explorer.width.to_string(),
         ExplorerHidden => onoff(cfg.explorer.show_hidden),
+        AiProvider => {
+            // The name plus what it actually is: "claude-api" and "openai" say
+            // nothing about whether a key is needed or which model answers.
+            match cfg.ai.providers.get(&cfg.ai.default) {
+                Some(crate::config::Provider::ClaudeCode { command, .. }) => {
+                    format!("{} ({command} CLI)", cfg.ai.default)
+                }
+                Some(crate::config::Provider::Api { model, .. })
+                | Some(crate::config::Provider::Anthropic { model, .. }) => {
+                    format!("{} ({model})", cfg.ai.default)
+                }
+                None => format!("{} (not configured)", cfg.ai.default),
+            }
+        }
         KeyboardAmbient => onoff(cfg.keyboard.ambient),
         KeyboardFlashMs => cfg.keyboard.flash_ms.to_string(),
         KeyboardLeaderLights => onoff(cfg.keyboard.leader_lights),
@@ -198,6 +214,7 @@ pub fn adjust(cfg: &mut Config, id: SettingId, dir: i32) {
             cfg.explorer.width = w.clamp(crate::explorer::MIN_WIDTH as i32, 120) as usize;
         }
         ExplorerHidden => cfg.explorer.show_hidden = up,
+        AiProvider => cfg.ai.default = next_provider(cfg, dir),
         KeyboardAmbient => cfg.keyboard.ambient = up,
         KeyboardLeaderLights => cfg.keyboard.leader_lights = up,
         KeyboardFlashMs => {
@@ -221,5 +238,64 @@ pub fn set_text(cfg: &mut Config, id: SettingId, text: String) {
             cfg.window.background = if t.is_empty() { None } else { Some(t.to_string()) };
         }
         _ => {}
+    }
+}
+
+/// The provider after (or before) the current one, in name order.
+///
+/// Sorted rather than in map order: a HashMap iterates differently on every run, so
+/// unsorted cycling would send the same keypress somewhere different each session.
+fn next_provider(cfg: &Config, dir: i32) -> String {
+    let mut names: Vec<&String> = cfg.ai.providers.keys().collect();
+    names.sort();
+    if names.is_empty() {
+        return cfg.ai.default.clone();
+    }
+    let here = names.iter().position(|n| **n == cfg.ai.default).unwrap_or(0) as i32;
+    let next = (here + dir).rem_euclid(names.len() as i32) as usize;
+    names[next].clone()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Cycling has to be STABLE: a HashMap iterates in a different order every run,
+    /// so unsorted cycling would send the same keypress somewhere different each
+    /// session. Sorted by name, forwards and backwards, wrapping at both ends.
+    #[test]
+    fn the_provider_cycles_in_a_stable_order() {
+        let mut cfg = Config::default();
+        let mut names: Vec<String> = cfg.ai.providers.keys().cloned().collect();
+        names.sort();
+        assert!(names.len() > 2, "the defaults ship several providers");
+
+        cfg.ai.default = names[0].clone();
+        assert_eq!(next_provider(&cfg, 1), names[1]);
+        assert_eq!(next_provider(&cfg, -1), names[names.len() - 1], "wraps backwards");
+
+        cfg.ai.default = names[names.len() - 1].clone();
+        assert_eq!(next_provider(&cfg, 1), names[0], "wraps forwards");
+    }
+
+    /// A `default` naming a provider that is not in the map (hand-edited config, or
+    /// one deleted since) must still cycle rather than sticking or panicking.
+    #[test]
+    fn an_unknown_default_still_cycles() {
+        let mut cfg = Config::default();
+        cfg.ai.default = "does-not-exist".into();
+        let next = next_provider(&cfg, 1);
+        assert!(cfg.ai.providers.contains_key(&next), "landed on {next}");
+        assert_eq!(value(&cfg, SettingId::AiProvider), "does-not-exist (not configured)");
+    }
+
+    /// The row says what the provider IS, not just what it is called.
+    #[test]
+    fn the_provider_row_names_the_model_behind_it() {
+        let mut cfg = Config::default();
+        cfg.ai.default = "claude-api".into();
+        assert_eq!(value(&cfg, SettingId::AiProvider), "claude-api (claude-opus-4-8)");
+        cfg.ai.default = "claude".into();
+        assert_eq!(value(&cfg, SettingId::AiProvider), "claude (claude CLI)");
     }
 }

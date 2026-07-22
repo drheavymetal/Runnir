@@ -155,6 +155,41 @@ add it.
 The same [`install.sh`](install.sh) drives all three flows, so `sh install.sh --help` from
 a checkout shows every option.
 
+## The AI assistant — bring your own provider
+
+No provider is baked in. Three shapes are supported:
+
+- **`kind = "claude_code"`** — spawns the Claude Code CLI against your subscription.
+  No API key at all.
+- **`kind = "api"`** — any OpenAI-compatible `/chat/completions` endpoint: OpenAI,
+  Gemini, DeepSeek, Z.ai, a local llama.cpp server, whatever. Point `base_url` at it
+  and name the model.
+- **`kind = "anthropic"`** — Anthropic's own Messages API, which is *not*
+  OpenAI-compatible: different path, `x-api-key` instead of a bearer token, a pinned
+  version header, and a required `max_tokens`. Its own kind rather than an `api`
+  entry that would look right and fail at request time.
+
+```toml
+[ai]
+default = "claude-api"
+
+[ai.providers.claude-api]
+kind = "anthropic"
+model = "claude-opus-4-8"
+api_key_env = "ANTHROPIC_API_KEY"   # the KEY NAME, never the key
+
+[ai.providers.local]
+kind = "api"
+base_url = "http://localhost:8080/v1"
+model = "qwen2.5-coder"
+api_key_env = "LOCAL_KEY"
+```
+
+Keys are never stored in the config — each provider names an environment variable, so
+the file is safe in a dotfile repo. Switch provider without editing anything:
+`Ctrl+Shift+,` and the AI row cycles through everything you have configured, showing
+which model is behind each name.
+
 ## Configuration
 
 `~/.config/runnir/runnir.toml` — every value has a default that stands on its own, so an
