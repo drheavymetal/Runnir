@@ -38,6 +38,9 @@ pub struct Pane {
     last_command_seq: u64,
     /// The command counter when the user last stepped away, for the catch-up.
     catch_up_seq: u64,
+    /// The command counter already handed to the verb learner, so each command is
+    /// counted once and never twice.
+    verbs_seq: u64,
     /// The last watched word this pane saw, kept for the catch-up (the notification
     /// path takes its own copy and clears it).
     last_watch_hit: Option<String>,
@@ -82,6 +85,7 @@ impl Pane {
             running_since: None,
             last_command_seq: 0,
             catch_up_seq: 0,
+            verbs_seq: 0,
             last_watch_hit: None,
             last_bell: 0,
             watch: None,
@@ -158,6 +162,22 @@ impl Pane {
             last_line: g.last_nonblank_line(),
             marked,
         }
+    }
+
+    /// Hands over a command that just finished, once, with its exit code.
+    ///
+    /// Separate counter from `take_completion` on purpose: two consumers sharing one
+    /// "have I seen this" marker means whichever polls first eats the other's event.
+    pub fn take_finished_command(&mut self) -> Option<(String, i32)> {
+        let g = self.grid.lock().unwrap();
+        let seq = g.command_seq();
+        if seq <= self.verbs_seq || g.command_running() {
+            return None;
+        }
+        drop(g);
+        self.verbs_seq = seq;
+        let g = self.grid.lock().unwrap();
+        Some((g.last_command_line()?, g.last_exit()?))
     }
 
     /// Marks the point the user stepped away from, so the next catch-up can tell

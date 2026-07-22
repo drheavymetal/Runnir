@@ -1,0 +1,294 @@
+//! The real verbs of a repository: what is actually typed here, learned from use.
+//!
+//! Every project has five or six commands it is really worked with. They are not the
+//! aliases someone defined, and they are not the README nobody updated — they are
+//! what people type. runnir sees that, so it can offer it: open a repo and the window
+//! already knows how it is built, tested and deployed.
+//!
+//! **Arguments are never stored.** `curl -H "Authorization: Bearer …"` and
+//! `scp ~/clients/acme/dump.sql host:` are commands people run; the head is the verb,
+//! the tail is private. That line is enforced HERE, at capture, not at display —
+//! anything else means the secret is already on disk by the time someone thinks about
+//! it. This is the difference between a useful feature and a leak.
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
+
+/// Below this many runs, a command is not a habit. Two runs of something is an
+/// experiment; the point of this feature is to show what the project is worked with.
+pub const DEFAULT_THRESHOLD: u32 = 3;
+
+/// Tools whose first argument is a SUBCOMMAND rather than an argument, so the verb is
+/// two words: `cargo build`, not `cargo`.
+///
+/// A list rather than a heuristic on purpose. The heuristic ("a bare word is a
+/// subcommand") turns `python train.py` into the verb `python train.py` and
+/// `ssh cloudmax` into `ssh cloudmax` — a hostname is not a verb, and a filename is
+/// somebody's directory layout.
+const SUBCOMMAND_TOOLS: &[&str] = &[
+    "cargo", "git", "npm", "pnpm", "yarn", "bun", "deno", "go", "docker", "podman",
+    "kubectl", "systemctl", "brew", "apt", "pacman", "dnf", "pip", "uv", "poetry",
+    "composer", "gradle", "mvn", "dotnet", "terraform", "gh", "flatpak", "make",
+    "just", "task", "wrangler", "flyctl", "heroku", "aws", "gcloud", "az", "nix",
+];
+
+/// Shell noise: navigation and looking-around. These are how anyone uses any
+/// directory, so they say nothing about how THIS project is built, tested or
+/// deployed — and a list whose top entry is `cd` teaches a newcomer nothing.
+const NOISE: &[&str] = &[
+    "cd", "ls", "ll", "la", "pwd", "clear", "exit", "cat", "bat", "less", "more",
+    "echo", "which", "type", "man", "history", "export", "source", "tree", "head",
+    "tail", "wc", "touch", "mkdir", "cp", "mv", "rm", "chmod", "chown", "sudo",
+];
+
+/// The verb of a command line, or `None` when there is nothing worth learning.
+///
+/// Returns at most two words, and only words that cannot carry private data: a
+/// subcommand from a known tool's fixed vocabulary. Everything else — paths, hosts,
+/// flags, URLs, tokens — is dropped before it can be written anywhere.
+pub fn verb_of(line: &str) -> Option<String> {
+    let line = line.trim();
+    if line.is_empty() {
+        return None;
+    }
+    // A pipeline, a chain or a redirection is not one verb. Take the first stage:
+    // `cargo build && ./run` is a `cargo build` habit.
+    let first_stage = line
+        .split(&['|', ';', '\n'][..])
+        .next()?
+        .split("&&")
+        .next()?
+        .trim();
+    let mut words = first_stage.split_whitespace();
+    let head = words.next()?;
+
+    // An assignment prefix (`RUST_LOG=debug cargo test`) is environment, not a verb.
+    let head = if head.contains('=') { words.next()? } else { head };
+    // A path to something in the project is not a shared verb: `./deploy.sh` says as
+    // much about someone's directory as about the project, and `/home/pedro/x` more.
+    if head.starts_with('-') || head.contains('/') || head.starts_with('$') {
+        return None;
+    }
+    let head = head.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '_');
+    if head.is_empty() {
+        return None;
+    }
+
+    if NOISE.contains(&head) {
+        return None;
+    }
+    if SUBCOMMAND_TOOLS.contains(&head) {
+        // The subcommand only counts when it looks like one: a bare word from the
+        // tool's own vocabulary. `docker compose` yes; `docker /var/run/x.sock` no.
+        if let Some(sub) = words.next() {
+            if is_subcommand(sub) {
+                return Some(format!("{head} {sub}"));
+            }
+        }
+    }
+    Some(head.to_string())
+}
+
+/// Whether a word can be a subcommand: letters, digits and dashes only, short, not a
+/// flag, not a path, not a file with an extension.
+fn is_subcommand(w: &str) -> bool {
+    !w.is_empty()
+        && w.len() <= 20
+        && !w.starts_with('-')
+        && !w.contains('/')
+        && !w.contains('.')
+        && !w.contains('=')
+        && w.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// Counts per repository. Serialised to runnir's data directory — never inside the
+/// repo, where a `.runnir-verbs` file would get committed and publish somebody's
+/// shell habits to the team.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct Verbs {
+    /// repo root -> verb -> times it succeeded.
+    repos: HashMap<String, HashMap<String, u32>>,
+}
+
+impl Verbs {
+    /// Records one SUCCESSFUL run. Failures are deliberately not counted: a verb
+    /// learned from what does not work teaches the wrong thing to whoever reads it.
+    pub fn record(&mut self, repo: &Path, line: &str) -> Option<String> {
+        let verb = verb_of(line)?;
+        let entry = self.repos.entry(repo.to_string_lossy().into_owned()).or_default();
+        *entry.entry(verb.clone()).or_insert(0) += 1;
+        Some(verb)
+    }
+
+    /// The verbs this repo is worked with, most used first, above the threshold.
+    /// Ties break alphabetically so the list does not shuffle between openings.
+    pub fn top(&self, repo: &Path, threshold: u32, limit: usize) -> Vec<(String, u32)> {
+        let Some(counts) = self.repos.get(&repo.to_string_lossy().into_owned()) else {
+            return Vec::new();
+        };
+        let mut v: Vec<(String, u32)> =
+            counts.iter().filter(|(_, n)| **n >= threshold).map(|(k, n)| (k.clone(), *n)).collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        v.truncate(limit);
+        v
+    }
+
+    pub fn path() -> Option<PathBuf> {
+        Some(dirs::data_dir()?.join("runnir/verbs.json"))
+    }
+
+    pub fn load() -> Self {
+        let Some(p) = Self::path() else { return Self::default() };
+        std::fs::read_to_string(p)
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default()
+    }
+
+    /// Best-effort save. A lost count is not worth an error in the user's face.
+    pub fn save(&self) {
+        let Some(p) = Self::path() else { return };
+        if let Some(dir) = p.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if let Ok(text) = serde_json::to_string_pretty(self) {
+            let _ = std::fs::write(p, text);
+        }
+    }
+
+    /// Forgets everything about one repo, for when a project's history is nobody
+    /// else's business any more.
+    pub fn forget(&mut self, repo: &Path) {
+        self.repos.remove(&repo.to_string_lossy().into_owned());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The rule that makes this feature shareable instead of a leak: whatever the
+    /// command carried, only the verb survives.
+    #[test]
+    fn arguments_never_survive_capture() {
+        for line in [
+            "curl -H \"Authorization: Bearer sk-live-abc123\" https://api.example.com",
+            "scp ~/clients/acme/dump.sql root@10.0.0.4:/tmp/",
+            "psql postgres://user:hunter2@db.internal/prod",
+            "ssh cloudmax",
+        ] {
+            let verb = verb_of(line).unwrap();
+            assert!(
+                !verb.contains("sk-live") && !verb.contains("acme") && !verb.contains("hunter2"),
+                "{line} leaked through as {verb}"
+            );
+            assert!(verb.split_whitespace().count() <= 2, "{verb} is not a verb");
+        }
+        assert_eq!(verb_of("ssh cloudmax").unwrap(), "ssh", "a hostname is not a subcommand");
+    }
+
+
+    /// A list whose top entry is `cd` teaches a newcomer nothing: navigation is how
+    /// anyone uses any directory, not how this project is worked.
+    #[test]
+    fn navigation_and_looking_around_are_not_verbs() {
+        for line in ["cd ~/projects/runnir", "ls -la", "cat README.md", "clear", "sudo pacman -Syu"] {
+            assert!(verb_of(line).is_none(), "{line} was learned as a verb");
+        }
+        // …while the real verbs still are.
+        assert_eq!(verb_of("cargo test").unwrap(), "cargo test");
+    }
+
+    /// A tool's subcommand IS the verb — `cargo` alone says nothing about whether
+    /// this repo is built, tested or published here.
+    #[test]
+    fn a_known_tool_keeps_its_subcommand() {
+        assert_eq!(verb_of("cargo build --release").unwrap(), "cargo build");
+        assert_eq!(verb_of("git push origin main").unwrap(), "git push");
+        assert_eq!(verb_of("npm run deploy").unwrap(), "npm run");
+        assert_eq!(verb_of("docker compose up -d").unwrap(), "docker compose");
+    }
+
+    /// …but only when the next word is really a subcommand. A filename is somebody's
+    /// directory layout and a path may be private.
+    #[test]
+    fn a_filename_or_path_is_not_a_subcommand() {
+        assert_eq!(verb_of("python train.py --epochs 40").unwrap(), "python");
+        assert_eq!(verb_of("docker /var/run/docker.sock").unwrap(), "docker");
+        assert_eq!(verb_of("make -j8").unwrap(), "make");
+    }
+
+    /// Scripts and paths are not shared verbs: `./deploy.sh` describes a directory as
+    /// much as a project, and an absolute path describes a machine.
+    #[test]
+    fn paths_and_flags_are_not_verbs() {
+        assert!(verb_of("./deploy.sh prod").is_none());
+        assert!(verb_of("/usr/local/bin/thing").is_none());
+        assert!(verb_of("--help").is_none());
+        assert!(verb_of("   ").is_none());
+    }
+
+    /// A pipeline is one habit, not a new verb per stage.
+    #[test]
+    fn a_pipeline_counts_as_its_first_stage() {
+        assert_eq!(verb_of("cargo test 2>&1 | rg FAIL").unwrap(), "cargo test");
+        assert_eq!(verb_of("cargo build && ./target/release/runnir").unwrap(), "cargo build");
+        assert_eq!(verb_of("RUST_LOG=debug cargo run").unwrap(), "cargo run");
+    }
+
+    /// Two runs is an experiment. The threshold is what separates a verb from a
+    /// thing somebody tried once.
+    #[test]
+    fn a_command_run_twice_is_not_yet_a_verb() {
+        let repo = Path::new("/r");
+        let mut v = Verbs::default();
+        v.record(repo, "cargo build");
+        v.record(repo, "cargo build");
+        assert!(v.top(repo, DEFAULT_THRESHOLD, 5).is_empty());
+        v.record(repo, "cargo build --release");
+        assert_eq!(v.top(repo, DEFAULT_THRESHOLD, 5), vec![("cargo build".to_string(), 3)]);
+    }
+
+    /// Most used first, ties alphabetical — a list that reorders between openings is
+    /// one nobody trusts.
+    #[test]
+    fn the_list_is_ordered_and_stable() {
+        let repo = Path::new("/r");
+        let mut v = Verbs::default();
+        for _ in 0..5 {
+            v.record(repo, "cargo test");
+        }
+        for _ in 0..3 {
+            v.record(repo, "git push");
+        }
+        for _ in 0..3 {
+            v.record(repo, "cargo build");
+        }
+        let top = v.top(repo, 3, 10);
+        assert_eq!(
+            top,
+            vec![
+                ("cargo test".to_string(), 5),
+                ("cargo build".to_string(), 3),
+                ("git push".to_string(), 3),
+            ]
+        );
+    }
+
+    /// Repos do not bleed into each other, and one can be forgotten on its own.
+    #[test]
+    fn repos_are_separate_and_forgettable() {
+        let (a, b) = (Path::new("/a"), Path::new("/b"));
+        let mut v = Verbs::default();
+        for _ in 0..3 {
+            v.record(a, "cargo test");
+            v.record(b, "npm test");
+        }
+        assert_eq!(v.top(a, 3, 5).len(), 1);
+        v.forget(a);
+        assert!(v.top(a, 3, 5).is_empty());
+        assert_eq!(v.top(b, 3, 5).len(), 1, "forgetting one repo leaves the others alone");
+    }
+}

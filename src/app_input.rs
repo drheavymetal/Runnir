@@ -733,6 +733,7 @@ impl Gpu {
             Action::ToggleImageWatch => self.toggle_image_watch(config),
             Action::ToggleExplorer => self.toggle_explorer(config),
             Action::CatchUp => self.show_catch_up(),
+            Action::RepoVerbs => self.show_repo_verbs(config),
             Action::SetImageWatchDir => self.set_image_watch_dir(),
             Action::SaveProjectSession => self.save_project_session_cmd(),
             Action::RestoreProjectSession => self.restore_project_session_cmd(config),
@@ -3001,6 +3002,7 @@ impl Gpu {
             Some(Overlay::Viewer(_)) => "viewer",
             Some(Overlay::Props(_)) => "props",
             Some(Overlay::CatchUp(_)) => "catch_up",
+            Some(Overlay::Verbs(_)) => "verbs",
             Some(_) => "other",
         };
         let mut out = json!({
@@ -3030,6 +3032,11 @@ impl Gpu {
                         "pane": pane, "state": state, "title": title, "detail": detail
                     }))
                     .collect::<Vec<_>>()
+            );
+        }
+        if let Some(Overlay::Verbs(p)) = &self.overlay {
+            out["verbs"] = json!(
+                p.rows().into_iter().map(|(v, n)| json!({"verb": v, "count": n})).collect::<Vec<_>>()
             );
         }
         if let Some(Overlay::Prompt(p)) = &self.overlay {
@@ -3428,6 +3435,39 @@ impl Gpu {
                 }
                 _ => {}
             },
+            // The verbs panel: Enter STAGES the verb at the prompt and never runs
+            // it. A list learned from what you typed, typing itself back, is exactly
+            // the place where a stray Enter must not execute anything.
+            Overlay::Verbs(p) => match key {
+                Key::Named(NamedKey::Escape) => self.overlay = None,
+                Key::Named(NamedKey::ArrowUp) => p.up(),
+                Key::Named(NamedKey::ArrowDown) => p.down(),
+                Key::Named(NamedKey::Enter) => {
+                    let verb = p.selected();
+                    self.overlay = None;
+                    if let Some(v) = verb {
+                        self.insert_command(v);
+                    }
+                }
+                Key::Character(c) => match c.as_str() {
+                    "k" => p.up(),
+                    "j" => p.down(),
+                    "q" => self.overlay = None,
+                    // Forget everything learned about this repo. A record of what
+                    // somebody typed needs a way out that does not involve finding a
+                    // JSON file, so it lives on the panel that shows the record.
+                    "X" => {
+                        let repo = std::path::PathBuf::from(p.repo());
+                        self.verbs.forget(&repo);
+                        self.verbs.save();
+                        self.overlay = None;
+                        self.status = Some("forgot this repo's verbs".into());
+                        self.status_expiry = Some(Instant::now() + Duration::from_secs(3));
+                    }
+                    _ => {}
+                },
+                _ => {}
+            },
             // The catch-up: j/k or the arrows move, Enter focuses that pane, Esc
             // closes. No search box on purpose — the list is at most one line per
             // pane, and anything you would filter you can already see.
@@ -3718,6 +3758,7 @@ impl Gpu {
             Action::ToggleImageWatch => self.toggle_image_watch(config),
             Action::ToggleExplorer => self.toggle_explorer(config),
             Action::CatchUp => self.show_catch_up(),
+            Action::RepoVerbs => self.show_repo_verbs(config),
             Action::SetImageWatchDir => self.set_image_watch_dir(),
             Action::SaveProjectSession => self.save_project_session_cmd(),
             Action::RestoreProjectSession => self.restore_project_session_cmd(config),
@@ -5917,6 +5958,31 @@ impl Gpu {
         }
         argv.push(path.to_string_lossy().into_owned());
         self.split_running(config, argv);
+    }
+
+    /// Opens the verbs panel for the focused pane's repository.
+    fn show_repo_verbs(&mut self, config: &Config) {
+        let root = self.tab().focused().cwd().and_then(|d| crate::git::repo_root(&d));
+        let Some(root) = root else {
+            self.status = Some("not inside a git repository".into());
+            self.status_expiry = Some(Instant::now() + Duration::from_secs(3));
+            self.window.request_redraw();
+            return;
+        };
+        if !config.verbs.enabled {
+            // Say what to switch on rather than showing an empty panel: nothing was
+            // ever recorded, and an empty list reads as "this repo has no verbs".
+            self.status = Some("learning is off — enable verbs.enabled to collect them".into());
+            self.status_expiry = Some(Instant::now() + Duration::from_secs(5));
+            self.window.request_redraw();
+            return;
+        }
+        let list = self.verbs.top(&root, config.verbs.threshold, 8);
+        self.overlay = Some(Overlay::Verbs(overlay::VerbsPanel::new(
+            root.to_string_lossy().into_owned(),
+            list,
+        )));
+        self.window.request_redraw();
     }
 
     /// Builds the catch-up from what every pane knows and opens it.

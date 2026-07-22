@@ -26,6 +26,9 @@ pub struct Config {
     /// Now-playing media overlay (album art, transport, waveform).
     #[serde(default)]
     pub media: Media,
+    /// Learning this project's real verbs from what is typed here.
+    #[serde(default)]
+    pub verbs: VerbsCfg,
     /// The ZSA keyboard's lights.
     #[serde(default)]
     pub keyboard: Keyboard,
@@ -95,6 +98,7 @@ impl Default for Config {
             ai: Ai::default(),
             watch: Watch::default(),
             media: Media::default(),
+            verbs: VerbsCfg::default(),
             keyboard: Keyboard::default(),
             explorer: Explorer::default(),
             keys: HashMap::new(),
@@ -365,6 +369,28 @@ pub struct Media {
 impl Default for Media {
     fn default() -> Self {
         Self { waveform: true, bars: 24, art_cells: 18 }
+    }
+}
+
+// ---- verbs ------------------------------------------------------------------
+
+/// Learning the commands a repository is actually worked with.
+///
+/// OFF by default and per-machine: this watches what you type. Only the verb is ever
+/// stored — never arguments — and never inside the repo, but even so it is not the
+/// kind of thing to switch on for someone.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct VerbsCfg {
+    pub enabled: bool,
+    /// How many successful runs before a command counts as a verb. Two is an
+    /// experiment; the default is three.
+    pub threshold: u32,
+}
+
+impl Default for VerbsCfg {
+    fn default() -> Self {
+        Self { enabled: false, threshold: crate::verbs::DEFAULT_THRESHOLD }
     }
 }
 

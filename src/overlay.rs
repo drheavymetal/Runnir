@@ -33,6 +33,8 @@ pub enum Overlay {
     Props(PropsPanel),
     /// The catch-up: one headline per pane after a while away.
     CatchUp(CatchUpPanel),
+    /// This repository's real verbs, learned from what is typed here.
+    Verbs(VerbsPanel),
 }
 
 impl Overlay {
@@ -56,6 +58,7 @@ impl Overlay {
             Overlay::Viewer(v) => v.render(cols, rows, theme),
             Overlay::Props(p) => p.render(cols, rows, theme),
             Overlay::CatchUp(p) => p.render(cols, rows, theme),
+            Overlay::Verbs(p) => p.render(cols, rows, theme),
         }
     }
 }
@@ -2212,6 +2215,93 @@ impl ClipHistoryPicker {
     }
 }
 
+
+
+/// The verbs panel: how this repository is actually built, tested and deployed,
+/// ranked by how often each verb succeeded here.
+pub struct VerbsPanel {
+    repo: String,
+    verbs: Vec<(String, u32)>,
+    cursor: usize,
+}
+
+impl VerbsPanel {
+    pub fn new(repo: String, verbs: Vec<(String, u32)>) -> Self {
+        Self { repo, verbs, cursor: 0 }
+    }
+
+    pub fn up(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    pub fn down(&mut self) {
+        if self.cursor + 1 < self.verbs.len() {
+            self.cursor += 1;
+        }
+    }
+
+    /// The verb under the cursor, for staging at the prompt.
+    pub fn selected(&self) -> Option<String> {
+        self.verbs.get(self.cursor).map(|(v, _)| v.clone())
+    }
+
+    pub fn repo(&self) -> &str {
+        &self.repo
+    }
+
+    /// For the remote control, so a script can assert what was learned.
+    pub fn rows(&self) -> Vec<(String, u32)> {
+        self.verbs.clone()
+    }
+
+    fn render(&self, cols: usize, rows: usize, theme: &Theme) -> Vec<Panel> {
+        let w = (cols * 6 / 10).clamp(34, 76).min(cols.saturating_sub(2));
+        let visible = 10.min(self.verbs.len().max(1)).max(1);
+        let h = visible + 4;
+        let mut g = panel_grid(w, h, theme);
+
+        let head = format!("How this repo is worked  \u{b7}  {}", short_path(&self.repo, w - 28));
+        write(&mut g, 0, 2, &head, accent());
+
+        if self.verbs.is_empty() {
+            write(&mut g, 2, 2, "nothing learned here yet", dim());
+        }
+        for (i, (verb, count)) in self.verbs.iter().take(visible).enumerate() {
+            let row = 2 + i;
+            let sel = i == self.cursor;
+            if sel {
+                write(&mut g, row, 0, &" ".repeat(w), selected());
+            }
+            let pen = if sel { selected() } else { normal() };
+            write(&mut g, row, 2, verb, pen);
+            // The count is the evidence: it is why this line is here at all.
+            let times = format!("{count}\u{d7}");
+            let at = w.saturating_sub(times.chars().count() + 2);
+            write(&mut g, row, at, &times, if sel { selected() } else { dim() });
+        }
+
+        let hint = if self.verbs.is_empty() {
+            "esc  close"
+        } else {
+            "j k move \u{b7} enter puts it at the prompt (does not run it) \u{b7} esc"
+        };
+        write(&mut g, h - 1, 2, hint, dim());
+
+        let col = (cols.saturating_sub(w)) / 2;
+        let row = (rows.saturating_sub(h)) / 3;
+        vec![Panel { grid: g, col, row }]
+    }
+}
+
+/// A path shortened from the LEFT: the tail (the project) identifies it, the head
+/// (somebody's home directory) does not.
+fn short_path(p: &str, max: usize) -> String {
+    if p.chars().count() <= max {
+        return p.to_string();
+    }
+    let tail: String = p.chars().skip(p.chars().count().saturating_sub(max - 1)).collect();
+    format!("\u{2026}{tail}")
+}
 
 /// The catch-up panel: one line per pane that has something to say, most urgent
 /// first, with the pane ids kept so Enter can jump to the one you pick.

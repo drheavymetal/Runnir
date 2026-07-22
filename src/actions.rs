@@ -65,6 +65,8 @@ pub enum Action {
     ToggleExplorer,
     /// One headline per pane, for coming back after a while away.
     CatchUp,
+    /// The verbs this repository is actually worked with.
+    RepoVerbs,
     SetImageWatchDir,
     SaveProjectSession,
     RestoreProjectSession,
@@ -159,6 +161,7 @@ impl Action {
             ToggleImageWatch => "toggle_image_watch",
             ToggleExplorer => "toggle_explorer",
             CatchUp => "catch_up",
+            RepoVerbs => "repo_verbs",
             SetImageWatchDir => "set_image_watch_dir",
             SaveProjectSession => "save_project_session",
             RestoreProjectSession => "restore_project_session",
@@ -246,6 +249,7 @@ impl Action {
             ToggleImageWatch => "Auto-preview images: toggle on this pane's dir",
             ToggleExplorer => "File explorer sidebar (tree of the project)",
             CatchUp => "Catch up: one headline per pane after time away",
+            RepoVerbs => "How this repo is worked (learned verbs)",
             SetImageWatchDir => "Auto-preview images: set / clear watched dir",
             SaveProjectSession => "Save session for this project",
             RestoreProjectSession => "Restore session for this project",
@@ -336,6 +340,7 @@ impl Action {
             "toggle_image_watch" => ToggleImageWatch,
             "toggle_explorer" => ToggleExplorer,
             "catch_up" => CatchUp,
+            "repo_verbs" => RepoVerbs,
             "set_image_watch_dir" => SetImageWatchDir,
             "save_project_session" => SaveProjectSession,
             "restore_project_session" => RestoreProjectSession,
@@ -436,6 +441,7 @@ impl Action {
             ToggleImageWatch,
             ToggleExplorer,
             CatchUp,
+            RepoVerbs,
             SetImageWatchDir,
             SaveProjectSession,
             RestoreProjectSession,
@@ -1014,6 +1020,7 @@ fn default_leader_bindings() -> HashMap<Chord, LeaderNode> {
         leaf(g, "l", LaunchLayout);
     });
     group(&mut m, "o", "Open", |g| {
+        leaf(g, "v", RepoVerbs);
         leaf(g, "c", OpenConfig);
         leaf(g, "t", OpenThemePicker);
         leaf(g, "d", ShowDocs);

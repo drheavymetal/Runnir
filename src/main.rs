@@ -32,6 +32,7 @@ mod settings;
 mod shell_integration;
 mod tab;
 mod themes;
+mod verbs;
 mod watch;
 mod whisper;
 mod zsa;
@@ -795,6 +796,9 @@ struct Gpu {
     /// The ZSA keyboard, when there is one and the user asked for it. `None` covers
     /// both "no such keyboard" and "not enabled", which behave identically.
     board: Option<zsa::Board>,
+    /// What this project is really worked with, learned from successful commands.
+    /// Loaded once; only written when it changes.
+    verbs: verbs::Verbs,
     /// When a keystroke last reached a child process. The catch-up measures "away"
     /// from here rather than from window focus, which lies in both directions.
     last_pty_key: Instant,
@@ -1084,6 +1088,7 @@ impl App {
                 .then(zsa::Board::start)
                 .flatten(),
             board_layout: None,
+            verbs: verbs::Verbs::load(),
             last_pty_key: Instant::now(),
             away_marked: false,
             proxy: self.proxy.clone(),
@@ -1755,6 +1760,9 @@ impl Gpu {
             // Collected rather than flashed inline: the panes are borrowed here, and
             // two signals in one sweep should be one flash, not a fight over the board.
             let mut flashes: Vec<config::Rgb> = Vec::new();
+            // Collected here, applied after the pane loop: recording borrows the
+            // window-level store while the panes are already borrowed.
+            let mut learned: Vec<(std::path::PathBuf, String)> = Vec::new();
             for tab in &mut self.tabs {
                 for pane in tab.panes.values_mut() {
                     pane.refresh_context(config);
@@ -1766,6 +1774,18 @@ impl Gpu {
                             flashes.push(FLASH_DONE);
                         }
                     }
+                    // Learn this repo's verbs from commands that SUCCEEDED. Failures
+                    // teach the wrong thing, and the verb is extracted (arguments
+                    // dropped) before anything reaches memory, let alone disk.
+                    if config.verbs.enabled {
+                        if let Some((line, 0)) = pane.take_finished_command() {
+                            if let Some(root) =
+                                pane.cwd().and_then(|d| crate::git::repo_root(&d))
+                            {
+                                learned.push((root, line));
+                            }
+                        }
+                    }
                     // Keyword watch (W4): fires whether focused or not — it is an
                     // explicit "tell me when this appears" on a monitored pane.
                     if pane.watching().is_some() {
@@ -1775,6 +1795,12 @@ impl Gpu {
                         }
                     }
                 }
+            }
+            if !learned.is_empty() {
+                for (root, line) in learned {
+                    self.verbs.record(&root, &line);
+                }
+                self.verbs.save();
             }
             // The board says ONE thing at a time: the most urgent colour of this
             // sweep wins. Ordering is by list position, so watch beats done.

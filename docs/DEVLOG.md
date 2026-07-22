@@ -2395,6 +2395,42 @@ Three changes, in increasing order of how obvious they should have been:
 Reproduced from inside htop with real work behind it, and verified the summary now
 starts instead of refusing.
 
+## 2026-07-22 - Candidate 2 built: the real verbs of this repo
+
+`src/verbs.rs` plus a panel (`leader o v`). Learns what a repository is actually
+worked with from commands that SUCCEEDED here, and offers them back: a newcomer opens
+the repo and the window already knows how it is built, tested and deployed.
+
+**The privacy line is enforced at CAPTURE, not at display.** `curl -H "Authorization:
+Bearer …"`, `scp ~/clients/acme/dump.sql host:` and `psql postgres://user:pass@…` are
+things people type; the head is the verb and the tail is private. Filtering at display
+would mean the secret is already on disk by the time anyone thinks about it. A test
+runs those exact three lines and asserts nothing survives but the verb.
+
+**Two words, never three.** `cargo` alone says nothing about whether this repo is
+built, tested or published, so a known tool keeps its subcommand — but only when the
+next word is really a subcommand from a fixed vocabulary. The tempting heuristic ("a
+bare word after a tool is a subcommand") turns `python train.py` into a verb
+containing somebody's filename and `ssh cloudmax` into one containing a hostname.
+
+**Only successes count**, because a verb learned from what does not work teaches the
+wrong thing. And a threshold, because two runs is an experiment, not a habit.
+
+**The first live run taught the list what it is not.** With everything working, the
+top entry was `cd`. Navigation and looking-around (`ls`, `cat`, `clear`, `sudo`…) are
+how anyone uses any directory and say nothing about this project — a list whose first
+line is `cd` teaches a newcomer nothing. They are filtered now.
+
+Verified on a real instance, and the claim checked where it matters — on DISK. After
+running a `scp` with a private path and a `git status --short` three times, the store
+contained exactly `{"git status": 3, "cargo": 1}` under the repo root: no arguments,
+no `--short`, no path, and the failed `scp` not recorded at all.
+
+**Still open before this can be shared with a team**, which the idea calls for: the
+store is keyed by absolute repo path, so an export would carry `/home/pedro/...`. The
+export step has to key by repo remote or name instead. Not built — sharing is not
+part of this slice.
+
 ## Gotchas (do not re-learn)
 
 - The board must be put back even if runnir DIES. `sustain` (ms) on every ZSA paint is

@@ -66,6 +66,11 @@ Then the groups. The letter is the noun:
 @                        M run a described command, E explain, S summarise
 @ Leader R ...     run & launch: C Claude, W whisper, S ssh, M now playing,
 @                        L a saved layout
+@ Leader O V       how this repo is worked: the verbs learned from what you
+                   actually type here. Enter puts one at the prompt (never runs it),
+                   X forgets everything learned about this repo. Off until you set
+                   verbs.enabled: only the verb is ever stored, never arguments, and
+                   never inside the repo.
 @ Leader O ...     open: C config, T theme, D these docs, S snippets,
 @                        P the palette, I/W image watch
 @ Leader S ...     session: S save, R restore, C clear, Q quit
