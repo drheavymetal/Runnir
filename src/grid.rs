@@ -884,6 +884,37 @@ impl Grid {
         self.text_range((first_output, 0), (range.1, self.cols.saturating_sub(1)))
     }
 
+    /// The last `n` non-blank lines of the CURRENT block's output — what the pane
+    /// last printed, with the prompt that produced it left out.
+    ///
+    /// The map wants a glimpse of the work, and the tail of the scrollback is mostly
+    /// prompt: a themed prompt is three lines of powerline glyphs and a clock, which
+    /// says nothing about the pane. Without marks there is no block, and the honest
+    /// answer is the tail as it is.
+    pub fn recent_output(&self, n: usize) -> Vec<String> {
+        // Which block is "the work" depends on whether anything is running. With a
+        // command in flight the cursor's own block is it; at a prompt the cursor sits
+        // in a block that has printed nothing yet, and showing THAT is how a map ends
+        // up full of powerline glyphs instead of output.
+        let cur = self.cursor_abs();
+        let row = if self.command_running() {
+            Some(cur)
+        } else {
+            let mut marks: Vec<usize> =
+                self.prompt_marks.iter().filter_map(|&s| self.stable_to_local(s)).collect();
+            marks.sort_unstable();
+            marks.iter().rev().find(|&&m| m < cur).and_then(|&m| m.checked_sub(1)).or(Some(cur))
+        };
+        let lines: Vec<String> = match row.and_then(|r| self.block_at(r)) {
+            Some(range) => self.block_text(range).lines().map(str::to_string).collect(),
+            None => self.scrollback_text(),
+        };
+        let mut tail: Vec<String> =
+            lines.into_iter().filter(|l| !l.trim().is_empty()).rev().take(n).collect();
+        tail.reverse();
+        tail
+    }
+
     /// The stable index one past the last row that actually holds output — the
     /// cursor's row — for the keyword watcher's high-water mark. Using the cursor
     /// row (not the screen height) means blank rows below the cursor are not counted
@@ -2848,6 +2879,25 @@ mod tests {
         let second = g.block_at(4).expect("row 4 is inside the second block");
         assert!(g.block_text(second).contains("gamma"));
         assert_ne!(first, second);
+    }
+
+    /// The map's glimpse must be the OUTPUT of the last command, not the prompt that
+    /// came after it. Sitting at a fresh prompt, the cursor's own block has printed
+    /// nothing — reading it is how a map fills with powerline glyphs.
+    #[test]
+    fn a_glimpse_of_a_pane_is_its_output_not_the_prompt_after_it() {
+        let mut g = Grid::new(20, 8);
+        feed(&mut g, "\x1b]133;A\x07$ one\r\n\x1b]133;C\x07alpha\r\nbeta\r\n\x1b]133;D;0\x07");
+        feed(&mut g, "\x1b]133;A\x07$ two\r\n");
+
+        let seen = g.recent_output(2);
+        assert!(seen.iter().any(|l| l.contains("beta")), "{seen:?}");
+        assert!(!seen.iter().any(|l| l.contains("$ two")), "read the new prompt: {seen:?}");
+
+        // …while a command in flight IS the cursor's own block: what it has printed so
+        // far is exactly what someone glancing at the map wants.
+        feed(&mut g, "\x1b]133;C\x07gamma\r\n");
+        assert!(g.recent_output(2).iter().any(|l| l.contains("gamma")));
     }
 
     /// A pane with no shell integration has no blocks at all, and saying so is the

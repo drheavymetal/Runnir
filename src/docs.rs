@@ -43,6 +43,11 @@ Straight away, no group — the things you do constantly:
 @ Leader hjkl      focus the pane left/down/up/right
 @ Leader HJKL      resize the focused pane (arrows do this too)
 @ Leader U         catch up: one headline per pane after time away
+@ Leader M         the map: every pane zoomed out to a card — its state, what it
+@                        last ran and the tail of what that printed. J/K (or the
+@                        arrows) move, Enter goes to that pane, Escape comes back.
+@                        The cards keep the panes' own places, so the session looks
+@                        like itself: the zoom is what you read, not where things are.
 @ Leader V         clipboard history
 @ Leader G         fix the last failed command
 @ Leader Z / Shift+Z  font bigger / smaller (+, = and - work too; the letters

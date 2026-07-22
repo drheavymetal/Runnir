@@ -241,6 +241,12 @@ impl Pane {
         crate::platform::cwd(self.pty.pid()?)
     }
 
+    /// The last `n` non-blank lines the pane printed, prompt excluded. See
+    /// [`Grid::recent_output`].
+    pub fn recent_output(&self, n: usize) -> Vec<String> {
+        self.grid.lock().unwrap().recent_output(n)
+    }
+
     pub fn scrollback_text(&self) -> Vec<String> {
         self.grid.lock().unwrap().scrollback_text()
     }

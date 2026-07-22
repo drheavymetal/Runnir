@@ -67,6 +67,8 @@ pub enum Action {
     CatchUp,
     /// The verbs this repository is actually worked with.
     RepoVerbs,
+    /// Zoom out: the session as a map of headlines.
+    Map,
     /// Arrange the window around a deploy: watches, and the deploy staged.
     WarRoom,
     /// Take the war room down, keeping any pane the user typed in.
@@ -166,6 +168,7 @@ impl Action {
             ToggleExplorer => "toggle_explorer",
             CatchUp => "catch_up",
             RepoVerbs => "repo_verbs",
+            Map => "map",
             WarRoom => "war_room",
             WarRoomClose => "war_room_close",
             SetImageWatchDir => "set_image_watch_dir",
@@ -256,6 +259,7 @@ impl Action {
             ToggleExplorer => "File explorer sidebar (tree of the project)",
             CatchUp => "Catch up: one headline per pane after time away",
             RepoVerbs => "How this repo is worked (learned verbs)",
+            Map => "Map: the session zoomed out to one headline per pane",
             WarRoom => "War room: arrange the window around a deploy",
             WarRoomClose => "War room: close it, keeping panes you typed in",
             SetImageWatchDir => "Auto-preview images: set / clear watched dir",
@@ -349,6 +353,7 @@ impl Action {
             "toggle_explorer" => ToggleExplorer,
             "catch_up" => CatchUp,
             "repo_verbs" => RepoVerbs,
+            "map" => Map,
             "war_room" => WarRoom,
             "war_room_close" => WarRoomClose,
             "set_image_watch_dir" => SetImageWatchDir,
@@ -452,6 +457,7 @@ impl Action {
             ToggleExplorer,
             CatchUp,
             RepoVerbs,
+            Map,
             WarRoom,
             WarRoomClose,
             SetImageWatchDir,
@@ -954,6 +960,8 @@ fn default_leader_bindings() -> HashMap<Chord, LeaderNode> {
     // `u` for "update me": the catch-up is read on arrival, so it earns a top-level
     // key rather than a group nobody walks into when they just sat down.
     leaf(&mut m, "u", CatchUp);
+    // `m` for map: zoom out to see the whole session at once.
+    leaf(&mut m, "m", Map);
     // Font size, where every terminal already puts it — but +, - and = are not all
     // one keypress on every layout (on the Spanish one `=` is shift+0), so the
     // letters are the binding that always works and the symbols are the alias.

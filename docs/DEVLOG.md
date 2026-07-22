@@ -2512,6 +2512,42 @@ scripted key could open panels but not type a single letter — which is also wh
 and the scripted path types like the real one. That is the third time this session
 that `press_key` diverging from `on_key` cost a debugging round.
 
+## 2026-07-22 - Candidate 5 built: the map — and the half of it that is NOT built
+
+`leader m` zooms the whole session out: every pane becomes a card with its state, the
+command it last ran, and the tail of what that printed. J/K move, Enter goes to that
+pane, Escape comes back.
+
+**The cards keep the panes' own geometry.** A map that re-flows into a neat grid makes
+you re-learn the shape of your session every time you open it; here the zoom is what
+you read, not where things are, so the map looks like the window it describes.
+
+**What shipped is the SEMANTIC half of "lienzo, no mosaico".** The design asked for an
+infinite canvas: panes at free positions, pan around, zoom out to see everything. The
+free positions and the panning are **still not built**, and the reason is in the design
+itself — a pane is a PTY, and a PTY's size is rows and columns, not pixels. Zooming out
+"for real" would mean either resizing every child (which reflows vim, htop and every
+TUI in the session) or rendering text at a scale where it is not text any more. So the
+zoom is a VIEW: cards in the panes' places, at readable size. The canvas half stays
+designed-not-built rather than shipped as a lie.
+
+**Every pane gets a card, including the quiet ones.** `catchup::headline` returns
+`None` for a pane with nothing to say — right for the catch-up, wrong here, because a
+map with holes in it is not a map. Quiet panes fall back to `idle · at a prompt`.
+
+**The glimpse had to come from the BLOCK, not the scrollback.** The first version
+showed the last three non-blank lines, which on a themed prompt is powerline glyphs, a
+hostname and a clock — a map full of clocks. `Grid::recent_output` now reads the OSC
+133 block: the cursor's own when a command is running, the previous one when the pane
+sits at a fresh prompt (that block has printed nothing yet). Without marks it falls
+back to the raw tail, and says so by simply showing it.
+
+**Three visual passes, and the screenshots earned all three.** Rendered first with no
+card surface (text floating on the backdrop, the selected card a full-width blue bar),
+then with per-card backgrounds and a header row, then with the block-output glimpse.
+Verified live over the control socket AND by eye at 1400x900: `ok cargo --version`,
+`running sleep 500`, `failed ls /noexiste` with the real error underneath.
+
 ## Gotchas (do not re-learn)
 
 - The board must be put back even if runnir DIES. `sustain` (ms) on every ZSA paint is

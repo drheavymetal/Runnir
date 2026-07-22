@@ -35,6 +35,8 @@ pub enum Overlay {
     CatchUp(CatchUpPanel),
     /// This repository's real verbs, learned from what is typed here.
     Verbs(VerbsPanel),
+    /// Zoomed out: the session as a map of headlines rather than of text.
+    Map(MapPanel),
 }
 
 impl Overlay {
@@ -59,6 +61,7 @@ impl Overlay {
             Overlay::Props(p) => p.render(cols, rows, theme),
             Overlay::CatchUp(p) => p.render(cols, rows, theme),
             Overlay::Verbs(p) => p.render(cols, rows, theme),
+            Overlay::Map(p) => p.render(cols, rows, theme),
         }
     }
 }
@@ -2216,6 +2219,108 @@ impl ClipHistoryPicker {
 }
 
 
+
+
+/// One pane as it appears on the map: where it sits, what it is doing, and the last
+/// thing it said.
+pub struct MapCard {
+    pub pane: u64,
+    /// Cell-space rectangle of the pane, in the SESSION's coordinates.
+    pub col: usize,
+    pub row: usize,
+    pub cols: usize,
+    pub rows: usize,
+    pub tag: String,
+    pub title: String,
+    pub detail: String,
+    pub preview: Vec<String>,
+}
+
+/// The map: the session zoomed out.
+///
+/// Zooming out cannot shrink the terminals — the PTY's size in rows and columns is
+/// not a view property, and resizing it per zoom step would tear apart every
+/// full-screen program running in the session. So the map does not draw small text:
+/// it draws each pane as a card carrying the same headline the catch-up uses. That is
+/// what "semantic zoom" means here, and it is the half of the idea that pays.
+pub struct MapPanel {
+    cards: Vec<MapCard>,
+    cursor: usize,
+}
+
+impl MapPanel {
+    pub fn new(cards: Vec<MapCard>) -> Self {
+        Self { cards, cursor: 0 }
+    }
+
+    pub fn up(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    pub fn down(&mut self) {
+        if self.cursor + 1 < self.cards.len() {
+            self.cursor += 1;
+        }
+    }
+
+    pub fn selected_pane(&self) -> Option<u64> {
+        self.cards.get(self.cursor).map(|c| c.pane)
+    }
+
+    pub fn rows(&self) -> Vec<(u64, String, String)> {
+        self.cards.iter().map(|c| (c.pane, c.tag.clone(), c.title.clone())).collect()
+    }
+
+    fn render(&self, cols: usize, rows: usize, theme: &Theme) -> Vec<Panel> {
+        let mut out = Vec::new();
+        // A backdrop the size of the session: the map is a PLACE, not panels floating
+        // over the text they summarise. Without it the cards read as debris.
+        let mut back = panel_grid(cols, rows.saturating_sub(1), theme);
+        back.fill(Pen { bg: Color::Rgb(0x0b, 0x0b, 0x0e), ..Pen::default() });
+        write(&mut back, 0, 2, "MAP \u{b7} the session zoomed out", accent());
+        write(
+            &mut back,
+            rows.saturating_sub(2),
+            2,
+            "j k move \u{b7} enter opens that pane full size \u{b7} esc back",
+            dim(),
+        );
+        out.push(Panel { grid: back, col: 0, row: 0 });
+
+        for (i, c) in self.cards.iter().enumerate() {
+            // Cards keep the panes' own geometry: the map is spatial, and a card that
+            // moved would make you re-learn the session's shape every time you zoom.
+            let w = c.cols.clamp(14, cols.saturating_sub(c.col).max(14));
+            let h = c.rows.clamp(4, rows.saturating_sub(c.row).max(4));
+            let sel = i == self.cursor;
+            let mut g = Grid::new(w, h);
+            // A card needs its own surface, or it is just text on the backdrop. The
+            // selected one is lighter still rather than outlined: a border costs two
+            // rows and two columns out of a card that may only have four.
+            let bg = if sel { Color::Rgb(0x24, 0x2a, 0x36) } else { Color::Rgb(0x16, 0x17, 0x1c) };
+            g.fill(Pen { bg, ..Pen::default() });
+            let head_bg = if sel { Color::Rgb(0x33, 0x3d, 0x4d) } else { Color::Rgb(0x1e, 0x20, 0x27) };
+            let head_pen = Pen { bg: head_bg, fg: Color::Rgb(0xf5, 0xf5, 0x43), ..Pen::default() };
+            let title_pen = Pen { bg: head_bg, fg: Color::Rgb(0xd4, 0xd6, 0xd9), ..Pen::default() };
+            g.write_str(0, 0, &" ".repeat(w), head_pen);
+            let tag: String = format!("{:<8}", c.tag).chars().take(w).collect();
+            g.write_str(0, 1, &tag, head_pen);
+            let title: String = c.title.chars().take(w.saturating_sub(11)).collect();
+            g.write_str(0, 10.min(w.saturating_sub(1)), &title, title_pen);
+
+            let body = Pen { bg, fg: Color::Rgb(0xb8, 0xba, 0xc0), ..Pen::default() };
+            let faint = Pen { bg, fg: Color::Rgb(0x6a, 0x6d, 0x74), ..Pen::default() };
+            let detail: String = c.detail.chars().take(w.saturating_sub(2)).collect();
+            g.write_str(1, 1, &detail, body);
+            for (n, line) in c.preview.iter().take(h.saturating_sub(3)).enumerate() {
+                let line: String = line.trim().chars().take(w.saturating_sub(2)).collect();
+                g.write_str(3 + n, 1, &line, faint);
+            }
+            out.push(Panel { grid: g, col: c.col, row: c.row });
+        }
+        out
+    }
+}
 
 /// The verbs panel: how this repository is actually built, tested and deployed,
 /// ranked by how often each verb succeeded here.

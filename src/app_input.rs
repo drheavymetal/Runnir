@@ -761,6 +761,7 @@ impl Gpu {
             Action::ToggleExplorer => self.toggle_explorer(config),
             Action::CatchUp => self.show_catch_up(),
             Action::RepoVerbs => self.show_repo_verbs(config),
+            Action::Map => self.show_map(),
             Action::WarRoom => self.open_war_room(config),
             Action::WarRoomClose => self.close_war_room(config),
             Action::SetImageWatchDir => self.set_image_watch_dir(),
@@ -3042,6 +3043,7 @@ impl Gpu {
             Some(Overlay::Props(_)) => "props",
             Some(Overlay::CatchUp(_)) => "catch_up",
             Some(Overlay::Verbs(_)) => "verbs",
+            Some(Overlay::Map(_)) => "map",
             Some(_) => "other",
         };
         let mut out = json!({
@@ -3075,6 +3077,13 @@ impl Gpu {
                         "pane": pane, "state": state, "title": title, "detail": detail
                     }))
                     .collect::<Vec<_>>()
+            );
+        }
+        if let Some(Overlay::Map(p)) = &self.overlay {
+            out["map"] = json!(
+                p.rows().into_iter().map(|(pane, tag, title)| json!({
+                    "pane": pane, "state": tag, "title": title
+                })).collect::<Vec<_>>()
             );
         }
         if let Some(Overlay::Verbs(p)) = &self.overlay {
@@ -3478,6 +3487,27 @@ impl Gpu {
                 }
                 _ => {}
             },
+            // The map: move between cards, Enter opens that pane at full size —
+            // which is all "zooming in" can mean when the terminals never resized.
+            Overlay::Map(p) => match key {
+                Key::Named(NamedKey::Escape) => self.overlay = None,
+                Key::Named(NamedKey::ArrowUp) | Key::Named(NamedKey::ArrowLeft) => p.up(),
+                Key::Named(NamedKey::ArrowDown) | Key::Named(NamedKey::ArrowRight) => p.down(),
+                Key::Named(NamedKey::Enter) => {
+                    let pane = p.selected_pane();
+                    self.overlay = None;
+                    if let Some(id) = pane {
+                        self.focus_pane(id);
+                    }
+                }
+                Key::Character(c) => match c.as_str() {
+                    "k" | "h" => p.up(),
+                    "j" | "l" => p.down(),
+                    "q" => self.overlay = None,
+                    _ => {}
+                },
+                _ => {}
+            },
             // The verbs panel: Enter STAGES the verb at the prompt and never runs
             // it. A list learned from what you typed, typing itself back, is exactly
             // the place where a stray Enter must not execute anything.
@@ -3802,6 +3832,7 @@ impl Gpu {
             Action::ToggleExplorer => self.toggle_explorer(config),
             Action::CatchUp => self.show_catch_up(),
             Action::RepoVerbs => self.show_repo_verbs(config),
+            Action::Map => self.show_map(),
             Action::WarRoom => self.open_war_room(config),
             Action::WarRoomClose => self.close_war_room(config),
             Action::SetImageWatchDir => self.set_image_watch_dir(),
@@ -6003,6 +6034,54 @@ impl Gpu {
         }
         argv.push(path.to_string_lossy().into_owned());
         self.split_running(config, argv);
+    }
+
+    /// Zooms out: every pane as a card carrying its headline, in the geometry it
+    /// already occupies.
+    ///
+    /// This is the half of "canvas, not mosaic" that can exist while a pane is a
+    /// pseudo-terminal: the PTY's size in rows and columns is not a view property, so
+    /// zooming cannot scale the text without resizing every program in the session.
+    /// What zoom CAN do is change what is drawn — headlines instead of unreadable
+    /// glyphs — which is the part that makes a session readable at a glance.
+    fn show_map(&mut self) {
+        let area = self.active_area();
+        let (cw, ch) = self.renderer.cell_size();
+        let rects = self.visible_rects(area);
+        let waiting = matches!(&self.overlay, Some(Overlay::Prompt(_)))
+            .then(|| self.tabs[self.active].focus);
+
+        let mut cards: Vec<overlay::MapCard> = rects
+            .iter()
+            .map(|(id, r)| {
+                let pane = &self.tabs[self.active].panes[id];
+                let snap = pane.catch_up_snapshot(*id, waiting == Some(*id));
+                // Every pane gets a card, including the quiet ones: a map with holes
+                // in it is not a map. The catch-up omits them; this must not.
+                let head = crate::catchup::headline(&snap);
+                let (tag, detail) = match &head {
+                    Some(h) => (h.state.tag().to_string(), h.detail.clone()),
+                    None => ("idle".to_string(), "at a prompt".to_string()),
+                };
+                // The block's output, not the tail of the scrollback: the tail of a
+                // themed prompt is glyphs and a clock, and a map of clocks is no map.
+                let preview = pane.recent_output(3);
+                overlay::MapCard {
+                    pane: *id,
+                    col: (r.x / cw).round() as usize,
+                    row: (r.y / ch).round() as usize,
+                    cols: (r.w / cw).round() as usize,
+                    rows: (r.h / ch).round() as usize,
+                    tag,
+                    title: snap.title,
+                    detail,
+                    preview,
+                }
+            })
+            .collect();
+        cards.sort_by_key(|c| (c.row, c.col));
+        self.overlay = Some(Overlay::Map(overlay::MapPanel::new(cards)));
+        self.window.request_redraw();
     }
 
     /// Arranges the window around an operation: a status watch and one log pane per
