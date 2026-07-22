@@ -2641,6 +2641,47 @@ since been rebuilt does not match `readlink /proc/PID/exe` any more — the link
 `watch` children. Match on the process environment (`XDG_DATA_HOME` under the
 scratchpad), not on the exe path.
 
+## 2026-07-23 - Third round: stop blacklisting shell syntax, and claim a pane on paste
+
+Five more. The verbs capture leaked for the THIRD round running — this time through
+command substitution: `TOKEN=$(cat secret-name.txt) cargo test` tokenises so that the
+assignment skip lands on `secret-name.txt)`, and trimming the stray `)` laundered it
+into an honest-looking verb.
+
+**The lesson is the fix.** Two rounds of blacklisting were each one shell feature
+behind. Now an assignment prefix is only stepped over when it is PLAIN
+(`NAME=value`, variable-shaped name, and a value with no `$`, backtick or parens),
+and a word can only be a verb when it is shaped like a program name. Anything the
+shell would have expanded means the line teaches nothing at all. `trim_matches` is
+gone: sanitising the ends of a word is what made a filename look like a command.
+
+- `split_running` was taught to report a refused split for the war room in the last
+  round — and every OTHER caller went on ignoring it. A git push that "reruns in a
+  split" ran nowhere on a cramped window; the control socket answered `ok` to
+  `launch --type split` with the OLD pane's id, so a script's next `send-text` typed
+  into the user's shell; `pipe_through` wrote its temp file for a filter that never
+  opened. One helper states the two failure wordings, and eleven call sites use it.
+- **Paste never claimed the pane.** `touched`, `last_pty_key` and the catch-up
+  baseline were set in `write_key_bytes` only, so a deploy PASTED into a war-room pane
+  (trailing newline, zero keystrokes) left the pane "untouched": `leader w q` then
+  removed the tab and `Pty::drop` killed the running deploy. Now a shared
+  `Pane::write_from_user` claims the pane and a shared `note_input_reached_child`
+  winds the window-wide clock; paste, middle-click, clipboard history, file drop,
+  broadcast (which never claimed anything either) and the AI's inserted command all go
+  through them. The war room stages its deploy TYPED BUT NOT CLAIMED — otherwise the
+  room could never be torn down at all.
+- `named_key` stopped at F12 while `named_id` and `canonical_named` went to F24, so
+  `runnir @ key --chord f13` could not press the very keys the ZSA work exists for.
+- The map was built from `visible_rects`, which honours zoom and Stack — so "the
+  session zoomed out" showed exactly ONE card when a pane was zoomed, breaking the
+  invariant written three lines above it. `Tab::map_layout` gives the arrangement the
+  tab would have without zoom, with a grid fallback rather than a map with holes.
+  Verified live: three panes, one zoomed, three cards.
+
+498 tests (was 492). Flagged, not fixed: control-socket `send-text` deliberately does
+NOT claim a pane (a script is not a person), which means a war-room pane driven only
+by a script still tears down under a running command.
+
 ## Gotchas (do not re-learn)
 
 - The board must be put back even if runnir DIES. `sustain` (ms) on every ZSA paint is

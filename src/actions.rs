@@ -1206,6 +1206,22 @@ mod chord_roundtrip_tests {
         let (key, _) = chord_to_key("shift+]").unwrap();
         assert_eq!(key, Key::Character("]".into()), "punctuation is not upper-cased");
     }
+
+    /// The high function keys are the ones no compositor claims, so they are the ones
+    /// worth binding — and a binding a script cannot press is a binding nothing can
+    /// test. Every name the config accepts has to reach a real key.
+    #[test]
+    fn every_key_the_config_accepts_can_also_be_pressed_by_a_script() {
+        for n in 1..=24 {
+            let spec = format!("f{n}");
+            let (key, mods) = chord_to_key(&spec)
+                .unwrap_or_else(|| panic!("{spec} parses in a config but not for the remote"));
+            assert_eq!(Chord::from_event(&key, mods), Chord::parse(&spec), "{spec} did not round-trip");
+        }
+        // …with the modifiers a ZSA layer actually sends alongside them.
+        let (key, mods) = chord_to_key("ctrl+shift+f19").unwrap();
+        assert_eq!(Chord::from_event(&key, mods), Chord::parse("ctrl+shift+f19"));
+    }
 }
 
 /// Turns a chord spec into the key and modifiers a real press of it would carry.
@@ -1264,6 +1280,20 @@ fn named_key(id: &str) -> Option<NamedKey> {
         "f10" => NamedKey::F10,
         "f11" => NamedKey::F11,
         "f12" => NamedKey::F12,
+        // F13-F24 too, or the remote control cannot press the very keys the ZSA work
+        // exists for: a binding on `f13` would be one no script could ever exercise.
+        "f13" => NamedKey::F13,
+        "f14" => NamedKey::F14,
+        "f15" => NamedKey::F15,
+        "f16" => NamedKey::F16,
+        "f17" => NamedKey::F17,
+        "f18" => NamedKey::F18,
+        "f19" => NamedKey::F19,
+        "f20" => NamedKey::F20,
+        "f21" => NamedKey::F21,
+        "f22" => NamedKey::F22,
+        "f23" => NamedKey::F23,
+        "f24" => NamedKey::F24,
         _ => return None,
     })
 }

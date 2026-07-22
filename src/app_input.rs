@@ -452,7 +452,11 @@ impl Gpu {
         let col = (((pos.x as f32 - rect.x) / cw).floor().max(0.0)) as usize;
         let row = (((pos.y as f32 - rect.y) / ch).floor().max(0.0)) as usize;
         if let Some(bytes) = mouse::encode(mode, sgr, button, kind, col, row) {
-            self.tab().focused().write(&bytes);
+            // A click a TUI reads is somebody working in that pane as surely as a
+            // keystroke is; an afternoon spent in a mouse-driven program must not end
+            // with the catch-up reporting an absence.
+            self.note_input_reached_child();
+            self.tab().focused().write_from_user(&bytes);
             true
         } else {
             false
@@ -602,15 +606,7 @@ impl Gpu {
     /// Sends encoded key bytes to the focused pane (or all panes when broadcasting),
     /// snapping the view to the live output and clearing any selection first.
     fn write_key_bytes(&mut self, bytes: &[u8]) {
-        // The away clock. Window focus lies (a focused window on another monitor is
-        // not attention); a key reaching the child process does not.
-        self.last_pty_key = Instant::now();
-        self.baseline.key_reached_a_child();
-        // Whoever opened this pane, the moment somebody types in it, it is theirs.
-        let focus = self.tabs[self.active].focus;
-        if let Some(p) = self.tabs[self.active].panes.get_mut(&focus) {
-            p.touched = true;
-        }
+        self.note_input_reached_child();
         self.scroll_glide = None;
         if self.tab().focused().snap_to_bottom() {
             self.window.request_redraw();
@@ -619,8 +615,23 @@ impl Gpu {
         if self.broadcast {
             self.broadcast_bytes(bytes);
         } else {
-            self.tab().focused().write(bytes);
+            self.tab().focused().write_from_user(bytes);
         }
+    }
+
+    /// The window-wide half of "input reached a child": the away clock and the mark
+    /// the catch-up measures everything from. (The per-pane half is `write_from_user`,
+    /// which claims the pane the bytes actually landed in — with broadcast on that is
+    /// several panes, not the focused one.)
+    ///
+    /// Every path that puts the user's bytes into a shell owes this, not just the
+    /// keyboard: window focus lies (a focused window on another monitor is not
+    /// attention), and so does a clock that only keys wind. An hour of pasting and
+    /// mouse-driven work would end with the catch-up announcing an absence that never
+    /// happened.
+    fn note_input_reached_child(&mut self) {
+        self.last_pty_key = Instant::now();
+        self.baseline.key_reached_a_child();
     }
 
     fn run_action(&mut self, action: Action, config: &Config, event_loop: &ActiveEventLoop) {
@@ -1459,11 +1470,12 @@ impl Gpu {
             e.focused = false;
         }
         if busy {
-            self.split_running(config, cmd);
+            self.split_running_or_say_why(config, cmd);
             return;
         }
         let line = cmd.iter().map(|a| shell_quote(a)).collect::<Vec<_>>().join(" ");
-        self.tab().focused().write(format!("{line}\r").as_bytes());
+        self.note_input_reached_child();
+        self.tab().focused().write_from_user(format!("{line}\r").as_bytes());
         self.window.request_redraw();
     }
 
@@ -4210,7 +4222,7 @@ impl Gpu {
             }
             PromptKind::QuickConnect => {
                 if !value.is_empty() {
-                    self.split_running(config, vec!["ssh".into(), value]);
+                    self.split_running_or_say_why(config, vec!["ssh".into(), value]);
                 }
             }
             PromptKind::AiCommand => {
@@ -4304,10 +4316,11 @@ impl Gpu {
                 // already typed in the shell, so this is just the Enter we withheld —
                 // broadcast it to the group if broadcast is on, exactly as the
                 // original keystroke would have gone.
+                self.note_input_reached_child();
                 if self.broadcast {
                     self.broadcast_bytes(b"\r");
                 } else {
-                    self.tab().focused().write(b"\r");
+                    self.tab().focused().write_from_user(b"\r");
                 }
             }
             PromptKind::HistoryInsert => {
@@ -5313,9 +5326,15 @@ impl Gpu {
             }
         }
         if let Some(cmd) = rerun {
-            self.split_running(config, cmd);
+            // The panel says what really happened to the handover. Claiming the push
+            // is "rerunning in a split" when the split was refused leaves someone
+            // watching for a prompt that never appears, on a push nobody sent.
+            let said = match self.split_running(config, cmd) {
+                Ok(_) => "needs a terminal — rerunning in a split".to_string(),
+                Err(why) => format!("needs a terminal, and {why}"),
+            };
             if let Some(Overlay::Git(p)) = &mut self.overlay {
-                p.message = Err("needs a terminal — rerunning in a split".into());
+                p.message = Err(said);
             }
         }
         if reload {
@@ -5703,7 +5722,7 @@ impl Gpu {
             self.set_clipboard(text);
         }
         if let Some(cmd) = split {
-            self.split_running(config, cmd);
+            self.split_running_or_say_why(config, cmd);
             self.overlay = None;
         }
         if let Some(dir) = open_dir {
@@ -5748,7 +5767,7 @@ impl Gpu {
         match crate::hints::act(&h.text, h.kind, false) {
             crate::hints::HintAct::Copy(text) => self.set_clipboard(text),
             crate::hints::HintAct::Done => {}
-            crate::hints::HintAct::Split(cmd) => self.split_running(config, cmd),
+            crate::hints::HintAct::Split(cmd) => self.split_running_or_say_why(config, cmd),
         }
         true
     }
@@ -5807,7 +5826,9 @@ impl Gpu {
         let scoped = self.tab().panes.values().any(|p| p.in_group);
         for pane in self.tab().panes.values_mut() {
             if !scoped || pane.in_group {
-                pane.write(bytes);
+                // Broadcasting into a pane is typing in it: each one it reaches is a
+                // pane somebody is working in, not one to tidy away behind them.
+                pane.write_from_user(bytes);
             }
         }
     }
@@ -5875,14 +5896,17 @@ impl Gpu {
             .chars()
             .filter(|&c| c == '\t' || c == '\n' || c == '\r' || !c.is_control())
             .collect();
+        self.note_input_reached_child();
         let bracketed = self.tab().focused().bracketed_paste();
         let pane = self.tab().focused();
+        // `write_from_user` throughout: a pasted line runs, and the pane it ran in is
+        // the user's however few keys were pressed to get it there.
         if bracketed {
-            pane.write(b"\x1b[200~");
-            pane.write(text.as_bytes());
-            pane.write(b"\x1b[201~");
+            pane.write_from_user(b"\x1b[200~");
+            pane.write_from_user(text.as_bytes());
+            pane.write_from_user(b"\x1b[201~");
         } else {
-            pane.write(text.as_bytes());
+            pane.write_from_user(text.as_bytes());
         }
     }
 
@@ -6031,7 +6055,7 @@ impl Gpu {
             return;
         }
         argv.push(path.to_string_lossy().into_owned());
-        self.split_running(config, argv);
+        self.split_running_or_say_why(config, argv);
     }
 
     /// Zooms out: every pane as a card carrying its headline, in the geometry it
@@ -6045,14 +6069,17 @@ impl Gpu {
     fn show_map(&mut self) {
         let area = self.active_area();
         let (cw, ch) = self.renderer.cell_size();
-        let rects = self.visible_rects(area);
+        // Not `visible_rects`: that honours zoom, and the map of a session with one
+        // pane zoomed would be a single card — exactly the hole the cards exist to
+        // close. Zooming out to see everything must show everything.
+        let rects = self.tabs[self.active].map_layout(area);
         let waiting = matches!(&self.overlay, Some(Overlay::Prompt(_)))
             .then(|| self.tabs[self.active].focus);
 
         let mut cards: Vec<overlay::MapCard> = rects
             .iter()
-            .map(|(id, r)| {
-                let pane = &self.tabs[self.active].panes[id];
+            .filter_map(|(id, r)| {
+                let pane = self.tabs[self.active].panes.get(id)?;
                 let snap = pane.catch_up_snapshot(*id, waiting == Some(*id));
                 // Every pane gets a card, including the quiet ones: a map with holes
                 // in it is not a map. The catch-up omits them; this must not.
@@ -6064,7 +6091,7 @@ impl Gpu {
                 // The block's output, not the tail of the scrollback: the tail of a
                 // themed prompt is glyphs and a clock, and a map of clocks is no map.
                 let preview = pane.recent_output(3);
-                overlay::MapCard {
+                Some(overlay::MapCard {
                     pane: *id,
                     col: (r.x / cw).round() as usize,
                     row: (r.y / ch).round() as usize,
@@ -6074,7 +6101,7 @@ impl Gpu {
                     title: snap.title,
                     detail,
                     preview,
-                }
+                })
             })
             .collect();
         cards.sort_by_key(|c| (c.row, c.col));
@@ -6161,7 +6188,9 @@ impl Gpu {
         // Quoted like the watch commands: this line is one Enter away from running,
         // and the path came from wherever the repository was cloned to.
         let dir = shell_quote(&file.parent().unwrap_or(std::path::Path::new(".")).to_string_lossy());
-        self.insert_command(format!("cd {dir} && docker compose up -d"));
+        // Staged, not claimed: the room typed this line itself, so the pane is still
+        // untouched and teardown is still free to take it down.
+        self.type_command(format!("cd {dir} && docker compose up -d"), false);
         // Counted from what is ON SCREEN, never from the file: the log panes are capped
         // at three and a split can be refused, so the compose file's own count would be
         // a promise the window does not keep. The first watch pane is the status board
@@ -6431,7 +6460,9 @@ impl Gpu {
             "runnir-pipe".to_string(),
             path.to_string_lossy().into_owned(),
         ];
-        self.split_running(config, argv);
+        // The captured text is already on disk; if the filter's pane never opens, the
+        // file is all there is, and silence would look exactly like an empty result.
+        self.split_running_or_say_why(config, argv);
     }
 
     /// Opens the layout picker (W3): choose a named layout from the config and it
@@ -6479,7 +6510,7 @@ impl Gpu {
         if snip.run_now {
             // insert_command already snapped to the bottom and typed the line; this is
             // just the Enter, sent to the same focused pane it was typed into.
-            self.tab().focused().write(b"\r");
+            self.tab().focused().write_from_user(b"\r");
         }
     }
 
@@ -6528,12 +6559,32 @@ impl Gpu {
         self.window.request_redraw();
     }
 
-    fn split_running(&mut self, config: &Config, command: Vec<String>) {
+    /// Splits the focused pane and runs `command` in the new one. `Ok` carries the new
+    /// pane's id.
+    ///
+    /// The outcome is returned rather than swallowed because a split can simply not
+    /// happen — the tab refuses to divide a pane already at its minimum size — and a
+    /// caller that assumes success then announces a command nobody is running, hands
+    /// out the OLD pane's id, or drops the command in silence.
+    fn split_running(&mut self, config: &Config, command: Vec<String>) -> Result<u64, String> {
         let area = self.active_area();
         let id = self.new_pane_id();
         let wake = wake_fn(self.proxy.clone());
-        let _ = self.tab().split_running_with_id(area, Axis::Horizontal, config, id, command, wake);
+        let done = self.tab().split_running_with_id(area, Axis::Horizontal, config, id, command, wake);
         self.window.request_redraw();
+        match split_refusal(done) {
+            None => Ok(id),
+            Some(why) => Err(why),
+        }
+    }
+
+    /// The same, for the callers whose only sensible answer to a refusal is to say so
+    /// out loud. Saying nothing is what leaves somebody watching a pane that never
+    /// opened for output that is never coming.
+    fn split_running_or_say_why(&mut self, config: &Config, command: Vec<String>) {
+        if let Err(why) = self.split_running(config, command) {
+            self.note_pipe(&why);
+        }
     }
 
     fn open_quick_connect(&mut self) {
@@ -6547,7 +6598,7 @@ impl Gpu {
 
     fn launch_claude(&mut self, config: &Config) {
         let cmd = ai::claude_launch_command(config);
-        self.split_running(config, cmd);
+        self.split_running_or_say_why(config, cmd);
     }
 
     // ------------------------------------------------------------------
@@ -6926,11 +6977,13 @@ impl Gpu {
                 let argv = cmd.as_deref().map(argv_of).unwrap_or_default();
                 match target {
                     LaunchTarget::Tab => self.control_new_tab(config, argv),
-                    LaunchTarget::Split => {
-                        self.split_running(config, argv);
-                        let id = self.tab().focused_ptr();
-                        ControlResponse::ok(json!({ "pane": id }))
-                    }
+                    // The id has to be the pane that was really opened. Answering `ok`
+                    // with the focused pane after a refused split hands the script the
+                    // OLD pane, and its next `send-text` types into the user's shell.
+                    LaunchTarget::Split => match self.split_running(config, argv) {
+                        Ok(id) => ControlResponse::ok(json!({ "pane": id })),
+                        Err(why) => ControlResponse::error(why),
+                    },
                 }
             }
 
@@ -7137,6 +7190,35 @@ fn shell_quote(s: &str) -> String {
     }
     out.push('\'');
     out
+}
+
+/// Why a split produced no pane, or `None` when it did produce one.
+///
+/// A refusal and a failed spawn leave the caller in the same place — holding a command
+/// nobody is running — and differ only in what there is to tell the user. Stated once,
+/// here, so no caller has to decide that a `false` was good enough.
+fn split_refusal(done: anyhow::Result<bool>) -> Option<String> {
+    match done {
+        Ok(true) => None,
+        Ok(false) => Some("no room to split — resize the window or close a pane".into()),
+        Err(e) => Some(format!("could not open a pane: {e}")),
+    }
+}
+
+#[cfg(test)]
+mod split_outcome_tests {
+    use super::split_refusal;
+
+    /// Every way a split can fail to put a pane on screen has to read as a failure.
+    /// `Ok(false)` is the one that looks like success and is not: the tab declined to
+    /// divide a pane already at its smallest, and nothing is running anywhere.
+    #[test]
+    fn a_split_that_opened_no_pane_never_passes_for_success() {
+        assert_eq!(split_refusal(Ok(true)), None);
+        assert!(split_refusal(Ok(false)).is_some(), "a refused split is not a split");
+        let failed = split_refusal(Err(anyhow::anyhow!("no ptys left")));
+        assert!(failed.is_some_and(|why| why.contains("no ptys left")), "say what went wrong");
+    }
 }
 
 #[cfg(test)]

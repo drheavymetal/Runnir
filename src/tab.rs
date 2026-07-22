@@ -105,6 +105,30 @@ impl Tab {
         }
     }
 
+    /// Every pane's rectangle for the session map, including the ones the screen is
+    /// not showing.
+    ///
+    /// `layout` answers what is drawn, and in `Stack` that is one pane — right for
+    /// rendering, wrong for a map: a map of the session that omits the panes you
+    /// cannot see is a map of the screen. `Stack` has no arrangement of its own, so
+    /// the panes are placed where the tree puts them, which is the arrangement
+    /// switching back to `Splits` would restore.
+    pub fn map_layout(&self, area: Rect) -> Vec<(PaneId, Rect)> {
+        let inner = pad(area, self.padding);
+        let rects = match self.mode {
+            LayoutMode::Stack => self.tree.layout(inner, self.gap),
+            _ => self.layout(area),
+        };
+        // A pane left without a rect is the hole this exists to prevent, and the tree
+        // can outlive a pane that failed to spawn. A grid of everything is a poorer
+        // likeness of the session than the real arrangement, but it is a complete one.
+        if rects.len() == self.panes.len() {
+            rects
+        } else {
+            crate::layout::grid(&self.order, inner, self.gap)
+        }
+    }
+
     /// Cycles to the next layout mode and returns it, reflowing so every pane's PTY
     /// learns the size the new arrangement gives it.
     pub fn cycle_layout(&mut self, area: Rect) -> LayoutMode {
@@ -699,6 +723,36 @@ mod tests {
         );
         assert!(!tab.panes.contains_key(&3), "a refused split leaves no pane behind");
         assert_eq!(tab.panes.len(), 2);
+    }
+
+    /// The map is how a session is read at a glance, so it owes a place to every pane
+    /// in the tab — including the ones the screen is hiding. In `Stack` the screen
+    /// shows one; a map that agreed would say the session has one pane.
+    #[test]
+    fn every_pane_has_a_place_on_the_map_even_when_the_screen_hides_it() {
+        let config = crate::config::Config::default();
+        let mut tab = Tab::new(AREA, (10.0, 20.0), &config, 1, &Spawn::default(), || {})
+            .expect("a tab spawns its first shell");
+        for id in 2..=3 {
+            assert!(tab.split_with_id(AREA, Axis::Horizontal, &config, id, || {}).unwrap());
+        }
+        assert_eq!(tab.panes.len(), 3);
+
+        for mode in [LayoutMode::Splits, LayoutMode::Stack, LayoutMode::Tall, LayoutMode::Grid] {
+            tab.mode = mode;
+            let map = tab.map_layout(AREA);
+            assert_eq!(map.len(), 3, "{mode:?} left a hole in the map");
+            for id in tab.panes.keys() {
+                assert!(map.iter().any(|(p, _)| p == id), "{mode:?} lost pane {id}");
+            }
+            // A place, not a point: a card with no size cannot carry a headline.
+            for (id, r) in &map {
+                assert!(r.w > 0.0 && r.h > 0.0, "{mode:?} gave pane {id} nothing to draw in");
+            }
+        }
+        // Stack draws one pane; only the map disagrees.
+        tab.mode = LayoutMode::Stack;
+        assert_eq!(tab.layout(AREA).len(), 1, "the screen still shows one pane at a time");
     }
 
     #[test]

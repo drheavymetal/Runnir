@@ -363,6 +363,18 @@ impl Pane {
         self.pty.write(bytes);
     }
 
+    /// Bytes a PERSON put in this pane — typed, pasted, dropped on the window, chosen
+    /// from a picker, or broadcast into it from another pane.
+    ///
+    /// However they arrived, they make the pane theirs. A deploy pasted with its
+    /// trailing newline is running exactly as much as one that was typed key by key,
+    /// and counting only keystrokes is how the war room decides that pane was never
+    /// used and kills the deploy taking it down.
+    pub fn write_from_user(&mut self, bytes: &[u8]) {
+        self.touched = true;
+        self.pty.write(bytes);
+    }
+
     /// Snaps the view to the live output. Any keystroke should trigger this so
     /// typing while scrolled back is not silently swallowed.
     pub fn snap_to_bottom(&mut self) -> bool {
@@ -583,6 +595,21 @@ mod tests {
     /// keyword typed into the first row would not be a hit — nor should it be.
     fn print(pane: &Pane, text: &str) {
         vte::Parser::new().advance(&mut *pane.grid.lock().unwrap(), text.as_bytes());
+    }
+
+    /// The war room closes the panes it opened "and only those the user never typed
+    /// in", and a paste is not typing. A deploy pasted into a room pane with its
+    /// trailing newline is running; if the pane still counts as untouched, `leader w q`
+    /// takes the tab down and `Pty::drop` kills the deploy mid-flight.
+    #[test]
+    fn a_pasted_command_claims_the_pane_as_much_as_a_typed_one() {
+        let mut pane = quiet_pane();
+        assert!(!pane.touched, "a freshly opened pane is nobody's yet");
+
+        // No keystroke anywhere: this is the clipboard arriving whole.
+        pane.write_from_user(b"\x1b[200~./deploy.sh prod\n\x1b[201~");
+
+        assert!(pane.touched, "the pane a command was pasted into is the user's");
     }
 
     /// A watch hit is news about the stretch of absence it fired in. Kept past that,

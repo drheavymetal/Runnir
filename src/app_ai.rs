@@ -201,6 +201,14 @@ impl Gpu {
     /// cannot submit itself line by line — the whole point is that you review it and
     /// press Enter yourself.
     fn insert_command(&mut self, cmd: String) {
+        self.type_command(cmd, true);
+    }
+
+    /// The body of `insert_command`. `claimed` says whether the pane becomes the
+    /// user's: a snippet, a history line or an accepted suggestion is somebody working
+    /// here, but the war room stages its deploy unbidden, and a pane the room typed
+    /// into all by itself is still the room's to close.
+    fn type_command(&mut self, cmd: String, claimed: bool) {
         let cmd: String = cmd
             .chars()
             .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
@@ -208,7 +216,12 @@ impl Gpu {
         let cmd = cmd.trim_end();
         if !cmd.is_empty() {
             self.tab().focused().snap_to_bottom();
-            self.tab().focused().write(cmd.as_bytes());
+            if claimed {
+                self.note_input_reached_child();
+                self.tab().focused().write_from_user(cmd.as_bytes());
+            } else {
+                self.tab().focused().write(cmd.as_bytes());
+            }
             self.window.request_redraw();
         }
     }
@@ -314,7 +327,7 @@ impl Gpu {
                     self.tab().focus_dir(area, crate::layout::Direction::Down);
                 }
                 "ssh" if !step.arg.is_empty() => {
-                    self.split_running(config, vec!["ssh".into(), step.arg]);
+                    self.split_running_or_say_why(config, vec!["ssh".into(), step.arg]);
                 }
                 "run" if !step.arg.is_empty() => {
                     // Typed, not executed: the user reviews then presses Enter.
@@ -323,7 +336,8 @@ impl Gpu {
                     // the review-before-run contract this action rests on.
                     let typed = step.arg.split(['\n', '\r']).next().unwrap_or("");
                     if !typed.is_empty() {
-                        self.tab().focused().write(typed.as_bytes());
+                        self.note_input_reached_child();
+                        self.tab().focused().write_from_user(typed.as_bytes());
                     }
                 }
                 "search" if !step.arg.is_empty() => {
@@ -379,7 +393,7 @@ impl Gpu {
             hints::HintAct::Done => {}
             // Runs in the pane's own directory, which is what makes a bare
             // `git show <sha>` resolve at all.
-            hints::HintAct::Split(cmd) => self.split_running(config, cmd),
+            hints::HintAct::Split(cmd) => self.split_running_or_say_why(config, cmd),
         }
     }
 }

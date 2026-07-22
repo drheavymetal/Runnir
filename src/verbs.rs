@@ -68,23 +68,23 @@ pub fn verb_of(line: &str) -> Option<String> {
     // and there can be any number of them. Stepping over only the first is how
     // `RUST_LOG=debug OPENAI_API_KEY=sk-… cargo run` gets learned as the key itself,
     // written to disk under the repo's name.
+    //
+    // What is stepped over has to be a REAL assignment, though. Nothing here runs a
+    // shell, so `TOKEN=$(cat secret-name.txt) cargo test` is four words, not two, and
+    // skipping "the word with the `=` in it" lands on `secret-name.txt)` — the name of
+    // somebody's secret file, standing where the command name should be.
     let mut head = head;
     while head.contains('=') {
+        if !is_plain_assignment(head) {
+            return None;
+        }
         head = words.next()?;
     }
-    // A path to something in the project is not a shared verb: `./deploy.sh` says as
-    // much about someone's directory as about the project, and `/home/pedro/x` more.
-    if head.starts_with('-') || head.contains('/') || head.starts_with('$') {
-        return None;
-    }
-    // A command name is one word. Anything that is only one word because a quote held
-    // it together is somebody's data — a password, a message, a query — sitting where
-    // the verb should be.
-    if head.contains(char::is_whitespace) {
-        return None;
-    }
-    let head = head.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '_');
-    if head.is_empty() {
+    // And whatever is left standing there has to LOOK like a command name. Naming what
+    // is safe is the only version of this check that holds: every round of listing what
+    // is not safe (a leading `-`, a `/`, a leading `$`) has been one shell feature
+    // behind, and the cost of being behind is a filename in verbs.json.
+    if !is_command_word(head) {
         return None;
     }
 
@@ -174,6 +174,35 @@ fn first_stage_words(line: &str) -> Option<Vec<String>> {
         words.push(word);
     }
     Some(words)
+}
+
+/// Whether a word is an environment assignment that the shell would have handed to
+/// the command untouched — `RUST_LOG=debug`, `AUTH=Bearer sk-…`.
+///
+/// A value the shell would have EXPANDED is not one of these, because the expansion
+/// also decides where the word ends: `TOKEN=$(cat x.txt)` is one assignment to a
+/// shell and two words to anything that does not run one. Refusing the whole line is
+/// the only answer that cannot put the second half of it somewhere permanent.
+fn is_plain_assignment(w: &str) -> bool {
+    let Some((name, value)) = w.split_once('=') else { return false };
+    let mut chars = name.chars();
+    let named_like_a_variable = chars.next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
+    named_like_a_variable && !value.contains(['$', '`', '(', ')'])
+}
+
+/// Whether a word can be the name of a command: letters, digits and the punctuation
+/// that really appears in program names (`docker-compose`, `python3.11`, `g++`).
+///
+/// Everything else — a path, a flag, a substitution, a quoted phrase, a word carrying
+/// a stray bracket — is refused rather than cleaned up. Trimming the punctuation off
+/// the ends is what made `secret-name.txt)` look like an honest verb.
+fn is_command_word(w: &str) -> bool {
+    !w.is_empty()
+        && !w.starts_with('-')
+        && !w.starts_with('.')
+        && w.chars().any(|c| c.is_ascii_alphanumeric())
+        && w.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+'))
 }
 
 /// Whether a word can be a subcommand: letters, digits and dashes only, short, not a
@@ -290,6 +319,39 @@ mod tests {
         // Assignments and nothing else is an environment change, not a verb at all.
         assert!(verb_of("OPENAI_API_KEY=sk-live-abc123").is_none());
         assert!(verb_of("A=1 B=2").is_none());
+    }
+
+    /// A shell would have run the substitution before the command ever started, so
+    /// the words either side of it are pieces of one value, not a verb. Nothing here
+    /// runs a shell — so nothing here may keep any of them.
+    #[test]
+    fn a_command_substitution_never_leaves_its_filename_behind_as_the_verb() {
+        for line in [
+            "TOKEN=$(cat secret-name.txt) cargo test",
+            "PASS=`cat vault.txt` psql",
+            "TOKEN=${SECRET_FILE} cargo run",
+            "AWS_KEY=$(pass show clients/acme) terraform apply",
+        ] {
+            assert!(verb_of(line).is_none(), "{line} was learned as {:?}", verb_of(line));
+        }
+        // A substitution standing where the command name goes is no better.
+        assert!(verb_of("$(which cargo) build").is_none());
+        assert!(verb_of("`which cargo` build").is_none());
+        // …while a plain assignment in front of a real verb still steps aside.
+        assert_eq!(verb_of("RUST_LOG=debug cargo test").unwrap(), "cargo test");
+    }
+
+    /// The command name is whitelisted, not sanitised: a word that is not shaped like
+    /// a program name is dropped whole. Trimming the odd bracket off the ends is how
+    /// somebody's filename came out looking like an honest verb.
+    #[test]
+    fn only_a_word_shaped_like_a_program_name_can_be_a_verb() {
+        for line in ["secret-name.txt)", "(cargo build)", "vault.txt`", "'my query' psql"] {
+            assert!(verb_of(line).is_none(), "{line} was learned as a verb");
+        }
+        // Real program names keep their punctuation.
+        assert_eq!(verb_of("docker-compose up").unwrap(), "docker-compose");
+        assert_eq!(verb_of("python3.11 train.py").unwrap(), "python3.11");
     }
 
     /// A value in quotes holds spaces, so whitespace alone cannot say where it ends.
