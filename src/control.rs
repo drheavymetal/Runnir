@@ -102,6 +102,15 @@ pub enum ControlRequest {
         #[serde(default, rename = "to-row")]
         to_row: Option<usize>,
     },
+    /// Turn the wheel at a cell. `lines` is signed the way a wheel is: positive is
+    /// up, away from the user. The pointer goes to the cell first, because every
+    /// wheel target here is chosen by what is UNDER the pointer.
+    Wheel {
+        col: usize,
+        row: usize,
+        #[serde(default)]
+        lines: Option<f32>,
+    },
     /// Run an action by the id the config and the palette use (`git_panel`,
     /// `new_tab`, …), with no binding needed.
     Action { id: String },
@@ -206,6 +215,11 @@ pub fn parse_client_args(cmd: &str, flags: &[String]) -> Result<ControlRequest, 
             row: opt_usize(&m, "row")?.ok_or("drag needs --row")?,
             to_col: opt_usize(&m, "to-col")?.ok_or("drag needs --to-col")?,
             to_row: opt_usize(&m, "to-row")?,
+        },
+        "wheel" => ControlRequest::Wheel {
+            col: opt_usize(&m, "col")?.ok_or("wheel needs --col")?,
+            row: opt_usize(&m, "row")?.ok_or("wheel needs --row")?,
+            lines: opt_f32(&m, "lines")?,
         },
         "action" => ControlRequest::Action {
             id: m.get("id").ok_or("action needs --id (e.g. --id git_panel)")?.clone(),

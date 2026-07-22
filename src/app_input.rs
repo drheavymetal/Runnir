@@ -99,6 +99,9 @@ impl Gpu {
             let over_files = self.git_pointer_over_files(self.cursor_px);
             match self.overlay.as_mut() {
                 Some(Overlay::Docs(d)) => d.scroll(-lines.round() as isize),
+                // The file viewer is where the sidebar sends you, so the wheel has to
+                // work here too — reading a long file is exactly when you reach for it.
+                Some(Overlay::Viewer(v)) => v.scroll_by(-lines.round() as isize),
                 Some(Overlay::Docker(p)) => {
                     let step = -lines.round() as i32;
                     match p.focus {
@@ -124,6 +127,20 @@ impl Gpu {
                 self.git_preview();
             }
             self.window.request_redraw();
+            return;
+        }
+        // The sidebar is chrome beside the panes, not an overlay, so nothing above
+        // catches it: over the tree the wheel scrolls the tree. Checked before the
+        // pane paths, or the wheel scrolls a pane the pointer is not even over.
+        if self.explorer_row_at(self.cursor_px).is_some() {
+            let step = -wheel_lines(delta, config.behaviour.wheel_lines, cell_h).round() as i32;
+            if step != 0 {
+                let body = self.explorer_body_rows();
+                if let Some(e) = self.tabs[self.active].explorer.as_mut() {
+                    e.scroll_by(step, body);
+                }
+                self.window.request_redraw();
+            }
             return;
         }
         // A mouse-mode app (unless Shift is held) gets the wheel as button events.
@@ -2927,6 +2944,9 @@ impl Gpu {
                 "width": e.width_in(self.window_area(), self.renderer.cell_size()),
                 "side": e.side.label(),
                 "cursor": e.cursor,
+                // The first visible row, so a script can tell the wheel (which moves
+                // the view) from j/k (which move the selection).
+                "scroll": e.scroll,
                 "rows": e.rows.len(),
                 "selected": e.selected().map(|r| r.entry.path.display().to_string()),
                 "open_dirs": e.expanded.len(),
@@ -6224,6 +6244,15 @@ impl Gpu {
                 self.on_cursor(mid, ModifiersState::empty());
                 self.on_cursor(to, ModifiersState::empty());
                 self.on_click(ElementState::Released, MouseButton::Left, ModifiersState::empty(), config);
+                self.window.request_redraw();
+                ControlResponse::ok(self.ui_state())
+            }
+            ControlRequest::Wheel { col, row, lines } => {
+                self.cursor_px = self.cell_centre(col, row);
+                // LineDelta is what a real mouse wheel sends; a touchpad's PixelDelta
+                // goes through the same `wheel_lines` conversion either way.
+                let delta = MouseScrollDelta::LineDelta(0.0, lines.unwrap_or(1.0));
+                self.on_wheel(delta, config, ModifiersState::empty());
                 self.window.request_redraw();
                 ControlResponse::ok(self.ui_state())
             }

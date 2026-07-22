@@ -384,6 +384,20 @@ impl Explorer {
         self.scroll_into_view(body_rows);
     }
 
+    /// Scrolls the VIEW by `delta` rows, for the mouse wheel.
+    ///
+    /// The cursor comes along only when the scroll would leave it off screen: a
+    /// wheel is a look around, not a selection change, but a cursor parked outside
+    /// the visible rows makes the next `j` jump somewhere nobody was looking.
+    pub fn scroll_by(&mut self, delta: i32, body_rows: usize) {
+        let body = body_rows.max(1);
+        let last = self.rows.len().saturating_sub(1);
+        let max = self.rows.len().saturating_sub(body) as i32;
+        self.scroll = (self.scroll as i32 + delta).clamp(0, max.max(0)) as usize;
+        let bottom = (self.scroll + body - 1).min(last);
+        self.cursor = self.cursor.clamp(self.scroll.min(bottom), bottom);
+    }
+
     pub fn set_cursor(&mut self, i: usize, body_rows: usize) {
         self.cursor = i.min(self.rows.len().saturating_sub(1));
         self.scroll_into_view(body_rows);
@@ -1210,6 +1224,46 @@ mod tests {
         assert!(!e.toggle(Path::new("/r/src")));
         assert_eq!(e.rows.len(), 2);
         assert!(!e.toggle(Path::new("/r/src")), "and reopening reuses what was read");
+    }
+
+    /// The wheel scrolls the view; the selection only moves when it would otherwise
+    /// end up off screen, and neither can run past the ends of the tree.
+    #[test]
+    fn the_wheel_scrolls_the_view_and_drags_the_cursor_only_when_it_must() {
+        let mut e = Explorer::new(PathBuf::from("/r"), 30, Side::Left);
+        let files: Vec<Entry> = (0..20).map(|i| entry(&format!("f{i:02}.rs"), false)).collect();
+        e.insert_children(PathBuf::from("/r"), files);
+        let body = 5;
+
+        e.set_cursor(0, body);
+        e.scroll_by(3, body);
+        assert_eq!(e.scroll, 3);
+        assert_eq!(e.cursor, 3, "the cursor was scrolled off the top, so it came along");
+
+        e.set_cursor(6, body); // scroll is now 3..=7 with the cursor inside it
+        e.scroll_by(1, body);
+        assert_eq!((e.scroll, e.cursor), (4, 6), "still visible: left where it was");
+
+        // Neither end can be run past, no matter how hard the wheel is spun.
+        e.scroll_by(-99, body);
+        assert_eq!((e.scroll, e.cursor), (0, 4));
+        e.scroll_by(99, body);
+        assert_eq!(e.scroll, 15, "the last full screen: 20 rows less a body of 5");
+        assert_eq!(e.cursor, 15);
+    }
+
+    /// A tree with fewer rows than the body has nothing to scroll, and an empty one
+    /// has no cursor to clamp — both have to survive a wheel spin.
+    #[test]
+    fn the_wheel_on_a_short_tree_does_nothing_and_does_not_panic() {
+        let mut e = Explorer::new(PathBuf::from("/r"), 30, Side::Left);
+        e.scroll_by(5, 10);
+        assert_eq!((e.scroll, e.cursor), (0, 0));
+
+        e.insert_children(PathBuf::from("/r"), vec![entry("a.rs", false), entry("b.rs", false)]);
+        e.set_cursor(1, 10);
+        e.scroll_by(5, 10);
+        assert_eq!((e.scroll, e.cursor), (0, 1), "two rows in a ten-row body: nowhere to go");
     }
 
     #[test]

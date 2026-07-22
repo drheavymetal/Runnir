@@ -650,13 +650,14 @@ RUNNIR_LISTEN, so anything inside a pane can drive its own terminal:
   runnir @ new-tab / focus-tab --index 2 / close-tab
   runnir @ set-colors --opacity 0.85 --bg '#101014'
 
-send-text talks to the CHILD. These four talk to runnir itself, so they reach the
+send-text talks to the CHILD. These five talk to runnir itself, so they reach the
 overlays, the leader layer and everything bound to a key:
 
   runnir @ action --id git_panel       run an action by its config id
   runnir @ key --chord enter           press a key (same spellings as the config)
   runnir @ click --col 30 --row 6      click a cell of the window
   runnir @ drag --col 40 --row 6 --to-col 60    press, move, release
+  runnir @ wheel --col 4 --row 10 --lines -3    turn the wheel there (+ is up)
 
 They answer with what is on screen — which overlay is up, and for the git panel its
 view, focus, cursor, column widths and open commit — so a script can check what it

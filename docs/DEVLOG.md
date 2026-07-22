@@ -1722,8 +1722,48 @@ that list, `apply_fish` correctly refuses to prepend it twice, and the test fail
 a machine where the code is right. Split into a pure `fish_data_dirs(base, existing)`
 and tested both ways, nested included.
 
+## 2026-07-22 - The wheel did nothing over the sidebar or the file viewer
+
+Reported from use. Two holes in `on_wheel`, both from the same blind spot — the
+function knows about OVERLAYS and about panes, and the sidebar is neither:
+
+- The explorer is chrome beside the panes, not an overlay, so it never reached the
+  overlay branch and fell through to the pane scroll. Worse than nothing: the wheel
+  scrolled a pane the pointer was not even over.
+- The file viewer IS an overlay, but the match listed Docs, Docker and Git and ended
+  in `_ => {}`. A catch-all arm is how an overlay added later silently gets nothing,
+  and the viewer is precisely where a long file is read.
+
+The sidebar wheel scrolls the VIEW (`Explorer::scroll_by`), unlike the git panel
+where it moves the selection: a tree is a file manager, and every file manager
+scrolls without changing what is selected. The cursor is dragged along only when the
+scroll would leave it off screen, so the next `j` still moves from something visible.
+
+**`runnir @ wheel --col C --row R [--lines N]` is new**, and it is why this could be
+verified at all: `key`, `click` and `drag` were scriptable, the wheel was not, so the
+one input that was broken was the one no test could reach. Positive is up, the
+pointer is placed at the cell first because every wheel target is chosen by what is
+under it. `ui_state` now also reports the explorer's `scroll`, so a script can tell
+the wheel (moves the view) from `j`/`k` (move the selection).
+
+Verified on a real instance over the control socket: 68-row tree in a 23-row window,
+wheel down 5 → first row 15, wheel up → the selection stays put while the view moves,
+both ends clamp, and the wheel over a PANE leaves the tree alone. In the viewer,
+4 lines down → `scroll: 12` on a 123-line file.
+
+**Not a runnir bug, same session**: `o` on a PDF appeared to do nothing. `xdg-open`
+is fine (a PNG opens Loupe); the default handler is `org.gnome.Evince.desktop` and
+evince 1:48.4-1 on this machine RUNS without ever mapping a window — reproducible
+straight from a shell, with nothing of runnir involved. Pedro's fix is a different
+handler (`xdg-mime default <app>.desktop application/pdf`), not a code change here.
+
 ## Gotchas (do not re-learn)
 
+- A wheel handler that knows about overlays and panes forgets the CHROME. The
+  sidebar is neither, and falling through means scrolling a pane the pointer is not
+  over. Any new surface needs a wheel arm, and `_ => {}` is how it gets missed.
+- Whatever cannot be driven by `runnir @` cannot be tested, and that is exactly where
+  the bugs sit. The wheel was unreachable and broken in two places at once.
 - A default of `vi` is not a default, it is a bug on any distro that does not ship it.
   Probe `$PATH` for something executable and say so when there is nothing.
 - A GUI window's environment is the COMPOSITOR's. Shell rc files and fish universal
