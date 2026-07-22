@@ -74,16 +74,26 @@ fn push_env(spawn: &mut Spawn, key: &str, val: String) {
 }
 
 fn apply_fish(spawn: &mut Spawn, base: &Path) {
-    // fish scans `<entry>/fish/vendor_conf.d/*.fish` for every entry of
-    // XDG_DATA_DIRS. Prepend `base` so our runnir.fish loads, but keep the existing
-    // entries (and the spec default when unset) so system integrations still work.
     let existing = std::env::var("XDG_DATA_DIRS")
         .unwrap_or_else(|_| "/usr/local/share:/usr/share".to_string());
-    let base_str = base.to_string_lossy();
-    if existing.split(':').any(|d| d == base_str) {
-        return; // Already present (nested runnir): don't prepend twice.
+    if let Some(dirs) = fish_data_dirs(&base.to_string_lossy(), &existing) {
+        push_env(spawn, "XDG_DATA_DIRS", dirs);
     }
-    push_env(spawn, "XDG_DATA_DIRS", format!("{base_str}:{existing}"));
+}
+
+/// The `XDG_DATA_DIRS` a fish pane should get, or `None` to leave it alone.
+///
+/// fish scans `<entry>/fish/vendor_conf.d/*.fish` for every entry of XDG_DATA_DIRS.
+/// Prepend `base` so our runnir.fish loads, but keep the existing entries (and the
+/// spec default when unset) so system integrations still work. Takes the current
+/// value as an argument rather than reading the environment: runnir is often run
+/// from inside runnir, and a function that reads its own process env cannot be
+/// tested for the nested case that decides its only branch.
+fn fish_data_dirs(base: &str, existing: &str) -> Option<String> {
+    if existing.split(':').any(|d| d == base) {
+        return None; // Already present (nested runnir): don't prepend twice.
+    }
+    Some(format!("{base}:{existing}"))
 }
 
 fn apply_zsh(spawn: &mut Spawn, base: &Path) {
@@ -346,15 +356,27 @@ mod tests {
 
     #[test]
     fn fish_prepends_xdg_data_dirs() {
+        assert_eq!(
+            fish_data_dirs("/home/u/.local/share/runnir/shell", "/usr/local/share:/usr/share"),
+            Some("/home/u/.local/share/runnir/shell:/usr/local/share:/usr/share".to_string())
+        );
+    }
+
+    /// runnir inside runnir: the pane already has our dir on the list, and prepending
+    /// it again would grow the variable one entry per nesting level.
+    #[test]
+    fn fish_does_not_prepend_twice_when_nested() {
+        let base = "/home/u/.local/share/runnir/shell";
+        assert_eq!(fish_data_dirs(base, &format!("{base}:/usr/share")), None);
+        // A dir that merely starts with the same text is a different dir.
+        assert!(fish_data_dirs(base, &format!("{base}-old:/usr/share")).is_some());
+    }
+
+    /// The spawn side: fish is env-only, so the command must survive untouched.
+    #[test]
+    fn fish_leaves_the_command_alone() {
         let mut s = spawn_with(Some(vec!["/usr/bin/fish"]));
         apply(&mut s, true);
-        let xdg = env_of(&s, "XDG_DATA_DIRS").expect("XDG_DATA_DIRS set");
-        let base = data_base().unwrap();
-        assert!(
-            xdg.starts_with(&*base.to_string_lossy()),
-            "runnir dir must be prepended: {xdg}"
-        );
-        // Command is left alone for fish (env-only mechanism).
         assert_eq!(s.command, Some(vec!["/usr/bin/fish".to_string()]));
     }
 

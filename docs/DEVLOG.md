@@ -1684,8 +1684,54 @@ A Docker Hub PAT with read/write scope can publish to `go2chaindev/*`.
 - The settings rule from the explorer still holds: an option lives in the config, in
   the settings panel AND in the code that reads it — all three or none.
 
+## 2026-07-22 - `$EDITOR` was assumed to be `vi`, and on Arch it is not there
+
+Reported from use: `e` on a file in the explorer put `'vi' '/home/…/dump.sql'` in the
+pane and fish answered `Unknown command: vi`. Three copies of the same lookup existed
+(`hints.rs`, and twice in `app_input.rs`), all ending in `.unwrap_or_else(|| "vi")`,
+and two of them disagreed about precedence — the scrollback dump read `$EDITOR` before
+`$VISUAL`, everything else the other way round.
+
+Two separate faults, and the second is the one that bites:
+- A window launched from the compositor inherits the COMPOSITOR's environment. Not a
+  shell rc, not fish's universal variables — Hyprland's own, which carries no editor.
+  So the fallback is not an edge case for a GUI terminal, it is the normal path.
+- `vi` is not a package on Arch. The fallback of every terminal that predates this
+  assumed a base system that shipped one; here it produces a command line the user's
+  own shell then rejects, which reads as runnir being broken.
+
+Now one `platform::editor_argv() -> Option<Vec<String>>`: `$VISUAL`, else `$EDITOR`
+(either may carry arguments — `"code -w"` is legal — so it is split, and a variable
+set to blanks counts as unset), else the first of `nvim vim nano vi emacs` that is
+actually EXECUTABLE on `$PATH`. What the user set is trusted without probing: it may
+name a shell function only their shell can resolve. `None` — nothing found anywhere —
+now says `no editor found — set $EDITOR (e.g. EDITOR=nvim)` instead of running
+something that cannot work; the hint path falls back to copying the path, which is
+what the plain key would have done anyway. The scrollback dump resolves the editor
+BEFORE writing the temp file, so a failure leaves nothing behind.
+
+Pedro's machine also got the compositor half of the fix, outside the repo:
+`~/.config/hypr/custom/env.conf` (`env = EDITOR,nvim`), sourced from `hyprland.conf`.
+`hyprctl reload` re-reads the config but does NOT re-export env — that needs a fresh
+Hyprland, and already-running windows keep the environment they were spawned with.
+
+**A test was lying**, found while running the suite: `fish_prepends_xdg_data_dirs`
+called `apply()`, which reads the process's own `XDG_DATA_DIRS`. Run from a shell
+inside runnir — the normal way anyone runs the suite here — our dir is already on
+that list, `apply_fish` correctly refuses to prepend it twice, and the test fails on
+a machine where the code is right. Split into a pure `fish_data_dirs(base, existing)`
+and tested both ways, nested included.
+
 ## Gotchas (do not re-learn)
 
+- A default of `vi` is not a default, it is a bug on any distro that does not ship it.
+  Probe `$PATH` for something executable and say so when there is nothing.
+- A GUI window's environment is the COMPOSITOR's. Shell rc files and fish universal
+  variables never reach it; on Hyprland that means `env =` in the config, and only
+  at Hyprland start — `hyprctl reload` does not re-export it.
+- A test that calls a function which reads `std::env` tests the MACHINE, not the code.
+  Take the value as a parameter and test the pure half — especially anything about
+  runnir running inside runnir, which is how the suite is normally run here.
 - Half-block art is square per CELL, not on screen. Any image fit needs the cell
   aspect (`cw/ch`) or it comes out twice as tall as it should.
 - A scripted input path must mirror the real one's ORDER, not only its handlers.

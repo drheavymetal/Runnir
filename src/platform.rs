@@ -21,6 +21,69 @@ pub fn notify(body: &str) {
     imp::notify(body)
 }
 
+/// The user's editor as an argv, for every "open this file in an editor" key.
+///
+/// `$VISUAL` wins over `$EDITOR` — the long-standing convention, `$VISUAL` being the
+/// full-screen one — and either may carry arguments (`"code -w"` is a legal `$EDITOR`),
+/// so the value is split rather than treated as a bare program name. What is set is
+/// trusted: it may name a shell function or an alias that only the user's shell can
+/// resolve, and second-guessing it would override an explicit choice.
+///
+/// With neither set we probe `$PATH` instead of assuming `vi`. A terminal launched
+/// from the compositor inherits the compositor's environment, which usually carries
+/// no editor at all, and on a distro without `vi` installed that assumption sends a
+/// command the user's own shell then rejects. `None` means nothing was found, so the
+/// caller can say so rather than run something that cannot work.
+pub fn editor_argv() -> Option<Vec<String>> {
+    if let Some(argv) = env_editor() {
+        return Some(argv);
+    }
+    // Newest-first, then the traditional names. `nano` outranks `vi` because a user
+    // who set nothing is likelier to want the editor that says how to quit.
+    ["nvim", "vim", "nano", "vi", "emacs"]
+        .into_iter()
+        .find(|c| on_path(c))
+        .map(|c| vec![c.to_string()])
+}
+
+/// `$VISUAL`, else `$EDITOR`, split into an argv. A variable set to the empty string
+/// (or to blanks) is not a setting — it is an unset variable that survived an export.
+fn env_editor() -> Option<Vec<String>> {
+    ["VISUAL", "EDITOR"].into_iter().find_map(|var| {
+        let value = std::env::var(var).ok()?;
+        let argv: Vec<String> = value.split_whitespace().map(str::to_string).collect();
+        (!argv.is_empty()).then_some(argv)
+    })
+}
+
+/// Whether `name` resolves to an executable file on `$PATH`. A name containing a
+/// separator is a path already and is checked where it stands.
+fn on_path(name: &str) -> bool {
+    if name.contains('/') {
+        return is_executable(std::path::Path::new(name));
+    }
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path).any(|dir| is_executable(&dir.join(name)))
+}
+
+fn is_executable(path: &std::path::Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        return meta.permissions().mode() & 0o111 != 0;
+    }
+    #[cfg(not(unix))]
+    true
+}
+
 // ---- Linux -----------------------------------------------------------------
 
 #[cfg(target_os = "linux")]
@@ -175,4 +238,44 @@ mod imp {
         None
     }
     pub fn notify(_body: &str) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The env vars are process-global, so these tests never touch them: they cover
+    /// the PATH probe, which is the part that decides what an unconfigured machine
+    /// gets. `sh` is on PATH everywhere this builds.
+    #[test]
+    fn on_path_finds_a_real_program() {
+        assert!(on_path("sh"));
+        assert!(!on_path("runnir-definitely-not-a-program"));
+    }
+
+    #[test]
+    fn on_path_rejects_a_directory() {
+        // A dir named like a program must not count as one — `metadata` succeeds on
+        // it and the executable bit is set, so only the is_file check saves us.
+        assert!(!on_path("/tmp"));
+        assert!(!is_executable(std::path::Path::new("/")));
+    }
+
+    #[test]
+    fn an_absolute_name_is_checked_where_it_stands() {
+        assert!(on_path("/bin/sh") || on_path("/usr/bin/sh"));
+        assert!(!on_path("/nonexistent/sh"));
+    }
+
+    /// Whatever the machine has, the fallback is never a bare name that is not
+    /// installed — that was the `vi` bug: a command the user's shell then rejects.
+    #[test]
+    fn the_fallback_is_something_that_exists() {
+        if let Some(argv) = editor_argv() {
+            assert!(!argv.is_empty());
+            if std::env::var_os("VISUAL").is_none() && std::env::var_os("EDITOR").is_none() {
+                assert!(on_path(&argv[0]), "picked {:?}, which is not on PATH", argv[0]);
+            }
+        }
+    }
 }

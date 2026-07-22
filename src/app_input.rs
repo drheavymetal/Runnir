@@ -1374,7 +1374,13 @@ impl Gpu {
     /// confirm asks. The path is shell-quoted: a filename with a space or a `$` is
     /// otherwise an injection into the user's own shell.
     fn explorer_edit(&mut self, path: std::path::PathBuf, config: &Config) {
-        let cmd = vec![editor_cmd(), path.display().to_string()];
+        let Some(mut cmd) = crate::platform::editor_argv() else {
+            self.status = Some(NO_EDITOR.into());
+            self.status_expiry = Some(Instant::now() + Duration::from_secs(4));
+            self.window.request_redraw();
+            return;
+        };
+        cmd.push(path.display().to_string());
         self.run_in_pane_or_split(cmd, config);
     }
 
@@ -5296,7 +5302,13 @@ impl Gpu {
                 // Open the file under the cursor: how you resolve a conflict by hand.
                 "e" if view == GitView::Status => {
                     if let Some(f) = p.selected_file() {
-                        split = Some(vec![editor_cmd(), f.path.clone()]);
+                        match crate::platform::editor_argv() {
+                            Some(mut cmd) => {
+                                cmd.push(f.path.clone());
+                                split = Some(cmd);
+                            }
+                            None => p.message = Err(NO_EDITOR.into()),
+                        }
                     }
                 }
                 // History of just this file, in a split, so the log view stays where
@@ -5719,10 +5731,18 @@ impl Gpu {
         }
     }
 
-    /// Dumps the focused pane's scrollback to a temp file and opens it in $EDITOR
-    /// (or $VISUAL, else vi) in a new split — for searching, copying or saving long
-    /// output with a real editor instead of the terminal's own scrollback.
+    /// Dumps the focused pane's scrollback to a temp file and opens it in the user's
+    /// editor (`platform::editor_argv`) in a new split — for searching, copying or
+    /// saving long output with a real editor instead of the terminal's own scrollback.
     fn open_scrollback_in_editor(&mut self, config: &Config) {
+        // Resolved before the dump is written: no point leaving a temp file behind
+        // for an editor that does not exist.
+        let Some(mut argv) = crate::platform::editor_argv() else {
+            self.status = Some(NO_EDITOR.into());
+            self.status_expiry = Some(Instant::now() + Duration::from_secs(4));
+            self.window.request_redraw();
+            return;
+        };
         let text = self.tab().focused().scrollback_text().join("\n");
         // A per-pane filename (the pty pid) so repeated dumps of the same pane reuse
         // one path and a fresh dump overwrites the stale one.
@@ -5740,12 +5760,6 @@ impl Gpu {
             self.window.request_redraw();
             return;
         }
-        let editor = std::env::var("EDITOR")
-            .or_else(|_| std::env::var("VISUAL"))
-            .unwrap_or_else(|_| "vi".into());
-        // $EDITOR may carry args (e.g. "code -w"); split on whitespace and append the
-        // file. Not a full shell parse, but it covers the common cases.
-        let mut argv: Vec<String> = editor.split_whitespace().map(str::to_string).collect();
         argv.push(path.to_string_lossy().into_owned());
         self.split_running(config, argv);
     }
@@ -6372,12 +6386,9 @@ impl Gpu {
     }
 }
 
-/// The user's editor, for the panel's "open this file" keys.
-fn editor_cmd() -> String {
-    std::env::var("VISUAL")
-        .or_else(|_| std::env::var("EDITOR"))
-        .unwrap_or_else(|_| "vi".to_string())
-}
+/// What to tell the user when no editor could be found at all — the same sentence
+/// wherever an "open this file" key gives up, since the fix is always the same.
+const NO_EDITOR: &str = "no editor found — set $EDITOR (e.g. EDITOR=nvim)";
 
 /// Whether a foreground process name is just the pane's shell sitting at its
 /// prompt. Login shells arrive as `-fish`, so the leading dash is stripped first.

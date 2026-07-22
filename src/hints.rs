@@ -211,20 +211,19 @@ pub fn act(text: &str, kind: HintKind, alt: bool) -> HintAct {
             // An editor that does not (VS Code wants `-g file:line`) simply opens
             // the file at the top, which is the harmless failure.
             let (path, line) = strip_line_suffix(text);
-            match line {
-                Some(n) => HintAct::Split(vec![editor(), format!("+{n}"), path.into()]),
-                None => HintAct::Split(vec![editor(), path.into()]),
+            // With no editor anywhere the useful thing left is the path itself:
+            // copying it is what the plain (non-alt) key would have done.
+            let Some(mut argv) = crate::platform::editor_argv() else {
+                return HintAct::Copy(path.to_string());
+            };
+            if let Some(n) = line {
+                argv.push(format!("+{n}"));
             }
+            argv.push(path.into());
+            HintAct::Split(argv)
         }
         _ => HintAct::Copy(text.to_string()),
     }
-}
-
-/// The user's editor, same precedence the scrollback dump uses.
-fn editor() -> String {
-    std::env::var("VISUAL")
-        .or_else(|_| std::env::var("EDITOR"))
-        .unwrap_or_else(|_| "vi".to_string())
 }
 
 fn open_in_browser(url: &str) {
