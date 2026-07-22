@@ -33,6 +33,7 @@ mod shell_integration;
 mod tab;
 mod themes;
 mod verbs;
+mod warroom;
 mod watch;
 mod whisper;
 mod zsa;

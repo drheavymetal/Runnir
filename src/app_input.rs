@@ -585,6 +585,11 @@ impl Gpu {
         // not attention); a key reaching the child process does not.
         self.last_pty_key = Instant::now();
         self.away_marked = false;
+        // Whoever opened this pane, the moment somebody types in it, it is theirs.
+        let focus = self.tabs[self.active].focus;
+        if let Some(p) = self.tabs[self.active].panes.get_mut(&focus) {
+            p.touched = true;
+        }
         self.scroll_glide = None;
         if self.tab().focused().snap_to_bottom() {
             self.window.request_redraw();
@@ -756,6 +761,8 @@ impl Gpu {
             Action::ToggleExplorer => self.toggle_explorer(config),
             Action::CatchUp => self.show_catch_up(),
             Action::RepoVerbs => self.show_repo_verbs(config),
+            Action::WarRoom => self.open_war_room(config),
+            Action::WarRoomClose => self.close_war_room(config),
             Action::SetImageWatchDir => self.set_image_watch_dir(),
             Action::SaveProjectSession => self.save_project_session_cmd(),
             Action::RestoreProjectSession => self.restore_project_session_cmd(config),
@@ -2995,8 +3002,18 @@ impl Gpu {
         // Same order as `on_key`: the sidebar takes what the leader and the bound
         // chords did not. Leaving this out is what made a scripted `j` do nothing
         // while the same key worked from the keyboard.
-        if !mods.control_key() && !mods.alt_key() && !mods.super_key() {
+        if !mods.control_key() && !mods.alt_key() && !mods.super_key() && self.explorer_focused() {
             self.explorer_key(key, config);
+            return;
+        }
+        // And finally the child process, which `on_key` has always done and this path
+        // never did: a scripted key could open panels but not type a single letter
+        // into a shell. That is also why `touched` was never set from a script.
+        let flags = self.tab().focused().keyboard_flags();
+        let mode = keys::KeyMode { app_cursor: self.tab().focused().app_cursor() };
+        let _ = flags;
+        if let Some(bytes) = keys::encode_key(key, mods, mode) {
+            self.write_key_bytes(&bytes);
         }
     }
 
@@ -3785,6 +3802,8 @@ impl Gpu {
             Action::ToggleExplorer => self.toggle_explorer(config),
             Action::CatchUp => self.show_catch_up(),
             Action::RepoVerbs => self.show_repo_verbs(config),
+            Action::WarRoom => self.open_war_room(config),
+            Action::WarRoomClose => self.close_war_room(config),
             Action::SetImageWatchDir => self.set_image_watch_dir(),
             Action::SaveProjectSession => self.save_project_session_cmd(),
             Action::RestoreProjectSession => self.restore_project_session_cmd(config),
@@ -5984,6 +6003,94 @@ impl Gpu {
         }
         argv.push(path.to_string_lossy().into_owned());
         self.split_running(config, argv);
+    }
+
+    /// Arranges the window around an operation: a status watch and one log pane per
+    /// service, with the deploy itself STAGED at the prompt rather than run.
+    ///
+    /// Nothing is asked of the user — the compose file already says what the project
+    /// is made of. Explicitly started, never guessed: a layout that appears unbidden
+    /// is a window that reorganises your work.
+    fn open_war_room(&mut self, config: &Config) {
+        let cwd = self.tab().focused().cwd();
+        let Some(cwd) = cwd else {
+            self.note_pipe("cannot tell where this pane is");
+            return;
+        };
+        let root = crate::git::repo_root(&cwd);
+        let Some(file) = crate::warroom::find_compose(&cwd, root.as_deref()) else {
+            // Say so instead of opening an empty room: a war room that guesses wrong
+            // about a project is worse than none.
+            self.note_pipe("no compose file here — nothing to build a war room from");
+            return;
+        };
+        let Some(plan) = crate::warroom::plan_from(&file) else {
+            self.note_pipe("that compose file lists no services");
+            return;
+        };
+
+        // A tab of its own: the room is a place you go to, and it must not rearrange
+        // the panes you were already working in.
+        let n = plan.services.len();
+        self.control_new_tab(config, Vec::new());
+        if let Some(pane) = self.tabs[self.active].panes.values_mut().next() {
+            pane.from_war_room = true;
+        }
+        for (_, cmd) in crate::warroom::watch_commands(&plan, 3) {
+            let id = self.new_pane_id();
+            let area = self.active_area();
+            let wake = wake_fn(self.proxy.clone());
+            let argv = vec!["sh".to_string(), "-c".to_string(), cmd];
+            let axis = if self.tabs[self.active].panes.len() % 2 == 0 {
+                Axis::Horizontal
+            } else {
+                Axis::Vertical
+            };
+            if let Err(e) =
+                self.tabs[self.active].split_running_with_id(area, axis, config, id, argv, wake)
+            {
+                // Say which pane could not open rather than silently opening a room
+                // with holes in it: a war room missing the service you care about is
+                // worse than one that admits it.
+                self.note_pipe(&format!("war room: could not open a pane ({e})"));
+                break;
+            }
+            if let Some(pane) = self.tabs[self.active].panes.get_mut(&id) {
+                pane.from_war_room = true;
+            }
+        }
+        // Back to the first pane and stage the deploy for the user to fire.
+        if let Some(first) = self.tabs[self.active].first_pane() {
+            self.tabs[self.active].focus = first;
+        }
+        let dir = file.parent().unwrap_or(std::path::Path::new(".")).to_string_lossy().into_owned();
+        self.insert_command(format!("cd {dir} && docker compose up -d"));
+        self.note_pipe(&format!(
+            "war room: {n} services \u{2014} the deploy is at the prompt, not running"
+        ));
+    }
+
+    /// Takes the room down: closes the panes IT opened, and only those the user never
+    /// typed in. A pane somebody worked in is theirs.
+    fn close_war_room(&mut self, config: &Config) {
+        let doomed: Vec<u64> = self.tabs[self.active]
+            .panes
+            .iter()
+            .filter(|(_, p)| p.from_war_room && !p.touched)
+            .map(|(id, _)| *id)
+            .collect();
+        if doomed.is_empty() {
+            self.note_pipe("no untouched war-room panes here");
+            return;
+        }
+        let kept = self.tabs[self.active].panes.len() - doomed.len();
+        let area = self.active_area();
+        for id in doomed {
+            self.tabs[self.active].close_pane(id, area);
+        }
+        let _ = config;
+        self.note_pipe(&format!("war room closed, {kept} panes kept"));
+        self.window.request_redraw();
     }
 
     /// A tactile pipe: the command block under `from` is handed to the pane under

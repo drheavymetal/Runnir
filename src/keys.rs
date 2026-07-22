@@ -11,11 +11,24 @@ pub struct KeyMode {
 /// Translates a key press into the bytes a PTY expects, or `None` if the key
 /// produces nothing.
 pub fn encode(event: &KeyEvent, mods: ModifiersState, mode: KeyMode) -> Option<Vec<u8>> {
+    // Dead keys and IME output arrive only as committed `text` on the event, so that
+    // case stays here; everything a scripted key can produce goes through `encode_key`.
+    if matches!(event.logical_key, Key::Unidentified(_) | Key::Dead(_)) {
+        let text = event.text.as_ref()?;
+        return Some(text.as_bytes().to_vec());
+    }
+    encode_key(&event.logical_key, mods, mode)
+}
+
+/// The same encoding from a bare `Key`, for callers that do not have a winit
+/// `KeyEvent` — a scripted keypress cannot construct one (`platform_specific` is
+/// private), and without this a scripted key could drive overlays but never type.
+pub fn encode_key(key: &Key, mods: ModifiersState, mode: KeyMode) -> Option<Vec<u8>> {
     let ctrl = mods.control_key();
     let alt = mods.alt_key();
     let shift = mods.shift_key();
 
-    let bytes = match &event.logical_key {
+    let bytes = match key {
         Key::Named(named) => named_key(*named, mods, mode)?,
         Key::Character(s) => {
             if ctrl {
@@ -39,15 +52,13 @@ pub fn encode(event: &KeyEvent, mods: ModifiersState, mode: KeyMode) -> Option<V
                 s.as_bytes().to_vec()
             }
         }
-        _ => {
-            // Dead keys and IME output arrive here as committed text.
-            let text = event.text.as_ref()?;
-            text.as_bytes().to_vec()
-        }
+        // Anything else (dead keys, IME) only carries text on the full event, which
+        // `encode` handles before delegating here.
+        _ => return None,
     };
 
     // Alt is the classic ESC prefix (xterm's metaSendsEscape).
-    if alt && !bytes.is_empty() && !matches!(event.logical_key, Key::Named(_)) {
+    if alt && !bytes.is_empty() && !matches!(key, Key::Named(_)) {
         let mut out = vec![0x1b];
         out.extend_from_slice(&bytes);
         return Some(out);

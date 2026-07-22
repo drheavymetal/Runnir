@@ -219,6 +219,29 @@ impl Tab {
 
     /// Closes the focused pane. Returns false when it was the last one — the caller
     /// decides whether that closes the tab.
+    /// The first pane in insertion order, for callers that need "the one at the top
+    /// left" without knowing the tree.
+    pub fn first_pane(&self) -> Option<PaneId> {
+        self.order.first().copied()
+    }
+
+    /// Closes one pane by id, wherever it is. `close_focused` is the interactive
+    /// path; this is for a caller taking down several panes it opened itself, which
+    /// must not depend on focus wandering as each one goes.
+    pub fn close_pane(&mut self, id: PaneId, area: Rect) -> bool {
+        if self.order.len() <= 1 || !self.panes.contains_key(&id) {
+            return false;
+        }
+        self.tree.close(id);
+        self.order.retain(|&p| p != id);
+        self.panes.remove(&id);
+        if self.focus == id {
+            self.focus = self.order[0];
+        }
+        self.reflow(area);
+        true
+    }
+
     pub fn close_focused(&mut self, area: Rect) -> bool {
         if self.order.len() <= 1 {
             return false;

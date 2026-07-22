@@ -38,6 +38,11 @@ pub struct Pane {
     last_command_seq: u64,
     /// The command counter when the user last stepped away, for the catch-up.
     catch_up_seq: u64,
+    /// Opened by the war room, so teardown knows what it may close.
+    pub from_war_room: bool,
+    /// The user has typed in this pane. A pane someone worked in is theirs, whoever
+    /// opened it — teardown leaves it alone.
+    pub touched: bool,
     /// The command counter already handed to the verb learner, so each command is
     /// counted once and never twice.
     verbs_seq: u64,
@@ -86,6 +91,8 @@ impl Pane {
             last_command_seq: 0,
             catch_up_seq: 0,
             verbs_seq: 0,
+            from_war_room: false,
+            touched: false,
             last_watch_hit: None,
             last_bell: 0,
             watch: None,

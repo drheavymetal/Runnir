@@ -67,6 +67,10 @@ pub enum Action {
     CatchUp,
     /// The verbs this repository is actually worked with.
     RepoVerbs,
+    /// Arrange the window around a deploy: watches, and the deploy staged.
+    WarRoom,
+    /// Take the war room down, keeping any pane the user typed in.
+    WarRoomClose,
     SetImageWatchDir,
     SaveProjectSession,
     RestoreProjectSession,
@@ -162,6 +166,8 @@ impl Action {
             ToggleExplorer => "toggle_explorer",
             CatchUp => "catch_up",
             RepoVerbs => "repo_verbs",
+            WarRoom => "war_room",
+            WarRoomClose => "war_room_close",
             SetImageWatchDir => "set_image_watch_dir",
             SaveProjectSession => "save_project_session",
             RestoreProjectSession => "restore_project_session",
@@ -250,6 +256,8 @@ impl Action {
             ToggleExplorer => "File explorer sidebar (tree of the project)",
             CatchUp => "Catch up: one headline per pane after time away",
             RepoVerbs => "How this repo is worked (learned verbs)",
+            WarRoom => "War room: arrange the window around a deploy",
+            WarRoomClose => "War room: close it, keeping panes you typed in",
             SetImageWatchDir => "Auto-preview images: set / clear watched dir",
             SaveProjectSession => "Save session for this project",
             RestoreProjectSession => "Restore session for this project",
@@ -341,6 +349,8 @@ impl Action {
             "toggle_explorer" => ToggleExplorer,
             "catch_up" => CatchUp,
             "repo_verbs" => RepoVerbs,
+            "war_room" => WarRoom,
+            "war_room_close" => WarRoomClose,
             "set_image_watch_dir" => SetImageWatchDir,
             "save_project_session" => SaveProjectSession,
             "restore_project_session" => RestoreProjectSession,
@@ -442,6 +452,8 @@ impl Action {
             ToggleExplorer,
             CatchUp,
             RepoVerbs,
+            WarRoom,
+            WarRoomClose,
             SetImageWatchDir,
             SaveProjectSession,
             RestoreProjectSession,
@@ -954,6 +966,10 @@ fn default_leader_bindings() -> HashMap<Chord, LeaderNode> {
 
     // --- Groups. The letter is the noun: t=tabs, p=panes, c=clipboard, f=find,
     // a=ai, l=launch, o=open, s=session.
+    group(&mut m, "w", "War room", |g| {
+        leaf(g, "w", WarRoom);
+        leaf(g, "q", WarRoomClose);
+    });
     group(&mut m, "t", "Tabs", |g| {
         leaf(g, "t", NewTab);
         leaf(g, "n", NextTab);

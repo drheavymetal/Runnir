@@ -2476,6 +2476,42 @@ spanning several rows leaves its extra rows in the payload. Stripping exactly on
 is right for a one-line prompt and approximate otherwise; guessing where a powerline
 prompt ends is worse than the residue. Pinned by tests either way.
 
+## 2026-07-22 - Candidate 4 built: the war room
+
+`leader w w` opens a tab arranged around a deploy: a `docker compose ps` watch, one
+`logs -f` pane per service, and the deploy itself staged at the prompt. `leader w q`
+takes it down.
+
+**It asks nothing.** The compose file already lists the services, so `warroom.rs`
+reads it — hand-parsed rather than adding a YAML crate, because what is needed is one
+level of keys under `services:` and the parse is deliberately conservative: anything
+ambiguous is dropped, since a pane opened for `ports` or `pgdata` is a room that lies
+about the project. Tests cover four-space and tab indentation, `x-services:` (an
+extension field, not the section), and settings being mistaken for services.
+
+**Nothing it opens does anything but watch**, and a test asserts exactly that — no
+`up -d`, no `restart`, no `pull` in any generated command. The deploy is staged for
+the user to fire: a window that arranges itself is a convenience, one that deploys by
+itself is an accident waiting for a witness.
+
+**Teardown keeps what you touched.** Every pane records whether a keystroke ever
+reached it; the close only removes panes the room opened AND nobody typed in.
+Verified live: typed in one pane, closed the room, that pane survived and the rest
+went — including the one holding the staged deploy.
+
+**Two of my own mistakes, both worth keeping:**
+- The first run opened 2 panes instead of 5 and said nothing, because the splits were
+  failing and the code ignored the error with `let _ =`. A war room missing the
+  service you care about is worse than one that admits it — it reports now, and stops.
+- The window was tiled small again, which is what made the splits fail.
+
+**And a real gap closed on the way**: `press_key` never forwarded to the child, so a
+scripted key could open panels but not type a single letter — which is also why
+`touched` could not be set from a script. `keys::encode_key` now takes a bare `Key`
+(a scripted press cannot build a winit `KeyEvent`; `platform_specific` is private),
+and the scripted path types like the real one. That is the third time this session
+that `press_key` diverging from `on_key` cost a debugging round.
+
 ## Gotchas (do not re-learn)
 
 - The board must be put back even if runnir DIES. `sustain` (ms) on every ZSA paint is

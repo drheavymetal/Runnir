@@ -51,6 +51,12 @@ Straight away, no group — the things you do constantly:
 
 Then the groups. The letter is the noun:
 
+@ Leader W W       war room: a tab that arranges itself around a deploy — one log
+                   pane per service from the compose file, a status watch, and the
+                   deploy itself LEFT AT THE PROMPT for you to fire. Nothing is run
+                   for you and nothing is asked of you; the compose file already says
+                   what the project is made of.
+@ Leader W Q       close the war room, keeping any pane you typed in
 @ Leader T ...     tabs: T new, N/P next/prev, W close, R rename, U reopen,
 @                        H/L (or the arrows) move the tab in the bar
 @ Leader P ...     panes: D split left/right, E split up/down, X close, Z zoom,
