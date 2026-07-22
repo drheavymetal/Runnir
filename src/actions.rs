@@ -1256,6 +1256,22 @@ fn named_id(named: NamedKey) -> Option<&'static str> {
         NamedKey::F10 => "f10",
         NamedKey::F11 => "f11",
         NamedKey::F12 => "f12",
+        // F13-F24: the keys a ZSA board can emit that NO compositor claims. Every
+        // modifier combination is already spoken for by some desktop (alt+space on
+        // 3 of 4, super by the compositor, ctrl+alt is AltGr on a Spanish layout),
+        // and these are the way out of that for a keyboard that can send them.
+        NamedKey::F13 => "f13",
+        NamedKey::F14 => "f14",
+        NamedKey::F15 => "f15",
+        NamedKey::F16 => "f16",
+        NamedKey::F17 => "f17",
+        NamedKey::F18 => "f18",
+        NamedKey::F19 => "f19",
+        NamedKey::F20 => "f20",
+        NamedKey::F21 => "f21",
+        NamedKey::F22 => "f22",
+        NamedKey::F23 => "f23",
+        NamedKey::F24 => "f24",
         _ => return None,
     })
 }
@@ -1290,6 +1306,18 @@ fn canonical_named(name: &str) -> Option<&'static str> {
         "f10" => "f10",
         "f11" => "f11",
         "f12" => "f12",
+        "f13" => "f13",
+        "f14" => "f14",
+        "f15" => "f15",
+        "f16" => "f16",
+        "f17" => "f17",
+        "f18" => "f18",
+        "f19" => "f19",
+        "f20" => "f20",
+        "f21" => "f21",
+        "f22" => "f22",
+        "f23" => "f23",
+        "f24" => "f24",
         _ => return None,
     })
 }
@@ -1558,6 +1586,40 @@ mod tests {
     /// What a keyboard gets, as opposed to what the panel gets: one entry per PHYSICAL
     /// key. There is one light under `h`, and the root binds both `h` (focus) and
     /// `shift+h` (resize) on it.
+    /// F13-F24: the keys a programmable board can send and NO desktop steals. The
+    /// leader's chord problem is documented in the DEVLOG as unsolvable in software —
+    /// alt+space is taken on 3 of 4 desktops, super goes to the compositor, ctrl+alt
+    /// is AltGr on a Spanish layout — and this is the hardware way around it.
+    #[test]
+    fn the_function_keys_no_compositor_claims_are_bindable() {
+        for n in 13..=24 {
+            let spec = format!("f{n}");
+            let parsed = Chord::parse(&spec).unwrap_or_else(|| panic!("{spec} does not parse"));
+            let named = match n {
+                13 => NamedKey::F13,
+                14 => NamedKey::F14,
+                15 => NamedKey::F15,
+                16 => NamedKey::F16,
+                17 => NamedKey::F17,
+                18 => NamedKey::F18,
+                19 => NamedKey::F19,
+                20 => NamedKey::F20,
+                21 => NamedKey::F21,
+                22 => NamedKey::F22,
+                23 => NamedKey::F23,
+                _ => NamedKey::F24,
+            };
+            let pressed = Chord::from_event(&Key::Named(named), ModifiersState::empty()).unwrap();
+            assert_eq!(parsed, pressed, "{spec} does not match a real keypress");
+        }
+
+        // And one of them can BE the leader, which is the point: no modifier race to
+        // lose against the compositor.
+        let map = Keymap::new(&HashMap::new(), "f13");
+        assert!(map.is_leader(&Key::Named(NamedKey::F13), ModifiersState::empty()));
+        assert!(!map.is_leader(&Key::Named(NamedKey::F14), ModifiersState::empty()));
+    }
+
     #[test]
     fn the_keyboards_view_of_a_level_has_one_entry_per_key() {
         let map = Keymap::new(&HashMap::new(), DEFAULT_LEADER);

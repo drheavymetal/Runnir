@@ -309,6 +309,8 @@ impl Runner for Kontroll {
 enum Cmd {
     /// `dim` for every key, then `leds` on top. One level of the leader layer.
     Paint { leds: Vec<(u8, crate::config::Rgb)>, dim: crate::config::Rgb, sustain_ms: u32 },
+    /// The whole board one colour for `ms`, then Keymapp hands it back on its own.
+    Flash { colour: crate::config::Rgb, ms: u32 },
     Restore,
     Stop,
 }
@@ -342,6 +344,16 @@ impl Board {
     /// nowhere: sustain expires the ENTIRE board, not the single LED it was passed with.
     pub fn paint(&self, leds: Vec<(u8, crate::config::Rgb)>, dim: crate::config::Rgb, sustain_ms: u32) {
         let _ = self.tx.send(Cmd::Paint { leds, dim, sustain_ms });
+    }
+
+    /// The whole board one colour, briefly: a signal that needs no key to be
+    /// identified, which is the only kind an opaque-keycap board can actually carry
+    /// (see the DEVLOG entry on why the lit leader layer was abandoned).
+    ///
+    /// One call and no cleanup: sustain expires the WHOLE board, so the flash undoes
+    /// itself even if runnir dies in the middle of it.
+    pub fn flash(&self, colour: crate::config::Rgb, ms: u32) {
+        let _ = self.tx.send(Cmd::Flash { colour, ms });
     }
 
     /// Gives the board back its own colours. Sent on disarm, on focus loss and on exit
@@ -385,6 +397,12 @@ fn worker(rx: std::sync::mpsc::Receiver<Cmd>, mut runner: Box<dyn Runner>) {
                 return;
             }
             Cmd::Restore => restore(&mut *runner, &mut connected),
+            Cmd::Flash { colour, ms } => {
+                if ensure_connected(&mut *runner, &mut connected) {
+                    let (c, s) = (hex(colour), ms.to_string());
+                    attempt(&mut *runner, &mut connected, &["set-rgb-all", "-c", &c, "-s", &s]);
+                }
+            }
             Cmd::Paint { leds, dim, sustain_ms } => {
                 if !ensure_connected(&mut *runner, &mut connected) {
                     continue;

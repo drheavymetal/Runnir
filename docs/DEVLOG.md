@@ -1916,6 +1916,47 @@ Filed rather than deleted because the next person with a ZSA board will have thi
 idea, and the only thing standing between them and three days of work is knowing to
 look at their keycaps first.
 
+## 2026-07-22 - ZSA: F13-F24, ambient flashes, and the guardian's missing half
+
+Both of the ideas that survived the opaque-keycap finding, plus a safety bug found
+while testing them.
+
+**F13-F24 (idea 4)** — runnir stopped at F12 in three places: the winit mapping, the
+config spelling, and the byte encoding. A programmable board can emit F13-F24, which
+no desktop claims because no keyboard has shipped them in decades, so `leader = f13`
+is a leader key with no modifiers for a compositor to win. F13-F20 also reach the
+child as their standard `~`-scheme sequences; F21-F24 have no agreed encoding, so they
+bind but send nothing rather than inventing bytes a program would misread.
+
+**Ambient flashes (idea 3)** — the whole board goes one colour where a desktop
+notification already fires: amber for a watched word, green for a long command
+finishing, red WITH the guardian's prompt. This is the only signal shape opaque
+keycaps can carry, and sustain makes it free: one call, no cleanup, and the board
+undoes the flash itself even if runnir dies mid-signal. Off by default
+(`keyboard.ambient`) — a keyboard changing colour unbidden is startling.
+
+**The guardian was not in the scripted key path.** `press_key` had the overlay, the
+explorer leader, the leader layer and the bound chords, but not the Enter guard, so
+`runnir @ key --chord enter` walked straight past it. The one safety feature in runnir
+was the one thing remote control could not exercise, which also means no test could
+have caught it disappearing. Both paths now call `guard_enter`.
+
+Three false alarms on the way to that, all mine, all worth writing down because each
+looks like a bug and is not:
+- `send-text` writes to the PTY, so the guardian does not see it. That is the
+  documented contract (it talks to the CHILD), but it means a scripted `send-text
+  'rm -rf /\n'` really does run the command. Only `rm`'s own refusal to operate on
+  `/` stopped it here.
+- Sending Enter immediately after `send-text` beats the shell's echo: the guardian
+  reads the command off the GRID, and the grid was still empty. Scripted input needs
+  to wait for the echo, the same way the docker panel's readings do.
+- fish autosuggested `rm -rf ~/` into `rm -rf ~/.config/nvim/.git` from history. The
+  guardian correctly said nothing — that path is not a root or home — but what is on
+  screen is not what was typed, and that is exactly what the guardian reads.
+
+Verified on a real instance: `mkfs` at the prompt (harmless if it runs, it just prints
+usage) opens `Run this? mkfs — reformats a filesystem, erasing it`.
+
 ## DESIGN, NOT YET BUILT — the leader layer, lit on the keys (ZSA Moonlander)
 
 Decided 2026-07-22 with the keyboard on the desk and the API answering. Nothing built.
@@ -2034,6 +2075,12 @@ Belt AND braces, both always:
   the only thing that survives `kill -9`; an explicit restore on exit is not enough.
 - Keymapp's API ships DISABLED (`api_enabled=0` in its sqlite) and its socket on Linux
   is `~/.config/.keymapp/keymapp.sock` — the port 50051 in its own UI is Windows-only.
+- `press_key` (the scripted path) must mirror `on_key` STEP FOR STEP. It has now been
+  missing the explorer keys once and the command guardian once; both times the feature
+  worked by hand and could not be tested at all.
+- A scripted key beats the shell's echo. Anything reading the GRID (the guardian, the
+  hint scanner) needs the echo to land first, and fish's autosuggestion means what is
+  on the grid is not what was typed.
 - A wheel handler that knows about overlays and panes forgets the CHROME. The
   sidebar is neither, and falling through means scrolling a pane the pointer is not
   over. Any new surface needs a wheel arm, and `_ => {}` is how it gets missed.

@@ -33,6 +33,8 @@ pub enum SettingId {
     ExplorerSide,
     ExplorerWidth,
     ExplorerHidden,
+    KeyboardAmbient,
+    KeyboardFlashMs,
 }
 
 /// How a setting is edited, which drives the key handling and the value hint.
@@ -87,6 +89,8 @@ pub fn rows() -> Vec<Row> {
         row!("Explorer", "Side", ExplorerSide, Enum),
         row!("Explorer", "Width (columns)", ExplorerWidth, Int),
         row!("Explorer", "Show hidden files", ExplorerHidden, Bool),
+        row!("Keyboard", "Flash the ZSA board", KeyboardAmbient, Bool),
+        row!("Keyboard", "Flash length (ms)", KeyboardFlashMs, Int),
     ]
 }
 
@@ -124,6 +128,8 @@ pub fn value(cfg: &Config, id: SettingId) -> String {
         ExplorerSide => cfg.explorer.side.clone(),
         ExplorerWidth => cfg.explorer.width.to_string(),
         ExplorerHidden => onoff(cfg.explorer.show_hidden),
+        KeyboardAmbient => onoff(cfg.keyboard.ambient),
+        KeyboardFlashMs => cfg.keyboard.flash_ms.to_string(),
     }
 }
 
@@ -189,6 +195,11 @@ pub fn adjust(cfg: &mut Config, id: SettingId, dir: i32) {
             cfg.explorer.width = w.clamp(crate::explorer::MIN_WIDTH as i32, 120) as usize;
         }
         ExplorerHidden => cfg.explorer.show_hidden = up,
+        KeyboardAmbient => cfg.keyboard.ambient = up,
+        KeyboardFlashMs => {
+            let ms = cfg.keyboard.flash_ms as i32 + dir * 200;
+            cfg.keyboard.flash_ms = ms.clamp(200, 10_000) as u32;
+        }
         FontFamily | Background => {} // text; edited inline
     }
 }

@@ -791,8 +791,19 @@ struct Gpu {
     /// ever clear, so it must expire on its own at this instant. Without it a
     /// synchronous `ai::ask` failure would leave the spinner turning forever.
     status_expiry: Option<Instant>,
+    /// The ZSA keyboard, when there is one and the user asked for it. `None` covers
+    /// both "no such keyboard" and "not enabled", which behave identically.
+    board: Option<zsa::Board>,
     proxy: EventLoopProxy<UserEvent>,
 }
+
+/// Whole-board colours for the ambient signals. Chosen by MEANING, not by theme: the
+/// board is not a surface runnir owns, and a colour there has to read the same way a
+/// traffic light does — the DEVLOG entry on opaque keycaps is why these are the only
+/// kind of signal this hardware can carry at all.
+const FLASH_WATCH: config::Rgb = config::Rgb(0xff, 0x9a, 0x00);
+const FLASH_DONE: config::Rgb = config::Rgb(0x00, 0xc8, 0x50);
+const FLASH_GUARDIAN: config::Rgb = config::Rgb(0xff, 0x20, 0x20);
 
 /// Fires a desktop notification (per-OS via `platform`). Silent on failure.
 fn notify(body: &str) {
@@ -1056,6 +1067,9 @@ impl App {
             bell_flash: None,
             status: None,
             status_expiry: None,
+            // Started only when asked for: the worker spawns a thread and looks for
+            // kontroll, and a terminal that does neither unless told to is the point.
+            board: self.config.keyboard.ambient.then(zsa::Board::start).flatten(),
             proxy: self.proxy.clone(),
         };
         // Arm the image auto-preview watch at startup when the config asks for it and
@@ -1695,6 +1709,9 @@ impl Gpu {
         if self.last_context_refresh.elapsed() >= Duration::from_millis(500) {
             self.last_context_refresh = Instant::now();
             let focused = self.window.has_focus();
+            // Collected rather than flashed inline: the panes are borrowed here, and
+            // two signals in one sweep should be one flash, not a fight over the board.
+            let mut flashes: Vec<config::Rgb> = Vec::new();
             for tab in &mut self.tabs {
                 for pane in tab.panes.values_mut() {
                     pane.refresh_context(config);
@@ -1703,6 +1720,7 @@ impl Gpu {
                     if config.behaviour.notify_after_secs > 0 && !focused {
                         if let Some(msg) = pane.take_completion(config.behaviour.notify_after_secs) {
                             notify(&msg);
+                            flashes.push(FLASH_DONE);
                         }
                     }
                     // Keyword watch (W4): fires whether focused or not — it is an
@@ -1710,9 +1728,15 @@ impl Gpu {
                     if pane.watching().is_some() {
                         if let Some(hit) = pane.take_watch_hit() {
                             notify(&hit);
+                            flashes.push(FLASH_WATCH);
                         }
                     }
                 }
+            }
+            // The board says ONE thing at a time: the most urgent colour of this
+            // sweep wins. Ordering is by list position, so watch beats done.
+            if let Some(colour) = flashes.first().copied() {
+                self.flash_board(colour, config);
             }
             if self.last_autosave.elapsed() >= Duration::from_secs(30) {
                 self.last_autosave = Instant::now();

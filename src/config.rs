@@ -26,6 +26,9 @@ pub struct Config {
     /// Now-playing media overlay (album art, transport, waveform).
     #[serde(default)]
     pub media: Media,
+    /// The ZSA keyboard's lights.
+    #[serde(default)]
+    pub keyboard: Keyboard,
     /// The file explorer sidebar.
     #[serde(default)]
     pub explorer: Explorer,
@@ -92,6 +95,7 @@ impl Default for Config {
             ai: Ai::default(),
             watch: Watch::default(),
             media: Media::default(),
+            keyboard: Keyboard::default(),
             explorer: Explorer::default(),
             keys: HashMap::new(),
             leader: default_leader(),
@@ -361,6 +365,31 @@ pub struct Media {
 impl Default for Media {
     fn default() -> Self {
         Self { waveform: true, bars: 24, art_cells: 18 }
+    }
+}
+
+// ---- keyboard -------------------------------------------------------------
+
+/// A programmable keyboard runnir can signal on (ZSA, through Keymapp's API).
+///
+/// Only whole-board flashes: what the board can carry is a colour, not a key. The
+/// lit-leader idea died on opaque keycaps — the LED lights the gap around the cap,
+/// not the legend — and the DEVLOG entry for 2026-07-22 has the measurements.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Keyboard {
+    /// Flash the board when something wants attention: the guardian asking, a long
+    /// command finishing, a watched word appearing. Off unless asked for — a keyboard
+    /// changing colour on its own is startling if you did not go looking for it.
+    pub ambient: bool,
+    /// How long a flash lasts. Also its own cleanup: the board restores itself when
+    /// this elapses, so runnir dying mid-flash cannot leave it coloured.
+    pub flash_ms: u32,
+}
+
+impl Default for Keyboard {
+    fn default() -> Self {
+        Self { ambient: false, flash_ms: 1200 }
     }
 }
 

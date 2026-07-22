@@ -526,27 +526,8 @@ impl Gpu {
         // Command guardian: a plain Enter about to submit a destructive command
         // opens a confirmation first. Only bare Enter (no modifiers) with the view
         // at the live prompt is guarded, so history editing and TUIs are untouched.
-        if config.behaviour.command_guardian
-            && matches!(event.logical_key, Key::Named(NamedKey::Enter))
-            && event.state.is_pressed()
-            && mods.is_empty()
-        {
-            let line = {
-                let g = self.tab().focused().grid.lock().unwrap();
-                // A full-screen app (vim, htop) has no shell command line to guard;
-                // scanning its buffer would pop the confirm over unrelated content.
-                if g.alt_screen() { String::new() } else { g.current_command_text() }
-            };
-            if let Some(reason) = crate::guardian::danger(&line) {
-                let label = format!("Run this? {reason}");
-                self.overlay = Some(Overlay::Prompt(Prompt::new(
-                    PromptKind::GuardedCommand,
-                    &label,
-                    vec![line.trim().to_string()],
-                )));
-                self.window.request_redraw();
-                return;
-            }
+        if event.state.is_pressed() && self.guard_enter(&event.logical_key, mods, config) {
+            return;
         }
 
         // Otherwise it is input for the focused pane's process. Under the kitty
@@ -2845,6 +2826,39 @@ impl Gpu {
     ///
     /// It deliberately stops short of the pane: text for the child goes through
     /// `send-text`, which does not have to guess an encoding.
+    /// The command guardian: a bare Enter about to submit something destructive opens
+    /// a confirmation instead. Returns whether it took the key.
+    ///
+    /// Shared by the real and the scripted key paths. It lived inline in `on_key`, so
+    /// a scripted Enter walked straight past it — which meant the one safety feature
+    /// in runnir was the one thing `runnir @ key` could not exercise, and a test could
+    /// never have caught it going missing.
+    fn guard_enter(&mut self, key: &Key, mods: ModifiersState, config: &Config) -> bool {
+        if !config.behaviour.command_guardian
+            || !matches!(key, Key::Named(NamedKey::Enter))
+            || !mods.is_empty()
+        {
+            return false;
+        }
+        let line = {
+            let g = self.tab().focused().grid.lock().unwrap();
+            // A full-screen app (vim, htop) has no shell command line to guard;
+            // scanning its buffer would pop the confirm over unrelated content.
+            if g.alt_screen() { String::new() } else { g.current_command_text() }
+        };
+        let Some(reason) = crate::guardian::danger(&line) else { return false };
+        // The board goes red WITH the prompt: this is the one signal that is a
+        // question rather than news, and your hands are already on the keys.
+        self.flash_board(crate::FLASH_GUARDIAN, config);
+        self.overlay = Some(Overlay::Prompt(Prompt::new(
+            PromptKind::GuardedCommand,
+            &format!("Run this? {reason}"),
+            vec![line.trim().to_string()],
+        )));
+        self.window.request_redraw();
+        true
+    }
+
     fn press_key(
         &mut self,
         key: &Key,
@@ -2866,6 +2880,9 @@ impl Gpu {
         if let Some(action) = keymap.resolve(key, mods) {
             let action = action.clone();
             self.run_action(action, config, event_loop);
+            return;
+        }
+        if self.guard_enter(key, mods, config) {
             return;
         }
         // Same order as `on_key`: the sidebar takes what the leader and the bound
@@ -5782,6 +5799,21 @@ impl Gpu {
         }
         argv.push(path.to_string_lossy().into_owned());
         self.split_running(config, argv);
+    }
+
+    /// Flashes the whole keyboard, if there is one and the config asked for it.
+    ///
+    /// Whole-board only, deliberately: with opaque keycaps a lit key cannot be read as
+    /// a key (measured — see the DEVLOG), but "the board went red" reads from the
+    /// corner of the eye. The flash needs no cleanup either: sustain expires the whole
+    /// board, so it undoes itself even if runnir dies mid-signal.
+    fn flash_board(&self, colour: crate::config::Rgb, config: &Config) {
+        if !config.keyboard.ambient {
+            return;
+        }
+        if let Some(board) = &self.board {
+            board.flash(colour, config.keyboard.flash_ms);
+        }
     }
 
     /// Opens the small text-input overlay to type a filter command; confirming

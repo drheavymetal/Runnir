@@ -29,6 +29,14 @@ Bare Alt+Space is deliberately NOT the leader: it is the window menu on Windows
 and GNOME, krunner on KDE and PowerToys Run on Windows, so it would never reach
 runnir on most desktops.
 
+On a programmable keyboard there is a way OUT of the modifier race entirely.
+F13 to F24 are real keycodes that no desktop claims, because no keyboard has
+shipped with them for decades. Put one on a layer in your board's firmware and
+set the leader setting to f13 in the config: no modifiers, nothing for a compositor to
+grab, one key. F13-F20 also reach the shell as their standard escape sequences
+when they are not bound; F21-F24 have no agreed encoding, so runnir binds them
+but sends nothing.
+
 Straight away, no group — the things you do constantly:
 
 @ Leader 1..9      jump to tab N

@@ -176,6 +176,17 @@ fn encode_kitty_inner(
             NamedKey::F10 => KittyKey::Tilde(21),
             NamedKey::F11 => KittyKey::Tilde(23),
             NamedKey::F12 => KittyKey::Tilde(24),
+            // xterm's ~-scheme carries on to F20. Past that there is no agreed
+            // legacy encoding, so F21-F24 stay bindable in runnir and send nothing
+            // to the child rather than inventing bytes a program would misread.
+            NamedKey::F13 => KittyKey::Tilde(25),
+            NamedKey::F14 => KittyKey::Tilde(26),
+            NamedKey::F15 => KittyKey::Tilde(28),
+            NamedKey::F16 => KittyKey::Tilde(29),
+            NamedKey::F17 => KittyKey::Tilde(31),
+            NamedKey::F18 => KittyKey::Tilde(32),
+            NamedKey::F19 => KittyKey::Tilde(33),
+            NamedKey::F20 => KittyKey::Tilde(34),
             _ => return None,
         },
         Key::Character(s) => {
@@ -361,6 +372,14 @@ fn named_key(key: NamedKey, mods: ModifiersState, mode: KeyMode) -> Option<Vec<u
         NamedKey::F10 => tilde(21),
         NamedKey::F11 => tilde(23),
         NamedKey::F12 => tilde(24),
+        NamedKey::F13 => tilde(25),
+        NamedKey::F14 => tilde(26),
+        NamedKey::F15 => tilde(28),
+        NamedKey::F16 => tilde(29),
+        NamedKey::F17 => tilde(31),
+        NamedKey::F18 => tilde(32),
+        NamedKey::F19 => tilde(33),
+        NamedKey::F20 => tilde(34),
 
         _ => None,
     }
