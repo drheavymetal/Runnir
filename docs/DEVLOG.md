@@ -2202,6 +2202,142 @@ because `cargo test` builds the test harness and does NOT refresh
 `target/release/runnir`. That is the second time today a stale binary made working
 code look broken.
 
+## DESIGN, NOT YET BUILT — five candidates, picked 2026-07-22
+
+Pedro picked all four proposed candidates plus the canvas. Written up here before any
+code, the same ritual the explorer and the Docker panel went through. Implementation
+order below is by risk, lowest first — each one ships on its own before the next
+starts. Prose versions live in the qlaios wiki (*Ideas candidatas* I and II).
+
+### 1. The window catches you up  (`catch_up`)
+
+**What.** Come back after a while away and get ONE headline per pane instead of six
+scrollbacks: `cargo build · ok · 3 warnings · 1m12s`, `deploy · waiting for your
+confirmation · 12m`, `cargo test · 2 new failures`. Enter jumps to the pane that
+matters; Escape dismisses.
+
+**Leans on** what already exists: OSC 133 marks every command with its exit code and
+duration (`grid.command_seq`, `last_exit_code`, `Pane::take_completion`), the keyword
+watch already pulls relevant lines out of output, and the guardian already knows when
+a pane is blocked on a confirmation.
+
+**Decisions.**
+- **Explicit, never automatic.** It is an action (leader `u`), not a heuristic that
+  guesses you were away and rearranges your screen.
+- **What "away" means is NOT window focus.** Focus lies: a focused window on a second
+  monitor is not attention. The clock that matters is *time since the last keystroke
+  went to a PTY* — runnir already knows that exactly.
+- **A pane with nothing to say says nothing.** Four panes idle at a prompt produce a
+  four-line summary saying "nothing happened", which is worse than no feature. Only
+  panes whose state CHANGED while you were away get a line.
+
+**Traps.** A wrong headline is worse than no headline — when the state cannot be
+summarised (a full-screen app, a pane with no shell integration), say "no marks" and
+show the last line verbatim rather than inventing a status. Ranking matters more than
+completeness: something waiting on the user outranks a failure, which outranks a
+success.
+
+**Verified** headless: `--dump` a scripted session per pane, assert the headline text.
+The ranking is a pure function over `(exit code, waiting, duration, watch hits)` and
+gets unit tests.
+
+### 2. The real verbs of this repo  (`repo_verbs`)
+
+**What.** runnir sees what is actually typed in each project, and offers the five
+verbs that repo is really worked with — not the aliases someone defined, not the
+README nobody updated. A new dev opens the repo and the window already knows how it
+is built, tested and deployed.
+
+**Leans on** the per-command history with cwd and exit code, plus the repo root the
+git panel and explorer already compute.
+
+**Decisions.**
+- **Only commands that SUCCEEDED count.** A verb learned from failures teaches the
+  wrong thing.
+- **Arguments are never stored.** `curl -H "Authorization: Bearer …"` and
+  `scp ~/clients/acme/dump.sql` are commands people run; the head of the command is
+  the verb, the tail is private. This is the difference between a useful feature and
+  a leak, so it is enforced at the point of capture, not at display.
+- **A threshold, not a tally.** Two runs is not a habit. Below N occurrences a
+  command is not a verb.
+- **Opt-in, and per-repo.** Nothing is recorded until asked.
+
+**Traps.** The store is per-repo-root and lives beside runnir's data, never inside the
+repo — a `.runnir-verbs` file committed by accident would publish someone's shell
+history to the team. Sharing is an explicit export, never automatic.
+
+### 3. Tactile pipes: drag one pane's output into another  (`drag_output`)
+
+**What.** Grab the output block of a command and drop it on another pane: it arrives
+as that pane's stdin. Dropped on the AI panel it is context; dropped on the explorer
+it is saved as a file. The pipe you compose AFTER running, with your hand.
+
+**Leans on** `dnd.rs` (runnir speaks `wl_data_device` directly — winit does not do
+drag sources) and the OSC 133 segmentation that makes "which block am I grabbing"
+answerable at all.
+
+**Decisions.**
+- **A drop PROPOSES, never executes.** It leaves the line staged at the prompt and a
+  key confirms. A drag that runs something is a mouse slip that runs something.
+- **The grab target is a command BLOCK**, not a selection: the unit the user thinks in
+  is "the output of that command", which is exactly what OSC 133 delimits.
+- **Big outputs go through a file.** Past a threshold the drop writes to a temp file
+  (0600, the same private-write path the scrollback dump uses) and stages the path
+  instead of the bytes.
+
+**Traps.** Dropping onto a pane that is running a full-screen app must be refused, not
+typed into vim. And the source pane's output can contain secrets — the same rule as
+the scrollback dump: private file, no world-readable temp.
+
+### 4. The war room that assembles itself  (`war_room`)
+
+**What.** You declare "I am deploying this" and the window arranges itself around the
+operation: the deploy pane, the remote daemon's events, the logs of the services that
+will change, the healthcheck. When it finishes cleanly it takes itself down.
+
+**Leans on** the Docker panel (contexts, remote hosts over ssh), `docker-compose.yml`
+for which services exist, container labels for where the project lives, and the git
+remote for which repository this is. It asks the user nothing.
+
+**Decisions.**
+- **Explicitly started, like the catch-up.** A layout that appears unbidden is a
+  window that reorganises your work.
+- **Teardown never closes a pane you touched.** If you typed in it, it stays. The
+  test is literal: any pane that received a keystroke is exempt.
+- **Each pane paints when its data arrives.** Services can live on several machines;
+  half the room may be waiting on the network. Never one frame that waits for all.
+
+**Traps.** The biggest is scope: this is the only one of the five that depends on
+another panel's maturity, so it goes last of the four before the canvas. A war room
+that guesses wrong about which services are involved is worse than no war room —
+when compose is absent or ambiguous, say so and open the deploy pane alone.
+
+### 5. Canvas, not mosaic  (`canvas`)
+
+**What.** Panes stop living in a grid of rectangles and move onto an infinite canvas
+with zoom. Zoomed out, the session is a map; zoomed in, a pane is a terminal at full
+fidelity. Semantic zoom: from far away a pane does not draw unreadable text, it draws
+its headline — repo, running command, state.
+
+**Leans on** the renderer already drawing arbitrary grids at arbitrary positions
+(panes, chrome, overlays, images as textures) and the layout tree already separating
+"what area does each pane get" from its content.
+
+**Decisions.**
+- **Zoom is VISUAL; the PTY size is not.** A pane being zoomed cannot be resizing —
+  every zoom step would resize the pseudo-terminal and full-screen programs do not
+  survive that. The cell grid stays fixed; only the transform changes.
+- **The headline at low zoom is the catch-up's headline.** Feature 1 is a prerequisite,
+  not a coincidence: both need one line that says what a pane is doing.
+- **Home is always one key away.** Getting lost is the classic failure of this
+  interface, so "fit everything" and "back to the focused pane" are bound from the
+  start, not added later.
+
+**Traps.** This is the biggest change in the list and the only one that touches the
+layout tree everywhere, so it goes last. It also has to earn its place: if navigating
+the canvas is slower than the mosaic for the everyday case, it stays behind a config
+flag rather than replacing the grid.
+
 ## Gotchas (do not re-learn)
 
 - The board must be put back even if runnir DIES. `sustain` (ms) on every ZSA paint is
