@@ -1982,6 +1982,20 @@ missing one leaves the board holding a level nobody is in.
   belongs to the whole desktop — but verifying it meant taking Pedro's focus for
   twenty seconds and giving it back.
 
+**The test sandbox cannot reach this feature at all.** `kontroll` finds Keymapp's
+socket through `XDG_CONFIG_HOME`, and so does `zsa::default_db`. Overriding it — which
+is how every other runnir feature is tested in isolation — points both at a scratch
+directory, and kontroll answers `Failed to connect to keymapp: transport error`. A
+symlink into the real `.keymapp` does not help: the connection still fails. So the
+keyboard is the one feature that has to be verified against the REAL config dir, and
+therefore against the user's own config. `RUNNIR_ZSA_DEBUG=1` exists for exactly that
+reason — it prints which step gave up, since silence-by-design otherwise makes "no
+keyboard here" and "broken" identical.
+
+Found by that same debug output: **`Board::status` read only stdout**. kontroll
+reports a failed connection on STDERR with a non-zero exit, so the failure arrived as
+an empty string and was shrugged off as "no revision". It honours the exit code now.
+
 **And a one-character bug that made the whole thing a no-op**: `parse_status` used
 `line.split_once(':')?`, so the FIRST line without a colon returned None for the whole
 status. kontroll separates its output into blocks with blank lines, so there was
@@ -2121,6 +2135,10 @@ Belt AND braces, both always:
 - A scripted key beats the shell's echo. Anything reading the GRID (the guardian, the
   hint scanner) needs the echo to land first, and fish's autosuggestion means what is
   on the grid is not what was typed.
+- `XDG_CONFIG_HOME` is not a safe thing to redirect when the feature talks to another
+  desktop app: kontroll finds Keymapp's socket through it, so the usual test isolation
+  silently disconnects the keyboard. Some features can only be verified in the real
+  environment.
 - A parser fixture written by hand tests the hand that wrote it. Copy the real
   output, blank lines and all — `split_once(':')?` on one blank line silently turned
   the whole keyboard feature into a no-op, with a passing test beside it.

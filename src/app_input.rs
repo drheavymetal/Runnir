@@ -2842,10 +2842,30 @@ impl Gpu {
     /// `sqlite3`, a revision Keymapp has never seen. Any of them simply leaves the
     /// leader lights off, with nothing said — the same rule the rest of this follows.
     fn load_board_layout(&mut self) {
-        let Some(board) = &self.board else { return };
-        let Some(status) = board.status() else { return };
+        // RUNNIR_ZSA_DEBUG=1 says which step gave up. The feature is silent by design,
+        // and silence is exactly what makes it impossible to tell "no keyboard here"
+        // from "broken" — this is the same escape hatch RUNNIR_KEYLOG is.
+        let debug = std::env::var("RUNNIR_ZSA_DEBUG").is_ok();
+        let Some(board) = &self.board else {
+            if debug {
+                eprintln!("zsa: no board (kontroll missing, or the feature is off)");
+            }
+            return;
+        };
+        let Some(status) = board.status() else {
+            if debug {
+                eprintln!("zsa: kontroll status gave no revision (keyboard connected?)");
+            }
+            return;
+        };
         let Some(db) = crate::zsa::default_db() else { return };
         self.board_layout = crate::zsa::read_layout(&db, &status.revision);
+        if debug {
+            match &self.board_layout {
+                Some(l) => eprintln!("zsa: layout {} loaded, {} layers", status.revision, l.layers()),
+                None => eprintln!("zsa: {} not readable from {}", status.revision, db.display()),
+            }
+        }
     }
 
     /// Lights the leader level the user is standing on: every key that does something

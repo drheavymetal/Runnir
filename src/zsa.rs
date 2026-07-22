@@ -533,8 +533,26 @@ impl Board {
     /// worker — never on the path of a keystroke.
     pub fn status(&self) -> Option<Status> {
         let bin = kontroll_path()?;
-        let out = std::process::Command::new(bin).arg("status").output().ok()?;
-        parse_status(&String::from_utf8_lossy(&out.stdout))
+        let out = std::process::Command::new(&bin).arg("status").output().ok()?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        // kontroll reports a failed connection on STDERR with a non-zero exit, and
+        // reading only stdout turned that into an empty string and a shrug. Worth
+        // knowing that `XDG_CONFIG_HOME` decides where kontroll looks for Keymapp's
+        // socket, so a sandbox that redirects it cannot reach the keyboard at all.
+        if std::env::var("RUNNIR_ZSA_DEBUG").is_ok() {
+            let err = String::from_utf8_lossy(&out.stderr);
+            eprintln!(
+                "zsa: {} status (exit {:?})\n  out: {}\n  err: {}",
+                bin.display(),
+                out.status.code(),
+                text.trim_end(),
+                err.trim_end()
+            );
+        }
+        if !out.status.success() {
+            return None;
+        }
+        parse_status(&text)
     }
 }
 
