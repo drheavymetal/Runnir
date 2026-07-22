@@ -39,9 +39,9 @@ impl Gpu {
         // transient `&self` reads, so it is safe here.
         let chrome = self.build_chrome(config, screen);
         let status_holder = self.build_status(config, screen);
-        let whichkey_holder = self.build_whichkey(screen);
+        let whichkey_holder = self.build_whichkey(screen, config);
         let explorer_holder = self.build_explorer(config);
-        let explorer_keys = self.build_explorer_whichkey(screen);
+        let explorer_keys = self.build_explorer_whichkey(screen, config);
 
         // Clear dirty flags so the next output marks a fresh redraw. (After chrome, so
         // the activity badge still reflects this frame's unseen output.)
@@ -159,7 +159,7 @@ impl Gpu {
         }
 
         // The search bar draws as chrome (undimmed) so matches stay visible.
-        let theme = self.renderer_theme();
+        let theme = config.theme.clone();
         let search_bar: Option<(Grid, f32, f32)> = match &self.overlay {
             Some(Overlay::Search(s)) => {
                 let cols = (screen.0 / cell.0).floor().max(1.0) as usize;
@@ -176,7 +176,7 @@ impl Gpu {
         }
 
         // Overlay panels, on a dimmed backdrop.
-        let overlay_grids = self.build_overlay(screen, cell);
+        let overlay_grids = self.build_overlay(screen, cell, config);
         let overlay = overlay_grids.as_ref().map(|panels| OverlayDraw {
             dim: 0.55,
             panels: panels
@@ -702,7 +702,7 @@ impl Gpu {
     /// The sidebar's leader menu, drawn along the bottom of the WINDOW rather than
     /// inside the sidebar: the tree is 30 columns wide and a which-key in it would
     /// be one entry per line. Same grid the global layer uses.
-    fn build_explorer_whichkey(&self, screen: (f32, f32)) -> Option<(Grid, f32, f32)> {
+    fn build_explorer_whichkey(&self, screen: (f32, f32), config: &Config) -> Option<(Grid, f32, f32)> {
         let e = self.tabs.get(self.active)?.explorer.as_ref()?;
         e.leader.as_ref()?;
         let entries = e.leader_entries();
@@ -711,7 +711,7 @@ impl Gpu {
         }
         let (cw, ch) = self.renderer.cell_size();
         let cols = (screen.0 / cw).floor().max(20.0) as usize;
-        let grid = whichkey_grid(&entries, &e.leader_path(), cols);
+        let grid = whichkey_grid(&entries, &e.leader_path(), cols, &config.theme.leader_palette());
         let bar = if self.status_bar { ch } else { 0.0 };
         let y = screen.1 - bar - grid.rows() as f32 * ch;
         Some((grid, 0.0, y.max(0.0)))
@@ -724,14 +724,14 @@ impl Gpu {
     /// the keyboard, and the whole point here is that the next keystroke goes to
     /// the leader resolver. It also means no dimmed backdrop: this is a hint, not
     /// a modal, and the terminal stays readable behind it.
-    fn build_whichkey(&self, screen: (f32, f32)) -> Option<(Grid, f32, f32)> {
+    fn build_whichkey(&self, screen: (f32, f32), config: &Config) -> Option<(Grid, f32, f32)> {
         if self.leader_armed.is_none() || self.leader_entries.is_empty() {
             return None;
         }
         let (cw, ch) = self.renderer.cell_size();
         let cols = (screen.0 / cw).floor().max(20.0) as usize;
         let path: Vec<String> = self.leader_path.iter().map(|c| c.label()).collect();
-        let grid = whichkey_grid(&self.leader_entries, &path, cols);
+        let grid = whichkey_grid(&self.leader_entries, &path, cols, &config.theme.leader_palette());
 
         // Sits directly on top of the status bar when there is one.
         let bar = if self.status_bar { ch } else { 0.0 };
@@ -774,7 +774,7 @@ impl Gpu {
         Some((grid, rect.x, rect.y))
     }
 
-    fn build_overlay(&self, screen: (f32, f32), cell: (f32, f32)) -> Option<Vec<(Grid, f32, f32)>> {
+    fn build_overlay(&self, screen: (f32, f32), cell: (f32, f32), config: &Config) -> Option<Vec<(Grid, f32, f32)>> {
         let overlay = self.overlay.as_ref()?;
         // Hints and search draw as chrome (no dimmed backdrop) so the pane stays
         // fully visible behind them.
@@ -784,17 +784,13 @@ impl Gpu {
         let (cw, ch) = cell;
         let cols = (screen.0 / cw).floor().max(1.0) as usize;
         let rows = (screen.1 / ch).floor().max(1.0) as usize;
-        let panels = overlay.render(cols, rows, &self.renderer_theme());
+        let panels = overlay.render(cols, rows, &config.theme);
         Some(
             panels
                 .into_iter()
                 .map(|p| (p.grid, p.col as f32 * cw, p.row as f32 * ch))
                 .collect(),
         )
-    }
-
-    fn renderer_theme(&self) -> crate::config::Theme {
-        crate::config::Theme::default()
     }
 
     /// Whether the cursor is in its visible phase. Steady when blink is off; else a
@@ -852,7 +848,12 @@ fn abbreviate_home(p: &std::path::Path) -> String {
 ///
 /// `entries` is `(key, title, is_group)` as `Keymap::leader_entries` returns it,
 /// `path` the keys pressed since the leader was armed (empty at the root).
-fn whichkey_grid(entries: &[(String, String, bool)], path: &[String], cols: usize) -> Grid {
+fn whichkey_grid(
+    entries: &[(String, String, bool)],
+    path: &[String],
+    cols: usize,
+    palette: &crate::config::LeaderPalette,
+) -> Grid {
     // Column width from the widest entry, so nothing is truncated at the root
     // (the level with the most entries and the longest titles).
     let widest = entries.iter().map(|(k, t, _)| k.chars().count() + t.chars().count()).max().unwrap_or(10);
@@ -860,16 +861,17 @@ fn whichkey_grid(entries: &[(String, String, bool)], path: &[String], cols: usiz
     let per_row = (cols.saturating_sub(2) / colw).max(1);
     let rows = entries.len().div_ceil(per_row);
 
-    let bg = Color::Rgb(0x1a, 0x1c, 0x22);
+    let rgb = |c: crate::config::Rgb| Color::Rgb(c.0, c.1, c.2);
+    let bg = rgb(palette.background);
     let mut grid = Grid::new(cols, rows + 2);
     grid.fill(Pen { bg, ..Pen::default() });
 
-    let dim = Pen { fg: Color::Rgb(0x8a, 0x8d, 0x94), bg, ..Pen::default() };
-    let key = Pen { fg: Color::Rgb(0xf5, 0xd5, 0x43), bg, flags: crate::grid::Flags::BOLD, ..Pen::default() };
-    let text = Pen { fg: Color::Rgb(0xd4, 0xd6, 0xd9), bg, ..Pen::default() };
+    let dim = Pen { fg: rgb(palette.dim), bg, ..Pen::default() };
+    let key = Pen { fg: rgb(palette.leaf), bg, flags: crate::grid::Flags::BOLD, ..Pen::default() };
+    let text = Pen { fg: rgb(palette.text), bg, ..Pen::default() };
     // Groups are told apart by colour, not by a suffix: a trailing arrow costs
     // width in every column and this reads faster.
-    let grp = Pen { fg: Color::Rgb(0x6b, 0xb1, 0xff), bg, ..Pen::default() };
+    let grp = Pen { fg: rgb(palette.group), bg, ..Pen::default() };
 
     // Header names where you are: the keys pressed so far, or the root.
     let header = if path.is_empty() {

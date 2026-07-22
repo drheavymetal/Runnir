@@ -554,6 +554,50 @@ pub struct Theme {
     pub dim: Rgb,
 }
 
+/// The colours the leader layer speaks in: the which-key panel draws with these
+/// today, and the ZSA keyboard's LEDs will paint the same tree with the same ones.
+///
+/// Derived from the theme rather than configured. Two surfaces showing the same tree
+/// in different colours is worse than only having one of them, and an option that can
+/// be set to disagree with itself is an option that eventually will be.
+pub struct LeaderPalette {
+    /// A key that opens another level.
+    pub group: Rgb,
+    /// A key that runs something.
+    pub leaf: Rgb,
+    /// The description beside a leaf key.
+    pub text: Rgb,
+    /// The header, and anything that is context rather than choice.
+    pub dim: Rgb,
+    /// The panel's own background: the terminal's, lifted just off it so the panel
+    /// reads as a surface sitting on top rather than a hole in the output.
+    pub background: Rgb,
+}
+
+impl Rgb {
+    /// Blends towards `other` by `t` (0.0 = self, 1.0 = other).
+    fn mix(self, other: Rgb, t: f32) -> Rgb {
+        let f = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * t).round().clamp(0.0, 255.0) as u8;
+        Rgb(f(self.0, other.0), f(self.1, other.1), f(self.2, other.2))
+    }
+}
+
+impl Theme {
+    pub fn leader_palette(&self) -> LeaderPalette {
+        LeaderPalette {
+            // The accent is what the rest of runnir's chrome already uses to mean
+            // "this is ours, and it leads somewhere".
+            group: self.accent,
+            // Bright yellow (ANSI 11) is the key cap colour every which-key uses; fall
+            // back to the foreground on a theme that somehow ships a short palette.
+            leaf: self.ansi.get(11).copied().unwrap_or(self.foreground),
+            text: self.foreground,
+            dim: self.dim,
+            background: self.background.mix(self.foreground, 0.07),
+        }
+    }
+}
+
 impl Default for Theme {
     fn default() -> Self {
         Self {
@@ -710,6 +754,50 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The palette is DERIVED, so the theme is the only place a colour is chosen.
+    /// The which-key panel and (next) the keyboard both read this one.
+    #[test]
+    fn the_leader_palette_comes_from_the_theme() {
+        let mut t = Theme::default();
+        t.accent = Rgb(1, 2, 3);
+        t.foreground = Rgb(200, 201, 202);
+        t.dim = Rgb(9, 9, 9);
+        t.ansi[11] = Rgb(250, 240, 10);
+        let p = t.leader_palette();
+        assert_eq!(p.group, Rgb(1, 2, 3), "groups take the chrome accent");
+        assert_eq!(p.leaf, Rgb(250, 240, 10), "leaves take bright yellow (ANSI 11)");
+        assert_eq!(p.text, t.foreground);
+        assert_eq!(p.dim, t.dim);
+    }
+
+    /// The panel background has to sit just off the terminal's, or the panel reads as
+    /// a hole punched in the output rather than a surface on top of it.
+    #[test]
+    fn the_panel_background_is_lifted_off_the_terminal_background() {
+        let t = Theme::default();
+        let p = t.leader_palette();
+        assert_ne!(p.background, t.background, "identical would be invisible");
+        let lift = |a: u8, b: u8| b as i32 - a as i32;
+        assert!(
+            lift(t.background.0, p.background.0) > 0,
+            "a dark theme lifts towards its foreground: {:?} -> {:?}",
+            t.background,
+            p.background
+        );
+
+        // And on a LIGHT theme it has to move the other way, or the panel vanishes.
+        let light = Theme { background: Rgb(250, 250, 250), foreground: Rgb(20, 20, 20), ..Theme::default() };
+        assert!(light.leader_palette().background.0 < 250);
+    }
+
+    /// A theme supplied by hand can carry a short `ansi` list; asking for colour 11
+    /// must not panic on it.
+    #[test]
+    fn a_short_ansi_palette_falls_back_instead_of_panicking() {
+        let t = Theme { ansi: vec![Rgb(0, 0, 0)], foreground: Rgb(7, 7, 7), ..Theme::default() };
+        assert_eq!(t.leader_palette().leaf, Rgb(7, 7, 7));
+    }
 
     #[test]
     fn leader_timeout_zero_means_the_layer_never_lapses() {

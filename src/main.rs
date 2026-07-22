@@ -380,7 +380,8 @@ fn leader_scene(path_out: &str, level: &str) {
         (f.cell_w, f.cell_h)
     };
     let cols = (WIDTH / cw) as usize;
-    let panel_rows = whichkey_grid(&entries, &labels, cols).rows() as f32;
+    let palette = crate::config::Theme::default().leader_palette();
+    let panel_rows = whichkey_grid(&entries, &labels, cols, &palette).rows() as f32;
     let height = ((panel_rows + TERM_ROWS + 2.0) * ch).ceil() as u32;
 
     render::offscreen_scene(path_out, WIDTH as u32, height, 16.0, |r| {
@@ -389,7 +390,7 @@ fn leader_scene(path_out: &str, level: &str) {
         let bar_h = ch;
         let height = height as f32;
 
-        let panel = whichkey_grid(&entries, &labels, cols);
+        let panel = whichkey_grid(&entries, &labels, cols, &palette);
         let panel_h = panel.rows() as f32 * ch;
         // Terminal area is what the chrome leaves: tab bar on top, which-key panel
         // and status bar at the bottom.

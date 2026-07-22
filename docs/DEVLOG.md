@@ -1757,6 +1757,34 @@ evince 1:48.4-1 on this machine RUNS without ever mapping a window — reproduci
 straight from a shell, with nothing of runnir involved. Pedro's fix is a different
 handler (`xdg-mime default <app>.desktop application/pdf`), not a code change here.
 
+## 2026-07-22 - ZSA step 1: the leader's colours come from the theme
+
+Step 1 of the design below, and the only one that touches no keyboard. The which-key
+panel picked its colours from four hex literals in `app_draw.rs` (leaf `#f5d543`,
+group `#6bb1ff`, text, dim) — fine while the panel was the only thing drawing the
+leader tree, wrong the moment the keyboard draws the same tree beside it. Two surfaces
+disagreeing about what colour a group is would be worse than only having the panel.
+
+`Theme::leader_palette()` now derives all five: groups take the chrome `accent`,
+leaves take bright yellow (ANSI 11), text and dim take theirs, and the panel
+background is the terminal background mixed 7% towards the foreground. Derived, NOT
+configured, and deliberately: a palette that can be set to disagree with the theme is
+a palette that eventually will. The 7% mix also means a light theme darkens instead of
+lightening, which a hardcoded `#1a1c22` could never do.
+
+**A stub was found on the way, and it was the real bug.** `renderer_theme()` returned
+`Theme::default()` — a constant. Every overlay that renders with a theme (the git
+panel, Docker, the viewer, the pickers, the search bar) has therefore been drawing
+with the DEFAULT palette all along, ignoring the user's theme entirely. Nobody noticed
+because the default theme is what most of them were tested against. It now takes
+`config.theme`, and the stub is gone.
+
+Verified on a real instance under a deliberately garish theme (magenta accent, green
+ANSI 11, brown background): groups magenta, leaf keys green, header dim tan, panel
+background lifted off the terminal's. Screenshot taken of the WINDOW, not the output —
+an output capture of a 3440px monitor caught a private chat window, which is a good
+reason never to crop a full-screen shot when a window shot exists.
+
 ## DESIGN, NOT YET BUILT — the leader layer, lit on the keys (ZSA Moonlander)
 
 Decided 2026-07-22 with the keyboard on the desk and the API answering. Nothing built.

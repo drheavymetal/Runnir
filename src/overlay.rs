@@ -1180,7 +1180,7 @@ impl GitPanel {
         if self.leader.is_some() {
             let entries = self.leader_entries();
             if !entries.is_empty() {
-                let wk = crate::whichkey_grid(&entries, &self.leader_path(), l.w);
+                let wk = crate::whichkey_grid(&entries, &self.leader_path(), l.w, &theme.leader_palette());
                 let rows = wk.rows();
                 out.push(Panel {
                     grid: wk,
@@ -5022,7 +5022,7 @@ impl DockerPanel {
         if self.leader.is_some() {
             let entries = self.leader_entries();
             if !entries.is_empty() {
-                let wk = crate::whichkey_grid(&entries, &self.leader_path(), w);
+                let wk = crate::whichkey_grid(&entries, &self.leader_path(), w, &theme.leader_palette());
                 let wk_rows = wk.rows();
                 out.push(Panel { grid: wk, col, row: (row + h).saturating_sub(wk_rows) });
             }
