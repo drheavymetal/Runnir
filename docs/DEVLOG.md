@@ -1957,7 +1957,47 @@ looks like a bug and is not:
 Verified on a real instance: `mkfs` at the prompt (harmless if it runs, it just prints
 usage) opens `Run this? mkfs — reformats a filesystem, erasing it`.
 
-## DESIGN, NOT YET BUILT — the leader layer, lit on the keys (ZSA Moonlander)
+## 2026-07-22 - ZSA step 4: the leader lights, behind an opt-in
+
+Built after all, at Pedro's request: the finding was that it does not work on OPAQUE
+keycaps, and shine-through ones are a keycap order away. `keyboard.leader_lights`,
+off by default, with the config comment saying plainly what it needs to be worth
+anything.
+
+Arming paints the root level; descending into a group repaints to that group's keys
+(33 down to 6 for Tabs, which is the part a fixed-colour keymap cannot do — the tree
+is contextual). Every exit from the layer goes through one `end_leader`, because a
+layer has four ways out — a key that acts, a miss, Escape, the timeout lapsing — and
+missing one leaves the board holding a level nobody is in.
+
+**Two things only a real run showed:**
+
+- **The timeout lapse has no keystroke to notice it.** The layer expires on its own,
+  and the existing code only discovered that when the NEXT key arrived. On screen that
+  is invisible; on the keyboard the board would sit lit. Both the lapse and focus loss
+  are now handled by the 500 ms sweep that was already running.
+- **Focus loss disarms it, and that made the feature untestable from outside.** The
+  scripted instance sits on another workspace, so it is never focused, so the sweep
+  handed the board back within 500 ms of every arm. Correct behaviour — the keyboard
+  belongs to the whole desktop — but verifying it meant taking Pedro's focus for
+  twenty seconds and giving it back.
+
+**And a one-character bug that made the whole thing a no-op**: `parse_status` used
+`line.split_once(':')?`, so the FIRST line without a colon returned None for the whole
+status. kontroll separates its output into blocks with blank lines, so there was
+always one — the revision was always None, the layout never loaded, and no paint ever
+happened. The test "covering" it passed a hand-written sample with no blank lines in
+it. Skip the line, never bail; the test now uses output copied from the real command,
+blank lines and all. Rule of thumb this earns: a parser test written by hand tests the
+hand that wrote it.
+
+`Board::status` parses `kontroll status` for the revision the firmware reports and the
+active layer. The revision matters because Keymapp's database holds every revision
+ever compiled, and lighting the newest row would light a layout that was never put on
+the board. The layout is read ONCE at startup (two blocking processes), never on a
+keystroke; a paint costs one channel send.
+
+## DESIGN — the leader layer, lit on the keys (ZSA Moonlander) — BUILT 2026-07-22
 
 Decided 2026-07-22 with the keyboard on the desk and the API answering. Nothing built.
 Background and the alternatives that were NOT chosen: the qlaios wiki page *runnir —
@@ -2081,6 +2121,9 @@ Belt AND braces, both always:
 - A scripted key beats the shell's echo. Anything reading the GRID (the guardian, the
   hint scanner) needs the echo to land first, and fish's autosuggestion means what is
   on the grid is not what was typed.
+- A parser fixture written by hand tests the hand that wrote it. Copy the real
+  output, blank lines and all — `split_once(':')?` on one blank line silently turned
+  the whole keyboard feature into a no-op, with a passing test beside it.
 - A wheel handler that knows about overlays and panes forgets the CHROME. The
   sidebar is neither, and falling through means scrolling a pane the pointer is not
   over. Any new surface needs a wheel arm, and `_ => {}` is how it gets missed.

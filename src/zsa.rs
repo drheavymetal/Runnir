@@ -489,6 +489,55 @@ fn hex(c: crate::config::Rgb) -> String {
     format!("#{:02x}{:02x}{:02x}", c.0, c.1, c.2)
 }
 
+/// What the board says it is running: the flashed layout's revision, and the layer
+/// that is active right now.
+///
+/// The revision matters because Keymapp's database holds every revision ever
+/// compiled; reading "the newest row" would light the keys of a layout that was never
+/// put on the board. The firmware answers `L4g4A/Jad5YO`, and the half after the
+/// slash is the revision id.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Status {
+    pub revision: String,
+    pub layer: usize,
+}
+
+/// Parses `kontroll status`. Its output is a handful of `Label:\tvalue` lines.
+fn parse_status(out: &str) -> Option<Status> {
+    let mut revision = None;
+    let mut layer = 0;
+    for line in out.lines() {
+        // Skip, never bail: kontroll's output carries blank lines between blocks, and
+        // a `?` here made one blank line discard the whole status — so the revision
+        // was always None, the layout never loaded, and the board never lit. The test
+        // that "covered" this used a hand-written sample with no blank lines in it.
+        let Some((label, value)) = line.split_once(':') else { continue };
+        let value = value.trim();
+        match label.trim() {
+            "Firmware version" => {
+                // `hashId/revisionId`; a board with no layout reports a bare `/`.
+                let rev = value.rsplit('/').next().unwrap_or_default();
+                if !rev.is_empty() {
+                    revision = Some(rev.to_string());
+                }
+            }
+            "Current layer" => layer = value.parse().unwrap_or(0),
+            _ => {}
+        }
+    }
+    Some(Status { revision: revision?, layer })
+}
+
+impl Board {
+    /// Asks the board what it is running. Blocking, so it belongs at startup or on a
+    /// worker — never on the path of a keystroke.
+    pub fn status(&self) -> Option<Status> {
+        let bin = kontroll_path()?;
+        let out = std::process::Command::new(bin).arg("status").output().ok()?;
+        parse_status(&String::from_utf8_lossy(&out.stdout))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -814,6 +863,28 @@ mod tests {
         let leds = (0..20).map(|i| (i, rgb(1, 1, 1))).collect();
         let log = drive(vec![Cmd::Paint { leds, dim: rgb(0, 0, 0), sustain_ms: 0 }], fake);
         assert_eq!(log.len(), 3, "stopped at the first refusal: {log:?}");
+    }
+
+    /// The status parser, against the shape kontroll really prints (measured on the
+    /// machine: labels, a tab, the value).
+    #[test]
+    fn the_status_gives_the_revision_that_is_actually_flashed() {
+        // Copied from the real thing, blank lines and all — the shape a hand-written
+        // sample got wrong.
+        let out = "Keymapp version:\t1.3.7\nKontroll version:\t1.0.3\n\nConnected keyboard:\tMoonlander MK1\nFirmware version:\tL4g4A/Jad5YO\nCurrent layer:\t\t3\n\n";
+        let st = parse_status(out).unwrap();
+        assert_eq!(st.revision, "Jad5YO", "the half AFTER the slash");
+        assert_eq!(st.layer, 3);
+    }
+
+    /// A board with no layout on it reports a bare slash, and a disconnected one says
+    /// so in prose. Neither is a revision, and guessing one would light a layout that
+    /// is not on the board.
+    #[test]
+    fn a_board_without_a_layout_yields_no_revision() {
+        assert!(parse_status("Firmware version:\t/\nCurrent layer:\t0\n").is_none());
+        assert!(parse_status("No keyboard connected\n").is_none());
+        assert!(parse_status("").is_none());
     }
 
     /// The real thing, against the real database — `cargo test -- --ignored zsa`.

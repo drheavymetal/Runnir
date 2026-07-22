@@ -35,6 +35,7 @@ pub enum SettingId {
     ExplorerHidden,
     KeyboardAmbient,
     KeyboardFlashMs,
+    KeyboardLeaderLights,
 }
 
 /// How a setting is edited, which drives the key handling and the value hint.
@@ -91,6 +92,7 @@ pub fn rows() -> Vec<Row> {
         row!("Explorer", "Show hidden files", ExplorerHidden, Bool),
         row!("Keyboard", "Flash the ZSA board", KeyboardAmbient, Bool),
         row!("Keyboard", "Flash length (ms)", KeyboardFlashMs, Int),
+        row!("Keyboard", "Light the leader on the keys", KeyboardLeaderLights, Bool),
     ]
 }
 
@@ -130,6 +132,7 @@ pub fn value(cfg: &Config, id: SettingId) -> String {
         ExplorerHidden => onoff(cfg.explorer.show_hidden),
         KeyboardAmbient => onoff(cfg.keyboard.ambient),
         KeyboardFlashMs => cfg.keyboard.flash_ms.to_string(),
+        KeyboardLeaderLights => onoff(cfg.keyboard.leader_lights),
     }
 }
 
@@ -196,6 +199,7 @@ pub fn adjust(cfg: &mut Config, id: SettingId, dir: i32) {
         }
         ExplorerHidden => cfg.explorer.show_hidden = up,
         KeyboardAmbient => cfg.keyboard.ambient = up,
+        KeyboardLeaderLights => cfg.keyboard.leader_lights = up,
         KeyboardFlashMs => {
             let ms = cfg.keyboard.flash_ms as i32 + dir * 200;
             cfg.keyboard.flash_ms = ms.clamp(200, 10_000) as u32;

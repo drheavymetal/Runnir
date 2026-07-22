@@ -2768,12 +2768,12 @@ impl Gpu {
             // An expired arm is treated as no arm at all: the key falls through to
             // the pane, so a stray keystroke is never silently eaten.
             if self.leader_timeout.is_some_and(|d| armed_at.elapsed() >= d) {
-                self.cancel_leader();
+                self.end_leader(config);
             } else {
                 // Escape backs out of the whole layer, the way it leaves every
                 // other modal thing in runnir.
                 if matches!(key, Key::Named(NamedKey::Escape)) {
-                    self.cancel_leader();
+                    self.end_leader(config);
                     self.window.request_redraw();
                     return true;
                 }
@@ -2787,16 +2787,17 @@ impl Gpu {
                     Some(LeaderNode::Group { .. }) => {
                         self.leader_armed = Some(Instant::now());
                         self.leader_entries = keymap.leader_entries(&self.leader_path);
+                        self.paint_leader(keymap, config);
                     }
                     Some(LeaderNode::Run(action)) => {
                         let action = action.clone();
-                        self.cancel_leader();
+                        self.end_leader(config);
                         self.run_action(action, config, event_loop);
                     }
                     // A miss ends the sequence, bound or not. Falling through to
                     // the pane would leak a stray character into the shell after
                     // a mistyped sequence.
-                    None => self.cancel_leader(),
+                    None => self.end_leader(config),
                 }
                 self.window.request_redraw();
                 return true;
@@ -2806,6 +2807,7 @@ impl Gpu {
             self.leader_armed = Some(Instant::now());
             self.leader_path.clear();
             self.leader_entries = keymap.leader_entries(&[]);
+            self.paint_leader(keymap, config);
             // The armed state shows as a chip in the status bar, which lives
             // exactly as long as the arming (`build_status` reads `leader_armed`).
             // With the bar hidden there is nowhere to put it, so fall back to a
@@ -2826,6 +2828,63 @@ impl Gpu {
     ///
     /// It deliberately stops short of the pane: text for the child goes through
     /// `send-text`, which does not have to guess an encoding.
+    /// Leaves the leader layer AND gives the keyboard back. Every exit from the layer
+    /// goes through here: a key that acts, a miss, Escape, or the timeout lapsing.
+    /// Missing one of them is how the board ends up holding a level nobody is in.
+    fn end_leader(&mut self, config: &Config) {
+        self.cancel_leader();
+        self.unpaint_leader(config);
+    }
+
+    /// Reads the flashed layout once, so a keystroke never pays for it.
+    ///
+    /// Both halves can be absent and that is normal: no board, no Keymapp, no
+    /// `sqlite3`, a revision Keymapp has never seen. Any of them simply leaves the
+    /// leader lights off, with nothing said — the same rule the rest of this follows.
+    fn load_board_layout(&mut self) {
+        let Some(board) = &self.board else { return };
+        let Some(status) = board.status() else { return };
+        let Some(db) = crate::zsa::default_db() else { return };
+        self.board_layout = crate::zsa::read_layout(&db, &status.revision);
+    }
+
+    /// Lights the leader level the user is standing on: every key that does something
+    /// here, groups in one colour and leaves in the other, everything else dark.
+    ///
+    /// Sustain is the leader's own timeout plus a margin, so the board clears itself
+    /// at about the moment the layer would have lapsed anyway — and, more to the
+    /// point, if runnir is killed while the layer is armed.
+    fn paint_leader(&mut self, keymap: &Keymap, config: &Config) {
+        if !config.keyboard.leader_lights {
+            return;
+        }
+        let (Some(board), Some(layout)) = (&self.board, &self.board_layout) else { return };
+        let layer = board.status().map_or(0, |s| s.layer);
+        let keys = keymap.leader_level_keys(&self.leader_path);
+        let groups: std::collections::HashSet<&str> =
+            keys.iter().filter(|(_, g)| *g).map(|(s, _)| s.as_str()).collect();
+        let palette = config.theme.leader_palette();
+        let leds: Vec<(u8, crate::config::Rgb)> = layout
+            .leds_for(keys.iter().map(|(s, _)| s.as_str()), layer)
+            .into_iter()
+            .map(|(s, led)| (led, if groups.contains(s) { palette.group } else { palette.leaf }))
+            .collect();
+        // `leader_timeout` of 0 means the layer never lapses; the board still gets a
+        // bound, because a dead-man switch that never fires is not one.
+        let hold = self.leader_timeout.map_or(60_000, |d| d.as_millis() as u32 + 2_000);
+        board.paint(leds, palette.background, hold);
+    }
+
+    /// Hands the board back its own colours, if we ever took them.
+    fn unpaint_leader(&self, config: &Config) {
+        if !config.keyboard.leader_lights {
+            return;
+        }
+        if let Some(board) = &self.board {
+            board.restore();
+        }
+    }
+
     /// The command guardian: a bare Enter about to submit something destructive opens
     /// a confirmation instead. Returns whether it took the key.
     ///

@@ -385,11 +385,19 @@ pub struct Keyboard {
     /// How long a flash lasts. Also its own cleanup: the board restores itself when
     /// this elapses, so runnir dying mid-flash cannot leave it coloured.
     pub flash_ms: u32,
+    /// Light the leader layer on the keys: every key that does something at the
+    /// current level, groups and leaves in the which-key's own colours.
+    ///
+    /// Off by default because it needs SHINE-THROUGH keycaps to be worth anything.
+    /// With opaque caps the LED lights the gap around the cap rather than the legend,
+    /// so what reaches the eye is a glow in a region, not a key you can name — measured
+    /// on a Moonlander, see the DEVLOG for 2026-07-22.
+    pub leader_lights: bool,
 }
 
 impl Default for Keyboard {
     fn default() -> Self {
-        Self { ambient: false, flash_ms: 1200 }
+        Self { ambient: false, flash_ms: 1200, leader_lights: false }
     }
 }
 

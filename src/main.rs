@@ -794,6 +794,9 @@ struct Gpu {
     /// The ZSA keyboard, when there is one and the user asked for it. `None` covers
     /// both "no such keyboard" and "not enabled", which behave identically.
     board: Option<zsa::Board>,
+    /// The flashed layout, read once at startup: which LED sits under which key.
+    /// Only loaded when the leader lights are on, since nothing else needs it.
+    board_layout: Option<zsa::Layout>,
     proxy: EventLoopProxy<UserEvent>,
 }
 
@@ -1069,9 +1072,17 @@ impl App {
             status_expiry: None,
             // Started only when asked for: the worker spawns a thread and looks for
             // kontroll, and a terminal that does neither unless told to is the point.
-            board: self.config.keyboard.ambient.then(zsa::Board::start).flatten(),
+            board: (self.config.keyboard.ambient || self.config.keyboard.leader_lights)
+                .then(zsa::Board::start)
+                .flatten(),
+            board_layout: None,
             proxy: self.proxy.clone(),
         };
+        // The flashed layout, read once. Blocking (two processes: kontroll status and
+        // sqlite3), so it happens here at startup and never on a keystroke.
+        if self.config.keyboard.leader_lights {
+            gpu.load_board_layout();
+        }
         // Arm the image auto-preview watch at startup when the config asks for it and
         // names a directory. A snapshot of the directory is taken now, so files
         // already there never flood the pane — only new drops fire.
@@ -1709,6 +1720,19 @@ impl Gpu {
         if self.last_context_refresh.elapsed() >= Duration::from_millis(500) {
             self.last_context_refresh = Instant::now();
             let focused = self.window.has_focus();
+            // The keyboard belongs to the whole desktop: runnir holds it only while
+            // it has the window focus, and only while the layer is actually armed.
+            // The lapse case matters as much as the focus one — the layer times out
+            // without any key arriving to notice, and the board would sit lit.
+            if self.leader_armed.is_some()
+                && (!focused
+                    || self.leader_timeout.is_some_and(|d| {
+                        self.leader_armed.is_some_and(|t| t.elapsed() >= d)
+                    }))
+            {
+                self.end_leader(config);
+                self.window.request_redraw();
+            }
             // Collected rather than flashed inline: the panes are borrowed here, and
             // two signals in one sweep should be one flash, not a fight over the board.
             let mut flashes: Vec<config::Rgb> = Vec::new();
