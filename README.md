@@ -2,122 +2,200 @@
   <img src="assets/logo.png" alt="runnir" width="640">
 </p>
 
-# runnir
+<p align="center">
+  <b>A GPU terminal that swallowed the tools you keep opening next to it.</b>
+</p>
 
-A GPU-accelerated terminal emulator, written from scratch in Rust.
+<p align="center">
+  Written from scratch in Rust — wgpu + winit, own VT parser, own renderer, no terminal library underneath.
+</p>
 
-The name is coined from Old Norse **rún** — which meant *secret, whisper, counsel spoken low* long before it meant *carved letter* — and the suffix **-nir** of Mjölnir, Gungnir and Sleipnir. The rune-artifact. A terminal is where you whisper to the machine.
+---
 
-## Install
-
-One command builds runnir from source and installs it into `~/.local` — no sudo:
+Most terminals are a fast rectangle you run other people's TUIs inside. runnir bets the
+other way: when the renderer is yours, the git client, the file tree, the container
+dashboard and the image viewer can be **native panels** instead of processes fighting for
+the same 80×24. They share the theme, the keymap and the which-key layer, they draw at GPU
+speed, and they know things a TUI cannot — which pane is sitting at a prompt, which file
+the cursor is on, which host you are ssh'd into.
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/drheavymetal/Runnar/main/install.sh | sh
 ```
 
-(`wget -qO- https://raw.githubusercontent.com/drheavymetal/Runnar/main/install.sh | sh` works too.)
+No sudo, no package manager, nothing system-wide. It builds from source into `~/.local`,
+drops a `.desktop` entry so your launcher finds it, and leaves `runnir-update` and
+`runnir-uninstall` next to the binary. [Details below.](#install)
 
-This clones the repo into `~/.local/share/runnir/src`, runs `cargo build --release`,
-installs the binary to `~/.local/bin/runnir`, and drops two helper commands next to it.
-On Linux it also installs a `.desktop` entry and icon so runnir shows in your app
-launcher. On macOS the `.desktop` step is skipped (the binary still installs).
+## What makes it different
 
-**Update** to the latest commit (rebuilds, keeps your config):
-
-```sh
-runnir-update
-```
-
-**Uninstall** (removes the binary, helpers and desktop entry; keeps your config and
-cached source unless you pass `--purge`):
-
-```sh
-runnir-uninstall
-```
-
-### Requirements & overrides
-
-- **Rust toolchain.** runnir builds from source, so `cargo` must be available. If it
-  isn't, the installer points you at [rustup](https://rustup.rs) — and, when run
-  interactively, offers to install it for you (never silently). Piped installs stop
-  with instructions rather than installing a toolchain without consent.
-- **`PREFIX`** overrides the install prefix (default `$HOME/.local`); the binary lands
-  in `$PREFIX/bin/runnir`. Example: `PREFIX=/usr/local sh install.sh` for a system-wide
-  install (the only case where running as root is allowed).
-- **PATH.** If `~/.local/bin` isn't on your `PATH`, the installer tells you how to add it.
-  The default shell here is fish:
-
-  ```fish
-  fish_add_path ~/.local/bin
-  ```
-
-  For bash/zsh/sh: `export PATH="$HOME/.local/bin:$PATH"` in your shell rc.
-
-The same [`install.sh`](install.sh) drives all three flows — `install` (default when
-piped), `update`, and `uninstall` — so `sh install.sh --help` from a checkout shows
-every option.
-
-## The leader key
-
-Compositors win every modifier race — Hyprland and GNOME claim most of the Super
-layer, and a key they grab never reaches an application at all. So runnir keeps its
-own keyboard layer behind a leader key.
+### A leader layer that teaches itself
 
 <p align="center">
-  <img src="docs-site/public/img/leader.png" alt="the which-key panel with the leader layer armed" width="800">
+  <img src="docs-site/public/img/leader.png" alt="the which-key panel with the leader layer armed" width="820">
 </p>
 
-Press `Alt+Shift+Space` and let go. The status bar shows **LEADER** and a which-key
-panel lists what the next key does, so the layer teaches itself. The hot keys act at
-once (`1..9` tabs, `hjkl` pane focus, `HJKL` and the arrows resize); the rest open a
-group that takes one more key — `t` tabs, `p` panes, `c` clipboard, `f` find &
-scroll, `a` AI, `r` run & launch, `o` open, `s` session. Escape backs out, and
-modifiers you are still holding are ignored, so you can keep `Alt+Shift` down
-through the whole sequence.
+Compositors win every modifier race — Hyprland and GNOME claim most of the Super layer,
+and a key they grab never reaches an application at all. So runnir keeps its own layer
+behind a leader key. Press `Alt+Shift+Space` and let go: a which-key panel lists what the
+next key does, so you never memorise a table. The hot keys act at once (`1..9` tabs,
+`hjkl` focus); the rest open a group. Every panel below has its own leader, filtered by
+what the row under the cursor can actually do.
 
-The layer is a strict superset of the chords: everything on `Ctrl+Shift` still
-works, but plenty of actions — tab switching, cycle layout, copy mode, project
-sessions, quit — are reachable only from here or the command palette.
+On a programmable keyboard you can leave the modifier race entirely: `F13`–`F24` are real
+keycodes no desktop claims. Flash one onto a key, set `leader = "f13"`, done.
 
-`leader` sets the arming chord (`""` turns the layer off), `leader_timeout` the
-seconds it waits per step (`0` waits as long as you do), and a `leader+` prefix in
-`[keys]` binds your own sequences: `leader+r c` is the leader, then `r`, then `c`.
-Press `F1` inside runnir for the full reference.
+### A native git client, not lazygit in a pane
 
-## Status
+Status, log with a real graph, branches, stashes, blame, staging by individual lines, and
+an interactive rebase you plan inside the panel. It understands worktrees and submodules,
+and the tab bar carries a dirty marker per repository.
 
-Working: window, PTY, VT parser, GPU renderer, keyboard, scrollback, selection, fonts.
-`vim`, `htop` and `btop` run inside it correctly.
+### A native Docker panel
 
-| Milestone | |
-|---|---|
-| M0 — window + wgpu | done |
-| M1 — PTY + VT parser → grid | done |
-| M2 — glyph atlas + renderer | done |
-| M3 — keyboard, alternate screen, scroll region | done |
-| M4 — scrollback, selection, damage tracking | done |
-| M5 — fonts: bold/italic, CJK, colour emoji, wide chars, ligatures, box drawing | done |
-| M6 — layout tree (tabs + splits), keybindings, command palette | next |
-| M7 — sessions, AI integration, SSH awareness | planned |
+<p align="center">
+  <img src="docs-site/public/img/docker-panel.png" alt="the docker panel" width="820">
+</p>
 
-## Build
+Containers, images, volumes, networks, health, logs, `exec` into a shell — plus Docker
+Hub: which of your running tags have drifted from the registry, and a deploy that pulls
+and brings the stack back up. Remote hosts over ssh, with confirmations that name the
+host.
+
+### A file explorer that is chrome, not a modal
+
+<p align="center">
+  <img src="docs-site/public/img/file-explorer.png" alt="the file explorer sidebar" width="820">
+</p>
+
+A persistent tree beside the panes, with git badges per row, a viewer for text and real
+images, properties and permissions you can edit, and the operations that can lose work
+asking first. It stays visible while you work in the pane next to it.
+
+### Images that are actually images
+
+<p align="center">
+  <img src="docs-site/public/img/file-viewer.png" alt="an image in the file viewer" width="820">
+</p>
+
+The kitty graphics protocol with real GPU textures, plus half-block art as a fallback.
+Drop a file on the window and its path lands at the prompt; point a watch at a directory
+and new images preview themselves.
+
+### Rendering that sweats the details
+
+<p align="center">
+  <img src="docs-site/public/img/ligatures.png" alt="programming ligatures" width="405">
+  <img src="docs-site/public/img/boxdraw.png" alt="box drawing" width="405">
+</p>
+
+Programming ligatures, box-drawing glyphs drawn at cell size so every join is seamless,
+styled underlines (curly, dotted, dashed, double, coloured), CJK and colour emoji, an
+optional cursor trail, background images, and a scrollback minimap that draws coloured
+text runs rather than bars.
+
+### It can be driven from outside
 
 ```sh
-cargo run
+runnir @ action --id git_panel      # run any action by its config id
+runnir @ key --chord enter          # press a key, down the same path a real one takes
+runnir @ click --col 30 --row 6     # click a cell
+runnir @ wheel --col 4 --row 10     # turn the wheel there
 ```
 
-Needs a Vulkan/Metal/DX12-capable GPU and a monospace font. `JetBrainsMono Nerd Font Mono`
-is the default; override with `RUNNIR_FONT`.
+`send-text` talks to the child process; these talk to **runnir itself**, so they reach the
+overlays and the leader layer. Every reply carries the UI state as JSON, which is how the
+panels are tested — no screenshots required.
+
+### Your keyboard, if it is a ZSA
+
+On a Moonlander or Voyager, runnir drives the lights through Keymapp's local API: the
+leader layer lit on the keys themselves, and whole-board colour when a watched word
+appears, a long command finishes, or the guardian asks whether you meant to run that.
+Both off by default. [More below.](#the-zsa-keyboard)
+
+### And the small things that add up
+
+Shell integration over OSC 133/7 (jump between commands, a status gutter, a sticky prompt,
+splits that inherit the cwd), copy mode, clipboard history, mouse-free hints on paths and
+URLs and hashes, broadcast input to a group of panes, per-project sessions, saved layouts,
+snippets, a command palette, a theme picker with live preview, a now-playing overlay with
+album art, an AI panel that explains a failure or writes the command you describe, and a
+guardian that stops `rm -rf /` before Enter reaches the shell.
+
+## Install
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/drheavymetal/Runnar/main/install.sh | sh
+```
+
+(`wget -qO- https://raw.githubusercontent.com/drheavymetal/Runnar/main/install.sh | sh`
+works too.)
+
+It clones into `~/.local/share/runnir/src`, runs `cargo build --release`, installs the
+binary to `~/.local/bin/runnir`, and drops two helpers beside it. On Linux it also
+installs a `.desktop` entry and icon; on macOS that step is skipped.
+
+```sh
+runnir-update      # fetch, rebuild, reinstall — keeps your config
+runnir-uninstall   # remove binary, helpers, desktop entry — keeps config and source
+```
+
+**Requirements.** `git`, and a Rust toolchain, since runnir builds from source. If `cargo`
+is missing the installer points you at [rustup](https://rustup.rs) and, run interactively,
+offers to install it — never silently; piped installs stop with instructions rather than
+installing a toolchain without consent. Plus a Vulkan/Metal/DX12 GPU and a monospace font
+(`JetBrainsMono Nerd Font Mono` by default, override with `RUNNIR_FONT`).
+
+**Overrides.** `PREFIX` sets the install prefix (default `$HOME/.local`); the binary lands
+in `$PREFIX/bin/runnir`. `PREFIX=/usr/local sh install.sh` is the one case where running as
+root is allowed. If `~/.local/bin` is not on your `PATH`, the installer tells you how to
+add it.
+
+The same [`install.sh`](install.sh) drives all three flows, so `sh install.sh --help` from
+a checkout shows every option.
+
+## Configuration
+
+`~/.config/runnir/runnir.toml` — every value has a default that stands on its own, so an
+absent or partial file is normal. A malformed file is reported and then ignored: a typo in
+a colour must never cost you your terminal. There is also a settings panel inside the
+terminal (`Ctrl+Shift+,`) that writes JSON; both hot-reload.
+
+Press `F1` inside runnir for the full manual. It lives in the binary, so it can never fall
+out of step with the build you are running.
+
+## The ZSA keyboard
+
+On a ZSA board (Moonlander, Voyager), runnir can drive the lights through
+[Keymapp](https://www.zsa.io/flash)'s local API — no custom firmware, and nothing at all
+unless you ask for it.
+
+- **`keyboard.leader_lights`** lights the leader layer ON THE KEYS: arming lights exactly
+  the keys that do something at that level, in the which-key panel's own colours, and
+  descending into a group repaints. Leaving the layer gives the board its colours back.
+- **`keyboard.ambient`** flashes the whole board where a desktop notification already
+  fires: amber for a watched word, green when a long command finishes, red when the
+  guardian asks.
+
+Both are off by default and need Keymapp running with its API enabled (it ships disabled)
+plus `cargo install kontroll`. With Keymapp absent the feature simply does not exist — no
+error at startup, none per keystroke. `RUNNIR_ZSA_DEBUG=1` says which step gave up.
+
+**The lit layer needs shine-through keycaps to be worth having.** With opaque caps the LED
+lights the gap around the cap rather than the legend, so what reaches the eye is a glow in
+a region and not a key you can name — measured on a Moonlander with 33 keys lit, with 8,
+and with those 8 in white at maximum brightness. The ambient flashes do not have that
+problem: they ask you to identify no key at all.
 
 ## Design notes
 
-**One draw call.** The whole screen is drawn as one instanced quad — one instance per
-cell, carrying its glyph, colours and attributes. The fragment shader places the glyph
-inside the cell and samples a single atlas.
+**One draw call.** The whole screen is one instanced quad — one instance per cell, carrying
+its glyph, colours and attributes. The fragment shader places the glyph inside the cell and
+samples a single atlas.
 
-**The renderer draws into a rect, not "the window".** Panes are just different rects into
-the same surface, so splits cost almost nothing to add.
+**The renderer draws into a rect, not "the window".** Panes are different rects into the
+same surface, so splits cost almost nothing to add.
 
 **Box-drawing characters are drawn, not rasterized from the font.** A font's strokes are
 sized for the font's metrics, not the terminal's cell, so they leave gaps exactly where a
@@ -125,34 +203,53 @@ box needs to join. Drawing them at cell size makes every join seamless. kitty an
 do the same, for the same reason.
 
 **Ligatures work the way monospace faces actually implement them:** the leading characters
-map to *blank* glyphs and the last one to the full ligature carrying a large negative left
+map to *blank* glyphs and the last one carries the full ligature with a large negative left
 bearing, so it reaches back over them and the advance grid stays intact. Detecting them
-means looking for blank glyphs followed by a real one — not for a cluster covering several
+means looking for blank glyphs followed by a real one — not for a cluster spanning several
 characters, which never happens.
 
 **Nothing enters the scrollback except full-screen scrolls of the primary screen.** A
-region scroll or anything on the alternate screen is not history; a minute of `htop` would
-otherwise evict everything worth keeping.
+region scroll, or anything on the alternate screen, is not history; a minute of `htop`
+would otherwise evict everything worth keeping.
 
 **Idle costs nothing.** `ControlFlow::Wait`, plus a cached instance buffer rebuilt only
 when the grid actually changes.
 
-## Verification
+## Status
 
-Two headless modes, deliberately separate so a parser bug can never masquerade as a GPU bug:
+A daily driver on Linux/Wayland (Hyprland). `vim`, `htop`, `btop` and full-screen TUIs
+behave; 441 tests, no warnings. macOS builds and runs but gets far less use, and the
+`/proc`-based niceties (pane cwd, foreground process detection) fall back to the shell's
+own reports there. Windows is not supported.
+
+Version numbers are not meaningful yet: `main` is what is used every day, and the DEVLOG
+in `docs/DEVLOG.md` is the honest history — including the features that were measured and
+then abandoned.
+
+## Building and verifying
 
 ```sh
-runnir --dump   '<cmd>'                  # run cmd on a real PTY, print the grid as text
+cargo run                                # debug
+cargo build --release
+cargo test
+```
+
+Two headless modes, deliberately separate so a parser bug can never masquerade as a GPU
+bug:
+
+```sh
+runnir --dump '<cmd>'                    # run cmd on a real PTY, print the grid as text
 runnir --render out.png '<cmd>' [ms]     # render the grid to a PNG, no window involved
+runnir --demo out.png [scene]            # render a scene: a leader level, the git panel…
 ```
 
 The delay matters for full-screen apps: without it the capture waits for the child to
 exit, by which point it has already left the alternate screen.
 
-```sh
-cargo test
-```
-
 ## Licence
 
-MIT
+MIT.
+
+The name is coined from Old Norse **rún** — *secret, whisper, counsel spoken low*, long
+before it meant *carved letter* — and the **-nir** of Mjölnir, Gungnir and Sleipnir. The
+rune-artifact. A terminal is where you whisper to the machine.

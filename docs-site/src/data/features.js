@@ -230,8 +230,26 @@ export const FEATURES = [
     config: [
       { k: 'leader', v: '"alt+shift+space"', d: { es: 'Acorde que arma la capa; "" la desactiva entera', en: 'Chord that arms the layer; "" turns it off entirely' } },
       { k: 'leader_timeout', v: '10', d: { es: 'Segundos de espera por paso; 0 = espera lo que haga falta', en: 'Seconds it waits per step; 0 = waits as long as you do' } },
+      { k: 'leader', v: '"f13"', d: { es: 'Un teclado programable puede emitir F13-F24, teclas que ningun escritorio reclama: un leader sin modificadores que ningun compositor puede robar', en: 'A programmable keyboard can emit F13-F24, keys no desktop claims: a leader with no modifiers for a compositor to steal' } },
     ],
     note: { es: 'En [keys], el prefijo leader+ ata tus acciones a la capa y el espacio separa los pasos: "leader+r c". Ojo: atar leader+t sustituye el grupo Pestañas entero por esa acción.', en: 'In [keys], a leader+ prefix binds your actions on the layer and a space separates the steps: "leader+r c". Careful: binding leader+t replaces the whole Tabs group with that action.' },
+  },
+  {
+    key: 'zsa-keyboard', section: 'input', status: 'shipped',
+    title: { es: 'Teclado ZSA: luces y avisos', en: 'ZSA keyboard: lights and signals' },
+    natural: {
+      es: 'Si usas un teclado ZSA (Moonlander, Voyager), runnir puede conducir sus luces a traves de la API local de Keymapp, sin firmware a medida. Dos cosas distintas. La capa leader iluminada: al armarla se encienden exactamente las teclas que hacen algo en ese nivel, con los colores del panel which-key (grupos en un color, acciones en otro), y al bajar a un grupo se repinta; al salir de la capa la placa vuelve a sus colores. Y los avisos de estado: la placa entera cambia de color donde ya saldria una notificacion del escritorio — ambar cuando aparece una palabra vigilada, verde cuando termina un comando largo, rojo cuando el guardian pregunta si de verdad quieres ejecutar algo. Ambas cosas vienen apagadas. Si Keymapp no esta corriendo, la funcion sencillamente no existe: ni un error al arrancar.',
+      en: 'On a ZSA keyboard (Moonlander, Voyager), runnir can drive its lights through Keymapp’s local API, with no custom firmware. Two separate things. The lit leader layer: arming it lights exactly the keys that do something at that level, in the which-key panel’s own colours (groups one colour, actions another), and descending into a group repaints; leaving the layer gives the board its colours back. And ambient signals: the whole board changes colour where a desktop notification would already fire — amber for a watched word, green when a long command finishes, red when the guardian asks whether you really meant to run that. Both are off by default. With Keymapp not running the feature simply does not exist: not even an error at startup.',
+    },
+    config: [
+      { k: 'keyboard.ambient', v: 'false', d: { es: 'Destellos de la placa entera para los avisos', en: 'Whole-board flashes for the signals' } },
+      { k: 'keyboard.flash_ms', v: '1200', d: { es: 'Cuanto dura un destello; tambien es su propia limpieza', en: 'How long a flash lasts; also its own cleanup' } },
+      { k: 'keyboard.leader_lights', v: 'false', d: { es: 'Iluminar la capa leader en las teclas', en: 'Light the leader layer on the keys' } },
+    ],
+    note: {
+      es: 'La capa iluminada necesita keycaps con leyenda translucida para valer de algo: con keycaps opacos el LED ilumina el contorno de la tecla y no la letra, asi que se ve la zona pero no que tecla es (medido sobre un Moonlander, con 33 teclas, con 8, y con esas 8 a brillo maximo). Los avisos de estado no tienen ese problema, porque no piden identificar ninguna tecla. Requiere Keymapp con su API activada (viene apagada) y kontroll instalado: cargo install kontroll. RUNNIR_ZSA_DEBUG=1 dice en que paso se rinde.',
+      en: 'The lit layer needs shine-through keycaps to be worth anything: with opaque caps the LED lights the gap around the cap rather than the legend, so you see a region and not which key it is (measured on a Moonlander with 33 keys, with 8, and with those 8 at maximum brightness). The ambient signals do not have that problem, since they ask you to identify no key at all. Needs Keymapp with its API enabled (it ships disabled) and kontroll installed: cargo install kontroll. RUNNIR_ZSA_DEBUG=1 says which step gave up.',
+    },
   },
   {
     key: 'keyboard-first', section: 'input', status: 'shipped',
