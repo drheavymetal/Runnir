@@ -1785,6 +1785,50 @@ background lifted off the terminal's. Screenshot taken of the WINDOW, not the ou
 an output capture of a 3440px monitor caught a private chat window, which is a good
 reason never to crop a full-screen shot when a window shot exists.
 
+## 2026-07-22 - ZSA step 2: which LED is under which key, with no keyboard attached
+
+`src/zsa.rs`: read Keymapp's layout, answer "the `g` key is LED 19". Pure lookup plus
+one file read, so all of it is testable with nothing plugged in — which is the point,
+because step 3 is the part that cannot be.
+
+`sqlite3` is invoked as a process rather than linking a SQLite crate. One read of one
+blob does not justify a C dependency in a terminal, and runnir already treats external
+tools this way (git, docker, kontroll). No `sqlite3` on PATH means no keyboard
+integration, silently, like every other missing tool.
+
+The revision id goes into a SQL statement, so it is whitelisted to alphanumerics
+before the query is built — Keymapp's ids are short alphanumerics, and anything else
+is either a bug or an attack. A test covers `Jad5YO' or '1'='1`.
+
+**Three things the real layout taught, none of which reading code would have:**
+
+- **QMK renames punctuation per locale.** This Spanish board carries `ES_MINS` and
+  `ES_PLUS` where a US one has `KC_MINUS` and no plus key at all. Enumerating locales
+  never ends, so a key matches its exact code first, then any `XX_<FAMILY>` — `MINS`
+  belongs to the `MINUS` family. `plus` prefers a real `+` and falls back to the `=`
+  it is shifted from on a US board. `=` on this layout lights nothing, correctly:
+  there is no unshifted `=` key.
+- **`h` and `shift+h` are ONE key** and there is one light under it. `leader_level_keys`
+  returns one entry per physical key, and a key carrying both a group and a leaf counts
+  as a group — the light promising a level that is not there is the worse mistake.
+- **A layer is mostly transparent** (55 of 72 on one of these). Resolving a code walks
+  down towards layer 0, which is how QMK reads it and the only reading available from
+  the single layer number `GetStatus` reports.
+
+`runnir --zsa-map <revision> [layer]` prints the whole top level as a table. It exists
+because the one question no amount of reading answers is "is LED 19 really the `g` key
+on THIS board", and it answers it without touching the keyboard. Against the real
+layout: 33 keys light, 1 does not, and `g`/`d`/`e` come back 19/17/10 — the same
+numbers measured by hand yesterday by lighting keys one at a time.
+
+That comparison is also an `#[ignore]`d test: it reads Keymapp's file on this machine,
+so it tests the desk rather than the code, but it is the only thing that catches the
+parser drifting away from the board. `cargo test -- --ignored zsa`.
+
+Two bugs of my own, caught before they shipped: `Box::leak` for the letter codes
+leaked a string per lookup (unbounded over a session — repaints are per keystroke),
+and the `plus` test encoded the US assumption that `+` is always shift on `=`.
+
 ## DESIGN, NOT YET BUILT — the leader layer, lit on the keys (ZSA Moonlander)
 
 Decided 2026-07-22 with the keyboard on the desk and the API answering. Nothing built.

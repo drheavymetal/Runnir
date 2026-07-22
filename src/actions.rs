@@ -541,6 +541,17 @@ impl Chord {
 
     /// Short label for the which-key panel: just the key, no modifiers, because
     /// everything on the leader layer is already unmodified.
+    /// The key as the CONFIG spells it (`g`, `escape`, `equal`), with modifiers
+    /// dropped. `label()` is for reading — it turns `left` into an arrow and
+    /// uppercases a shifted key — and neither is what a lookup wants: `shift+h` is
+    /// pressed on the same physical key as `h`.
+    pub fn key_spelling(&self) -> String {
+        match &self.key {
+            ChordKey::Char(c) => c.to_string(),
+            ChordKey::Named(n) => n.to_string(),
+        }
+    }
+
     pub fn label(&self) -> String {
         let base = match &self.key {
             ChordKey::Char(c) => c.to_string(),
@@ -740,6 +751,33 @@ impl Keymap {
         let mut out: Vec<_> = level.iter().collect();
         out.sort_by_key(|(c, _)| c.sort_key());
         out.iter().map(|(c, n)| (c.label(), n.title().to_string(), n.is_group())).collect()
+    }
+
+    /// The same level as `leader_entries`, but keyed by the config's spelling and
+    /// carrying whether the key opens a group — what a keyboard needs to colour them.
+    ///
+    /// One entry per PHYSICAL key: `h` and `shift+h` are two bindings on one key, and
+    /// there is one light under it. A key carrying both a group and a leaf counts as a
+    /// group, because that is the promise that costs more to get wrong — the light
+    /// says "there is another level here", and a leaf that turns out to open one is a
+    /// smaller surprise than the reverse.
+    pub fn leader_level_keys(&self, path: &[Chord]) -> Vec<(String, bool)> {
+        let level = match self.resolve_leader(path) {
+            _ if path.is_empty() => &self.leader_bindings,
+            Some(LeaderNode::Group { keys, .. }) => keys,
+            _ => return Vec::new(),
+        };
+        let mut out: Vec<_> = level.iter().collect();
+        out.sort_by_key(|(c, _)| c.sort_key());
+        let mut keys: Vec<(String, bool)> = Vec::new();
+        for (chord, node) in out {
+            let spelling = chord.key_spelling();
+            match keys.iter_mut().find(|(s, _)| *s == spelling) {
+                Some((_, is_group)) => *is_group |= node.is_group(),
+                None => keys.push((spelling, node.is_group())),
+            }
+        }
+        keys
     }
 }
 
@@ -1515,6 +1553,29 @@ mod tests {
         assert!(root.iter().any(|(k, _, group)| k == "l" && !*group));
         // A level that is an action, not a group, has nothing to list.
         assert!(map.leader_entries(&[Chord::parse("v").unwrap()]).is_empty());
+    }
+
+    /// What a keyboard gets, as opposed to what the panel gets: one entry per PHYSICAL
+    /// key. There is one light under `h`, and the root binds both `h` (focus) and
+    /// `shift+h` (resize) on it.
+    #[test]
+    fn the_keyboards_view_of_a_level_has_one_entry_per_key() {
+        let map = Keymap::new(&HashMap::new(), DEFAULT_LEADER);
+        let keys = map.leader_level_keys(&[]);
+
+        let hs: Vec<_> = keys.iter().filter(|(s, _)| s == "h").collect();
+        assert_eq!(hs.len(), 1, "h and shift+h are one key: {keys:?}");
+        // Spellings, not labels: the panel shows "←" and "H", a lookup needs "left".
+        assert!(keys.iter().any(|(s, _)| s == "left"), "named keys keep their spelling");
+        assert!(keys.iter().any(|(s, g)| s == "t" && *g), "groups are still flagged");
+        assert!(keys.iter().any(|(s, g)| s == "g" && !*g));
+
+        // A key with both a group and an action on it counts as a group: the light has
+        // to promise the level that is there.
+        let mut user = HashMap::new();
+        user.insert("leader+g x".to_string(), "new_tab".to_string());
+        let mixed = Keymap::new(&user, DEFAULT_LEADER);
+        assert!(mixed.leader_level_keys(&[]).iter().any(|(s, g)| s == "g" && *g));
     }
 
     #[test]

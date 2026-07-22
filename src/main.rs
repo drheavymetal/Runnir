@@ -33,6 +33,7 @@ mod tab;
 mod themes;
 mod watch;
 mod whisper;
+mod zsa;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -139,6 +140,23 @@ fn main() {
                 Err(e) => eprintln!("runnir: could not write config: {e}"),
             }
             return;
+        }
+        // `runnir --zsa-map <revision> [layer]` — what the ZSA keyboard would light
+        // for the leader's top level, as a table. Answers the only question that
+        // cannot be checked by reading code ("is LED 19 really the g key on THIS
+        // board?") without touching the keyboard, and it is how the layout reader was
+        // verified against a board measured by hand.
+        Some("--zsa-map") => {
+            let Some(revision) = args.get(2) else {
+                eprintln!(
+                    "usage: runnir --zsa-map <revision> [layer]\n  \
+                     revision: the half after the slash in the firmware version\n  \
+                     (kontroll status -> 'Firmware version: L4g4A/Jad5YO' -> Jad5YO)"
+                );
+                return;
+            };
+            let layer: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(0);
+            return zsa_map(revision, layer);
         }
         Some("--version" | "-v") => return println!("runnir {}", env!("CARGO_PKG_VERSION")),
         Some("--help" | "-h") => return print_help(),
@@ -349,6 +367,44 @@ fn git_scene(path_out: &str, state: &str) {
             .collect();
         (panes, Some(specs))
     });
+}
+
+/// Prints which LED each key of the leader's top level sits under, for `revision`
+/// of the flashed layout with `layer` active. Read-only, and it never touches the
+/// keyboard: the layout comes out of Keymapp's database.
+fn zsa_map(revision: &str, layer: usize) {
+    let Some(db) = zsa::default_db() else {
+        return eprintln!("runnir: no config directory to find keymapp's database in");
+    };
+    let Some(layout) = zsa::read_layout(&db, revision) else {
+        return eprintln!(
+            "runnir: could not read revision {revision} from {}\n  \
+             (is keymapp installed, and is sqlite3 on PATH?)",
+            db.display()
+        );
+    };
+    let keymap = actions::Keymap::new(&std::collections::HashMap::new(), &Config::default().leader);
+    let keys = keymap.leader_level_keys(&[]);
+    let spellings: Vec<&str> = keys.iter().map(|(s, _)| s.as_str()).collect();
+    let leds: std::collections::HashMap<&str, u8> =
+        layout.leds_for(spellings, layer).into_iter().collect();
+
+    println!("revision {revision}, layer {layer}, {} layers in the layout", layout.layers());
+    let (mut lit, mut dark) = (0, 0);
+    for (spelling, is_group) in &keys {
+        let kind = if *is_group { "group" } else { "leaf " };
+        match leds.get(spelling.as_str()) {
+            Some(led) => {
+                lit += 1;
+                println!("  {spelling:<9} {kind} LED {led}");
+            }
+            None => {
+                dark += 1;
+                println!("  {spelling:<9} {kind} -- not on this board");
+            }
+        }
+    }
+    println!("{lit} keys would light, {dark} have no key on this layout");
 }
 
 /// Renders the leader layer as the app draws it: a working terminal, the LEADER
