@@ -1757,8 +1757,122 @@ evince 1:48.4-1 on this machine RUNS without ever mapping a window — reproduci
 straight from a shell, with nothing of runnir involved. Pedro's fix is a different
 handler (`xdg-mime default <app>.desktop application/pdf`), not a code change here.
 
+## DESIGN, NOT YET BUILT — the leader layer, lit on the keys (ZSA Moonlander)
+
+Decided 2026-07-22 with the keyboard on the desk and the API answering. Nothing built.
+Background and the alternatives that were NOT chosen: the qlaios wiki page *runnir —
+Integración con el teclado Moonlander MK1 (ZSA) vía la API de Keymapp*.
+
+**What it is**: while the leader layer is armed, the keyboard lights exactly the keys
+that do something at that level — group keys in one colour, leaves in another, every
+other key dark. Descending into a group repaints. Disarming puts the board back.
+
+It is worth building because runnir's which-key is not a fixed list: it is a tree, it
+is contextual (the git panel, the Docker panel and the explorer each have their own),
+and it filters by what the row under the cursor can actually do. A keyboard that
+mirrors that stops being a memorised map and starts saying what is pressable NOW.
+
+### The two halves of the map, both solved
+
+Measured on the real board, not deduced (the `.proto` documents no LED indices):
+
+| Zone | Left | Right |
+|---|---|---|
+| Row 1 (7 keys) | 0–6 | 36–42 |
+| Row 2 (7) | 7–13 | 43–49 |
+| Row 3 (7) | 14–20 | 50–56 |
+| Row 4 (**6**) | 21–26 | 57–62 |
+| Row 5 (**5**) | 27–31 | 63–67 |
+| Thumb (**4**) | 32–35 | 68–71 |
+
+Each half is numbered on its own (0–35, 36–71) and runs left-to-right in PHYSICAL
+space, so LED 0 is the outer top-left key but LED 36 is the INNER top-right one, next
+to the gap. Rows 4 and 5 are 6 and 5 keys, not 7.
+
+The half that looked hard turned out to be free: **the LED index IS the key index in
+the Oryx layout**. `keys[19]` is `KC_G` and LED 19 is the `g` key. No hand-kept table,
+and nothing to drift when the layout is reflashed.
+
+### Where the layout comes from: keymapp's own database
+
+`~/.config/.keymapp/keymapp.sqlite3`, table `revision`, one JSON blob per revision:
+`layout.revision.layers[n].keys[i].tap.code` (`KC_G`, `KC_ESCAPE`, …), 72 keys per
+layer, 5 layers here.
+
+**Read-only, always.** It is another application's database and runnir has no business
+writing to it. Chosen over "point at an Oryx export in the config" because it needs no
+setup and cannot go stale — with the explicit acceptance that keymapp may change the
+schema, which is why the whole feature has to survive not finding what it expects.
+
+Pick the revision the firmware actually reports: `GetStatus` answers `L4g4A/Jad5YO`,
+and the part after the slash is the `revisionId`. Guessing "the newest row" would
+light the keys of a layout that is not on the board.
+
+`GetStatus` also gives the active layer, and the same physical key emits different
+codes per layer — layer 0 here has all 36 letters, layer 3 has 12 and the rest
+transparent. A code of `KC_TRANSPARENT` has to fall through to the layer below, the
+way QMK resolves it.
+
+### Colours: one palette, two surfaces
+
+The which-key colours are hardcoded in `app_draw.rs` today (leaf `#f5d543`, group
+`#6bb1ff`, dim `#8a8d94`). Lifting them into the theme is a PREREQUISITE, not a
+follow-up: the panel and the keyboard drawing the same tree in different colours is
+worse than not lighting the keyboard at all. One palette, read by both.
+
+### Putting the board back — the part that decides whether this ships
+
+Pedro had to unplug and replug the keyboard during this session because a demo painted
+it and never restored it. That is the whole feature's reputation in one keystroke: a
+terminal that leaves the board wrong is a terminal whose keyboard integration gets
+turned off and never turned on again.
+
+Belt AND braces, both always:
+- **Explicit `RestoreRGBLeds`** on disarm, on window focus loss, and on exit. Verified
+  to work: it puts back the layout's own colours, which is what "how it was before the
+  terminal was even open" means.
+- **`sustain` on every single paint**, set to `leader_timeout`. It is a dead-man
+  switch: `kill -9` on runnir, a panic, an X crash — the board still clears itself.
+  Nothing else in runnir can offer that, and it costs one field per call.
+
+### Failure modes, all seen for real in one session
+
+- **No socket** (keymapp not running, or its API left at the factory default
+  `api_enabled=0`): the feature does not exist. No error at startup, no error per
+  keystroke. Same rule as docker and the credential helper.
+- **Keymapp exits on its own.** It did, mid-session. Every call has to tolerate the
+  socket vanishing between one paint and the next.
+- **`no keyboard is connected`** after an unplug/replug: keymapp does NOT reconnect by
+  itself. Try `ConnectAnyKeyboard` once, then stand down until the next arm.
+- **`keyboard requires an updated firmware`** immediately after connecting, with the
+  very next call succeeding. Transient. Retry once before believing it.
+
+### Shape of the code
+
+- `kontroll` in a worker thread, never on the UI thread — same pattern as `docker
+  compose` and `docker-credential-*`. **No gRPC dependency in runnir.**
+- Measured: **4 ms per `kontroll` call**. A leader level is ~15 keys → 60 ms; all 72
+  → 290 ms. That is what makes a process-per-LED acceptable, and it is also why paints
+  happen only on state transitions (arm, descend, disarm) and are coalesced — never
+  per keystroke.
+- runnir owns the board only while it has focus. The keyboard belongs to the whole
+  desktop.
+
+### Order of work
+
+1. The palette out of `app_draw.rs` and into the theme (panel keeps working, no
+   keyboard involved yet).
+2. Read-only layout resolution: sqlite → active revision → active layer → char to LED,
+   with the transparent fall-through. Testable with no keyboard attached.
+3. The worker: connect, paint, restore, and every failure mode above.
+4. Wire it to arm/descend/disarm, with `sustain` from the first paint.
+
 ## Gotchas (do not re-learn)
 
+- The board must be put back even if runnir DIES. `sustain` (ms) on every ZSA paint is
+  the only thing that survives `kill -9`; an explicit restore on exit is not enough.
+- Keymapp's API ships DISABLED (`api_enabled=0` in its sqlite) and its socket on Linux
+  is `~/.config/.keymapp/keymapp.sock` — the port 50051 in its own UI is Windows-only.
 - A wheel handler that knows about overlays and panes forgets the CHROME. The
   sidebar is neither, and falling through means scrolling a pane the pointer is not
   over. Any new surface needs a wheel arm, and `_ => {}` is how it gets missed.
