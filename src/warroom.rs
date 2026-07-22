@@ -133,6 +133,34 @@ pub fn watch_commands(plan: &Plan, max_services: usize) -> Vec<(String, String)>
     out
 }
 
+/// What taking a room down means for the tab it lives in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Teardown {
+    /// Nothing here is an untouched room pane; leave the tab alone.
+    Nothing,
+    /// Close those panes; the rest of the tab is somebody's work.
+    Panes,
+    /// Every pane is the room's, so the TAB is what goes.
+    WholeTab,
+}
+
+/// Decides which of the three it is.
+///
+/// The last case is the one that needs saying: a tab cannot be emptied — closing its
+/// final pane is refused, because a tab with no pane is not a thing — so a room
+/// nobody typed in cannot be taken apart pane by pane. One would always survive,
+/// still polling docker every two seconds, in a tab nobody asked for, while the
+/// message claimed the room was closed.
+pub fn teardown(panes_in_tab: usize, untouched_room_panes: usize) -> Teardown {
+    if untouched_room_panes == 0 {
+        Teardown::Nothing
+    } else if untouched_room_panes >= panes_in_tab {
+        Teardown::WholeTab
+    } else {
+        Teardown::Panes
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -215,6 +243,18 @@ volumes:
                 assert!(!cmd.contains(danger), "{cmd} does more than watch");
             }
         }
+    }
+
+    /// A room nobody typed in leaves nothing behind. Closing its panes one by one
+    /// cannot do that — the last one in a tab is not closeable — so a pane would
+    /// survive its own room, still polling docker every two seconds.
+    #[test]
+    fn a_room_nobody_typed_in_leaves_no_pane_behind() {
+        assert_eq!(teardown(5, 5), Teardown::WholeTab, "all five are the room's");
+        assert_eq!(teardown(1, 1), Teardown::WholeTab, "a one-pane room is still a room");
+        // Somebody worked in two of them: those two, and the tab, stay.
+        assert_eq!(teardown(5, 3), Teardown::Panes);
+        assert_eq!(teardown(5, 0), Teardown::Nothing, "nothing here belongs to a room");
     }
 
     /// A compose file is text somebody else wrote, and opening a war room asks the

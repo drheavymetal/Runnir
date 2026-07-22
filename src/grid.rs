@@ -1080,18 +1080,24 @@ impl Grid {
         self.dirty = true;
     }
 
-    /// Text of the rows in `[from, to]` absolute range, trailing blanks trimmed.
     /// The last line with anything on it, for panes with no shell integration: the
     /// catch-up shows it verbatim rather than inventing a status it cannot know.
+    ///
+    /// Searched from the bottom of `scrollback ++ screen` upwards, because that is
+    /// the space rows are numbered in. Counting the first `rows()` of them instead
+    /// reads the OLDEST history a pane holds, so a pane past its first screenful gets
+    /// a headline quoting the first line it ever printed — and a wrong headline is
+    /// worse than none.
     pub fn last_nonblank_line(&self) -> Option<String> {
-        let last = self.rows().saturating_sub(1);
-        (0..=last).rev().find_map(|row| {
-            let text = self.text_range((row, 0), (row, self.cols.saturating_sub(1)));
+        let last = self.total_rows().saturating_sub(1);
+        (0..=last).rev().find_map(|abs| {
+            let text = self.text_range((abs, 0), (abs, self.cols.saturating_sub(1)));
             let trimmed = text.trim();
             (!trimmed.is_empty()).then(|| trimmed.to_string())
         })
     }
 
+    /// Text of the rows in `[from, to]` absolute range, trailing blanks trimmed.
     pub fn text_range(&self, from: (usize, usize), to: (usize, usize)) -> String {
         let (from, to) = if from <= to { (from, to) } else { (to, from) };
         let mut out = String::new();
@@ -2600,6 +2606,26 @@ mod tests {
         let text = g.scrollback_text();
         assert!(text.contains(&"three".to_string()), "visible rows must be saved: {text:?}");
         assert!(text.contains(&"one".to_string()));
+    }
+
+    /// The catch-up quotes this line for panes with no shell integration, and rows
+    /// are numbered across history AND screen. Counting only the first screenful of
+    /// that space answers with the oldest line the pane ever printed, presented as
+    /// what it is doing now.
+    #[test]
+    fn the_last_line_is_the_newest_one_not_the_oldest_in_history() {
+        let mut g = Grid::new(20, 3);
+        feed(&mut g, "the first line ever\r\n");
+        for i in 0..8 {
+            feed(&mut g, &format!("line {i}\r\n"));
+        }
+        assert!(g.total_rows() > g.rows(), "this pane is past its first screenful");
+        assert_eq!(g.last_nonblank_line().as_deref(), Some("line 7"));
+
+        // A blank screen is not "nothing to say" either: the search carries on into
+        // history and answers with the newest line still there.
+        feed(&mut g, "\x1b[2J");
+        assert_eq!(g.last_nonblank_line().as_deref(), Some("line 5"));
     }
 
     #[test]

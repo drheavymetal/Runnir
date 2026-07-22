@@ -149,6 +149,36 @@ fn truncate(s: &str, max: usize) -> String {
     format!("{cut}…")
 }
 
+/// When the "what did I miss" baseline is taken.
+///
+/// Everything the catch-up can ever report is measured from a mark on each pane's
+/// command counter, so WHERE that mark sits decides what is reportable at all. Taking
+/// it when the absence is finally noticed — after a minute of silence — quietly
+/// swallows that minute: a deploy that failed thirty seconds after the user stood up
+/// is folded into the baseline and can never be a headline, which is precisely the
+/// case the feature exists for.
+///
+/// So the mark belongs at the last KEYSTROKE, the moment the user was demonstrably
+/// still there. This flag is what puts it there: a key arms it, and the next sweep
+/// over the panes takes the mark.
+#[derive(Debug, Default)]
+pub struct Baseline {
+    armed: bool,
+}
+
+impl Baseline {
+    /// A key reached a child: the user is here, and this is the new "before".
+    pub fn key_reached_a_child(&mut self) {
+        self.armed = true;
+    }
+
+    /// Whether this sweep owes the panes a mark. Consumes the arming, so a stretch of
+    /// typing costs one pass over the panes rather than one per sweep for ever.
+    pub fn take_due(&mut self) -> bool {
+        std::mem::take(&mut self.armed)
+    }
+}
+
 /// Every pane's headline, most urgent first.
 ///
 /// Ties break by pane id so the list is stable: a catch-up whose lines reorder
@@ -252,6 +282,27 @@ mod tests {
         let b = snap(2);
         let order: Vec<u64> = catch_up(&[a, b]).iter().map(|h| h.pane).collect();
         assert_eq!(order, vec![2, 7]);
+    }
+
+    /// The baseline belongs at the last keystroke. Taken a minute later, when the
+    /// silence finally reads as absence, it has already absorbed the thirty-second
+    /// deploy that failed just after the user stood up — the one headline the whole
+    /// catch-up exists to print.
+    #[test]
+    fn the_baseline_is_taken_at_the_last_keystroke_not_when_the_absence_is_noticed() {
+        let mut baseline = Baseline::default();
+        assert!(!baseline.take_due(), "nothing to mark before anyone has typed");
+
+        baseline.key_reached_a_child();
+        assert!(baseline.take_due(), "the mark follows the key, not a timer");
+        assert!(!baseline.take_due(), "and it is taken once, not again on every sweep");
+
+        // Typing again moves the baseline forward: whatever ran while the user was at
+        // the keyboard is not something they missed.
+        baseline.key_reached_a_child();
+        baseline.key_reached_a_child();
+        assert!(baseline.take_due());
+        assert!(!baseline.take_due());
     }
 
     /// A watched word is news even when the command itself succeeded.

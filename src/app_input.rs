@@ -605,7 +605,7 @@ impl Gpu {
         // The away clock. Window focus lies (a focused window on another monitor is
         // not attention); a key reaching the child process does not.
         self.last_pty_key = Instant::now();
-        self.away_marked = false;
+        self.baseline.key_reached_a_child();
         // Whoever opened this pane, the moment somebody types in it, it is theirs.
         let focus = self.tabs[self.active].focus;
         if let Some(p) = self.tabs[self.active].panes.get_mut(&focus) {
@@ -6121,6 +6121,8 @@ impl Gpu {
         if let Some(pane) = self.tabs[self.active].panes.values_mut().next() {
             pane.from_war_room = true;
         }
+        let mut opened = 0usize;
+        let mut refused: Option<String> = None;
         for (_, cmd) in crate::warroom::watch_commands(&plan, 3) {
             let id = self.new_pane_id();
             let area = self.active_area();
@@ -6131,14 +6133,22 @@ impl Gpu {
             } else {
                 Axis::Vertical
             };
-            if let Err(e) =
-                self.tabs[self.active].split_running_with_id(area, axis, config, id, argv, wake)
-            {
+            match self.tabs[self.active].split_running_with_id(area, axis, config, id, argv, wake) {
                 // Say which pane could not open rather than silently opening a room
                 // with holes in it: a war room missing the service you care about is
                 // worse than one that admits it.
-                self.note_pipe(&format!("war room: could not open a pane ({e})"));
-                break;
+                Err(e) => {
+                    refused = Some(format!("could not open a pane ({e})"));
+                    break;
+                }
+                // A refused split is the same hole with a gentler cause — the tab will
+                // not divide a pane already at its minimum size — and silence about it
+                // is what lets the room claim services that are not on screen.
+                Ok(false) => {
+                    refused = Some("the window is too small for the rest".to_string());
+                    break;
+                }
+                Ok(true) => opened += 1,
             }
             if let Some(pane) = self.tabs[self.active].panes.get_mut(&id) {
                 pane.from_war_room = true;
@@ -6152,9 +6162,18 @@ impl Gpu {
         // and the path came from wherever the repository was cloned to.
         let dir = shell_quote(&file.parent().unwrap_or(std::path::Path::new(".")).to_string_lossy());
         self.insert_command(format!("cd {dir} && docker compose up -d"));
-        self.note_pipe(&format!(
-            "war room: {n} services \u{2014} the deploy is at the prompt, not running"
-        ));
+        // Counted from what is ON SCREEN, never from the file: the log panes are capped
+        // at three and a split can be refused, so the compose file's own count would be
+        // a promise the window does not keep. The first watch pane is the status board
+        // and the loop stops at the first refusal, so what opened is always a prefix.
+        let watching = opened.saturating_sub(1);
+        let note = match refused {
+            Some(why) => format!("war room: {watching} of {n} services \u{2014} {why}"),
+            None => format!(
+                "war room: {watching} of {n} services \u{2014} the deploy is at the prompt, not running"
+            ),
+        };
+        self.note_pipe(&note);
     }
 
     /// Takes the room down: closes the panes IT opened, and only those the user never
@@ -6166,17 +6185,45 @@ impl Gpu {
             .filter(|(_, p)| p.from_war_room && !p.touched)
             .map(|(id, _)| *id)
             .collect();
-        if doomed.is_empty() {
-            self.note_pipe("no untouched war-room panes here");
-            return;
+        let total = self.tabs[self.active].panes.len();
+        match crate::warroom::teardown(total, doomed.len()) {
+            crate::warroom::Teardown::Nothing => {
+                self.note_pipe("no untouched war-room panes here");
+            }
+            crate::warroom::Teardown::Panes => {
+                let area = self.active_area();
+                for id in doomed {
+                    self.tabs[self.active].close_pane(id, area);
+                }
+                let kept = self.tabs[self.active].panes.len();
+                self.note_pipe(&format!("war room closed, {kept} panes kept"));
+            }
+            crate::warroom::Teardown::WholeTab => {
+                // Nobody worked in any of them, so there is nothing here to keep and
+                // nothing to reopen either. Taking the panes one at a time would leave
+                // the last one alive — a tab cannot be emptied — still watching docker
+                // in a tab nothing points at.
+                if self.tabs.len() == 1 {
+                    // Closing the only tab is closing the window, which a teardown key
+                    // must never do behind your back: a plain shell takes its place.
+                    let id = self.new_pane_id();
+                    let area = self.active_area();
+                    let wake = wake_fn(self.proxy.clone());
+                    let cell = self.renderer.cell_size();
+                    match Tab::new(area, cell, config, id, &Spawn::default(), wake) {
+                        Ok(tab) => self.tabs.push(tab),
+                        Err(e) => {
+                            self.note_pipe(&format!("war room: nothing to put in its place ({e})"));
+                            return;
+                        }
+                    }
+                }
+                self.tabs.remove(self.active);
+                self.active = self.active.min(self.tabs.len().saturating_sub(1));
+                self.reflow_all();
+                self.note_pipe("war room closed");
+            }
         }
-        let kept = self.tabs[self.active].panes.len() - doomed.len();
-        let area = self.active_area();
-        for id in doomed {
-            self.tabs[self.active].close_pane(id, area);
-        }
-        let _ = config;
-        self.note_pipe(&format!("war room closed, {kept} panes kept"));
         self.window.request_redraw();
     }
 

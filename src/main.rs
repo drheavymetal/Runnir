@@ -814,10 +814,11 @@ struct Gpu {
     /// When a keystroke last reached a child process. The catch-up measures "away"
     /// from here rather than from window focus, which lies in both directions.
     last_pty_key: Instant,
-    /// Whether the panes have been marked at the moment the user stepped away.
-    /// Marking has to happen when absence STARTS, not when the panel opens — by then
-    /// everything that moved has already moved, and every pane looks unchanged.
-    away_marked: bool,
+    /// Whether the panes still owe the catch-up a baseline. Marking has to happen at
+    /// the last KEYSTROKE, not when the panel opens (by then everything that moved has
+    /// already moved, and every pane looks unchanged) and not when the absence is
+    /// finally noticed either — see [`catchup::Baseline`].
+    baseline: catchup::Baseline,
     /// The flashed layout, read once at startup: which LED sits under which key.
     /// Only loaded when the leader lights are on, since nothing else needs it.
     board_layout: Option<zsa::Layout>,
@@ -1103,7 +1104,7 @@ impl App {
             middle_press: None,
             verbs: verbs::Verbs::load(),
             last_pty_key: Instant::now(),
-            away_marked: false,
+            baseline: catchup::Baseline::default(),
             proxy: self.proxy.clone(),
         };
         // The flashed layout, read once. Blocking (two processes: kontroll status and
@@ -1746,13 +1747,21 @@ impl Gpu {
         if self.last_context_refresh.elapsed() >= Duration::from_millis(500) {
             self.last_context_refresh = Instant::now();
             let focused = self.window.has_focus();
-            // Absence begins after a minute with no key reaching a child. Mark every
-            // pane's command counter now, so the next catch-up can tell what moved
-            // while nobody was looking.
-            if !self.away_marked && self.last_pty_key.elapsed() >= Duration::from_secs(60) {
-                self.away_marked = true;
-                for pane in self.tabs[self.active].panes.values_mut() {
-                    pane.mark_catch_up_point();
+            // The baseline the catch-up measures from: every pane's command counter as
+            // of the last keystroke. Taken here, on the first sweep after a key, rather
+            // than on the key itself — this loop already walks the panes, and locking
+            // every grid on every keypress would put the typing behind whatever a busy
+            // child is printing.
+            //
+            // EVERY tab, not just the active one: the watch scan below runs over all of
+            // them, so a pane left with the baseline it had two tabs ago reports work
+            // that finished yesterday as news, and an old watch hit outranks a real
+            // failure the moment you switch to it.
+            if self.baseline.take_due() {
+                for tab in &mut self.tabs {
+                    for pane in tab.panes.values_mut() {
+                        pane.mark_catch_up_point();
+                    }
                 }
             }
             // The keyboard belongs to the whole desktop: runnir holds it only while

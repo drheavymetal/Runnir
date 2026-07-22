@@ -2594,6 +2594,53 @@ pass to verify and fix. Eight findings were real, one was half right.
 cursor row + 1, so the first line printed after a poll boundary is never matched —
 harmless with multi-line output, which is why nobody noticed.
 
+## 2026-07-22 - Second audit round: the first round's fix was not deep enough
+
+Six more, all real. The pattern of the round: each one lived one level below where
+the last round stopped looking.
+
+- **The verbs leak again, deeper.** Round one made the environment-prefix skip loop
+  over every assignment — but it recognised an assignment by `contains('=')` on a
+  whitespace token, so a QUOTED value with a space walked straight through:
+  `AUTH="Bearer sk-live-…" curl …` tokenises as `AUTH="Bearer`, `sk-live-…"`, `curl`,
+  and the second token became the verb and went to disk on the first run. The fix is a
+  quote-aware pass that also cuts the stage at an unquoted `|`, `;` or `&&`, and
+  returns NOTHING when a quote never closes: a missing verb costs nothing, a leaked
+  one is unrecoverable.
+- **The catch-up baseline was taken 60 seconds too late.** Absence was noticed a
+  minute after the last keystroke and the baseline was marked THEN, so a 30-second
+  deploy that failed while you were walking away was absorbed into the baseline and
+  could never be reported — the feature's flagship scenario, silently broken. The
+  baseline now sits at the last keystroke (armed on the key, consumed by the 500 ms
+  sweep; marking on the key itself would lock every pane's grid on every keypress).
+- **…and only the ACTIVE tab was marked**, while the watch scan in the same sweep
+  walked all of them. Every other tab kept a stale baseline and an uncleared watch hit
+  — round one's "watch hit never cleared" fix simply never ran there.
+- `last_nonblank_line` scanned rows `0..rows()` while `abs_cell` indexes
+  `scrollback ++ screen`, so with any history at all it answered with the OLDEST line
+  in the buffer. An unmarked pane's catch-up headline quoted the first line it ever
+  printed. Its tests only ever used grids with empty scrollback.
+- **The war room left a watcher running.** `close_war_room` ignored that `close_pane`
+  refuses to close a tab's LAST pane, so a room nobody typed in left one
+  `watch -n 2 docker compose ps` polling forever in a tab that looked empty — while
+  the toast said "0 panes kept". When nothing is kept the TAB goes now (and a plain
+  tab is created first if it was the only one: a teardown key must not close the
+  window). The kept count is read after closing, so it cannot lie.
+- `split_running_with_id` returns `Ok(())` WITHOUT splitting when the pane is too
+  small, so the war room dropped services silently on a small window — round one only
+  taught it to notice `Err`. Splits return `Result<bool>` now. The toast also claimed
+  `plan.services.len()` while the log panes are capped at 3; it reports what is on
+  screen.
+
+492 tests (was 487). Verified live: teardown removes the tab and leaves no watcher
+behind, and a command that fails seconds after the last keystroke IS in the catch-up.
+
+**A test-harness lesson, not a product one:** `kill -9` on a runnir whose binary has
+since been rebuilt does not match `readlink /proc/PID/exe` any more — the link reads
+`.../runnir (deleted)`. Twelve orphaned test instances had piled up, two still holding
+`watch` children. Match on the process environment (`XDG_DATA_HOME` under the
+scratchpad), not on the exe path.
+
 ## Gotchas (do not re-learn)
 
 - The board must be put back even if runnir DIES. `sustain` (ms) on every ZSA paint is

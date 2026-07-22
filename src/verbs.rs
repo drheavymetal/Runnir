@@ -47,21 +47,21 @@ const NOISE: &[&str] = &[
 ///
 /// Returns at most two words, and only words that cannot carry private data: a
 /// subcommand from a known tool's fixed vocabulary. Everything else — paths, hosts,
-/// flags, URLs, tokens — is dropped before it can be written anywhere.
+/// flags, URLs, tokens — is dropped before it can be written anywhere. A line whose
+/// shape cannot be read with certainty yields nothing at all, which is always the
+/// cheaper mistake.
 pub fn verb_of(line: &str) -> Option<String> {
     let line = line.trim();
     if line.is_empty() {
         return None;
     }
-    // A pipeline, a chain or a redirection is not one verb. Take the first stage:
-    // `cargo build && ./run` is a `cargo build` habit.
-    let first_stage = line
-        .split(&['|', ';', '\n'][..])
-        .next()?
-        .split("&&")
-        .next()?
-        .trim();
-    let mut words = first_stage.split_whitespace();
+    // A pipeline, a chain or a redirection is not one verb: take the first stage,
+    // so `cargo build && ./run` is a `cargo build` habit. Where the stage ends and
+    // where each word ends are the same question — quotes decide both — so one pass
+    // answers them together. Splitting on whitespace instead is what turns
+    // `AUTH="Bearer sk-live-abc123" curl …` into the verb `sk-live-abc123`.
+    let stage = first_stage_words(line)?;
+    let mut words = stage.iter().map(String::as_str);
     let head = words.next()?;
 
     // An assignment prefix (`RUST_LOG=debug cargo test`) is environment, not a verb —
@@ -75,6 +75,12 @@ pub fn verb_of(line: &str) -> Option<String> {
     // A path to something in the project is not a shared verb: `./deploy.sh` says as
     // much about someone's directory as about the project, and `/home/pedro/x` more.
     if head.starts_with('-') || head.contains('/') || head.starts_with('$') {
+        return None;
+    }
+    // A command name is one word. Anything that is only one word because a quote held
+    // it together is somebody's data — a password, a message, a query — sitting where
+    // the verb should be.
+    if head.contains(char::is_whitespace) {
         return None;
     }
     let head = head.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '_');
@@ -95,6 +101,79 @@ pub fn verb_of(line: &str) -> Option<String> {
         }
     }
     Some(head.to_string())
+}
+
+/// The words of a command line's FIRST stage, split the way a shell splits them: a
+/// quoted run is one word however many spaces it holds, a backslash escapes the
+/// character after it, and an unquoted `|`, `;` or `&&` ends the stage.
+///
+/// `None` when a quote never closes. A line that cannot be taken apart with certainty
+/// is one nothing is learned from, because the only alternative is to guess where the
+/// value in `AUTH="Bearer sk-live-abc123" curl …` ends — and a wrong guess writes the
+/// tail of somebody's token to disk as this repository's verb. A verb missed costs a
+/// line in a panel nobody notices; a verb invented out of a secret cannot be recalled.
+fn first_stage_words(line: &str) -> Option<Vec<String>> {
+    let mut words: Vec<String> = Vec::new();
+    let mut word = String::new();
+    // Tracked apart from `word.is_empty()`: `FOO=""` is a word, and an empty one.
+    let mut in_word = false;
+    let mut quote: Option<char> = None;
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        match quote {
+            // Inside single quotes everything is literal, backslash included — which
+            // is exactly why people put secrets in them.
+            Some('\'') => {
+                if c == '\'' {
+                    quote = None;
+                } else {
+                    word.push(c);
+                }
+            }
+            Some(q) => {
+                if c == '\\' {
+                    if let Some(next) = chars.next() {
+                        word.push(next);
+                    }
+                } else if c == q {
+                    quote = None;
+                } else {
+                    word.push(c);
+                }
+            }
+            None => match c {
+                '\'' | '"' => {
+                    quote = Some(c);
+                    in_word = true;
+                }
+                '\\' => {
+                    if let Some(next) = chars.next() {
+                        word.push(next);
+                        in_word = true;
+                    }
+                }
+                '|' | ';' | '\n' => break,
+                '&' if chars.peek() == Some(&'&') => break,
+                c if c.is_whitespace() => {
+                    if in_word {
+                        words.push(std::mem::take(&mut word));
+                        in_word = false;
+                    }
+                }
+                c => {
+                    word.push(c);
+                    in_word = true;
+                }
+            },
+        }
+    }
+    if quote.is_some() {
+        return None;
+    }
+    if in_word {
+        words.push(word);
+    }
+    Some(words)
 }
 
 /// Whether a word can be a subcommand: letters, digits and dashes only, short, not a
@@ -211,6 +290,26 @@ mod tests {
         // Assignments and nothing else is an environment change, not a verb at all.
         assert!(verb_of("OPENAI_API_KEY=sk-live-abc123").is_none());
         assert!(verb_of("A=1 B=2").is_none());
+    }
+
+    /// A value in quotes holds spaces, so whitespace alone cannot say where it ends.
+    /// The second half of `AUTH="Bearer sk-live-…"` is not this repository's verb.
+    #[test]
+    fn a_quoted_value_never_leaks_its_tail_as_the_verb() {
+        assert_eq!(
+            verb_of("AUTH=\"Bearer sk-live-abc123\" curl -s https://api.example.com").unwrap(),
+            "curl"
+        );
+        assert_eq!(verb_of("TOKEN='super secret value' terraform apply").unwrap(), "terraform apply");
+        assert_eq!(verb_of("PASS=hunter\\ two psql").unwrap(), "psql");
+        // A separator inside the quotes belongs to the value, not to the line.
+        assert_eq!(verb_of("TOKEN='a|b;c && d' cargo test").unwrap(), "cargo test");
+        // A quote that never closes cannot be taken apart at all: learn nothing rather
+        // than guess where the secret ends.
+        assert!(verb_of("AUTH=\"Bearer sk-live-abc123 curl").is_none());
+        // …and a word that is only one word because a quote held it together is data
+        // sitting where the command name should be.
+        assert!(verb_of("'super secret value'").is_none());
     }
 
     /// A list whose top entry is `cd` teaches a newcomer nothing: navigation is how

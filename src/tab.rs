@@ -145,12 +145,17 @@ impl Tab {
         config: &Config,
         id: PaneId,
         wake: impl Fn() + Send + Clone + 'static,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<bool> {
         self.split_running_with_id(area, axis, config, id, Vec::new(), wake)
     }
 
     /// Like `split_with_id`, but runs `command` in the new pane instead of a shell.
     /// An empty command means a shell.
+    ///
+    /// Returns whether a pane was really created: in `Splits` a pane already at the
+    /// minimum size is not divided at all, and that is not an error. A caller building
+    /// a room out of several panes has to be told, or it announces work it never put
+    /// on screen.
     pub fn split_running_with_id(
         &mut self,
         area: Rect,
@@ -159,7 +164,7 @@ impl Tab {
         id: PaneId,
         command: Vec<String>,
         wake: impl Fn() + Send + Clone + 'static,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<bool> {
         let inner = pad(area, self.padding);
         // The tree's minimum-size gate only governs the manual `Splits` mode. The
         // algorithmic modes redistribute space among all panes, so a new pane always
@@ -168,7 +173,7 @@ impl Tab {
         if self.mode == LayoutMode::Splits
             && !self.tree.can_split(self.focus, axis, inner, self.gap)
         {
-            return Ok(()); // Too small to divide usefully; ignore rather than error.
+            return Ok(false); // Too small to divide usefully; refused, not failed.
         }
 
         let spawn = Spawn {
@@ -208,7 +213,7 @@ impl Tab {
         self.panes.insert(id, pane);
         self.focus = id;
         self.reflow(area);
-        Ok(())
+        Ok(true)
     }
 
     /// The rect the active mode would give pane `id`, computed once `id` is already
@@ -668,6 +673,32 @@ mod tests {
             "in Tall the same point is the middle of a pane; grabbing there would \
              swallow the click and rewrite the hidden Splits arrangement"
         );
+    }
+
+    /// A window too small to divide refuses the split, and says so instead of
+    /// answering `Ok`. A caller opening a pane per service builds a room with holes in
+    /// it otherwise, and then announces the services it never put on screen.
+    #[test]
+    fn a_refused_split_says_so_instead_of_reporting_success() {
+        let config = crate::config::Config::default();
+        let mut tab = Tab::new(AREA, (10.0, 20.0), &config, 1, &Spawn::default(), || {})
+            .expect("a tab spawns its first shell");
+        assert_eq!(tab.mode, LayoutMode::Splits, "the gate only governs the manual mode");
+
+        // Two panes fit in a thousand pixels; nothing fits in forty.
+        assert!(
+            tab.split_with_id(AREA, Axis::Horizontal, &config, 2, || {}).unwrap(),
+            "there is room for a second pane"
+        );
+        assert_eq!(tab.panes.len(), 2);
+
+        let cramped = Rect { x: 0.0, y: 0.0, w: 40.0, h: 40.0 };
+        assert!(
+            !tab.split_with_id(cramped, Axis::Horizontal, &config, 3, || {}).unwrap(),
+            "refused, not failed — and not silently successful either"
+        );
+        assert!(!tab.panes.contains_key(&3), "a refused split leaves no pane behind");
+        assert_eq!(tab.panes.len(), 2);
     }
 
     #[test]
