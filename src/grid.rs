@@ -512,6 +512,12 @@ impl Grid {
         self.scrollback.len() + self.rows
     }
 
+    /// How many rows of history sit above the live screen. Callers translating a
+    /// VIEW row into a buffer row need it together with `display_offset`.
+    pub fn scrollback_len(&self) -> usize {
+        self.scrollback.len()
+    }
+
     pub fn display_offset(&self) -> usize {
         self.display_offset
     }
@@ -844,6 +850,38 @@ impl Grid {
             .filter(|&r| r <= cur)
             .unwrap_or(cur);
         self.text_range((start_row, 0), (cur, last_col))
+    }
+
+    /// The local row range of the command block containing `row`: from its prompt
+    /// mark down to just before the next one (or the end of the buffer).
+    ///
+    /// A block — the command line plus everything it printed — is the unit a person
+    /// means by "that output", which is why OSC 133 marks are what make dragging one
+    /// possible at all. Without marks there is no answer, and the caller must say so
+    /// rather than guess a range.
+    pub fn block_at(&self, row: usize) -> Option<(usize, usize)> {
+        let mut marks: Vec<usize> =
+            self.prompt_marks.iter().filter_map(|&s| self.stable_to_local(s)).collect();
+        marks.sort_unstable();
+        let start = *marks.iter().filter(|&&m| m <= row).next_back()?;
+        let end = marks
+            .iter()
+            .find(|&&m| m > row)
+            .map(|&m| m.saturating_sub(1))
+            .unwrap_or_else(|| self.scrollback.len() + self.rows.saturating_sub(1));
+        Some((start, end.max(start)))
+    }
+
+    /// The OUTPUT of a block, for handing it to another pane: the block without its
+    /// first row, which is the prompt and the command that produced it.
+    ///
+    /// "As stdin" means the output, not the prompt: a shell prompt is full of powerline
+    /// glyphs and a hostname, and neither is data. A prompt wrapped over more than one
+    /// row still leaves a line behind — accepted, because the alternative is guessing
+    /// where a themed prompt ends.
+    pub fn block_text(&self, range: (usize, usize)) -> String {
+        let first_output = (range.0 + 1).min(range.1);
+        self.text_range((first_output, 0), (range.1, self.cols.saturating_sub(1)))
     }
 
     /// The stable index one past the last row that actually holds output — the
@@ -2786,6 +2824,39 @@ mod tests {
             plan.iter().any(|p| matches!(p, PlanRow::Real(a) if *a == cur)),
             "the live prompt row must survive folding: {plan:?}"
         );
+    }
+
+
+    /// The unit a person means by "that output" is the command BLOCK, delimited by
+    /// the prompt marks OSC 133 already provides. Without those there is no answer,
+    /// and the caller has to be told rather than handed a guess.
+    #[test]
+    fn a_block_runs_from_one_prompt_to_the_next() {
+        let mut g = Grid::new(20, 8);
+        feed(&mut g, "\x1b]133;A\x07$ one\r\n\x1b]133;C\x07alpha\r\nbeta\r\n\x1b]133;D;0\x07");
+        feed(&mut g, "\x1b]133;A\x07$ two\r\n\x1b]133;C\x07gamma\r\n\x1b]133;D;0\x07");
+
+        // A row inside the first command belongs to the first block, and its text is
+        // the OUTPUT: the prompt line that produced it is not data.
+        let first = g.block_at(1).expect("row 1 is inside the first block");
+        let text = g.block_text(first);
+        assert!(text.contains("alpha") && text.contains("beta"), "{text:?}");
+        assert!(!text.contains("$ one"), "the command line is not stdin: {text:?}");
+        assert!(!text.contains("gamma"), "the next command is a different block: {text:?}");
+
+        // …and a row inside the second belongs to the second.
+        let second = g.block_at(4).expect("row 4 is inside the second block");
+        assert!(g.block_text(second).contains("gamma"));
+        assert_ne!(first, second);
+    }
+
+    /// A pane with no shell integration has no blocks at all, and saying so is the
+    /// only honest answer — a guessed range hands over somebody else's output.
+    #[test]
+    fn without_marks_there_is_no_block() {
+        let mut g = Grid::new(20, 4);
+        feed(&mut g, "just some output\r\nwith no marks\r\n");
+        assert!(g.block_at(0).is_none());
     }
 
     #[test]

@@ -2431,6 +2431,51 @@ store is keyed by absolute repo path, so an export would carry `/home/pedro/...`
 export step has to key by repo remote or name instead. Not built — sharing is not
 part of this slice.
 
+## 2026-07-22 - Candidate 3 built: tactile pipes
+
+Grab a command's output block with the MIDDLE button, drop it on another pane: the
+output is written to a private file and its path is staged at that pane's prompt. The
+pipe you compose after running, with your hand.
+
+**A drop proposes and never executes.** The path is left on the command line for a key
+to confirm — a gesture that runs something is a mouse slip that runs something, and
+this one starts from output the user has not necessarily read.
+
+**Always through a file, whatever the size.** Typing the text into a shell would run
+each line as a command, which is the opposite of "as stdin". The file is 0600 in the
+per-user runtime dir, the same private-write path the scrollback dump uses, because
+command output holds secrets often enough to assume it does.
+
+**Middle CLICK still pastes the primary selection.** The press only arms the gesture;
+the paste happens on release when the pointer never really moved (12 px). Breaking a
+decades-old mouse convention to add a new one would be a bad trade.
+
+**Dropping on a pane running a full-screen app is refused** — typing a path into vim
+is not a pipe. Dropping a block back on its own pane does nothing.
+
+Internal drag, deliberately: this needs no Wayland drag source at all, since both ends
+are runnir's own panes. Dragging OUT to another application would need
+`wl_data_device` as a source (dnd.rs currently only receives), and that is a separate
+piece of work.
+
+**Three of my own instruments lied before the code did**, which is the real lesson of
+this one:
+- `ui_state` did not expose the status toast, so every refusal and every success
+  message read as `null` from a script. The feature had been working for two rounds of
+  "it does nothing". It is exposed now — a message the user can see and a script
+  cannot is a message that cannot be tested.
+- The test window was tiled by Hyprland down to 22x5 cells, so the drag's two ends
+  landed in the same cell (correctly treated as a click) and later a split was refused
+  for want of room. Test windows for anything positional have to be floated and sized
+  first.
+- The coordinates came from a window that no longer existed, so the drop landed
+  outside the surface.
+
+**Known limitation**: block boundaries come from prompt marks, so a themed prompt
+spanning several rows leaves its extra rows in the payload. Stripping exactly one row
+is right for a one-line prompt and approximate otherwise; guessing where a powerline
+prompt ends is worse than the residue. Pinned by tests either way.
+
 ## Gotchas (do not re-learn)
 
 - The board must be put back even if runnir DIES. `sustain` (ms) on every ZSA paint is
@@ -2454,6 +2499,11 @@ part of this slice.
 - `cargo test` does NOT refresh `target/release/runnir`. Rebuild before launching an
   instance to verify a change, or you are testing the previous build — it has already
   cost two debugging detours.
+- Anything the user can SEE must be readable from `runnir @` — the status toast was
+  not, and two debugging rounds were spent on a feature that worked. If a script
+  cannot tell "it refused and said why" from "nothing happened", neither can a test.
+- A window tiled by the compositor can be far too small to exercise a positional
+  feature: float it and size it before dragging, splitting or clicking by coordinate.
 - A local mock HTTP server is the cheapest way to verify a wire format with no
   credentials: log the request to prove the headers, return a canned body to prove
   the parser. Both halves fail silently otherwise.

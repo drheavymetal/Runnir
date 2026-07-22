@@ -404,7 +404,29 @@ impl Gpu {
                     self.copy_selection();
                 }
             }
-            (ElementState::Pressed, MouseButton::Middle) => self.paste_primary(),
+            // Middle press ARMS a possible pipe drag; the paste happens on release
+            // only if the pointer never really moved, so middle-click paste keeps
+            // working exactly as it did.
+            (ElementState::Pressed, MouseButton::Middle) => {
+                self.middle_press = Some(self.cursor_px);
+                if std::env::var("RUNNIR_PIPE_DEBUG").is_ok() {
+                    eprintln!("pipe: middle press at {:?}", self.cursor_px);
+                }
+            }
+            (ElementState::Released, MouseButton::Middle) => {
+                let from = self.middle_press.take();
+                let moved = from.is_some_and(|p| {
+                    (p.x - self.cursor_px.x).abs() > 12.0 || (p.y - self.cursor_px.y).abs() > 12.0
+                });
+                if std::env::var("RUNNIR_PIPE_DEBUG").is_ok() {
+                    eprintln!("pipe: middle release from={from:?} moved={moved} at {:?}", self.cursor_px);
+                }
+                match (from, moved) {
+                    (Some(start), true) => self.pipe_output(start, self.cursor_px, config),
+                    (Some(_), false) => self.paste_primary(),
+                    _ => {}
+                }
+            }
             _ => {}
         }
     }
@@ -3010,6 +3032,10 @@ impl Gpu {
             "cols": cols,
             "rows": rows,
             "leader_armed": self.leader_armed.is_some(),
+            // The toast is user-visible state, so a script has to be able to read it:
+            // without this, every message runnir shows is invisible from outside and
+            // a test cannot tell "it refused and said why" from "nothing happened".
+            "status": self.status.clone(),
         });
         if let Some(Overlay::Props(p)) = &self.overlay {
             out["props"] = json!({
@@ -5960,6 +5986,84 @@ impl Gpu {
         self.split_running(config, argv);
     }
 
+    /// A tactile pipe: the command block under `from` is handed to the pane under
+    /// `to`, as a path staged at its prompt.
+    ///
+    /// It PROPOSES and never executes — the path is left on the command line for a
+    /// key to confirm. A gesture that runs something is a mouse slip that runs
+    /// something, and this one starts with output the user did not necessarily read.
+    ///
+    /// Always through a file, whatever the size. Typing the text itself into a shell
+    /// would run each line as a command, which is the opposite of "as stdin"; and the
+    /// file is written 0600 in the per-user runtime dir, because command output holds
+    /// secrets often enough to assume it does.
+    fn pipe_output(&mut self, from: PhysicalPosition<f64>, to: PhysicalPosition<f64>, config: &Config) {
+        let area = self.active_area();
+        let (Some((src_id, src_rect)), Some((dst_id, _))) =
+            (self.pane_at(from, area), self.pane_at(to, area))
+        else {
+            if std::env::var("RUNNIR_PIPE_DEBUG").is_ok() {
+                eprintln!("pipe: no pane under one end ({from:?} -> {to:?}); area={area:?}");
+                for (id, r) in self.visible_rects(area) {
+                    eprintln!("   pane {id}: x={} y={} w={} h={}", r.x, r.y, r.w, r.h);
+                }
+            }
+            return;
+        };
+        if std::env::var("RUNNIR_PIPE_DEBUG").is_ok() {
+            eprintln!("pipe: src={src_id} dst={dst_id}");
+        }
+        if src_id == dst_id {
+            // Dropping a block back on its own pane is a slip, not an instruction.
+            return;
+        }
+        let (_, ch) = self.renderer.cell_size();
+        let row_in_pane = ((from.y as f32 - src_rect.y) / ch).floor().max(0.0) as usize;
+
+        let text = {
+            let src = &self.tabs[self.active].panes[&src_id];
+            let g = src.grid.lock().unwrap();
+            // The row under the pointer is a VIEW row; blocks are addressed in the
+            // buffer, which is scrolled back by however much this pane is scrolled.
+            let top = g.scrollback_len().saturating_sub(g.display_offset());
+            let Some(range) = g.block_at(top + row_in_pane) else {
+                drop(g);
+                self.note_pipe("that pane has no command marks to grab a block from");
+                return;
+            };
+            g.block_text(range)
+        };
+        if text.trim().is_empty() {
+            self.note_pipe("nothing in that block");
+            return;
+        }
+        if self.tabs[self.active].panes[&dst_id].in_full_screen_app() {
+            // Typing a path into vim is not a pipe, it is vandalism.
+            self.note_pipe("that pane is running a full-screen app");
+            return;
+        }
+
+        let dir = std::env::var_os("XDG_RUNTIME_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let path = dir.join(format!("runnir-pipe-{}-{}.txt", std::process::id(), src_id));
+        if let Err(e) = write_private(&path, text.as_bytes()) {
+            self.note_pipe(&format!("could not stage that output: {e}"));
+            return;
+        }
+        let lines = text.lines().filter(|l| !l.trim().is_empty()).count();
+        self.tabs[self.active].focus = dst_id;
+        self.insert_command(shell_quote(&path.to_string_lossy()));
+        self.note_pipe(&format!("{lines} lines staged \u{2014} press Enter to use it"));
+        let _ = config;
+    }
+
+    fn note_pipe(&mut self, text: &str) {
+        self.status = Some(text.to_string());
+        self.status_expiry = Some(Instant::now() + Duration::from_secs(4));
+        self.window.request_redraw();
+    }
+
     /// Opens the verbs panel for the focused pane's repository.
     fn show_repo_verbs(&mut self, config: &Config) {
         let root = self.tab().focused().cwd().and_then(|d| crate::git::repo_root(&d));
@@ -6481,18 +6585,24 @@ impl Gpu {
                 self.window.request_redraw();
                 ControlResponse::ok(self.ui_state())
             }
-            ControlRequest::Drag { col, row, to_col, to_row } => {
+            ControlRequest::Drag { col, row, to_col, to_row, button } => {
+                let btn = match button.as_deref() {
+                    None | Some("left") => MouseButton::Left,
+                    Some("middle") => MouseButton::Middle,
+                    Some("right") => MouseButton::Right,
+                    Some(other) => return ControlResponse::error(format!("unknown button {other:?}")),
+                };
                 let from = self.cell_centre(col, row);
                 let to = self.cell_centre(to_col, to_row.unwrap_or(row));
                 self.cursor_px = from;
-                self.on_click(ElementState::Pressed, MouseButton::Left, ModifiersState::empty(), config);
+                self.on_click(ElementState::Pressed, btn, ModifiersState::empty(), config);
                 // Two steps, because a drag handler is allowed to care about motion
                 // rather than about the final position — one jump would not exercise
                 // what a hand does.
                 let mid = PhysicalPosition::new((from.x + to.x) / 2.0, (from.y + to.y) / 2.0);
                 self.on_cursor(mid, ModifiersState::empty());
                 self.on_cursor(to, ModifiersState::empty());
-                self.on_click(ElementState::Released, MouseButton::Left, ModifiersState::empty(), config);
+                self.on_click(ElementState::Released, btn, ModifiersState::empty(), config);
                 self.window.request_redraw();
                 ControlResponse::ok(self.ui_state())
             }

@@ -101,6 +101,10 @@ pub enum ControlRequest {
         to_col: usize,
         #[serde(default, rename = "to-row")]
         to_row: Option<usize>,
+        /// Which button drags. The middle one is its own gesture (the tactile pipe),
+        /// so a drag that cannot say which button cannot exercise it.
+        #[serde(default)]
+        button: Option<String>,
     },
     /// Turn the wheel at a cell. `lines` is signed the way a wheel is: positive is
     /// up, away from the user. The pointer goes to the cell first, because every
@@ -215,6 +219,7 @@ pub fn parse_client_args(cmd: &str, flags: &[String]) -> Result<ControlRequest, 
             row: opt_usize(&m, "row")?.ok_or("drag needs --row")?,
             to_col: opt_usize(&m, "to-col")?.ok_or("drag needs --to-col")?,
             to_row: opt_usize(&m, "to-row")?,
+            button: m.get("button").cloned(),
         },
         "wheel" => ControlRequest::Wheel {
             col: opt_usize(&m, "col")?.ok_or("wheel needs --col")?,
@@ -656,7 +661,7 @@ mod tests {
         assert_eq!(
             parse_client_args("drag", &flags(&["--col", "40", "--row", "5", "--to-col", "60"]))
                 .unwrap(),
-            ControlRequest::Drag { col: 40, row: 5, to_col: 60, to_row: None }
+            ControlRequest::Drag { col: 40, row: 5, to_col: 60, to_row: None, button: None }
         );
         assert_eq!(
             parse_client_args("action", &flags(&["--id", "git_panel"])).unwrap(),

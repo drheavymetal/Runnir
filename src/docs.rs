@@ -125,6 +125,12 @@ whatever order you built the splits in.
 @ Ctrl+Shift+C / V          copy / paste
 @ Alt+Shift+V               clipboard history: re-paste a recent copy (see below)
 @ middle click              paste the primary selection (the last text selected)
+@ middle DRAG               tactile pipe: grab a command's output block and drop it
+                            on another pane. The output is written to a private file
+                            and its path is left at that pane's prompt for you to
+                            use — it is never run for you. Needs shell integration
+                            (the blocks come from the OSC 133 marks); a pane running
+                            a full-screen app refuses the drop.
 @ Ctrl+Shift+Home/End       jump to top / live output
 @ Ctrl+Shift+F              search the scrollback; Enter/Up next/prev, Esc closes
 @ Ctrl+Shift+Q              dump the scrollback to $EDITOR in a new split

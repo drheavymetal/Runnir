@@ -796,6 +796,10 @@ struct Gpu {
     /// The ZSA keyboard, when there is one and the user asked for it. `None` covers
     /// both "no such keyboard" and "not enabled", which behave identically.
     board: Option<zsa::Board>,
+    /// Where the middle button went down, for the tactile pipe: a middle DRAG hands
+    /// a command block to another pane, a middle CLICK still pastes the primary
+    /// selection.
+    middle_press: Option<PhysicalPosition<f64>>,
     /// What this project is really worked with, learned from successful commands.
     /// Loaded once; only written when it changes.
     verbs: verbs::Verbs,
@@ -1088,6 +1092,7 @@ impl App {
                 .then(zsa::Board::start)
                 .flatten(),
             board_layout: None,
+            middle_press: None,
             verbs: verbs::Verbs::load(),
             last_pty_key: Instant::now(),
             away_marked: false,
