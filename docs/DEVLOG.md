@@ -1829,6 +1829,46 @@ Two bugs of my own, caught before they shipped: `Box::leak` for the letter codes
 leaked a string per lookup (unbounded over a session — repaints are per keystroke),
 and the `plus` test encoded the US assumption that `+` is always shift on `=`.
 
+## 2026-07-22 - ZSA step 3: the worker, and what `sustain` actually does
+
+`zsa::Board`: a thread that connects, paints and restores. Everything the UI thread
+does is `send()`. Measured: a full level is 34 processes and **156 ms**, which is the
+whole argument for the worker and for coalescing.
+
+**`sustain` is not what the design said, and finding out took four experiments.**
+Nothing documents it — not the `.proto`, not kontroll's README, not the Go wrapper.
+What it actually does, measured on the board:
+
+- **It expires the ENTIRE BOARD, not the LED it was passed with.** One key painted
+  with `sustain 15000` restored every other override with it, including one painted
+  with `sustain 0` seconds earlier. My first attempt at measuring it self-destructed
+  for exactly this reason, and read as "sustain does nothing".
+- `sustain 0` holds indefinitely — the board stayed white through a minute of typing,
+  which also disproves the theory that the firmware repaints over an override.
+- kontroll's own `restore-rgb-leds` is not a distinct call: it is
+  `set_rgb_all(0, 0, 0, sustain: 1)`. That is the tell — a non-zero sustain means
+  "hand the board back", and the number is how long to wait first.
+
+Board-global expiry is exactly right for the dead-man switch, and it is why every call
+of a paint carries the same sustain: whichever one lands last, the whole board comes
+back on its own after it. `kill -9` on runnir, a panic, an X crash — the keyboard
+still ends up in the user's own colours. A test asserts the sustain is on every call,
+because dropping it from one of them silently removes that guarantee.
+
+**Failure modes, all four scripted against a fake runner** so they are testable with
+no keyboard: no socket (Keymapp exited, which it did mid-session) spawns NOTHING;
+`no keyboard is connected` after a replug reconnects and retries the same call; the
+transient `keyboard requires an updated firmware` right after connecting retries once;
+anything else drops the connection and stops the paint instead of spawning 70 more
+processes for a board that is not there.
+
+The worker is driven to completion on the test thread — queue the commands, close the
+channel, call `worker()` — so there are no sleeps and nothing to go flaky.
+
+`runnir --zsa-paint <revision> [seconds]` paints the leader's top level on the real
+board and puts it back: step 3 end to end with the terminal not involved. On this
+machine, 33 keys, groups in the accent and leaves in bright yellow, restored on time.
+
 ## DESIGN, NOT YET BUILT — the leader layer, lit on the keys (ZSA Moonlander)
 
 Decided 2026-07-22 with the keyboard on the desk and the API answering. Nothing built.
@@ -1906,6 +1946,8 @@ Belt AND braces, both always:
 - **`sustain` on every single paint**, set to `leader_timeout`. It is a dead-man
   switch: `kill -9` on runnir, a panic, an X crash — the board still clears itself.
   Nothing else in runnir can offer that, and it costs one field per call.
+  (Measured in step 3: sustain expires the WHOLE BOARD, not the LED it came with,
+  which is what makes this work at all. See that entry before touching it.)
 
 ### Failure modes, all seen for real in one session
 

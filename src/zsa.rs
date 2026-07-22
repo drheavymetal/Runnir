@@ -261,6 +261,209 @@ pub fn read_layout(db: &Path, revision: &str) -> Option<Layout> {
     Layout::from_json(&String::from_utf8_lossy(&out.stdout))
 }
 
+
+// ---- driving the board ------------------------------------------------------
+
+/// How the board is actually painted: one `kontroll` process per call.
+///
+/// A trait so the failure modes below can be tested without a keyboard on the desk.
+/// Every one of them was seen for real in one session, and none of them is reachable
+/// from a test that needs hardware.
+trait Runner: Send {
+    /// Runs `kontroll <args>`, returning its output or the reason it failed.
+    fn run(&mut self, args: &[&str]) -> Result<String, String>;
+    /// Whether Keymapp is up at all. Its socket appearing and vanishing mid-session
+    /// is normal: Keymapp exits on its own, and it is the user's app, not ours.
+    fn alive(&self) -> bool;
+}
+
+struct Kontroll {
+    bin: PathBuf,
+    socket: PathBuf,
+}
+
+impl Runner for Kontroll {
+    fn run(&mut self, args: &[&str]) -> Result<String, String> {
+        let out = std::process::Command::new(&self.bin)
+            .args(args)
+            .output()
+            .map_err(|e| format!("kontroll: {e}"))?;
+        let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        // kontroll reports its failures on stdout with a zero exit code, so the exit
+        // status alone would call every one of them a success.
+        if !out.status.success() || text.starts_with("Failed") || text.contains("not found") {
+            return Err(if text.is_empty() { err } else { text });
+        }
+        Ok(text)
+    }
+
+    fn alive(&self) -> bool {
+        self.socket.exists()
+    }
+}
+
+/// What the keyboard is asked to do. Only the LAST one queued matters, which is what
+/// makes a repaint per keystroke affordable: descending three levels quickly paints
+/// once, at the level you stopped on.
+enum Cmd {
+    /// `dim` for every key, then `leds` on top. One level of the leader layer.
+    Paint { leds: Vec<(u8, crate::config::Rgb)>, dim: crate::config::Rgb, sustain_ms: u32 },
+    Restore,
+    Stop,
+}
+
+/// A handle to the keyboard, if there is one. Every method returns immediately: the
+/// work happens on a worker thread, because a paint is ~4 ms per key of process spawn
+/// and the UI thread cannot spend that.
+pub struct Board {
+    tx: std::sync::mpsc::Sender<Cmd>,
+}
+
+impl Board {
+    /// Starts the worker, or `None` when this machine has no keyboard integration —
+    /// no `kontroll` on PATH. Absent tools are not errors here, the same rule docker
+    /// and the credential helper follow: the feature simply does not exist.
+    pub fn start() -> Option<Board> {
+        let bin = kontroll_path()?;
+        let socket = dirs::config_dir()?.join(".keymapp/keymapp.sock");
+        Some(Board::with_runner(Box::new(Kontroll { bin, socket })))
+    }
+
+    fn with_runner(runner: Box<dyn Runner>) -> Board {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || worker(rx, runner));
+        Board { tx }
+    }
+
+    /// Lights `leds` over a `dim` background. `sustain_ms` is a DEAD-MAN SWITCH: after
+    /// it elapses Keymapp restores the whole board on its own, so a `kill -9`, a panic
+    /// or a crash cannot leave the keyboard wrong. Measured, because it is documented
+    /// nowhere: sustain expires the ENTIRE board, not the single LED it was passed with.
+    pub fn paint(&self, leds: Vec<(u8, crate::config::Rgb)>, dim: crate::config::Rgb, sustain_ms: u32) {
+        let _ = self.tx.send(Cmd::Paint { leds, dim, sustain_ms });
+    }
+
+    /// Gives the board back its own colours. Sent on disarm, on focus loss and on exit
+    /// — the sustain above covers only the case where runnir never gets to do this.
+    pub fn restore(&self) {
+        let _ = self.tx.send(Cmd::Restore);
+    }
+}
+
+impl Drop for Board {
+    fn drop(&mut self) {
+        let _ = self.tx.send(Cmd::Stop);
+    }
+}
+
+fn kontroll_path() -> Option<PathBuf> {
+    // `cargo install` is how kontroll is usually got, and ~/.cargo/bin is often absent
+    // from the environment a compositor hands a GUI app.
+    let home = dirs::home_dir();
+    std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).collect::<Vec<_>>())
+        .unwrap_or_default()
+        .into_iter()
+        .chain(home.map(|h| h.join(".cargo/bin")))
+        .map(|dir| dir.join("kontroll"))
+        .find(|p| p.is_file())
+}
+
+fn worker(rx: std::sync::mpsc::Receiver<Cmd>, mut runner: Box<dyn Runner>) {
+    let mut connected = false;
+    while let Ok(first) = rx.recv() {
+        // Coalesce: a burst of paints while a level is being walked collapses to the
+        // last one. Repainting 72 keys per keystroke is a race that cannot be won.
+        let mut cmd = first;
+        while let Ok(next) = rx.try_recv() {
+            cmd = next;
+        }
+        match cmd {
+            Cmd::Stop => {
+                restore(&mut *runner, &mut connected);
+                return;
+            }
+            Cmd::Restore => restore(&mut *runner, &mut connected),
+            Cmd::Paint { leds, dim, sustain_ms } => {
+                if !ensure_connected(&mut *runner, &mut connected) {
+                    continue;
+                }
+                let s = sustain_ms.to_string();
+                let dim_hex = hex(dim);
+                // The background first, so a key that is no longer part of this level
+                // goes dark in the same pass that lights the ones that are.
+                let _ = attempt(&mut *runner, &mut connected, &["set-rgb-all", "-c", &dim_hex, "-s", &s]);
+                for (led, colour) in &leds {
+                    let (n, c) = (led.to_string(), hex(*colour));
+                    if !attempt(&mut *runner, &mut connected, &["set-rgb", "-l", &n, "-c", &c, "-s", &s]) {
+                        // The board went away mid-paint (unplugged, Keymapp exited).
+                        // Finishing the loop would be 70 more processes for nothing.
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn restore(runner: &mut dyn Runner, connected: &mut bool) {
+    if runner.alive() {
+        attempt(runner, connected, &["restore-rgb-leds"]);
+    }
+}
+
+/// Runs one command, recovering from the two failures that are not really failures.
+///
+/// `no keyboard is connected` after an unplug: Keymapp does NOT reconnect by itself,
+/// so connect and try again. `keyboard requires an updated firmware` immediately after
+/// connecting: transient, and the very next call succeeds — seen live, with the retry
+/// working every time.
+fn attempt(runner: &mut dyn Runner, connected: &mut bool, args: &[&str]) -> bool {
+    if !runner.alive() {
+        *connected = false;
+        return false;
+    }
+    match runner.run(args) {
+        Ok(_) => true,
+        Err(e) if is_transient(&e) => {
+            if e.to_lowercase().contains("no keyboard") {
+                *connected = false;
+                if !ensure_connected(runner, connected) {
+                    return false;
+                }
+            }
+            runner.run(args).is_ok()
+        }
+        Err(_) => {
+            // Anything else: give up on this command and re-check the connection
+            // before the next paint rather than hammering a board that said no.
+            *connected = false;
+            false
+        }
+    }
+}
+
+fn is_transient(err: &str) -> bool {
+    let e = err.to_lowercase();
+    e.contains("no keyboard") || e.contains("updated firmware")
+}
+
+fn ensure_connected(runner: &mut dyn Runner, connected: &mut bool) -> bool {
+    if *connected {
+        return true;
+    }
+    if !runner.alive() {
+        return false;
+    }
+    *connected = runner.run(&["connect-any"]).is_ok();
+    *connected
+}
+
+fn hex(c: crate::config::Rgb) -> String {
+    format!("#{:02x}{:02x}{:02x}", c.0, c.1, c.2)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -389,6 +592,180 @@ mod tests {
         let l = Layout::from_json(r#"{"layout":{"revision":{"layers":[{}]}}}"#).unwrap();
         assert_eq!(l.layers(), 1);
         assert_eq!(l.led_for("g", 0), None);
+    }
+
+    /// A keyboard that is not there, scripted: every failure below was seen for real
+    /// in one session, and not one of them is reachable from a test that needs the
+    /// hardware. `alive` is the socket, `replies` are what kontroll would answer.
+    struct Fake {
+        alive: bool,
+        log: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        replies: std::collections::VecDeque<Result<String, String>>,
+    }
+
+    impl Fake {
+        fn new(replies: Vec<Result<String, String>>) -> (Fake, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+            let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            (Fake { alive: true, log: log.clone(), replies: replies.into() }, log)
+        }
+    }
+
+    impl Runner for Fake {
+        fn run(&mut self, args: &[&str]) -> Result<String, String> {
+            self.log.lock().unwrap().push(args.join(" "));
+            self.replies.pop_front().unwrap_or_else(|| Ok(String::new()))
+        }
+        fn alive(&self) -> bool {
+            self.alive
+        }
+    }
+
+    /// Drives the worker to completion on THIS thread: queue the commands, close the
+    /// channel, run. No sleeps, no flakiness, and the log is complete when it returns.
+    fn drive(cmds: Vec<Cmd>, fake: Fake) -> Vec<String> {
+        let log = fake.log.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        for c in cmds {
+            tx.send(c).unwrap();
+        }
+        drop(tx);
+        worker(rx, Box::new(fake));
+        let out = log.lock().unwrap().clone();
+        out
+    }
+
+    fn rgb(r: u8, g: u8, b: u8) -> crate::config::Rgb {
+        crate::config::Rgb(r, g, b)
+    }
+
+    #[test]
+    fn a_paint_dims_everything_then_lights_the_keys_of_the_level() {
+        let (fake, _) = Fake::new(vec![]);
+        let log = drive(
+            vec![Cmd::Paint {
+                leds: vec![(19, rgb(0xf5, 0xd5, 0x43)), (12, rgb(0x6b, 0xb1, 0xff))],
+                dim: rgb(5, 5, 16),
+                sustain_ms: 10_000,
+            }],
+            fake,
+        );
+        assert_eq!(
+            log,
+            vec![
+                "connect-any",
+                // The background goes down first, so a key that left this level goes
+                // dark in the same pass that lights the ones that arrived.
+                "set-rgb-all -c #050510 -s 10000",
+                "set-rgb -l 19 -c #f5d543 -s 10000",
+                "set-rgb -l 12 -c #6bb1ff -s 10000",
+            ]
+        );
+    }
+
+    /// The dead-man switch has to be on EVERY call, not just the first: sustain is
+    /// what puts the board back when runnir is killed before it can restore.
+    #[test]
+    fn every_call_of_a_paint_carries_the_sustain() {
+        let (fake, _) = Fake::new(vec![]);
+        let log = drive(
+            vec![Cmd::Paint { leds: vec![(1, rgb(1, 2, 3))], dim: rgb(0, 0, 0), sustain_ms: 4242 }],
+            fake,
+        );
+        assert!(log.iter().filter(|c| c.starts_with("set-rgb")).all(|c| c.ends_with("-s 4242")), "{log:?}");
+    }
+
+    /// Unplug and replug: Keymapp keeps its socket but drops the keyboard, and does
+    /// NOT reconnect on its own. Seen live, and it is why `connect-any` is not just a
+    /// startup step.
+    #[test]
+    fn a_disconnected_keyboard_is_reconnected_and_the_call_retried() {
+        let (fake, _) = Fake::new(vec![
+            Ok("connected".into()),                                  // connect-any
+            Err("Failed to set rgb: no keyboard is connected".into()), // set-rgb-all
+            Ok("connected".into()),                                  // connect-any again
+            Ok("ok".into()),                                         // the retry
+        ]);
+        let log = drive(
+            vec![Cmd::Paint { leds: vec![], dim: rgb(0, 0, 0), sustain_ms: 0 }],
+            fake,
+        );
+        assert_eq!(
+            log,
+            vec!["connect-any", "set-rgb-all -c #000000 -s 0", "connect-any", "set-rgb-all -c #000000 -s 0"]
+        );
+    }
+
+    /// The transient one: right after connecting, the first call can answer
+    /// "keyboard requires an updated firmware" and the next one succeeds. Believing
+    /// the first answer would turn the feature off for the whole session.
+    #[test]
+    fn the_firmware_error_right_after_connecting_is_retried_once() {
+        let (fake, _) = Fake::new(vec![
+            Err("Failed to set rgb: keyboard requires an updated firmware".into()),
+            Ok("ok".into()),
+        ]);
+        let log = drive(vec![Cmd::Restore], fake);
+        // No connect-any: the board is connected, it just was not ready yet. A restore
+        // does not force a connection either — if it turns out there is no keyboard,
+        // the "no keyboard" branch handles that, and this is not that.
+        assert_eq!(log, vec!["restore-rgb-leds", "restore-rgb-leds"]);
+    }
+
+    /// Keymapp exits on its own — it did, mid-session. With no socket, nothing runs at
+    /// all: no processes spawned, no errors, no keyboard integration.
+    #[test]
+    fn with_keymapp_gone_nothing_is_spawned_at_all() {
+        let (mut fake, _) = Fake::new(vec![]);
+        fake.alive = false;
+        let log = drive(
+            vec![
+                Cmd::Paint { leds: vec![(1, rgb(9, 9, 9))], dim: rgb(0, 0, 0), sustain_ms: 100 },
+                Cmd::Restore,
+            ],
+            fake,
+        );
+        assert!(log.is_empty(), "{log:?}");
+    }
+
+    /// Walking three levels of the leader quickly must paint ONCE, at the level the
+    /// walk stopped on. 72 keys at ~4 ms a process is a race that cannot be won by
+    /// painting every step of the way.
+    #[test]
+    fn a_burst_of_paints_collapses_to_the_last_one() {
+        let (fake, _) = Fake::new(vec![]);
+        let log = drive(
+            vec![
+                Cmd::Paint { leds: vec![(1, rgb(1, 1, 1))], dim: rgb(0, 0, 0), sustain_ms: 1 },
+                Cmd::Paint { leds: vec![(2, rgb(2, 2, 2))], dim: rgb(0, 0, 0), sustain_ms: 1 },
+                Cmd::Paint { leds: vec![(3, rgb(3, 3, 3))], dim: rgb(0, 0, 0), sustain_ms: 1 },
+            ],
+            fake,
+        );
+        assert_eq!(log.iter().filter(|c| c.starts_with("set-rgb ")).count(), 1, "{log:?}");
+        assert!(log.iter().any(|c| c.starts_with("set-rgb -l 3")), "the LAST level, not the first: {log:?}");
+    }
+
+    /// Stopping restores. A terminal that exits leaving the board in its colours is
+    /// the bug that gets the whole integration switched off.
+    #[test]
+    fn stopping_puts_the_board_back() {
+        let (fake, _) = Fake::new(vec![]);
+        let log = drive(vec![Cmd::Stop], fake);
+        assert_eq!(log, vec!["restore-rgb-leds"]);
+    }
+
+    /// The board going away DURING a paint stops the paint: the alternative is 70 more
+    /// processes spawned at 4 ms each for a keyboard that is not there.
+    #[test]
+    fn a_board_that_vanishes_mid_paint_does_not_finish_the_level() {
+        let (fake, _) = Fake::new(vec![
+            Ok("connected".into()),
+            Ok("dimmed".into()),
+            Err("Failed to set rgb: some other problem".into()),
+        ]);
+        let leds = (0..20).map(|i| (i, rgb(1, 1, 1))).collect();
+        let log = drive(vec![Cmd::Paint { leds, dim: rgb(0, 0, 0), sustain_ms: 0 }], fake);
+        assert_eq!(log.len(), 3, "stopped at the first refusal: {log:?}");
     }
 
     /// The real thing, against the real database — `cargo test -- --ignored zsa`.

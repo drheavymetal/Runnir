@@ -158,6 +158,17 @@ fn main() {
             let layer: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(0);
             return zsa_map(revision, layer);
         }
+        // `runnir --zsa-paint <revision> [seconds]` — paint the leader's top level on
+        // the real board, hold it, put it back. The whole of step 3 end to end,
+        // without the terminal being involved, so the keyboard half can be looked at
+        // on its own before anything is wired to a keystroke.
+        Some("--zsa-paint") => {
+            let Some(revision) = args.get(2) else {
+                return eprintln!("usage: runnir --zsa-paint <revision> [seconds]");
+            };
+            let secs: u64 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(5);
+            return zsa_paint(revision, secs);
+        }
         Some("--version" | "-v") => return println!("runnir {}", env!("CARGO_PKG_VERSION")),
         Some("--help" | "-h") => return print_help(),
         Some("--demo") => {
@@ -405,6 +416,43 @@ fn zsa_map(revision: &str, layer: usize) {
         }
     }
     println!("{lit} keys would light, {dark} have no key on this layout");
+}
+
+/// Paints the leader's top level on the keyboard for `secs`, then restores it.
+///
+/// The sustain is set past the hold on purpose: if this process is killed while the
+/// board is lit, Keymapp still puts it back on its own. That is the property the whole
+/// feature rests on, so the probe that demonstrates it should rely on it too.
+fn zsa_paint(revision: &str, secs: u64) {
+    let Some(board) = zsa::Board::start() else {
+        return eprintln!("runnir: no kontroll on PATH — install it with `cargo install kontroll`");
+    };
+    let Some(layout) = zsa::default_db().and_then(|db| zsa::read_layout(&db, revision)) else {
+        return eprintln!("runnir: could not read revision {revision} (is keymapp installed?)");
+    };
+    let config = Config::default();
+    let palette = config.theme.leader_palette();
+    let keymap = actions::Keymap::new(&std::collections::HashMap::new(), &config.leader);
+    let keys = keymap.leader_level_keys(&[]);
+
+    let spellings: Vec<&str> = keys.iter().map(|(s, _)| s.as_str()).collect();
+    let groups: std::collections::HashSet<&str> =
+        keys.iter().filter(|(_, g)| *g).map(|(s, _)| s.as_str()).collect();
+    let leds: Vec<(u8, config::Rgb)> = layout
+        .leds_for(spellings, 0)
+        .into_iter()
+        .map(|(s, led)| (led, if groups.contains(s) { palette.group } else { palette.leaf }))
+        .collect();
+
+    println!("painting {} keys for {secs}s, then restoring", leds.len());
+    let sustain = (secs as u32 + 5) * 1000;
+    board.paint(leds, palette.background, sustain);
+    std::thread::sleep(Duration::from_secs(secs));
+    board.restore();
+    // The worker owns the channel; dropping the handle queues a restore too, but the
+    // process has to outlive the thread doing the work.
+    std::thread::sleep(Duration::from_millis(500));
+    println!("restored");
 }
 
 /// Renders the leader layer as the app draws it: a working terminal, the LEADER
