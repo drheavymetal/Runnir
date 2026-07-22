@@ -244,6 +244,14 @@ Switch provider without editing anything: Ctrl+Shift+, opens the settings panel,
 and the AI row cycles through every provider you have configured, showing which
 model is behind each one.
 
+You can also route ONE TASK to a different provider than the rest, which is about
+cost rather than taste: summarising a whole session is long and cheap on a flat-rate
+subscription, while turning one sentence into a command wants the lowest latency you
+can get. In [ai.tasks], name a task and the provider it should use — panel, command,
+fix, explain, summarize, whisper. Anything not named there uses the default. A task
+name that is not one of those six, or a provider that does not exist, is reported
+when the config loads rather than silently falling back for ever.
+
 @ Ctrl+Shift+A     open / close the assistant panel
 @ Ctrl+Shift+G     send the last command, its output and its exit code to the model
 @ Ctrl+Shift+N     launch Claude Code in a new split

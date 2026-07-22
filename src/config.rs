@@ -504,6 +504,41 @@ pub struct Ai {
     pub providers: HashMap<String, Provider>,
     /// Seconds before a request is abandoned.
     pub timeout_secs: u64,
+    /// Per-task provider overrides, keyed by task name: `panel`, `command`, `fix`,
+    /// `explain`, `summarize`, `whisper`.
+    ///
+    /// The point is economics, not preference. Summarising a whole session is long
+    /// and cheap on a flat-rate subscription; translating one sentence into a command
+    /// wants the lowest latency you can get. Anything not named here uses `default`.
+    #[serde(default)]
+    pub tasks: HashMap<String, String>,
+}
+
+/// The tasks `ai.tasks` can override, and the only names it accepts.
+///
+/// A typo in a config file must not silently route a task to the default forever —
+/// so an unknown key is reported once at load rather than ignored.
+pub const AI_TASKS: [&str; 6] = ["panel", "command", "fix", "explain", "summarize", "whisper"];
+
+impl Ai {
+    /// The provider for `task`: its override when one is configured AND names a
+    /// provider that exists, else the default.
+    ///
+    /// An override pointing at a deleted provider falls back rather than failing the
+    /// request: the assistant going quiet is a worse answer to a stale config line
+    /// than quietly using the default one.
+    pub fn provider_for(&self, task: &str) -> String {
+        self.tasks
+            .get(task)
+            .filter(|name| self.providers.contains_key(*name))
+            .cloned()
+            .unwrap_or_else(|| self.default.clone())
+    }
+
+    /// Task keys that are not real tasks, for the warning at load time.
+    pub fn unknown_tasks(&self) -> Vec<&String> {
+        self.tasks.keys().filter(|k| !AI_TASKS.contains(&k.as_str())).collect()
+    }
 }
 
 impl Default for Ai {
@@ -569,7 +604,7 @@ impl Default for Ai {
                 api_key_env: "ZAI_API_KEY".into(),
             },
         );
-        Self { default: "claude".into(), providers, timeout_secs: 120 }
+        Self { default: "claude".into(), providers, timeout_secs: 120, tasks: HashMap::new() }
     }
 }
 
@@ -775,6 +810,23 @@ impl Config {
     /// Clamps values that would render the terminal unusable. A zero font size or
     /// a 3-entry ANSI palette is a mistake, not a preference.
     fn validate(&mut self) {
+        // Say it once, at load. A mistyped task key would otherwise route that task
+        // to the default silently and for ever — the failure has no symptom.
+        for key in self.ai.unknown_tasks() {
+            eprintln!(
+                "runnir: [ai.tasks] has no task {key:?} (known: {})",
+                AI_TASKS.join(", ")
+            );
+        }
+        for (task, provider) in &self.ai.tasks {
+            if !self.ai.providers.contains_key(provider) {
+                eprintln!(
+                    "runnir: [ai.tasks] {task} points at provider {provider:?}, which is not \
+                     configured — that task falls back to {:?}",
+                    self.ai.default
+                );
+            }
+        }
         self.font.size = self.font.size.clamp(4.0, 200.0);
         self.window.opacity = self.window.opacity.clamp(0.1, 1.0);
         self.window.padding = self.window.padding.clamp(0.0, 200.0);
@@ -1064,6 +1116,42 @@ mod tests {
                 );
             }
         }
+    }
+
+
+    /// Per-task providers exist for economics: a session summary is long and cheap on
+    /// a flat-rate subscription, while a one-line command translation wants latency.
+    #[test]
+    fn a_task_override_wins_over_the_default() {
+        let mut cfg = Config::default();
+        cfg.ai.default = "claude".into();
+        cfg.ai.tasks.insert("command".into(), "claude-api".into());
+        assert_eq!(cfg.ai.provider_for("command"), "claude-api");
+        assert_eq!(cfg.ai.provider_for("summarize"), "claude", "unnamed tasks keep the default");
+    }
+
+    /// An override naming a provider that no longer exists must fall back, not fail:
+    /// a silent assistant is a worse answer to a stale config line than the default.
+    #[test]
+    fn an_override_pointing_nowhere_falls_back() {
+        let mut cfg = Config::default();
+        cfg.ai.default = "claude".into();
+        cfg.ai.tasks.insert("fix".into(), "deleted-provider".into());
+        assert_eq!(cfg.ai.provider_for("fix"), "claude");
+    }
+
+    /// A typo in a task key has no symptom at request time — it just uses the
+    /// default for ever — so it has to be caught at load.
+    #[test]
+    fn an_unknown_task_key_is_reported() {
+        let mut cfg = Config::default();
+        cfg.ai.tasks.insert("sumarize".into(), "claude".into());
+        assert_eq!(cfg.ai.unknown_tasks(), vec![&"sumarize".to_string()]);
+        cfg.ai.tasks.clear();
+        for task in AI_TASKS {
+            cfg.ai.tasks.insert(task.into(), "claude".into());
+        }
+        assert!(cfg.ai.unknown_tasks().is_empty(), "every real task name is accepted");
     }
 
     #[test]

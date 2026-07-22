@@ -499,10 +499,11 @@ export const FEATURES = [
       { k: 'ai.default', v: '"claude"', d: { es: 'Que proveedor usar; se cicla tambien desde el panel de ajustes', en: 'Which provider to use; also cycled from the settings panel' } },
       { k: 'ai.providers.<name>.kind', v: '"claude_code" | "api" | "anthropic"', d: { es: 'La forma del proveedor', en: 'The provider shape' } },
       { k: 'ai.providers.<name>.api_key_env', v: '"ANTHROPIC_API_KEY"', d: { es: 'El NOMBRE de la variable de entorno, nunca la clave', en: 'The NAME of the environment variable, never the key' } },
+      { k: '[ai.tasks]', v: 'command = "claude-api"', d: { es: 'Enruta una tarea suelta a otro proveedor: panel, command, fix, explain, summarize, whisper', en: 'Route one task to a different provider: panel, command, fix, explain, summarize, whisper' } },
     ],
     note: {
-      es: 'Cambiar de proveedor no exige editar nada: Ctrl+Shift+, y la fila de IA cicla por todos los configurados, mostrando que modelo hay detras de cada nombre.',
-      en: 'Switching provider needs no editing: Ctrl+Shift+, and the AI row cycles through everything configured, showing which model is behind each name.',
+      es: 'Cambiar de proveedor no exige editar nada: Ctrl+Shift+, y la fila de IA cicla por todos los configurados, mostrando que modelo hay detras de cada nombre. Y se puede enrutar UNA tarea a otro proveedor, que es cuestion de coste y no de gusto: resumir una sesion entera es largo y sale gratis en una suscripcion plana, mientras que convertir una frase en un comando quiere la menor latencia posible. Un nombre de tarea mal escrito, o un proveedor inexistente, se avisa al cargar la config — porque en tiempo de peticion no tiene sintoma: simplemente usaria el default para siempre.',
+      en: 'Switching provider needs no editing: Ctrl+Shift+, and the AI row cycles through everything configured, showing which model is behind each name. You can also route ONE task to a different provider, which is about cost rather than taste: summarising a whole session is long and free on a flat-rate subscription, while turning one sentence into a command wants the lowest latency you can get. A misspelled task name, or a provider that does not exist, is reported when the config loads — at request time it has no symptom, it would just use the default for ever.',
     },
   },
   {

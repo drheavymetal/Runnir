@@ -5,7 +5,7 @@ impl Gpu {
         match &self.overlay {
             Some(Overlay::Ai(_)) => self.overlay = None,
             _ => {
-                let provider = config.ai.default.clone();
+                let provider = config.ai.provider_for("panel");
                 self.ai.provider = Some(provider.clone());
                 let mut panel = overlay::AiPanel::new(provider);
                 if config.ai.providers.is_empty() {
@@ -21,7 +21,7 @@ impl Gpu {
     /// answered in place.
     fn ask_ai_about_error(&mut self, config: &Config) {
         let output = self.tab().focused().last_command_output();
-        let provider = config.ai.default.clone();
+        let provider = config.ai.provider_for("panel");
 
         // Make sure the panel is open to show the exchange.
         if !matches!(self.overlay, Some(Overlay::Ai(_))) {
@@ -44,7 +44,7 @@ impl Gpu {
     }
 
     fn send_ai(&mut self, question: String, config: &Config) {
-        let provider = self.ai.provider.clone().unwrap_or_else(|| config.ai.default.clone());
+        let provider = self.ai.provider.clone().unwrap_or_else(|| config.ai.provider_for("panel"));
         if let Some(Overlay::Ai(panel)) = self.overlay.as_mut() {
             panel.push(overlay::Who::You, question.clone());
             panel.busy = true;
@@ -71,7 +71,7 @@ impl Gpu {
     }
 
     fn send_ai_command(&mut self, description: String, config: &Config) {
-        let provider = config.ai.default.clone();
+        let provider = config.ai.provider_for("command");
         let prompt = format!(
             "Translate this request into a single shell command for a Linux system. \
              Output ONLY the command, no explanation, no markdown, no backticks.\n\n{description}"
@@ -116,7 +116,7 @@ impl Gpu {
         let command = self.tab().focused().last_command_line().unwrap_or_default();
         let output = self.tab().focused().last_command_output().unwrap_or_default();
         let exit = self.tab().focused().last_exit().unwrap_or(-1);
-        let provider = config.ai.default.clone();
+        let provider = config.ai.provider_for("fix");
 
         let prompt = format!(
             "A shell command failed in my Linux terminal. Give me the single corrected \
@@ -141,7 +141,7 @@ impl Gpu {
     /// Sends the current selection to the assistant to be explained.
     fn ai_explain_selection(&mut self, config: &Config) {
         let Some(text) = self.tab().focused().selection_text() else { return };
-        let provider = config.ai.default.clone();
+        let provider = config.ai.provider_for("explain");
         if !matches!(self.overlay, Some(Overlay::Ai(_))) {
             self.ai.provider = Some(provider.clone());
             self.overlay = Some(Overlay::Ai(overlay::AiPanel::new(provider)));
@@ -160,7 +160,7 @@ impl Gpu {
             self.window.request_redraw();
             return;
         }
-        let provider = config.ai.default.clone();
+        let provider = config.ai.provider_for("summarize");
         if !matches!(self.overlay, Some(Overlay::Ai(_))) {
             self.ai.provider = Some(provider.clone());
             self.overlay = Some(Overlay::Ai(overlay::AiPanel::new(provider)));
@@ -235,7 +235,7 @@ impl Gpu {
     }
 
     fn send_whisper(&mut self, request: String, config: &Config) {
-        let provider = config.ai.default.clone();
+        let provider = config.ai.provider_for("whisper");
         let prompt = crate::whisper::prompt(&request);
         self.status = Some(format!("whispering to {provider}…"));
         self.status_expiry = None; // In-flight: the reply clears the toast.

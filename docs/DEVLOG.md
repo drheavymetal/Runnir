@@ -2175,6 +2175,33 @@ Keys stay out of the config file: every provider names an ENVIRONMENT VARIABLE, 
 the file is safe in a dotfile repo. That was already true and is now documented in
 the manual, the README and the site, none of which said it.
 
+## 2026-07-22 - One provider per TASK, because the economics differ per task
+
+Follow-up to the provider work: `ai.default` was global, so every AI feature shared
+one provider. `[ai.tasks]` now routes a single task elsewhere — `panel`, `command`,
+`fix`, `explain`, `summarize`, `whisper` — and anything unnamed keeps the default.
+
+The reason is cost, not preference. Summarising a whole session is long and free on a
+flat-rate subscription; turning one sentence into a shell command is short and wants
+the lowest latency available. Those pull in opposite directions and there was no way
+to say so.
+
+**An override that cannot be honoured falls back rather than failing.** A task
+pointing at a deleted provider gets the default: an assistant that goes silent is a
+worse answer to a stale config line than one that quietly works.
+
+**But a wrong name is reported at load**, because at request time it has no symptom —
+the task just uses the default for ever and nobody ever finds out. Both cases print
+once: a task key that is not one of the six (listing the six), and a provider name
+that is not configured (naming what it falls back to).
+
+Verified with TWO mock servers, one per provider, and a config routing `command` to
+the second: `command` hit the override, `summarize` hit the default. The warnings were
+verified separately — and only after noticing the running binary predated them,
+because `cargo test` builds the test harness and does NOT refresh
+`target/release/runnir`. That is the second time today a stale binary made working
+code look broken.
+
 ## Gotchas (do not re-learn)
 
 - The board must be put back even if runnir DIES. `sustain` (ms) on every ZSA paint is
@@ -2191,6 +2218,9 @@ the manual, the README and the site, none of which said it.
   desktop app: kontroll finds Keymapp's socket through it, so the usual test isolation
   silently disconnects the keyboard. Some features can only be verified in the real
   environment.
+- `cargo test` does NOT refresh `target/release/runnir`. Rebuild before launching an
+  instance to verify a change, or you are testing the previous build — it has already
+  cost two debugging detours.
 - A local mock HTTP server is the cheapest way to verify a wire format with no
   credentials: log the request to prove the headers, return a canned body to prove
   the parser. Both halves fail silently otherwise.

@@ -190,6 +190,25 @@ the file is safe in a dotfile repo. Switch provider without editing anything:
 `Ctrl+Shift+,` and the AI row cycles through everything you have configured, showing
 which model is behind each name.
 
+**Per-task routing**, because the economics differ per task — summarising a whole
+session is long and cheap on a flat-rate subscription, while translating one sentence
+into a command wants the lowest latency you can get:
+
+```toml
+[ai]
+default = "claude"          # the CLI, on your subscription
+
+[ai.tasks]
+command = "claude-api"      # one sentence in, one command out: latency matters
+whisper = "claude-api"
+                            # panel, fix, explain and summarize keep the default
+```
+
+The six task names are `panel`, `command`, `fix`, `explain`, `summarize` and
+`whisper`. A misspelled task, or one pointing at a provider that does not exist, is
+reported when the config loads — a wrong name has no symptom at request time, it just
+quietly uses the default for ever.
+
 ## Configuration
 
 `~/.config/runnir/runnir.toml` — every value has a default that stands on its own, so an
