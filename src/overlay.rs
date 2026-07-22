@@ -2365,7 +2365,10 @@ impl VerbsPanel {
         let h = visible + 4;
         let mut g = panel_grid(w, h, theme);
 
-        let head = format!("How this repo is worked  \u{b7}  {}", short_path(&self.repo, w - 28));
+        // Saturating: `w` is clamped to the window, so a narrow one leaves less room
+        // than the title takes and the header simply loses its path.
+        let head =
+            format!("How this repo is worked  \u{b7}  {}", short_path(&self.repo, w.saturating_sub(28)));
         write(&mut g, 0, 2, &head, accent());
 
         if self.verbs.is_empty() {
@@ -2401,10 +2404,14 @@ impl VerbsPanel {
 /// A path shortened from the LEFT: the tail (the project) identifies it, the head
 /// (somebody's home directory) does not.
 fn short_path(p: &str, max: usize) -> String {
-    if p.chars().count() <= max {
+    let len = p.chars().count();
+    if len <= max {
         return p.to_string();
     }
-    let tail: String = p.chars().skip(p.chars().count().saturating_sub(max - 1)).collect();
+    // The ellipsis costs a cell of its own. With none to spare there is nothing
+    // honest to draw — and a panic here would take the whole window with it.
+    let Some(keep) = max.checked_sub(1) else { return String::new() };
+    let tail: String = p.chars().skip(len - keep).collect();
     format!("\u{2026}{tail}")
 }
 
@@ -3873,6 +3880,33 @@ mod tests {
             .collect();
         assert!(row.contains('\u{2026}'), "a clipped field must say so: {row:?}");
         assert!(row.trim_end().ends_with('a'), "the end of the input must be visible: {row:?}");
+    }
+
+    /// A shortened path has to fit the room it was given, including when that room
+    /// is nothing at all: the panel is clamped to the window, so a narrow window
+    /// leaves the header less than its title takes. Getting this wrong is an
+    /// underflow, and a panic here takes the window and every shell in it.
+    #[test]
+    fn a_shortened_path_never_outgrows_the_room_it_was_given() {
+        let p = "/home/pedro/projects/runnir";
+        for max in 0..40 {
+            let short = short_path(p, max);
+            assert!(short.chars().count() <= max, "{max} cells: {short:?} does not fit");
+        }
+        assert_eq!(short_path(p, 40), p, "with room to spare the path is left alone");
+        assert!(short_path(p, 12).ends_with("runnir"), "the tail is what identifies it");
+    }
+
+    /// …and the panel that asks for it renders at any window width, however silly.
+    #[test]
+    fn the_verbs_panel_renders_in_a_window_narrower_than_itself() {
+        let p = VerbsPanel::new(
+            "/home/pedro/projects/runnir".into(),
+            vec![("cargo test".into(), 7), ("git push".into(), 3)],
+        );
+        for cols in 1..40 {
+            assert_eq!(p.render(cols, 24, &Theme::default()).len(), 1, "{cols} columns");
+        }
     }
 
     #[test]

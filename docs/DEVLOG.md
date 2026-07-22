@@ -2548,6 +2548,52 @@ then with per-card backgrounds and a header row, then with the block-output glim
 Verified live over the control socket AND by eye at 1400x900: `ok cargo --version`,
 `running sleep 500`, `failed ls /noexiste` with the real error underneath.
 
+## 2026-07-22 - Audit round on the five candidates: nine defects, two of them serious
+
+An adversarial read of everything added on `feat/ideas-candidatas`, then a separate
+pass to verify and fix. Eight findings were real, one was half right.
+
+**The two that mattered:**
+- `verbs.rs` promised in its own doc comment that arguments never reach disk, and then
+  wrote one. The environment-prefix skip stepped over exactly ONE assignment, so
+  `RUST_LOG=debug OPENAI_API_KEY=sk-live-… cargo run` recorded the KEY AND VALUE as
+  the verb and persisted it to `verbs.json`. Now every assignment is stepped over, and
+  a line that is only assignments yields no verb at all.
+- The war room interpolated the compose directory and the service names into a string
+  run with `sh -c`. `services_in` rejects quotes, braces and spaces but not `;`, `$(`
+  or backticks, so cloning a repo and pressing `leader w w` was arbitrary code
+  execution — including the staged `docker compose up -d`, one Enter away. Fixed by
+  QUOTING (`shell_quote`), not by filtering harder: a legal-but-odd service name still
+  deserves its pane, and a repo path with a space used to break every pane anyway.
+
+**The rest, each with a test that names the invariant:**
+- `recent_output` picked a block too far back on a ONE-LINE prompt, where the cursor
+  row equals the newest prompt mark. The map showed the output of the command before
+  the last one. My own test had passed only because it fed a trailing newline no shell
+  emits — the test was the bug's alibi.
+- `last_watch_hit` was set and never cleared, so one hit marked a pane "watch" forever
+  and hid every later failure (the headline checks the watch before the exit code). It
+  now clears where the catch-up window opens, and when the watch is taken off.
+- `pipe_output` mapped pointer row to buffer row by hand while `point_in` went through
+  the fold display plan: with outputs folded, a drag staged a different command's
+  output. Both paths share `Grid::row_at_view` now.
+- The leader lapse in `about_to_wait` cleared the three fields directly instead of
+  going through `end_leader`, so a leader that timed out left the KEYBOARD PAINTED
+  until the board's dead-man expired. Exactly the invariant `end_leader`'s doc comment
+  claims; written and then bypassed in another file.
+- `press_key` diverged from `on_key` for the FOURTH time — no kitty encoding, no copy
+  mode, no media keys, swallowed keys the explorer declined, and ran the sidebar in
+  the wrong order. Both now call one `route_key`. The lesson has repeated enough:
+  a second entry point into key handling is a bug generator, not a feature.
+- `open_war_room` ignored the tab-spawn result, so a failed spawn built the room in
+  the user's own tab and marked one of their panes as the room's property.
+- `short_path(w - 28)` could underflow on a narrow window (the clamp floor is 34, but
+  the following `.min(cols - 2)` goes under it).
+
+487 tests (was 477). Left for a separate look: `take_watch_hit` scans from the previous
+cursor row + 1, so the first line printed after a poll boundary is never matched —
+harmless with multi-line output, which is why nobody noticed.
+
 ## Gotchas (do not re-learn)
 
 - The board must be put back even if runnir DIES. `sustain` (ms) on every ZSA paint is

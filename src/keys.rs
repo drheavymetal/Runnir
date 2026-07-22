@@ -105,6 +105,14 @@ pub fn encode_kitty(
     encode_kitty_inner(&event.logical_key, event.text.as_deref(), event.repeat, mods, flags, released)
 }
 
+/// The kitty encoding from a bare `Key`, for the scripted path: a keypress arriving
+/// down the control socket has no winit `KeyEvent` behind it, and no text or repeat
+/// flag to carry. Without this, a scripted key sent the legacy bytes to a pane that
+/// had asked for CSI-u — different bytes from the hand it stands in for.
+pub fn encode_kitty_key(key: &Key, mods: ModifiersState, flags: u8) -> Option<Vec<u8>> {
+    encode_kitty_inner(key, None, false, mods, flags, false)
+}
+
 /// Core of [`encode_kitty`], split out so it can be unit-tested without a winit
 /// `KeyEvent` (whose platform field is not publicly constructible).
 fn encode_kitty_inner(
@@ -547,6 +555,34 @@ mod tests {
             kit(&Key::Named(NamedKey::Space), Some(" "), m(false, false, false, false), ALL).unwrap(),
             b"\x1b[32u"
         );
+    }
+
+    /// A key sent down the control socket must reach the child as the same bytes the
+    /// keyboard would have produced. The scripted path has no `KeyEvent`, and the
+    /// text and repeat it cannot supply are not what the encoding turns on.
+    #[test]
+    fn a_scripted_key_reaches_the_child_as_the_typed_one_would() {
+        let plain = m(false, false, false, false);
+        let ctrl = m(false, true, false, false);
+        for (key, text) in [
+            (ch("a"), Some("a")),
+            (ch("i"), Some("i")),
+            (Key::Named(NamedKey::Enter), Some("\r")),
+            (Key::Named(NamedKey::Escape), Some("\x1b")),
+            (Key::Named(NamedKey::ArrowUp), None),
+        ] {
+            for mods in [plain, ctrl] {
+                assert_eq!(
+                    encode_kitty_key(&key, mods, DISAMB),
+                    encode_kitty_inner(&key, text, false, mods, DISAMB, false),
+                    "{key:?} with {mods:?}"
+                );
+            }
+        }
+        // …and that is a real difference: under the kitty protocol Ctrl+I is CSI u,
+        // where the legacy encoder collapses it to the same byte as Tab.
+        assert_eq!(encode_kitty_key(&ch("i"), ctrl, DISAMB).unwrap(), b"\x1b[105;5u");
+        assert_eq!(encode_key(&ch("i"), ctrl, KeyMode::default()).unwrap(), b"\t");
     }
 
     #[test]

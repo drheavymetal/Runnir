@@ -70,6 +70,13 @@ pub fn leader_timeout(config: &Config) -> Option<Duration> {
     (config.leader_timeout > 0).then(|| Duration::from_secs(config.leader_timeout))
 }
 
+/// Whether an armed leader layer has outlived its step. Both halves have to be
+/// there: nothing armed is nothing to lapse, and no timeout means the layer waits
+/// as long as the user does.
+pub fn leader_lapsed(armed: Option<Instant>, timeout: Option<Duration>) -> bool {
+    matches!((armed, timeout), (Some(since), Some(limit)) if since.elapsed() >= limit)
+}
+
 /// Width of the minimap strip, in pixels. Like the tab bar, this is chrome that
 /// overlaps the pane, so the text grid must reserve it — see `tab::cells_in`.
 pub const MINIMAP_W: f32 = 46.0;
@@ -1408,15 +1415,13 @@ impl ApplicationHandler<UserEvent> for App {
 
         // An armed leader expires on a deadline nothing else wakes us for: on an idle
         // terminal the status-bar chip would stay lit long after the layer was gone.
-        // Clear it here and repaint once; the wake itself is folded into `extra_wake`
-        // below rather than returning early, which would stall the animations.
-        if let Some(limit) = gpu.leader_timeout {
-            if gpu.leader_armed.is_some_and(|t| t.elapsed() >= limit) {
-                gpu.leader_armed = None;
-                gpu.leader_path.clear();
-                gpu.leader_entries.clear();
-                gpu.window.request_redraw();
-            }
+        // Through `end_leader` like every other exit — clearing the fields here would
+        // leave the keyboard painted with a level nobody is in until the board's own
+        // dead-man expires. The wake itself is folded into `extra_wake` below rather
+        // than returning early, which would stall the animations.
+        if leader_lapsed(gpu.leader_armed, gpu.leader_timeout) {
+            gpu.end_leader(&self.config);
+            gpu.window.request_redraw();
         }
 
         // Animate a scroll glide (smooth scroll-to-top/bottom / jump-to-prompt).
@@ -1751,15 +1756,10 @@ impl Gpu {
                 }
             }
             // The keyboard belongs to the whole desktop: runnir holds it only while
-            // it has the window focus, and only while the layer is actually armed.
-            // The lapse case matters as much as the focus one — the layer times out
-            // without any key arriving to notice, and the board would sit lit.
-            if self.leader_armed.is_some()
-                && (!focused
-                    || self.leader_timeout.is_some_and(|d| {
-                        self.leader_armed.is_some_and(|t| t.elapsed() >= d)
-                    }))
-            {
+            // it has the window focus. The lapse itself is not checked here — it has
+            // its own deadline wake in `about_to_wait`, which fires on the second
+            // rather than on this half-second tick.
+            if self.leader_armed.is_some() && !focused {
                 self.end_leader(config);
                 self.window.request_redraw();
             }

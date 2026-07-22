@@ -64,8 +64,14 @@ pub fn verb_of(line: &str) -> Option<String> {
     let mut words = first_stage.split_whitespace();
     let head = words.next()?;
 
-    // An assignment prefix (`RUST_LOG=debug cargo test`) is environment, not a verb.
-    let head = if head.contains('=') { words.next()? } else { head };
+    // An assignment prefix (`RUST_LOG=debug cargo test`) is environment, not a verb —
+    // and there can be any number of them. Stepping over only the first is how
+    // `RUST_LOG=debug OPENAI_API_KEY=sk-… cargo run` gets learned as the key itself,
+    // written to disk under the repo's name.
+    let mut head = head;
+    while head.contains('=') {
+        head = words.next()?;
+    }
     // A path to something in the project is not a shared verb: `./deploy.sh` says as
     // much about someone's directory as about the project, and `/home/pedro/x` more.
     if head.starts_with('-') || head.contains('/') || head.starts_with('$') {
@@ -189,6 +195,23 @@ mod tests {
         assert_eq!(verb_of("ssh cloudmax").unwrap(), "ssh", "a hostname is not a subcommand");
     }
 
+
+    /// A command line can carry as many assignments as it likes before the verb, and
+    /// the second one holds a secret as readily as the first.
+    #[test]
+    fn every_env_assignment_is_stepped_over_not_just_the_first() {
+        assert_eq!(
+            verb_of("RUST_LOG=debug OPENAI_API_KEY=sk-live-abc123 cargo run").unwrap(),
+            "cargo run"
+        );
+        assert_eq!(
+            verb_of("AWS_PROFILE=prod AWS_SECRET_ACCESS_KEY=wJal DEBUG=1 terraform apply").unwrap(),
+            "terraform apply"
+        );
+        // Assignments and nothing else is an environment change, not a verb at all.
+        assert!(verb_of("OPENAI_API_KEY=sk-live-abc123").is_none());
+        assert!(verb_of("A=1 B=2").is_none());
+    }
 
     /// A list whose top entry is `cd` teaches a newcomer nothing: navigation is how
     /// anyone uses any directory, not how this project is worked.

@@ -494,61 +494,9 @@ impl Gpu {
             return;
         }
 
-        // An overlay swallows all keys while open.
-        if self.overlay.is_some() {
-            self.overlay_key(&event.logical_key, mods, config);
-            return;
-        }
-
-        // Copy-mode owns the keyboard: vim motions drive a virtual cursor/selection.
-        if self.copy_mode.is_some() {
-            self.copy_mode_key(&event, mods);
-            return;
-        }
-
-        // With the tree focused its own leader answers first: the same chord, a tree
-        // of file verbs instead of the window's.
-        if self.explorer_leader_key(&event.logical_key, mods, config) {
-            return;
-        }
-        if self.leader_key(&event.logical_key, mods, config, keymap, event_loop) {
-            return;
-        }
-
-        // The sidebar takes the keyboard only while it has focus, and only after the
-        // leader layer and the bound chords: a tree that swallowed ctrl+shift+t would
-        // be a mode, and this is chrome.
-        if self.explorer_focused() && !mods.control_key() && !mods.alt_key() && !mods.super_key() {
-            if self.explorer_key(&event.logical_key, config) {
-                return;
-            }
-        }
-
-        // The XF86 media transport keys drive the media backend directly, wherever the
-        // focus is (no overlay needed). Volume media keys are left to the system.
-        if let Key::Named(n) = &event.logical_key {
-            let media = match n {
-                NamedKey::MediaPlayPause => Some(Action::MediaPlayPause),
-                NamedKey::MediaTrackNext => Some(Action::MediaNext),
-                NamedKey::MediaTrackPrevious => Some(Action::MediaPrev),
-                _ => None,
-            };
-            if let Some(a) = media {
-                self.run_action(a, config, event_loop);
-                return;
-            }
-        }
-
-        // A bound chord runs its action and never reaches the child.
-        if let Some(action) = keymap.resolve(&event.logical_key, mods) {
-            self.run_action(action.clone(), config, event_loop);
-            return;
-        }
-
-        // Command guardian: a plain Enter about to submit a destructive command
-        // opens a confirmation first. Only bare Enter (no modifiers) with the view
-        // at the live prompt is guarded, so history editing and TUIs are untouched.
-        if event.state.is_pressed() && self.guard_enter(&event.logical_key, mods, config) {
+        // Everything the window itself does with a key, in one order, shared with the
+        // scripted path.
+        if self.route_key(&event.logical_key, mods, config, keymap, event_loop) {
             return;
         }
 
@@ -576,6 +524,79 @@ impl Gpu {
             }
             self.write_key_bytes(&bytes);
         }
+    }
+
+    /// Everything the window does with a key before the child sees it: the overlays,
+    /// copy-mode, both leader layers, the sidebar, the media keys, the bound chords
+    /// and the guardian. Returns whether the key was taken.
+    ///
+    /// One list, one order, one place. The real path and the scripted one each used
+    /// to carry their own copy, and every divergence between the two is either a key
+    /// that works from the keyboard and does nothing down the socket, or a test that
+    /// proves something the user never experiences.
+    fn route_key(
+        &mut self,
+        key: &Key,
+        mods: ModifiersState,
+        config: &Config,
+        keymap: &Keymap,
+        event_loop: &ActiveEventLoop,
+    ) -> bool {
+        // An overlay swallows all keys while open.
+        if self.overlay.is_some() {
+            self.overlay_key(key, mods, config);
+            return true;
+        }
+
+        // Copy-mode owns the keyboard: vim motions drive a virtual cursor/selection.
+        if self.copy_mode.is_some() {
+            self.copy_mode_key(key, mods);
+            return true;
+        }
+
+        // With the tree focused its own leader answers first: the same chord, a tree
+        // of file verbs instead of the window's.
+        if self.explorer_leader_key(key, mods, config) {
+            return true;
+        }
+        if self.leader_key(key, mods, config, keymap, event_loop) {
+            return true;
+        }
+
+        // The sidebar takes the keyboard only while it has focus, and never a chord
+        // with a modifier: a tree that swallowed ctrl+shift+t would be a mode, and
+        // this is chrome. A key it does not use falls through to the rest.
+        if self.explorer_focused() && !mods.control_key() && !mods.alt_key() && !mods.super_key() {
+            if self.explorer_key(key, config) {
+                return true;
+            }
+        }
+
+        // The XF86 media transport keys drive the media backend directly, wherever the
+        // focus is (no overlay needed). Volume media keys are left to the system.
+        if let Key::Named(n) = key {
+            let media = match n {
+                NamedKey::MediaPlayPause => Some(Action::MediaPlayPause),
+                NamedKey::MediaTrackNext => Some(Action::MediaNext),
+                NamedKey::MediaTrackPrevious => Some(Action::MediaPrev),
+                _ => None,
+            };
+            if let Some(a) = media {
+                self.run_action(a, config, event_loop);
+                return true;
+            }
+        }
+
+        // A bound chord runs its action and never reaches the child.
+        if let Some(action) = keymap.resolve(key, mods) {
+            self.run_action(action.clone(), config, event_loop);
+            return true;
+        }
+
+        // Command guardian: a plain Enter about to submit a destructive command
+        // opens a confirmation first. Only bare Enter (no modifiers) with the view
+        // at the live prompt is guarded, so history editing and TUIs are untouched.
+        self.guard_enter(key, mods, config)
     }
 
     /// Sends encoded key bytes to the focused pane (or all panes when broadcasting),
@@ -2858,12 +2879,6 @@ impl Gpu {
         false
     }
 
-    /// A keypress with no `KeyEvent` behind it, for the remote-control `key`
-    /// command: overlays, the leader layer and the bound actions, in the order
-    /// `on_key` tries them.
-    ///
-    /// It deliberately stops short of the pane: text for the child goes through
-    /// `send-text`, which does not have to guess an encoding.
     /// Leaves the leader layer AND gives the keyboard back. Every exit from the layer
     /// goes through here: a key that acts, a miss, Escape, or the timeout lapsing.
     /// Missing one of them is how the board ends up holding a level nobody is in.
@@ -2974,6 +2989,11 @@ impl Gpu {
         true
     }
 
+    /// A keypress with no `KeyEvent` behind it, for the remote-control `key` command.
+    ///
+    /// It stands in for a hand on the keyboard, so it goes through the same routing
+    /// and reaches the same child: a script that could open panels but not type a
+    /// letter would be a script that cannot exercise the thing being tested.
     fn press_key(
         &mut self,
         key: &Key,
@@ -2982,38 +3002,24 @@ impl Gpu {
         keymap: &Keymap,
         event_loop: &ActiveEventLoop,
     ) {
-        if self.overlay.is_some() {
-            self.overlay_key(key, mods, config);
+        // The same routing the keyboard goes through, in the same order — see
+        // `route_key` for why this is not a second copy of the list.
+        if self.route_key(key, mods, config, keymap, event_loop) {
             return;
         }
-        if self.explorer_leader_key(key, mods, config) {
-            return;
-        }
-        if self.leader_key(key, mods, config, keymap, event_loop) {
-            return;
-        }
-        if let Some(action) = keymap.resolve(key, mods) {
-            let action = action.clone();
-            self.run_action(action, config, event_loop);
-            return;
-        }
-        if self.guard_enter(key, mods, config) {
-            return;
-        }
-        // Same order as `on_key`: the sidebar takes what the leader and the bound
-        // chords did not. Leaving this out is what made a scripted `j` do nothing
-        // while the same key worked from the keyboard.
-        if !mods.control_key() && !mods.alt_key() && !mods.super_key() && self.explorer_focused() {
-            self.explorer_key(key, config);
-            return;
-        }
-        // And finally the child process, which `on_key` has always done and this path
-        // never did: a scripted key could open panels but not type a single letter
-        // into a shell. That is also why `touched` was never set from a script.
+        // And finally the child process, spoken to the way the pane asked to be
+        // spoken to: a pane that pushed kitty flags gets CSI-u here exactly as it
+        // would from the keyboard. A scripted key that quietly downgraded to the
+        // legacy encoding sends different bytes than the hand it stands in for,
+        // which makes every test driven this way prove the wrong thing.
         let flags = self.tab().focused().keyboard_flags();
-        let mode = keys::KeyMode { app_cursor: self.tab().focused().app_cursor() };
-        let _ = flags;
-        if let Some(bytes) = keys::encode_key(key, mods, mode) {
+        let bytes = if flags != 0 {
+            keys::encode_kitty_key(key, mods, flags)
+        } else {
+            let mode = keys::KeyMode { app_cursor: self.tab().focused().app_cursor() };
+            keys::encode_key(key, mods, mode)
+        };
+        if let Some(bytes) = bytes {
             self.write_key_bytes(&bytes);
         }
     }
@@ -4001,7 +4007,7 @@ impl Gpu {
         self.window.request_redraw();
     }
 
-    fn copy_mode_key(&mut self, event: &winit::event::KeyEvent, mods: ModifiersState) {
+    fn copy_mode_key(&mut self, key: &Key, mods: ModifiersState) {
         use winit::keyboard::{Key, NamedKey};
         // A modified chord (Ctrl+C, Ctrl+Q, …) leaves copy-mode rather than being
         // mis-read as a motion key, and hands control back to the shell/bindings.
@@ -4035,7 +4041,7 @@ impl Gpu {
         cm.dropped = dropped;
         let (mut yank, mut exit) = (false, false);
 
-        match &event.logical_key {
+        match key {
             Key::Named(NamedKey::Escape) => exit = true,
             Key::Named(NamedKey::Enter) => yank = true,
             Key::Named(NamedKey::ArrowLeft) => cm.cur.1 = cm.cur.1.saturating_sub(1),
@@ -5753,17 +5759,9 @@ impl Gpu {
         let row = (((pos.y as f32 - rect.y) / ch).floor().max(0.0)) as usize;
         let pane = self.tabs[self.active].panes.get(&id)?;
         let grid = pane.grid.lock().unwrap();
-        let row = row.min(grid.rows().saturating_sub(1));
         // With folds active a screen row maps through the display plan; a click on a
         // fold summary or blank padding is not a real cell (returns None).
-        let abs = if grid.has_folds() {
-            match grid.display_plan().get(row) {
-                Some(crate::grid::PlanRow::Real(a)) => *a,
-                _ => return None,
-            }
-        } else {
-            grid.abs_row(row)
-        };
+        let abs = grid.row_at_view(row)?;
         Some((abs, col.min(grid.cols().saturating_sub(1))))
     }
 
@@ -6111,7 +6109,15 @@ impl Gpu {
         // A tab of its own: the room is a place you go to, and it must not rearrange
         // the panes you were already working in.
         let n = plan.services.len();
-        self.control_new_tab(config, Vec::new());
+        let opened = self.control_new_tab(config, Vec::new());
+        if !opened.ok {
+            // Without a tab of its own the room would be built around the panes the
+            // user is working in, and every one of them would be marked as the room's
+            // to close. Refuse rather than take over somebody's window.
+            let why = opened.error.unwrap_or_else(|| "the tab did not open".into());
+            self.note_pipe(&format!("war room: {why}"));
+            return;
+        }
         if let Some(pane) = self.tabs[self.active].panes.values_mut().next() {
             pane.from_war_room = true;
         }
@@ -6142,7 +6148,9 @@ impl Gpu {
         if let Some(first) = self.tabs[self.active].first_pane() {
             self.tabs[self.active].focus = first;
         }
-        let dir = file.parent().unwrap_or(std::path::Path::new(".")).to_string_lossy().into_owned();
+        // Quoted like the watch commands: this line is one Enter away from running,
+        // and the path came from wherever the repository was cloned to.
+        let dir = shell_quote(&file.parent().unwrap_or(std::path::Path::new(".")).to_string_lossy());
         self.insert_command(format!("cd {dir} && docker compose up -d"));
         self.note_pipe(&format!(
             "war room: {n} services \u{2014} the deploy is at the prompt, not running"
@@ -6210,9 +6218,15 @@ impl Gpu {
             let src = &self.tabs[self.active].panes[&src_id];
             let g = src.grid.lock().unwrap();
             // The row under the pointer is a VIEW row; blocks are addressed in the
-            // buffer, which is scrolled back by however much this pane is scrolled.
-            let top = g.scrollback_len().saturating_sub(g.display_offset());
-            let Some(range) = g.block_at(top + row_in_pane) else {
+            // buffer, and with output folded the two do not differ by the scroll
+            // alone. The same mapping the click path uses, or a drag over a folded
+            // pane stages a different command's output than the one under the hand.
+            let Some(abs) = g.row_at_view(row_in_pane) else {
+                drop(g);
+                self.note_pipe("that row is a fold — unfold it to grab its output");
+                return;
+            };
+            let Some(range) = g.block_at(abs) else {
                 drop(g);
                 self.note_pipe("that pane has no command marks to grab a block from");
                 return;

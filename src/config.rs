@@ -962,6 +962,21 @@ mod tests {
         assert_eq!(crate::leader_timeout(&cfg), Some(std::time::Duration::from_secs(45)));
     }
 
+    /// The lapse is one question asked in two places (the deadline wake and the
+    /// half-second sweep), and both have to answer it the same way — a layer that
+    /// one of them thinks is still armed is a keyboard still painted.
+    #[test]
+    fn a_leader_lapses_only_when_it_is_armed_and_its_step_ran_out() {
+        use std::time::{Duration, Instant};
+        let long_ago = Instant::now() - Duration::from_secs(30);
+        assert!(crate::leader_lapsed(Some(long_ago), Some(Duration::from_secs(10))));
+        // Nothing armed cannot lapse…
+        assert!(!crate::leader_lapsed(None, Some(Duration::from_secs(10))));
+        // …and with the timeout off the layer waits as long as the user does.
+        assert!(!crate::leader_lapsed(Some(long_ago), None));
+        assert!(!crate::leader_lapsed(Some(Instant::now()), Some(Duration::from_secs(10))));
+    }
+
     #[test]
     fn defaults_round_trip_through_toml() {
         // The generated file must parse back, or `--write-config` writes something

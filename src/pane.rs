@@ -46,8 +46,9 @@ pub struct Pane {
     /// The command counter already handed to the verb learner, so each command is
     /// counted once and never twice.
     verbs_seq: u64,
-    /// The last watched word this pane saw, kept for the catch-up (the notification
-    /// path takes its own copy and clears it).
+    /// The last watched word this pane saw, kept for the catch-up because the
+    /// notification path consumes its own copy. Scoped to the current away window:
+    /// see [`Pane::mark_catch_up_point`].
     last_watch_hit: Option<String>,
     last_bell: u64,
     /// Keyword to watch for in this pane's output (lowercased), or `None`. When set,
@@ -190,8 +191,15 @@ impl Pane {
     /// Marks the point the user stepped away from, so the next catch-up can tell
     /// what moved. Called when the away clock starts, not when the panel opens —
     /// otherwise every pane looks unchanged.
+    ///
+    /// The remembered watch hit goes with it: it is a fact about the absence that
+    /// just ended, measured from the same instant `changed` is. Kept past here it
+    /// would headline the pane "watch" for the rest of the session, and a watch
+    /// outranks an exit code — so the command that failed afterwards would never be
+    /// the line you read.
     pub fn mark_catch_up_point(&mut self) {
         self.catch_up_seq = self.grid.lock().unwrap().command_seq();
+        self.last_watch_hit = None;
     }
 
     pub fn alive(&self) -> bool {
@@ -285,6 +293,10 @@ impl Pane {
     /// fire a flood of stale matches.
     pub fn set_watch(&mut self, keyword: String) {
         let kw = keyword.trim();
+        // Whatever the old watch saw stops being news the moment the watch changes:
+        // reporting "saw ERROR" for a word nobody is watching any more is a headline
+        // about a pane the user has already moved on from.
+        self.last_watch_hit = None;
         if kw.is_empty() {
             self.watch = None;
         } else {
@@ -553,6 +565,59 @@ mod tests {
             let (r, g, b) = host_colour(host);
             assert!(r < 130 && g < 130 && b < 130, "{host} tint too bright: {r},{g},{b}");
         }
+    }
+
+    /// A pane that will sit still for the length of the test, with a real PTY behind
+    /// it: the watch reads the grid, and the grid belongs to a pane.
+    fn quiet_pane() -> Pane {
+        let spawn = Spawn {
+            command: Some(vec!["sleep".into(), "30".into()]),
+            cwd: None,
+            ..Default::default()
+        };
+        Pane::new(20, 6, 100, (8.0, 16.0), &spawn, false, || {}).expect("spawn")
+    }
+
+    /// Output as a command would produce it: the echoed command line, then what it
+    /// printed. The watch starts scanning below the row the cursor was on, so a
+    /// keyword typed into the first row would not be a hit — nor should it be.
+    fn print(pane: &Pane, text: &str) {
+        vte::Parser::new().advance(&mut *pane.grid.lock().unwrap(), text.as_bytes());
+    }
+
+    /// A watch hit is news about the stretch of absence it fired in. Kept past that,
+    /// a single old hit headlines the pane "watch" forever — and because a watch
+    /// outranks an exit code, the command that failed afterwards is never the line
+    /// the user reads.
+    #[test]
+    fn a_watch_hit_does_not_outlive_the_absence_it_fired_in() {
+        let mut pane = quiet_pane();
+        pane.set_watch("error".into());
+        print(&pane, "$ deploy\r\nbuild failed: ERROR 3\r\n");
+
+        assert!(pane.take_watch_hit().is_some(), "the watched word was printed");
+        assert_eq!(
+            pane.catch_up_snapshot(1, false).watch_hit.as_deref(),
+            Some("error"),
+            "the catch-up exists to report exactly this"
+        );
+
+        // Stepping away again opens a new window; what the last one saw is not in it.
+        pane.mark_catch_up_point();
+        assert_eq!(pane.catch_up_snapshot(1, false).watch_hit, None);
+    }
+
+    /// A word nobody is watching any more cannot be a headline about this pane.
+    #[test]
+    fn a_watch_taken_off_takes_what_it_saw_with_it() {
+        let mut pane = quiet_pane();
+        pane.set_watch("error".into());
+        print(&pane, "$ deploy\r\nbuild failed: ERROR 3\r\n");
+        assert!(pane.take_watch_hit().is_some());
+
+        pane.set_watch(String::new());
+        assert_eq!(pane.catch_up_snapshot(1, false).watch_hit, None);
+        assert!(pane.watching().is_none());
     }
 
     #[test]

