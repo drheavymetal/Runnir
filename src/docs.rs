@@ -49,7 +49,9 @@ Straight away, no group — the things you do constantly:
 @                        The cards keep the panes' own places, so the session looks
 @                        like itself: the zoom is what you read, not where things are.
 @ Leader V         clipboard history
-@ Leader G         fix the last failed command
+@ Leader G         the git panel
+@ Leader D         the docker panel
+@ Leader E         the file tree beside the panes
 @ Leader Z / Shift+Z  font bigger / smaller (+, = and - work too; the letters
 @                        are the binding that survives a layout where = is shifted)
 @ Leader 0         reset the font size
@@ -106,6 +108,7 @@ which stays the way to find a command you have not memorised.
 @ Ctrl+Shift+T     new tab
 @ Ctrl+Shift+W     close tab
 @ Ctrl+PageUp/Dn   previous / next tab
+@ Ctrl+Tab / Ctrl+Shift+Tab  next / previous tab
 @ Ctrl+Shift+Left/Right  move the current tab left / right in the bar
 @ Leader 1..9      jump to tab N
 @ Ctrl+Shift+R     rename the current tab
@@ -236,9 +239,9 @@ docker blue. It launches the real ssh, so your ~/.ssh/config, jump hosts and
 
 # Hint mode (keyboard, no mouse)
 
-@ Ctrl+Shift+F     label every URL, path and git hash on screen; type a label to
-                   open or copy it. This removes most of the reasons to reach for
-                   the mouse.
+@ Ctrl+Shift+Space hint mode: label every URL, path and git hash on screen; type a
+                   label to open or copy it. This removes most of the reasons to
+                   reach for the mouse.
 
 Hovering the pointer over a URL or path also underlines it; Ctrl+click opens a URL
 in the browser or copies a path/hash, without entering hint mode. OSC 8 hyperlinks
@@ -263,9 +266,9 @@ Keys are never stored in the config. Each provider names an ENVIRONMENT VARIABLE
 (api_key_env) and runnir reads the key from there, so the config file is safe to
 keep in a dotfile repo.
 
-Switch provider without editing anything: Ctrl+Shift+, opens the settings panel,
-and the AI row cycles through every provider you have configured, showing which
-model is behind each one.
+Switch provider without editing anything: Leader O C opens the settings panel, and
+the AI row cycles through every provider you have configured, showing which model
+is behind each one.
 
 You can also route ONE TASK to a different provider than the rest, which is about
 cost rather than taste: summarising a whole session is long and cheap on a flat-rate
@@ -413,7 +416,7 @@ a + / - column, so the code stays aligned with its context.
 
 # Hint mode knows git
 
-Hint mode (Ctrl+Shift+Space, or Leader I) labels every URL, path and commit hash on
+Hint mode (Ctrl+Shift+Space, or Leader F I) labels every URL, path and commit hash on
 screen, and in a repository it also labels branch names - by name, against the real
 ref list, so only a branch this repo actually has is a target. Paths git prints
 relatively (src/main.rs, and src/main.rs:412 from a compiler) are labelled too.

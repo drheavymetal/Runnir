@@ -17,6 +17,8 @@
 //! file, which is what makes it testable with no hardware attached.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
 
 /// LEDs on a Moonlander MK1, and therefore keys per layer in its layout.
 ///
@@ -320,6 +322,11 @@ enum Cmd {
 /// and the UI thread cannot spend that.
 pub struct Board {
     tx: std::sync::mpsc::Sender<Cmd>,
+    /// The layer the board last said it was on. Kept here because asking costs a
+    /// subprocess and the answer is wanted on a keystroke; see `refresh_layer`.
+    layer: Arc<AtomicUsize>,
+    /// Whether a reading of that is already out.
+    asking: Arc<AtomicBool>,
 }
 
 impl Board {
@@ -335,7 +342,31 @@ impl Board {
     fn with_runner(runner: Box<dyn Runner>) -> Board {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || worker(rx, runner));
-        Board { tx }
+        Board {
+            tx,
+            layer: Arc::new(AtomicUsize::new(0)),
+            asking: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// The layer to resolve keys against right now, without asking the board.
+    ///
+    /// Layer 0 until something says otherwise, which is the base layer and also the
+    /// right answer for any layer above it that leaves the letters transparent —
+    /// `effective` walks down to it. That makes "we have not been told yet" and the
+    /// ordinary case the same paint, so nothing has to wait to light correctly.
+    pub fn known_layer(&self) -> usize {
+        self.layer.load(Ordering::Relaxed)
+    }
+
+    /// Starts a reading of the current layer in the background, for the NEXT paint.
+    ///
+    /// `status` is a `kontroll` subprocess with no timeout, and Keymapp does wedge —
+    /// its socket stays on disk while it answers nothing. Called from the leader's
+    /// arming keystroke, so doing it inline froze the whole window on the keypress
+    /// that was supposed to light the keyboard up.
+    pub fn refresh_layer(&self) {
+        ask_layer(self.layer.clone(), self.asking.clone(), read_status);
     }
 
     /// Lights `leds` over a `dim` background. `sustain_ms` is a DEAD-MAN SWITCH: after
@@ -529,31 +560,61 @@ fn parse_status(out: &str) -> Option<Status> {
 }
 
 impl Board {
-    /// Asks the board what it is running. Blocking, so it belongs at startup or on a
-    /// worker — never on the path of a keystroke.
+    /// Asks the board what it is running, and remembers the layer for the paints.
+    /// Blocking, so it belongs at startup or on a worker — never on the path of a
+    /// keystroke. `known_layer` is what a keystroke may read.
     pub fn status(&self) -> Option<Status> {
-        let bin = kontroll_path()?;
-        let out = std::process::Command::new(&bin).arg("status").output().ok()?;
-        let text = String::from_utf8_lossy(&out.stdout);
-        // kontroll reports a failed connection on STDERR with a non-zero exit, and
-        // reading only stdout turned that into an empty string and a shrug. Worth
-        // knowing that `XDG_CONFIG_HOME` decides where kontroll looks for Keymapp's
-        // socket, so a sandbox that redirects it cannot reach the keyboard at all.
-        if std::env::var("RUNNIR_ZSA_DEBUG").is_ok() {
-            let err = String::from_utf8_lossy(&out.stderr);
-            eprintln!(
-                "zsa: {} status (exit {:?})\n  out: {}\n  err: {}",
-                bin.display(),
-                out.status.code(),
-                text.trim_end(),
-                err.trim_end()
-            );
-        }
-        if !out.status.success() {
-            return None;
-        }
-        parse_status(&text)
+        let status = read_status()?;
+        self.layer.store(status.layer, Ordering::Relaxed);
+        Some(status)
     }
+}
+
+/// Reads one layer at a time into `layer`, on a thread, never twice at once.
+///
+/// The "never twice" is the point: with Keymapp wedged the read never returns, and
+/// one thread per arming keystroke would pile up threads on a tool that has already
+/// stopped answering. One is stuck, the layer keeps its last value, and the leader
+/// lights carry on painting where they last knew the keys to be.
+fn ask_layer(
+    layer: Arc<AtomicUsize>,
+    asking: Arc<AtomicBool>,
+    read: impl FnOnce() -> Option<Status> + Send + 'static,
+) {
+    if asking.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    std::thread::spawn(move || {
+        if let Some(status) = read() {
+            layer.store(status.layer, Ordering::Relaxed);
+        }
+        asking.store(false, Ordering::SeqCst);
+    });
+}
+
+/// Runs `kontroll status` and reads its answer. Blocking, with no timeout of its own.
+fn read_status() -> Option<Status> {
+    let bin = kontroll_path()?;
+    let out = std::process::Command::new(&bin).arg("status").output().ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    // kontroll reports a failed connection on STDERR with a non-zero exit, and
+    // reading only stdout turned that into an empty string and a shrug. Worth
+    // knowing that `XDG_CONFIG_HOME` decides where kontroll looks for Keymapp's
+    // socket, so a sandbox that redirects it cannot reach the keyboard at all.
+    if std::env::var("RUNNIR_ZSA_DEBUG").is_ok() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        eprintln!(
+            "zsa: {} status (exit {:?})\n  out: {}\n  err: {}",
+            bin.display(),
+            out.status.code(),
+            text.trim_end(),
+            err.trim_end()
+        );
+    }
+    if !out.status.success() {
+        return None;
+    }
+    parse_status(&text)
 }
 
 #[cfg(test)]
@@ -930,6 +991,40 @@ mod tests {
         // LED 36 the INNER top-right one.
         assert_eq!(l.led_for("escape", 0), Some(0));
         assert_eq!(l.led_for("6", 0), Some(36));
+    }
+
+    /// The leader lights need the active layer, and the only way to learn it is a
+    /// `kontroll` subprocess with no timeout — on a keystroke, with Keymapp wedged,
+    /// that is the window frozen under the user's hand. So the arming key reads what
+    /// the board last said and asks for the next reading in the background, and a
+    /// second arming while the first is still out asks nothing at all.
+    #[test]
+    fn arming_the_leader_never_waits_for_the_keyboard_to_answer() {
+        let layer = Arc::new(AtomicUsize::new(3));
+        let asking = Arc::new(AtomicBool::new(false));
+        // Stands in for a wedged Keymapp: it answers when the test lets it, not before.
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let (answered, done) = std::sync::mpsc::channel::<()>();
+        ask_layer(layer.clone(), asking.clone(), move || {
+            held.recv().ok()?;
+            let _ = answered.send(());
+            Some(Status { revision: "Jad5YO".into(), layer: 1 })
+        });
+
+        // The arming key is already through: it paints on the layer it knew.
+        assert_eq!(layer.load(Ordering::SeqCst), 3, "the paint uses the last known layer");
+        // And every further arming while that one hangs starts nothing new.
+        for _ in 0..5 {
+            ask_layer(layer.clone(), asking.clone(), || panic!("a second reading was started"));
+        }
+
+        release.send(()).unwrap();
+        done.recv_timeout(std::time::Duration::from_secs(5)).expect("the reading finishes");
+        // The answer lands for the next paint, not for the one that asked.
+        while asking.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+        assert_eq!(layer.load(Ordering::SeqCst), 1, "the next paint uses what the board said");
     }
 
     /// A revision id reaches a SQL statement, so anything that is not what Keymapp

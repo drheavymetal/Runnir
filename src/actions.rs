@@ -1751,3 +1751,143 @@ mod tests {
         assert_eq!(map.bindings.get(&chord), Some(&Action::CommandPalette));
     }
 }
+
+#[cfg(test)]
+mod manual_tests {
+    use super::*;
+    use crate::docs::HELP;
+
+    /// One thing the manual teaches: the chord exactly as it is WRITTEN in the
+    /// manual, the action pressing it must run, and a word every line naming that
+    /// chord has to carry.
+    ///
+    /// That last column is the one that catches a manual which has drifted. A chord
+    /// is only ever written down beside the thing it does, so a line offering
+    /// Ctrl+Shift+F as hint mode — it is the scrollback search — fails here, instead
+    /// of misleading whoever pressed F1 to find out.
+    const TAUGHT: &[(&str, Action, &str)] = &[
+        // Tabs
+        ("Ctrl+Shift+T", Action::NewTab, "new tab"),
+        ("Ctrl+Shift+W", Action::CloseTab, "close tab"),
+        ("Ctrl+Tab", Action::NextTab, "tab"),
+        ("Ctrl+Shift+Tab", Action::PrevTab, "tab"),
+        ("Ctrl+PageUp", Action::PrevTab, "tab"),
+        ("Ctrl+Shift+R", Action::RenameTab, "rename"),
+        ("Ctrl+Shift+U", Action::ReopenClosed, "closed"),
+        // Panes
+        ("Ctrl+Shift+D", Action::SplitHorizontal, "split"),
+        ("Ctrl+Shift+E", Action::SplitVertical, "split"),
+        ("Ctrl+Shift+X", Action::ClosePane, "close"),
+        ("Ctrl+Shift+Z", Action::ToggleZoom, "zoom"),
+        ("Ctrl+Shift+B", Action::ToggleBroadcast, "broadcast"),
+        // Clipboard and scrollback
+        ("Ctrl+Shift+C", Action::Copy, "cop"),
+        ("Alt+Shift+V", Action::ClipboardHistory, "clipboard"),
+        ("Ctrl+Shift+O", Action::CopyLastOutput, "output"),
+        ("Ctrl+Shift+F", Action::SearchScrollback, "search"),
+        ("Ctrl+Shift+Q", Action::OpenScrollbackInEditor, "scrollback"),
+        ("Shift+PageUp", Action::ScrollPageUp, "scroll"),
+        ("Ctrl+Shift+Home", Action::ScrollToTop, "top"),
+        ("Ctrl+Shift+Up", Action::JumpPrevPrompt, "command"),
+        // The assistant, and the two keys most often confused with it
+        ("Ctrl+Shift+A", Action::ToggleAi, "assistant"),
+        ("Ctrl+Shift+G", Action::AskAiAboutError, "last command"),
+        ("Alt+Shift+G", Action::FixLastCommand, "fix"),
+        ("Ctrl+Shift+M", Action::AiCommand, "command"),
+        ("Ctrl+Shift+Y", Action::AiExplain, "explain"),
+        ("Ctrl+Shift+I", Action::SummarizeSession, "summarize"),
+        ("Ctrl+Shift+N", Action::LaunchClaude, "claude"),
+        ("Ctrl+Shift+Enter", Action::Whisper, "whisper"),
+        // The rest of the flat layer
+        ("Ctrl+Shift+S", Action::QuickConnect, "connect"),
+        ("Ctrl+Shift+Space", Action::HintMode, "hint"),
+        ("Ctrl+Shift+P", Action::CommandPalette, "palette"),
+        ("Alt+Shift+S", Action::OpenSnippets, "saved command"),
+        ("Alt+Shift+P", Action::NowPlaying, "now-playing"),
+        ("Ctrl+0", Action::FontReset, "reset"),
+        // The leader layer: the top-level keys, and the deeper paths the manual
+        // spells out in prose where a wrong one is hardest to notice.
+        ("Leader V", Action::ClipboardHistory, "clipboard"),
+        ("Leader G", Action::GitPanel, "git"),
+        ("Leader D", Action::DockerPanel, "docker"),
+        ("Leader E", Action::ToggleExplorer, "tree"),
+        ("Leader U", Action::CatchUp, "catch up"),
+        ("Leader M", Action::Map, "map"),
+        ("Leader 0", Action::FontReset, "font"),
+        ("Leader W W", Action::WarRoom, "war room"),
+        ("Leader W Q", Action::WarRoomClose, "war room"),
+        ("Leader F I", Action::HintMode, "hint"),
+        ("Leader O C", Action::OpenConfig, "settings"),
+        ("Leader O P", Action::CommandPalette, "palette"),
+        ("Leader O V", Action::RepoVerbs, "verbs"),
+    ];
+
+    /// The manual ships inside the binary so it can never be out of step with the
+    /// build — which only helps if it is out of step with nothing else either. A
+    /// chord that moved, or a line that names the wrong one, is a bug the same way a
+    /// broken key is: someone reads it, presses it, and gets something else.
+    #[test]
+    fn the_manual_names_the_key_that_really_runs_each_thing() {
+        let flat = default_bindings();
+        let leader = default_leader_bindings();
+        for (written, action, about) in TAUGHT {
+            assert_eq!(
+                resolve(written, &flat, &leader).as_ref(),
+                Some(action),
+                "the manual says {written}, but that is not what runs {action:?}"
+            );
+            let naming: Vec<&str> = HELP.lines().filter(|line| names(line, written)).collect();
+            assert!(!naming.is_empty(), "the manual no longer teaches {written} at all");
+            for line in naming {
+                assert!(
+                    line.to_lowercase().contains(about),
+                    "{written} runs {action:?}, but the manual offers it for something else:\n  {}",
+                    line.trim()
+                );
+            }
+        }
+    }
+
+    /// What a chord written the manual's way actually runs. `Leader X Y` walks the
+    /// layer step by step; anything else is one chord in the flat table.
+    fn resolve(
+        written: &str,
+        flat: &HashMap<Chord, Action>,
+        leader: &HashMap<Chord, LeaderNode>,
+    ) -> Option<Action> {
+        let Some(path) = written.strip_prefix("Leader ") else {
+            return flat.get(&Chord::parse(written)?).cloned();
+        };
+        let mut level = leader;
+        let mut steps = path.split_whitespace().peekable();
+        while let Some(step) = steps.next() {
+            // The manual capitalises the leader steps for readability; the bindings
+            // are on the unshifted key, which is what `parse` folds them to. The
+            // shifted ones (`Leader J` resizes where `Leader j` moves focus) are
+            // therefore not written this way and are not taught here.
+            match level.get(&Chord::parse(step)?)? {
+                LeaderNode::Run(action) => {
+                    return steps.next().is_none().then(|| action.clone());
+                }
+                LeaderNode::Group { keys, .. } => level = keys,
+            }
+        }
+        None
+    }
+
+    /// Whether this line names exactly this chord. A line saying `Ctrl+Shift+Up` does
+    /// not name `Ctrl+Shift+U`, and `Ctrl+Shift+Tab` does not name `Ctrl+Shift+T` —
+    /// half the flat layer would otherwise be checked against the wrong lines.
+    fn names(line: &str, chord: &str) -> bool {
+        let edge = |c: Option<char>| !c.is_some_and(|c| c.is_ascii_alphanumeric() || c == '+');
+        let mut from = 0;
+        while let Some(at) = line[from..].find(chord) {
+            let (start, end) = (from + at, from + at + chord.len());
+            if edge(line[..start].chars().next_back()) && edge(line[end..].chars().next()) {
+                return true;
+            }
+            from = end;
+        }
+        false
+    }
+}

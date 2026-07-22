@@ -634,6 +634,47 @@ impl Gpu {
         self.baseline.key_reached_a_child();
     }
 
+    /// Performs `CloseTab` / `ClosePane`, and answers whether the window itself must
+    /// now go.
+    ///
+    /// The keyboard and the palette both come here. They used to close things
+    /// separately, and the palette's copy quietly lost every case that is not the
+    /// easy one: its "close pane" did nothing at all on a tab's last pane, and its
+    /// "close tab" did nothing at all on the last tab — two commands that answered a
+    /// deliberate choice from a menu with silence. Closing is one behaviour, so it is
+    /// written once; the callers differ only in how they leave, because the keyboard
+    /// has an `ActiveEventLoop` to exit and the palette has not.
+    fn close_something(&mut self, action: &Action, config: &Config) -> bool {
+        let Some(target) = closing_target(action, self.tabs.len(), self.tab().tree.len()) else {
+            return false;
+        };
+        match target {
+            Closing::Pane => {
+                let area = self.active_area();
+                self.tab().close_focused(area);
+            }
+            Closing::Tab => {
+                // Snapshotted before the removal, and while the tab still holds the
+                // pane the user was closing, so ReopenClosed brings back what was
+                // there rather than an empty tab.
+                self.closed_tabs.push(self.tabs[self.active].to_session());
+                self.tabs.remove(self.active);
+                self.active = self.active.min(self.tabs.len() - 1);
+                self.reflow_all();
+            }
+            Closing::Window => {
+                // Closing the last thing open IS closing the window; it asks the same
+                // question, or a habit of ctrl+w would still kill running work.
+                if !self.request_close(config) {
+                    return false;
+                }
+                self.save_session(config);
+                return true;
+            }
+        }
+        false
+    }
+
     fn run_action(&mut self, action: Action, config: &Config, event_loop: &ActiveEventLoop) {
         let area = self.active_area();
         let wake = wake_fn(self.proxy.clone());
@@ -654,20 +695,8 @@ impl Gpu {
                     self.reflow_all();
                 }
             }
-            Action::CloseTab => {
-                if self.tabs.len() > 1 {
-                    // Remember it so ReopenClosed can bring it back.
-                    self.closed_tabs.push(self.tabs[self.active].to_session());
-                    self.tabs.remove(self.active);
-                    self.active = self.active.min(self.tabs.len() - 1);
-                    self.reflow_all();
-                } else {
-                    // Closing the last tab IS closing the window; it asks the same
-                    // question, or a habit of ctrl+w would still kill running work.
-                    if !self.request_close(config) {
-                        return;
-                    }
-                    self.save_session(config);
+            Action::CloseTab | Action::ClosePane => {
+                if self.close_something(&action, config) {
                     event_loop.exit();
                 }
             }
@@ -695,19 +724,6 @@ impl Gpu {
                 let axis = action.split_axis().unwrap();
                 let id = self.new_pane_id();
                 let _ = self.tab().split_with_id(area, axis, config, id, wake);
-            }
-            Action::ClosePane => {
-                if !self.tab().close_focused(area) && self.tabs.len() > 1 {
-                    self.tabs.remove(self.active);
-                    self.active = self.active.min(self.tabs.len() - 1);
-                    self.reflow_all();
-                } else if self.tabs.len() == 1 && self.tab().tree.len() == 1 {
-                    if !self.request_close(config) {
-                        return;
-                    }
-                    self.save_session(config);
-                    event_loop.exit();
-                }
             }
             a if a.focus_dir().is_some() => {
                 self.tab().focus_dir(area, a.focus_dir().unwrap());
@@ -2942,7 +2958,14 @@ impl Gpu {
             return;
         }
         let (Some(board), Some(layout)) = (&self.board, &self.board_layout) else { return };
-        let layer = board.status().map_or(0, |s| s.layer);
+        // The layer the board last reported, not a fresh reading: this runs on the
+        // arming keystroke and on every descent into a group, and asking the board
+        // is a `kontroll` subprocess that never times out — with Keymapp wedged the
+        // window froze under the hand that armed the leader. The reading is asked
+        // for in the background instead, so a layer change costs one paint aimed at
+        // the layer before it, and never a frozen window.
+        let layer = board.known_layer();
+        board.refresh_layer();
         let keys = keymap.leader_level_keys(&self.leader_path);
         let groups: std::collections::HashSet<&str> =
             keys.iter().filter(|(_, g)| *g).map(|(s, _)| s.as_str()).collect();
@@ -3897,21 +3920,18 @@ impl Gpu {
                     self.set_clipboard(text);
                 }
             }
-            Action::CloseTab => {
-                if self.tabs.len() > 1 {
-                    self.closed_tabs.push(self.tabs[self.active].to_session());
-                    self.tabs.remove(self.active);
-                    self.active = self.active.min(self.tabs.len() - 1);
-                    self.reflow_all();
+            // Same closing the keyboard does, down to the confirm on the last one:
+            // picking this from a menu is as deliberate as pressing the key, so it
+            // cannot be the version that gives up early and says nothing.
+            Action::CloseTab | Action::ClosePane => {
+                if self.close_something(&action, config) {
+                    std::process::exit(0);
                 }
             }
             Action::ReopenClosed => self.reopen_closed(config),
             Action::NextTab => self.active = (self.active + 1) % self.tabs.len(),
             Action::PrevTab => {
                 self.active = (self.active + self.tabs.len() - 1) % self.tabs.len()
-            }
-            Action::ClosePane => {
-                self.tab().close_focused(area);
             }
             Action::CycleLayout => self.cycle_layout(area),
             Action::ScrollToTop => {
@@ -7077,6 +7097,69 @@ impl Gpu {
 /// What to tell the user when no editor could be found at all — the same sentence
 /// wherever an "open this file" key gives up, since the fix is always the same.
 const NO_EDITOR: &str = "no editor found — set $EDITOR (e.g. EDITOR=nvim)";
+
+/// What a close key actually takes down.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Closing {
+    /// One pane; its tab has others and survives.
+    Pane,
+    /// The whole tab: either the tab was asked for, or the pane was the tab's last.
+    Tab,
+    /// Nothing would be left behind it, so this is the window closing.
+    Window,
+}
+
+/// Which of the three a close key means, given how much is open.
+///
+/// Split out from the closing itself because the cases that matter are the ones
+/// nobody exercises by hand — the last pane of the last tab, the last tab of the
+/// window — and because both dispatches ask this one question, so neither can
+/// answer it differently from the other.
+fn closing_target(action: &Action, tabs: usize, panes_in_tab: usize) -> Option<Closing> {
+    match action {
+        // The tab goes, unless it is the only one and there is nothing left to be a
+        // window around.
+        Action::CloseTab if tabs > 1 => Some(Closing::Tab),
+        Action::CloseTab => Some(Closing::Window),
+        // A pane with siblings just goes. The last pane of a tab takes the tab with
+        // it, and the last pane of the last tab takes the window: asking the tab to
+        // close its own last pane leaves an empty tab nothing can be typed into.
+        Action::ClosePane if panes_in_tab > 1 => Some(Closing::Pane),
+        Action::ClosePane if tabs > 1 => Some(Closing::Tab),
+        Action::ClosePane => Some(Closing::Window),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod closing_tests {
+    use super::{closing_target, Closing};
+    use crate::actions::Action;
+
+    /// Walking down to nothing has to end in the window closing, once, at the bottom.
+    /// The palette used to stop one step early on both keys — its "close pane" left
+    /// the last pane alone and said nothing, and its "close tab" did the same with
+    /// the last tab — which reads as a broken command rather than as a refusal.
+    #[test]
+    fn closing_the_last_pane_closes_its_tab_and_the_last_tab_closes_the_window() {
+        let pane = &Action::ClosePane;
+        let tab = &Action::CloseTab;
+        assert_eq!(closing_target(pane, 2, 3), Some(Closing::Pane));
+        assert_eq!(closing_target(pane, 2, 1), Some(Closing::Tab), "the tab's last pane takes the tab");
+        assert_eq!(closing_target(pane, 1, 1), Some(Closing::Window), "and the last of those, the window");
+        assert_eq!(closing_target(tab, 2, 1), Some(Closing::Tab));
+        assert_eq!(closing_target(tab, 1, 4), Some(Closing::Window), "panes do not keep the last tab open");
+        assert_eq!(closing_target(&Action::NewTab, 1, 1), None, "nothing else closes anything");
+    }
+
+    /// The count that decides is the panes there are BEFORE the key, not after it.
+    /// Reading it afterwards saw the one pane left of two and asked to close the
+    /// window — so splitting a window and closing one half offered to quit.
+    #[test]
+    fn closing_one_of_two_panes_never_offers_to_close_the_window() {
+        assert_eq!(closing_target(&Action::ClosePane, 1, 2), Some(Closing::Pane));
+    }
+}
 
 /// Whether a foreground process name is just the pane's shell sitting at its
 /// prompt. Login shells arrive as `-fish`, so the leading dash is stripped first.

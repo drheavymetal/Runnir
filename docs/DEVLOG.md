@@ -2682,6 +2682,38 @@ gone: sanitising the ends of a word is what made a filename look like a command.
 NOT claim a pane (a script is not a person), which means a war-room pane driven only
 by a script still tears down under a running command.
 
+## 2026-07-23 - Fourth round: convergence, and the manual made honest
+
+The signal to stop: this round found nothing new in the feature code. The four it did
+find were all PRE-EXISTING, surfaced by reading the seams the fixes had exposed.
+
+- **The palette was a degraded twin of the keyboard for closing.** `route_key` killed
+  the on_key/press_key divergence for keys, but `run_action`/`run_palette_action` are
+  still two hand-kept copies — and their close arms had drifted: from the palette,
+  "close pane" on a tab's last pane and "close tab" on the last tab were SILENT
+  no-ops, while the keyboard collapsed the last pane into its tab and the last tab
+  into a window-close-with-confirm. One `closing_target` (pure) + one `close_something`
+  now decide it; both dispatches call them. The two dispatchers still differ only where
+  they must — `event_loop.exit()` versus `process::exit(0)` — which is exactly why the
+  pair cannot be merged wholesale.
+- **`paint_leader` blocked the UI thread on `kontroll status`** — a subprocess with no
+  timeout — on every leader arming and every group descent, the one path zsa.rs's own
+  comment says must never pay for a keystroke. With `leader_lights` on and Keymapp
+  wedged, arming the leader froze the window. The board now caches its layer in an
+  atomic and refreshes it on the worker; `paint_leader` reads the last-known layer and
+  paints layer 0 when none is known yet — `effective()` walks transparent upper-layer
+  keys down to base anyway, so the unknown case paints identically and nothing waits.
+- **The manual lied in four places** and once contradicted itself: `leader g` was
+  documented as "fix the last failed command" (it opens the git panel; the fix is
+  `leader a g`), hint mode was shown on Ctrl+Shift+F (that is search; hint mode is
+  Ctrl+Shift+Space), "Leader I" did not exist (it is `leader f i`), and settings had a
+  chord that was never bound. A test now parses EVERY chord the manual prints, walks it
+  through the real binding tables step by step, and asserts it lands on the action it
+  is shown beside — a lying manual cannot come back silently.
+
+502 tests (was 498). Four rounds, twenty-four fixes; the curve — 9, 6, 5, 4, and the
+fourth all pre-existing — says the branch has converged.
+
 ## Gotchas (do not re-learn)
 
 - The board must be put back even if runnir DIES. `sustain` (ms) on every ZSA paint is
