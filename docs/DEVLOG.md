@@ -1982,6 +1982,19 @@ missing one leaves the board holding a level nobody is in.
   belongs to the whole desktop — but verifying it meant taking Pedro's focus for
   twenty seconds and giving it back.
 
+**It works, verified by Pedro on his own board**: arming lights the level, descending
+repaints, and the lights last exactly as long as the layer does — he timed it at the
+`leader_timeout` of 10 s and called it right. Which is the answer to "the light goes
+out too soon": it is not the light, it is the layer, and the fix is a number in the
+config (`leader_timeout = 30`, or `0` for never).
+
+Two sharp edges left standing, both correct-by-design and both worth knowing:
+- Focus follows the mouse on this desktop (`input:follow_mouse = 1`), so moving the
+  pointer over another window drops the focus, ends the layer and hands the keyboard
+  back mid-sequence. The keyboard belongs to the focused window; that is the rule.
+- A scripted test that hands focus back while the layer is armed puts the lights out,
+  which is what made this look broken from the outside for an hour.
+
 **The test sandbox cannot reach this feature at all.** `kontroll` finds Keymapp's
 socket through `XDG_CONFIG_HOME`, and so does `zsa::default_db`. Overriding it — which
 is how every other runnir feature is tested in isolation — points both at a scratch
