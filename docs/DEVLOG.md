@@ -1869,6 +1869,53 @@ channel, call `worker()` — so there are no sleeps and nothing to go flaky.
 board and puts it back: step 3 end to end with the terminal not involved. On this
 machine, 33 keys, groups in the accent and leaves in bright yellow, restored on time.
 
+## 2026-07-22 - ZSA: the leader lit on the keys does not work on OPAQUE keycaps
+
+Step 4 is not being built, and the reason is worth more than the feature would have
+been. The three steps below all work — the palette, the layout lookup, the worker —
+and the board really does light the 33 keys of the leader's root level in the theme's
+colours. Pedro looked at it and could not tell WHICH keys were lit.
+
+His keycaps have no shine-through legends. The LED lights the gap AROUND the cap, not
+the letter on it, so what reaches the eye is a glow in a region, not an identified key.
+Tried, in order, each ruled out by looking at the real board:
+
+- 33 keys, two hues (accent for groups, yellow for leaves): colours told apart easily,
+  keys not. Half the board lit is a lit board, and position stops carrying anything.
+- 8 keys only (the groups), everything else fully black: "veo luz en la zona, pero no
+  se aprecia demasiado". Fewer lights did not make them identifiable.
+- Same 8 in white, brightness up 5 steps — the most this board can emit: "no cambia
+  demasiado".
+
+**The premise was wrong, not the implementation.** The design said a keyboard that
+mirrors the which-key tree "stops being a memorised map and starts saying what is
+pressable now". That holds only if a lit key can be READ as a key. With opaque caps
+the channel carries roughly one bit per region, and a 72-key tree does not fit through
+it. No amount of colour, count or brightness fixes a legend the light cannot reach.
+
+What survives, and why:
+
+- **Idea 4 (F13–F24)** never needed the LEDs at all. It is a keycode problem: the
+  board emits codes no compositor steals, which is the leader-chord problem this
+  DEVLOG already calls unsolvable in software. Unaffected by any of the above, and
+  the design page always called it the one with structural rather than decorative
+  value.
+- **Idea 3 (ambient state)** fits what the hardware CAN say. "The board is amber" is a
+  region-free, identity-free signal — guardian waiting, build finished, a container
+  unhealthy — and it reads from the corner of the eye precisely because it does not
+  ask which key anything is.
+
+The code from steps 1–3 stays and is not dead: `Theme::leader_palette` is what the
+which-key panel draws with, `zsa::Layout` answers key→LED for anything that wants it,
+and `zsa::Board` is the way to paint at all — ambient state needs exactly that worker,
+minus the per-key resolution. `runnir --zsa-paint` remains as the probe that
+demonstrates the finding on any board; on shine-through keycaps it may well be the
+feature as designed.
+
+Filed rather than deleted because the next person with a ZSA board will have this
+idea, and the only thing standing between them and three days of work is knowing to
+look at their keycaps first.
+
 ## DESIGN, NOT YET BUILT — the leader layer, lit on the keys (ZSA Moonlander)
 
 Decided 2026-07-22 with the keyboard on the desk and the API answering. Nothing built.
