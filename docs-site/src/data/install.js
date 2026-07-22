@@ -7,9 +7,9 @@
 // the single source of truth; don't document steps the script doesn't do.
 // Prose is { es, en } pairs; commands and paths are plain strings.
 
-export const INSTALL_CMD = 'curl -fsSL https://raw.githubusercontent.com/drheavymetal/Runnar/main/install.sh | sh'
+export const INSTALL_CMD = 'curl -fsSL https://raw.githubusercontent.com/drheavymetal/Runnir/main/install.sh | sh'
 
-export const INSTALL_CMD_ALT = 'wget -qO- https://raw.githubusercontent.com/drheavymetal/Runnar/main/install.sh | sh'
+export const INSTALL_CMD_ALT = 'wget -qO- https://raw.githubusercontent.com/drheavymetal/Runnir/main/install.sh | sh'
 
 // Lo que hace el instalador, en orden. / What the installer does, in order.
 export const INSTALL_STEPS = [

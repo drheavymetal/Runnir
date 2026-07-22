@@ -20,7 +20,7 @@ speed, and they know things a TUI cannot — which pane is sitting at a prompt, 
 the cursor is on, which host you are ssh'd into.
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/drheavymetal/Runnar/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/drheavymetal/Runnir/main/install.sh | sh
 ```
 
 No sudo, no package manager, nothing system-wide. It builds from source into `~/.local`,
@@ -126,10 +126,10 @@ guardian that stops `rm -rf /` before Enter reaches the shell.
 ## Install
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/drheavymetal/Runnar/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/drheavymetal/Runnir/main/install.sh | sh
 ```
 
-(`wget -qO- https://raw.githubusercontent.com/drheavymetal/Runnar/main/install.sh | sh`
+(`wget -qO- https://raw.githubusercontent.com/drheavymetal/Runnir/main/install.sh | sh`
 works too.)
 
 It clones into `~/.local/share/runnir/src`, runs `cargo build --release`, installs the

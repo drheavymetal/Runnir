@@ -2,7 +2,7 @@
 
 Working memory across sessions. When context runs out, read this first to resume.
 
-Repo: `git@github.com:drheavymetal/Runnar.git` (repo **Runnar**, crate **runnir**).
+Repo: `git@github.com:drheavymetal/Runnir.git` (repo **Runnir**, crate **runnir**).
 Commits **unsigned** (`git -c commit.gpgsign=false commit`). Push after each unit.
 Build: `cargo build` / test: `cargo test` / release: `cargo build --release`.
 Shell is fish: NEVER put backticks in `git commit -m "..."` — fish command-substitutes

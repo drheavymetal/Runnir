@@ -49,7 +49,7 @@ function render(kind, t) {
     case 'hover':
       return (
         <div className="d-body">
-          <div className="d-line">clone: <span className="d-url">https://github.com/drheavymetal/Runnar</span></div>
+          <div className="d-line">clone: <span className="d-url">https://github.com/drheavymetal/Runnir</span></div>
           <div className="d-line">log: <span className="c-d">/var/log/</span><span className="d-path">deploy.log</span></div>
           <div className="d-hint c-d">{t({ es: 'al pasar el ratón se subraya; Ctrl+clic abre o copia', en: 'hover underlines; Ctrl+click opens or copies' })}</div>
         </div>

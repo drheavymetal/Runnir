@@ -11,7 +11,7 @@
 #   install.sh --help        show help
 #
 # One-liner install:
-#   curl -fsSL https://raw.githubusercontent.com/drheavymetal/Runnar/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/drheavymetal/Runnir/main/install.sh | sh
 #
 # Environment overrides:
 #   PREFIX      install prefix for the binary (default: $HOME/.local)
@@ -22,7 +22,7 @@ set -eu
 
 # --- constants ---------------------------------------------------------------
 
-REPO_URL="https://github.com/drheavymetal/Runnar.git"
+REPO_URL="https://github.com/drheavymetal/Runnir.git"
 RUSTUP_URL="https://sh.rustup.rs"
 
 DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
@@ -418,7 +418,7 @@ Usage:
   install.sh --help        show this help
 
 One-liner install:
-  curl -fsSL https://raw.githubusercontent.com/drheavymetal/Runnar/main/install.sh | sh
+  curl -fsSL https://raw.githubusercontent.com/drheavymetal/Runnir/main/install.sh | sh
 
 Environment:
   PREFIX   install prefix (default: \$HOME/.local); binary at \$PREFIX/bin/runnir
