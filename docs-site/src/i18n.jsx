@@ -87,6 +87,65 @@ export const UI = {
   noteLabel: { es: 'Nota', en: 'Note' },
 
   // Hero
+  // ---- introducción / introduction --------------------------------------
+  introLead: {
+    es: 'runnir es un emulador de terminal escrito desde cero en Rust: parser VT propio, renderizador propio por GPU (wgpu + winit), ninguna librería de terminal por debajo. Se usa a diario en Linux/Wayland.',
+    en: 'runnir is a terminal emulator written from scratch in Rust: its own VT parser, its own GPU renderer (wgpu + winit), no terminal library underneath. It is a daily driver on Linux/Wayland.',
+  },
+  introBet: {
+    es: 'La mayoría de terminales son un rectángulo rápido dentro del cual ejecutas las TUIs de otros. runnir apuesta al revés: cuando el renderizador es tuyo, el cliente de git, el árbol de ficheros, el panel de contenedores y el visor de imágenes pueden ser paneles nativos en vez de procesos peleándose por las mismas 80×24. Comparten el tema, el keymap y la capa which-key, dibujan a velocidad de GPU, y saben cosas que una TUI no puede saber: qué panel está en un prompt, sobre qué fichero está el cursor, a qué host estás conectado por ssh.',
+    en: 'Most terminals are a fast rectangle you run other people’s TUIs inside. runnir bets the other way: when the renderer is yours, the git client, the file tree, the container dashboard and the image viewer can be native panels instead of processes fighting over the same 80×24. They share the theme, the keymap and the which-key layer, they draw at GPU speed, and they know things a TUI cannot — which pane is sitting at a prompt, which file the cursor is on, which host you are ssh’d into.',
+  },
+  introPoints: [
+    {
+      title: { es: 'Paneles nativos, no TUIs', en: 'Native panels, not TUIs' },
+      body: {
+        es: 'Cliente de git completo (estado, log con grafo, ramas, stashes, blame, staging por líneas, rebase interactivo), panel de Docker con Docker Hub y despliegue, explorador de ficheros con badges de git, y visor de texto e imágenes. Todo dibujado por runnir, no procesos externos.',
+        en: 'A full git client (status, graph log, branches, stashes, blame, line-by-line staging, interactive rebase), a Docker panel with Docker Hub and deploys, a file explorer with git badges, and a text and image viewer. All drawn by runnir, not external processes.',
+      },
+    },
+    {
+      title: { es: 'Una capa que se enseña sola', en: 'A layer that teaches itself' },
+      body: {
+        es: 'El compositor gana toda carrera de modificadores, así que runnir monta su propia capa detrás de una tecla leader. Al armarla, un panel which-key lista qué hace la siguiente tecla: no hay tabla que memorizar. Cada panel tiene su propio leader, filtrado por lo que la fila bajo el cursor puede hacer.',
+        en: 'The compositor wins every modifier race, so runnir keeps its own layer behind a leader key. Arming it shows a which-key panel listing what the next key does: no table to memorise. Every panel has its own leader, filtered by what the row under the cursor can actually do.',
+      },
+    },
+    {
+      title: { es: 'Sabe qué está pasando', en: 'It knows what is going on' },
+      body: {
+        es: 'Con integración de shell por OSC 133/7, la sesión está segmentada por comando: saltar entre comandos, gutter de estado, prompt fijo al hacer scroll, splits que heredan el directorio, avisos cuando termina algo largo, y un guardián que frena un rm -rf / antes de que Enter llegue a la shell.',
+        en: 'With OSC 133/7 shell integration the session is segmented per command: jump between commands, a status gutter, a sticky prompt while scrolled back, splits that inherit the cwd, notifications when something long finishes, and a guardian that stops an rm -rf / before Enter reaches the shell.',
+      },
+    },
+    {
+      title: { es: 'Se puede conducir desde fuera', en: 'It can be driven from outside' },
+      body: {
+        es: 'runnir @ ejecuta acciones, pulsa teclas, hace clic y mueve la rueda en el propio terminal — no en el proceso hijo — y cada respuesta trae el estado de la UI en JSON. Es como se prueban los paneles, sin capturas de pantalla, y sirve igual para scriptar tu propio flujo.',
+        en: 'runnir @ runs actions, presses keys, clicks and turns the wheel in the terminal itself — not in the child process — and every reply carries the UI state as JSON. It is how the panels are tested, without screenshots, and it works just as well for scripting your own workflow.',
+      },
+    },
+  ],
+  introForTitle: { es: 'Para quién es', en: 'Who it is for' },
+  introFor: [
+    { es: 'Trabajas en la terminal todo el día y abres git, docker y un explorador junto a ella.', en: 'You live in the terminal all day and keep git, docker and a file browser open beside it.' },
+    { es: 'Prefieres el teclado y te molesta memorizar tablas de atajos.', en: 'You prefer the keyboard and resent memorising shortcut tables.' },
+    { es: 'Quieres poder scriptar tu terminal, no solo lo que corre dentro.', en: 'You want to script your terminal, not just what runs inside it.' },
+    { es: 'Linux con Wayland (probado a diario en Hyprland) o macOS.', en: 'Linux on Wayland (a daily driver on Hyprland) or macOS.' },
+  ],
+  introNotTitle: { es: 'Qué no es', en: 'What it is not' },
+  introNot: [
+    { es: 'No es un multiplexor: no hay sesiones que sobrevivan al cierre ni attach remoto. Para eso, tmux dentro de runnir funciona.', en: 'Not a multiplexer: no sessions surviving a close, no remote attach. tmux inside runnir works fine for that.' },
+    { es: 'No es un editor. El visor de ficheros es de solo lectura a propósito: su editor es el que corras en un panel.', en: 'Not an editor. The file viewer is deliberately read-only: its editor is whatever you run in a pane.' },
+    { es: 'No hay soporte de Windows.', en: 'No Windows support.' },
+    { es: 'No hay binarios precompilados: se compila desde el código en tu máquina.', en: 'No prebuilt binaries: it builds from source on your machine.' },
+  ],
+  introFoot: {
+    es: 'Todo lo que sigue está documentado función a función, con sus atajos y sus opciones de configuración.',
+    en: 'Everything below is documented feature by feature, with its keybindings and config options.',
+  },
+  introFootCta: { es: 'Ver cómo se instala', en: 'See how to install it' },
+
   heroTag: {
     es: 'Emulador de terminal por GPU, keyboard-first, escrito en Rust para Linux y macOS. Integración de shell real (OSC 133), asistente de IA sin salir del terminal y un puñado de detalles propios.',
     en: 'GPU-accelerated, keyboard-first terminal emulator written in Rust for Linux and macOS. Real shell integration (OSC 133), an in-terminal AI assistant, and a handful of features of its own.',

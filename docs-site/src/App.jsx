@@ -5,6 +5,7 @@ import FeatureCard from './components/FeatureCard.jsx'
 import KeybindingsPage from './components/KeybindingsPage.jsx'
 import ConfigPage from './components/ConfigPage.jsx'
 import InstallPage from './components/InstallPage.jsx'
+import Intro from './components/Intro.jsx'
 import { SECTIONS } from './data/sections.js'
 import { FEATURES } from './data/features.js'
 import { useLang, UI } from './i18n.jsx'
@@ -92,6 +93,7 @@ export default function App() {
         {view === 'guia' && (
           <div className="wrap">
             {!q && <Hero onInstall={() => setView('instalacion')} />}
+            {!q && <Intro onInstall={() => setView('instalacion')} />}
 
             {q && filtered.length === 0 && (
               <p className="empty">{t(UI.emptyPrefix)} “{query}”. {t(UI.emptySuffix)}</p>

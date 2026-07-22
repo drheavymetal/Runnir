@@ -359,3 +359,25 @@ td .id { font-family: var(--mono); color: var(--fg-faint); font-size: 12px; }
 .term-cur { color: var(--green); animation: blink 1.1s steps(1) infinite; }
 .kbd-wrap { display: inline; }
 .demo figcaption { font-style: italic; }
+
+/* ---- introducción -----------------------------------------------------
+   Va entre el hero y el catálogo: dice qué es runnir y por qué, para quien
+   llega desde un enlace y no sabe nada. Se oculta al buscar (lo hace App). */
+.intro { padding: 30px 0 10px; border-bottom: 1px solid var(--border-soft); }
+.intro-lead { font-size: clamp(16px, 2.2vw, 19px); line-height: 1.55; color: var(--fg); max-width: 74ch; margin: 0 0 14px; }
+.intro-body { font-size: 15px; line-height: 1.65; color: var(--fg-dim); max-width: 74ch; margin: 0 0 26px; }
+/* 320px de minimo => dos columnas en escritorio (rejilla 2x2 con cuatro
+   tarjetas, en vez de 3+1 con una huerfana) y una sola en movil. */
+.intro-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 16px; margin-bottom: 28px; }
+.intro-card { background: var(--bg-raise); border: 1px solid var(--border); border-radius: 10px; padding: 16px 18px; }
+.intro-card h3 { font-family: var(--mono); font-size: 14px; color: var(--green-bright); margin: 0 0 8px; letter-spacing: -0.2px; }
+.intro-card p { font-size: 14px; line-height: 1.6; color: var(--fg-dim); margin: 0; }
+.intro-split { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px 32px; margin-bottom: 22px; }
+.intro-col-head { font-family: var(--mono); font-size: 13px; margin: 0 0 10px; letter-spacing: 0.2px; }
+.intro-yes { color: var(--green); }
+.intro-no { color: var(--fg-dim); }
+.intro-list { margin: 0; padding-left: 18px; }
+.intro-list li { font-size: 14px; line-height: 1.6; color: var(--fg-dim); margin-bottom: 6px; }
+.intro-foot { font-size: 14px; color: var(--fg-dim); margin: 0 0 4px; }
+.intro-link { background: none; border: 0; padding: 0; font: inherit; color: var(--green-bright); cursor: pointer; text-decoration: underline; text-underline-offset: 3px; }
+.intro-link:hover { color: var(--green); }
