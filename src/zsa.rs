@@ -456,7 +456,14 @@ fn ensure_connected(runner: &mut dyn Runner, connected: &mut bool) -> bool {
     if !runner.alive() {
         return false;
     }
-    *connected = runner.run(&["connect-any"]).is_ok();
+    *connected = match runner.run(&["connect-any"]) {
+        Ok(_) => true,
+        // `Failed to connect: keyboard already connected` is a SUCCESS wearing the
+        // word Failed. Reading it as an error meant the first call of every paint
+        // failed, the paint was dropped whole, and — the feature being silent by
+        // design — nothing anywhere said so. The board simply never lit.
+        Err(e) => e.to_lowercase().contains("already connected"),
+    };
     *connected
 }
 
@@ -692,6 +699,29 @@ mod tests {
         assert_eq!(
             log,
             vec!["connect-any", "set-rgb-all -c #000000 -s 0", "connect-any", "set-rgb-all -c #000000 -s 0"]
+        );
+    }
+
+    /// The bug that made the whole feature look dead: Keymapp answers
+    /// `Failed to connect: keyboard already connected` when the board is ALREADY
+    /// connected. Read as an error, it failed the first call of every paint, dropped
+    /// the paint whole, and — the feature being silent by design — said nothing. The
+    /// keyboard just never lit, for an hour.
+    #[test]
+    fn already_connected_is_a_success_wearing_the_word_failed() {
+        let (fake, _) = Fake::new(vec![
+            Err("Failed to connect: keyboard already connected".into()),
+            Ok("dimmed".into()),
+            Ok("lit".into()),
+        ]);
+        let log = drive(
+            vec![Cmd::Paint { leds: vec![(19, rgb(1, 2, 3))], dim: rgb(0, 0, 0), sustain_ms: 500 }],
+            fake,
+        );
+        assert_eq!(
+            log,
+            vec!["connect-any", "set-rgb-all -c #000000 -s 500", "set-rgb -l 19 -c #010203 -s 500"],
+            "the paint has to go ahead"
         );
     }
 
