@@ -31,6 +31,8 @@ pub enum Overlay {
     Viewer(FileViewer),
     /// One path's properties, with its permission bits editable.
     Props(PropsPanel),
+    /// The catch-up: one headline per pane after a while away.
+    CatchUp(CatchUpPanel),
 }
 
 impl Overlay {
@@ -53,6 +55,7 @@ impl Overlay {
             Overlay::Docker(p) => p.render(cols, rows, theme),
             Overlay::Viewer(v) => v.render(cols, rows, theme),
             Overlay::Props(p) => p.render(cols, rows, theme),
+            Overlay::CatchUp(p) => p.render(cols, rows, theme),
         }
     }
 }
@@ -2202,6 +2205,87 @@ impl ClipHistoryPicker {
             let clipped: String = preview.chars().take(w.saturating_sub(4)).collect();
             write(&mut g, row, 2, &clipped, pen);
         }
+
+        let col = (cols.saturating_sub(w)) / 2;
+        let row = (rows.saturating_sub(h)) / 3;
+        vec![Panel { grid: g, col, row }]
+    }
+}
+
+
+/// The catch-up panel: one line per pane that has something to say, most urgent
+/// first, with the pane ids kept so Enter can jump to the one you pick.
+pub struct CatchUpPanel {
+    lines: Vec<crate::catchup::Headline>,
+    cursor: usize,
+    /// How long the user was away, already worded for a human.
+    away: String,
+}
+
+impl CatchUpPanel {
+    pub fn new(lines: Vec<crate::catchup::Headline>, away: String) -> Self {
+        Self { lines, cursor: 0, away }
+    }
+
+    pub fn up(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    pub fn down(&mut self) {
+        if self.cursor + 1 < self.lines.len() {
+            self.cursor += 1;
+        }
+    }
+
+    /// The pane the cursor is on, for Enter.
+    pub fn selected_pane(&self) -> Option<u64> {
+        self.lines.get(self.cursor).map(|h| h.pane)
+    }
+
+    /// For the remote control's UI state, so a script can assert what the panel says
+    /// without a screenshot.
+    pub fn rows(&self) -> Vec<(u64, String, String, String)> {
+        self.lines
+            .iter()
+            .map(|h| (h.pane, h.state.tag().to_string(), h.title.clone(), h.detail.clone()))
+            .collect()
+    }
+
+    fn render(&self, cols: usize, rows: usize, theme: &Theme) -> Vec<Panel> {
+        let w = (cols * 7 / 10).clamp(34, 92).min(cols.saturating_sub(2));
+        let visible = 12.min(self.lines.len().max(1)).max(1);
+        let h = visible + 4;
+        let mut g = panel_grid(w, h, theme);
+
+        write(&mut g, 0, 2, &format!("While you were away ({})", self.away), accent());
+
+        if self.lines.is_empty() {
+            write(&mut g, 2, 2, "nothing happened", dim());
+        }
+
+        for (line, hl) in self.lines.iter().take(visible).enumerate() {
+            let row = 2 + line;
+            let sel = line == self.cursor;
+            if sel {
+                write(&mut g, row, 0, &" ".repeat(w), selected());
+            }
+            let pen = if sel { selected() } else { normal() };
+            // The tag is the thing the eye lands on, so it goes first and keeps a
+            // fixed width: a ragged left edge makes a list you have to read twice.
+            let tag = format!("{:<8}", hl.state.tag());
+            write(&mut g, row, 2, &tag, if sel { selected() } else { accent() });
+            let text = format!("{}  {}", hl.title, hl.detail);
+            let room = w.saturating_sub(12);
+            let clipped: String = text.chars().take(room).collect();
+            write(&mut g, row, 11, &clipped, pen);
+        }
+
+        let hint = if self.lines.is_empty() {
+            "esc  close"
+        } else {
+            "j k move \u{b7} enter jump to that pane \u{b7} esc close"
+        };
+        write(&mut g, h - 1, 2, hint, dim());
 
         let col = (cols.saturating_sub(w)) / 2;
         let row = (rows.saturating_sub(h)) / 3;

@@ -608,6 +608,31 @@ impl Grid {
         lines
     }
 
+    /// The primary screen as it was parked when a full-screen app took over.
+    ///
+    /// It is deliberately NOT part of `scrollback_text` — the alternate screen is not
+    /// history and must never enter the scrollback. But it IS what the pane was
+    /// doing before the app started, which is exactly the context a session summary
+    /// wants when the pane has been sitting in vim or Claude Code ever since.
+    pub fn parked_text(&self) -> Vec<String> {
+        let Some((primary, _)) = &self.parked else { return Vec::new() };
+        let mut lines: Vec<String> = (0..self.rows)
+            .map(|row| {
+                let start = row * self.cols;
+                let s: String = primary[start..start + self.cols]
+                    .iter()
+                    .filter(|c| !c.is_spacer())
+                    .map(|c| c.ch)
+                    .collect();
+                s.trim_end().to_string()
+            })
+            .collect();
+        while lines.last().is_some_and(|l| l.is_empty()) {
+            lines.pop();
+        }
+        lines
+    }
+
     /// Restores saved history as inert scrollback above the live screen. Colour is
     /// not persisted — restored history is plain text, which is what a session is
     /// for (reading what happened), not re-running it.
@@ -961,6 +986,17 @@ impl Grid {
     }
 
     /// Text of the rows in `[from, to]` absolute range, trailing blanks trimmed.
+    /// The last line with anything on it, for panes with no shell integration: the
+    /// catch-up shows it verbatim rather than inventing a status it cannot know.
+    pub fn last_nonblank_line(&self) -> Option<String> {
+        let last = self.rows().saturating_sub(1);
+        (0..=last).rev().find_map(|row| {
+            let text = self.text_range((row, 0), (row, self.cols.saturating_sub(1)));
+            let trimmed = text.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        })
+    }
+
     pub fn text_range(&self, from: (usize, usize), to: (usize, usize)) -> String {
         let (from, to) = if from <= to { (from, to) } else { (to, from) };
         let mut out = String::new();

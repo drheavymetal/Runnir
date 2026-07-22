@@ -1,6 +1,7 @@
 mod actions;
 mod ai;
 mod boxdraw;
+mod catchup;
 mod clipboard;
 mod config;
 mod control;
@@ -794,6 +795,13 @@ struct Gpu {
     /// The ZSA keyboard, when there is one and the user asked for it. `None` covers
     /// both "no such keyboard" and "not enabled", which behave identically.
     board: Option<zsa::Board>,
+    /// When a keystroke last reached a child process. The catch-up measures "away"
+    /// from here rather than from window focus, which lies in both directions.
+    last_pty_key: Instant,
+    /// Whether the panes have been marked at the moment the user stepped away.
+    /// Marking has to happen when absence STARTS, not when the panel opens — by then
+    /// everything that moved has already moved, and every pane looks unchanged.
+    away_marked: bool,
     /// The flashed layout, read once at startup: which LED sits under which key.
     /// Only loaded when the leader lights are on, since nothing else needs it.
     board_layout: Option<zsa::Layout>,
@@ -1076,6 +1084,8 @@ impl App {
                 .then(zsa::Board::start)
                 .flatten(),
             board_layout: None,
+            last_pty_key: Instant::now(),
+            away_marked: false,
             proxy: self.proxy.clone(),
         };
         // The flashed layout, read once. Blocking (two processes: kontroll status and
@@ -1720,6 +1730,15 @@ impl Gpu {
         if self.last_context_refresh.elapsed() >= Duration::from_millis(500) {
             self.last_context_refresh = Instant::now();
             let focused = self.window.has_focus();
+            // Absence begins after a minute with no key reaching a child. Mark every
+            // pane's command counter now, so the next catch-up can tell what moved
+            // while nobody was looking.
+            if !self.away_marked && self.last_pty_key.elapsed() >= Duration::from_secs(60) {
+                self.away_marked = true;
+                for pane in self.tabs[self.active].panes.values_mut() {
+                    pane.mark_catch_up_point();
+                }
+            }
             // The keyboard belongs to the whole desktop: runnir holds it only while
             // it has the window focus, and only while the layer is actually armed.
             // The lapse case matters as much as the focus one — the layer times out

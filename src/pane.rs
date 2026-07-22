@@ -36,6 +36,11 @@ pub struct Pane {
     /// notifications. Tracked via OSC 133 marks when available, else the foreground.
     running_since: Option<(std::time::Instant, String)>,
     last_command_seq: u64,
+    /// The command counter when the user last stepped away, for the catch-up.
+    catch_up_seq: u64,
+    /// The last watched word this pane saw, kept for the catch-up (the notification
+    /// path takes its own copy and clears it).
+    last_watch_hit: Option<String>,
     last_bell: u64,
     /// Keyword to watch for in this pane's output (lowercased), or `None`. When set,
     /// a matching line raises a desktop notification (W4).
@@ -76,6 +81,8 @@ impl Pane {
             title_override: None,
             running_since: None,
             last_command_seq: 0,
+            catch_up_seq: 0,
+            last_watch_hit: None,
             last_bell: 0,
             watch: None,
             watch_stable: 0,
@@ -112,6 +119,52 @@ impl Pane {
             self.running_since = None;
         }
         done
+    }
+
+
+    /// The facts the catch-up needs about this pane, gathered under one lock.
+    ///
+    /// `seen_seq` is the command counter as of the moment the user went away, which
+    /// is what makes "changed while you were gone" answerable — a pane that has been
+    /// sitting at a prompt reports the same number and gets no headline.
+    pub fn catch_up_snapshot(&self, id: u64, waiting: bool) -> crate::catchup::Snapshot {
+        let g = self.grid.lock().unwrap();
+        let marked = g.command_seq() > 0;
+        let running = g.command_running();
+        crate::catchup::Snapshot {
+            pane: id,
+            // What happened here is the COMMAND, not the shell's window title: a row
+            // reading "drheavymetal@host:~" tells you nothing about what you missed.
+            // The running command's name wins while one runs; otherwise the last one
+            // the shell marked; the pane title is the last resort, for panes with no
+            // shell integration at all.
+            title: self
+                .running_since
+                .as_ref()
+                .map(|(_, name)| name.clone())
+                .or_else(|| g.last_command_line().map(|c| c.trim().to_string()))
+                .filter(|c| !c.is_empty())
+                .unwrap_or_else(|| {
+                    self.title_override.clone().unwrap_or_else(|| self.title.clone())
+                }),
+            // Anything that finished since we started watching, or is running now, is
+            // news. A quiet prompt is not.
+            changed: running || g.command_seq() > self.catch_up_seq,
+            waiting,
+            running,
+            exit: g.last_exit(),
+            secs: self.running_since.as_ref().map(|(t, _)| t.elapsed().as_secs()),
+            watch_hit: self.last_watch_hit.clone(),
+            last_line: g.last_nonblank_line(),
+            marked,
+        }
+    }
+
+    /// Marks the point the user stepped away from, so the next catch-up can tell
+    /// what moved. Called when the away clock starts, not when the panel opens —
+    /// otherwise every pane looks unchanged.
+    pub fn mark_catch_up_point(&mut self) {
+        self.catch_up_seq = self.grid.lock().unwrap().command_seq();
     }
 
     pub fn alive(&self) -> bool {
@@ -165,6 +218,23 @@ impl Pane {
         self.grid.lock().unwrap().scrollback_text()
     }
 
+    /// Everything readable about this pane's history, for a summary: the scrollback,
+    /// plus the primary screen parked behind a full-screen app. A pane that has been
+    /// in vim or Claude Code since early on has almost nothing in its scrollback,
+    /// which is why asking to summarise it used to answer "nothing to summarise".
+    pub fn history_text(&self) -> Vec<String> {
+        let g = self.grid.lock().unwrap();
+        let mut lines = g.parked_text();
+        lines.extend(g.scrollback_text());
+        lines
+    }
+
+    /// Whether a full-screen app is up, so a summary can say what it is looking at
+    /// instead of silently summarising something else.
+    pub fn in_full_screen_app(&self) -> bool {
+        self.grid.lock().unwrap().alt_screen()
+    }
+
     /// Whether a bell (BEL) has arrived since the last call. Drives the visual
     /// flash and window-urgency hint, once per bell.
     pub fn take_bell(&mut self) -> bool {
@@ -214,9 +284,18 @@ impl Pane {
             g.text_since_stable(self.watch_stable)
         };
         self.watch_stable = end;
-        text.lines()
+        let hit = text
+            .lines()
             .find(|l| l.to_lowercase().contains(&kw))
-            .map(|l| format!("{}: {}", self.title, l.trim()))
+            .map(|l| format!("{}: {}", self.title, l.trim()));
+        // Keep a copy for the catch-up. This method is a TAKING one — the
+        // notification path consumes the hit — so without this the catch-up could
+        // never report a watch that already fired while you were away, which is
+        // exactly the case it exists for.
+        if hit.is_some() {
+            self.last_watch_hit = Some(kw.clone());
+        }
+        hit
     }
 
     /// Toggles folding of every finished command's output (W2): folds all if none is

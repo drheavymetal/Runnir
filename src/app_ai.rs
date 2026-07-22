@@ -153,10 +153,32 @@ impl Gpu {
     /// broke, how it was fixed. Reads the scrollback, so it works retroactively on a
     /// session you have been in for a while.
     fn summarize_session(&mut self, config: &Config) {
-        let text = self.tab().focused().scrollback_text().join("\n");
+        // A session is the WINDOW, not one pane. Start with the focused pane —
+        // usually what the user means — and fall back to the rest of the tab, so
+        // asking from a pane that has been sitting in a full-screen app all along
+        // summarises the work instead of answering "nothing to summarise".
+        let focused = self.tab().focused().history_text().join("\n");
+        let in_app = self.tab().focused().in_full_screen_app();
+        let mut text = focused;
         if text.trim().is_empty() {
-            self.status = Some("nothing in the scrollback to summarize yet".into());
-            self.status_expiry = Some(Instant::now() + Duration::from_secs(4));
+            let others: Vec<String> = self.tabs[self.active]
+                .panes
+                .values()
+                .map(|p| p.history_text().join("\n"))
+                .filter(|t| !t.trim().is_empty())
+                .collect();
+            text = others.join("\n\n---\n\n");
+        }
+        if text.trim().is_empty() {
+            // Say WHICH of the two reasons it is: an empty window and a window full
+            // of full-screen apps need different things from the user.
+            self.status = Some(if in_app {
+                "nothing to summarize: this pane is a full-screen app and there is no \
+                 history behind it".into()
+            } else {
+                "nothing to summarize: no commands have run in this window yet".into()
+            });
+            self.status_expiry = Some(Instant::now() + Duration::from_secs(5));
             self.window.request_redraw();
             return;
         }

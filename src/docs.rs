@@ -42,6 +42,7 @@ Straight away, no group — the things you do constantly:
 @ Leader 1..9      jump to tab N
 @ Leader hjkl      focus the pane left/down/up/right
 @ Leader HJKL      resize the focused pane (arrows do this too)
+@ Leader U         catch up: one headline per pane after time away
 @ Leader V         clipboard history
 @ Leader G         fix the last failed command
 @ Leader Z / Shift+Z  font bigger / smaller (+, = and - work too; the letters
@@ -262,7 +263,10 @@ when the config loads rather than silently falling back for ever.
                    at the prompt for you to review and run (never run for you). For
                    example, after mkdr foo fails it types mkdir foo at the prompt.
 @ Ctrl+Shift+Y     explain the current selection in the assistant panel
-@ Ctrl+Shift+I     summarize this session (commands, results, errors and fixes)
+@ Ctrl+Shift+I     summarize this session (commands, results, errors and fixes).
+                   Reads the whole window, not just the focused pane, and includes
+                   the screen parked behind a full-screen app — so asking from
+                   inside vim or Claude Code summarises the work, not nothing.
 
 # Whisper — talk to the terminal
 

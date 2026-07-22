@@ -63,6 +63,8 @@ pub enum Action {
     ToggleImageWatch,
     /// Show/hide the file explorer sidebar, and put the keyboard in it.
     ToggleExplorer,
+    /// One headline per pane, for coming back after a while away.
+    CatchUp,
     SetImageWatchDir,
     SaveProjectSession,
     RestoreProjectSession,
@@ -156,6 +158,7 @@ impl Action {
             FoldOutput => "fold_output",
             ToggleImageWatch => "toggle_image_watch",
             ToggleExplorer => "toggle_explorer",
+            CatchUp => "catch_up",
             SetImageWatchDir => "set_image_watch_dir",
             SaveProjectSession => "save_project_session",
             RestoreProjectSession => "restore_project_session",
@@ -242,6 +245,7 @@ impl Action {
             FoldOutput => "Fold / unfold all command output",
             ToggleImageWatch => "Auto-preview images: toggle on this pane's dir",
             ToggleExplorer => "File explorer sidebar (tree of the project)",
+            CatchUp => "Catch up: one headline per pane after time away",
             SetImageWatchDir => "Auto-preview images: set / clear watched dir",
             SaveProjectSession => "Save session for this project",
             RestoreProjectSession => "Restore session for this project",
@@ -331,6 +335,7 @@ impl Action {
             "fold_output" => FoldOutput,
             "toggle_image_watch" => ToggleImageWatch,
             "toggle_explorer" => ToggleExplorer,
+            "catch_up" => CatchUp,
             "set_image_watch_dir" => SetImageWatchDir,
             "save_project_session" => SaveProjectSession,
             "restore_project_session" => RestoreProjectSession,
@@ -430,6 +435,7 @@ impl Action {
             FoldOutput,
             ToggleImageWatch,
             ToggleExplorer,
+            CatchUp,
             SetImageWatchDir,
             SaveProjectSession,
             RestoreProjectSession,
@@ -927,6 +933,9 @@ fn default_leader_bindings() -> HashMap<Chord, LeaderNode> {
     // `e` for the explorer, beside `g` for git: both are a whole surface, both are
     // one key. It is also the letter LazyVim uses for the same sidebar.
     leaf(&mut m, "e", ToggleExplorer);
+    // `u` for "update me": the catch-up is read on arrival, so it earns a top-level
+    // key rather than a group nobody walks into when they just sat down.
+    leaf(&mut m, "u", CatchUp);
     // Font size, where every terminal already puts it — but +, - and = are not all
     // one keypress on every layout (on the Spanish one `=` is shift+0), so the
     // letters are the binding that always works and the symbols are the alias.

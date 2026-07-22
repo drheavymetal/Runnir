@@ -559,6 +559,10 @@ impl Gpu {
     /// Sends encoded key bytes to the focused pane (or all panes when broadcasting),
     /// snapping the view to the live output and clearing any selection first.
     fn write_key_bytes(&mut self, bytes: &[u8]) {
+        // The away clock. Window focus lies (a focused window on another monitor is
+        // not attention); a key reaching the child process does not.
+        self.last_pty_key = Instant::now();
+        self.away_marked = false;
         self.scroll_glide = None;
         if self.tab().focused().snap_to_bottom() {
             self.window.request_redraw();
@@ -728,6 +732,7 @@ impl Gpu {
             Action::FoldOutput => self.tab().focused().toggle_fold_all(),
             Action::ToggleImageWatch => self.toggle_image_watch(config),
             Action::ToggleExplorer => self.toggle_explorer(config),
+            Action::CatchUp => self.show_catch_up(),
             Action::SetImageWatchDir => self.set_image_watch_dir(),
             Action::SaveProjectSession => self.save_project_session_cmd(),
             Action::RestoreProjectSession => self.restore_project_session_cmd(config),
@@ -2995,6 +3000,7 @@ impl Gpu {
             Some(Overlay::Docs(_)) => "docs",
             Some(Overlay::Viewer(_)) => "viewer",
             Some(Overlay::Props(_)) => "props",
+            Some(Overlay::CatchUp(_)) => "catch_up",
             Some(_) => "other",
         };
         let mut out = json!({
@@ -3015,6 +3021,16 @@ impl Gpu {
                 "contents": p.props.contents.map(|(f, d)| json!({"files": f, "dirs": d})),
                 "link_target": p.props.link_target.as_ref().map(|t| t.display().to_string()),
             });
+        }
+        if let Some(Overlay::CatchUp(p)) = &self.overlay {
+            out["catch_up"] = json!(
+                p.rows()
+                    .into_iter()
+                    .map(|(pane, state, title, detail)| json!({
+                        "pane": pane, "state": state, "title": title, "detail": detail
+                    }))
+                    .collect::<Vec<_>>()
+            );
         }
         if let Some(Overlay::Prompt(p)) = &self.overlay {
             out["prompt"] = json!({ "label": p.label, "input": p.input });
@@ -3412,6 +3428,28 @@ impl Gpu {
                 }
                 _ => {}
             },
+            // The catch-up: j/k or the arrows move, Enter focuses that pane, Esc
+            // closes. No search box on purpose — the list is at most one line per
+            // pane, and anything you would filter you can already see.
+            Overlay::CatchUp(p) => match key {
+                Key::Named(NamedKey::Escape) => self.overlay = None,
+                Key::Named(NamedKey::ArrowUp) => p.up(),
+                Key::Named(NamedKey::ArrowDown) => p.down(),
+                Key::Named(NamedKey::Enter) => {
+                    let pane = p.selected_pane();
+                    self.overlay = None;
+                    if let Some(id) = pane {
+                        self.focus_pane(id);
+                    }
+                }
+                Key::Character(c) => match c.as_str() {
+                    "k" => p.up(),
+                    "j" => p.down(),
+                    "q" => self.overlay = None,
+                    _ => {}
+                },
+                _ => {}
+            },
             Overlay::ClipHistory(p) => match key {
                 Key::Named(NamedKey::Escape) => self.overlay = None,
                 Key::Named(NamedKey::ArrowUp) => p.up(),
@@ -3679,6 +3717,7 @@ impl Gpu {
             Action::FoldOutput => self.tab().focused().toggle_fold_all(),
             Action::ToggleImageWatch => self.toggle_image_watch(config),
             Action::ToggleExplorer => self.toggle_explorer(config),
+            Action::CatchUp => self.show_catch_up(),
             Action::SetImageWatchDir => self.set_image_watch_dir(),
             Action::SaveProjectSession => self.save_project_session_cmd(),
             Action::RestoreProjectSession => self.restore_project_session_cmd(config),
@@ -5880,6 +5919,39 @@ impl Gpu {
         self.split_running(config, argv);
     }
 
+    /// Builds the catch-up from what every pane knows and opens it.
+    ///
+    /// "Away" is measured from the last keystroke that reached a PTY, not from window
+    /// focus: a focused window on a second monitor is not attention, and a window
+    /// that lost focus because the pointer crossed it is not absence.
+    fn show_catch_up(&mut self) {
+        let away = self.last_pty_key.elapsed();
+        let waiting_pane = match &self.overlay {
+            // A guardian confirm belongs to the pane that was focused when it opened.
+            Some(Overlay::Prompt(_)) => Some(self.tabs[self.active].focus),
+            _ => None,
+        };
+        let snaps: Vec<crate::catchup::Snapshot> = self.tabs[self.active]
+            .panes
+            .iter()
+            .map(|(id, pane)| pane.catch_up_snapshot(*id, waiting_pane == Some(*id)))
+            .collect();
+        let lines = crate::catchup::catch_up(&snaps);
+        self.overlay =
+            Some(Overlay::CatchUp(overlay::CatchUpPanel::new(lines, human_away(away))));
+        self.window.request_redraw();
+    }
+
+    /// Focuses a pane by id, wherever it is in the tree. Used by the catch-up, whose
+    /// whole promise is "enter takes you to the one that matters".
+    fn focus_pane(&mut self, id: u64) {
+        let tab = &mut self.tabs[self.active];
+        if tab.panes.contains_key(&id) {
+            tab.focus = id;
+            self.window.request_redraw();
+        }
+    }
+
     /// Flashes the whole keyboard, if there is one and the config asked for it.
     ///
     /// Whole-board only, deliberately: with opaque keycaps a lit key cannot be read as
@@ -6699,5 +6771,15 @@ mod write_private_tests {
         assert_eq!(mode, 0o600, "the capture must be private, not the old file's mode");
         assert_eq!(std::fs::read(&path).unwrap(), b"secret");
         let _ = std::fs::remove_file(&path);
+    }
+}
+
+/// How long you were away, worded for someone who just sat back down.
+fn human_away(d: Duration) -> String {
+    let secs = d.as_secs();
+    match secs {
+        0..=89 => "just now".to_string(),
+        90..=3599 => format!("{} min", secs / 60),
+        _ => format!("{}h{:02}m", secs / 3600, (secs % 3600) / 60),
     }
 }

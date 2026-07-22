@@ -2338,6 +2338,63 @@ layout tree everywhere, so it goes last. It also has to earn its place: if navig
 the canvas is slower than the mosaic for the everyday case, it stays behind a config
 flag rather than replacing the grid.
 
+## 2026-07-22 - Candidate 1 built: the window catches you up
+
+`src/catchup.rs` plus a panel and a leader key (`leader u`). Six panes of scrollback
+is not a status report; this turns each pane into one line and ranks them so the
+first line you read is the one that wants you.
+
+**The ranking is the feature**, and it is a pure function with tests: waiting on you
+> failed > watched word > running > done. Ties break by pane id, because a list that
+reorders between two glances is one you have to read twice.
+
+**"Away" is not window focus.** Focus lies in both directions — a focused window on a
+second monitor is not attention, and the pointer crossing another window is not
+absence. The clock runs from the last keystroke that reached a PTY, which runnir
+already knows exactly. After a minute of that, every pane's command counter is marked;
+the catch-up then reports only what moved past its mark.
+
+**A pane with nothing to say says nothing.** Four idle panes producing four lines of
+"nothing happened" is worse than no feature, so a quiet prompt is omitted entirely —
+unless it is blocking on you, which is worth saying even when nothing moved.
+
+**An unmarked pane gets its last line, verbatim, labelled `no marks`** — never an
+invented status. "The terminal told me it was fine" is the worst way to be wrong.
+
+The headline names the COMMAND, not the shell's window title. The first live run
+showed `drheavymetal@drheavymetal:~ · exit 1`, which is a row that tells you nothing
+about what you missed; it now reads `ls /noexiste · exit 2`.
+
+Verified on a real instance over the control socket, with the panel exposed in
+`ui_state` so a script can assert it: a failing command and a long-running one, with
+the third pane silent. Two of my own test runs were wrong before the code was —
+commands typed into a pane that was busy sleeping, and a split action id that does not
+exist (`split_down`; they are `split_horizontal` / `split_vertical`).
+
+## 2026-07-22 - "Nothing to summarize" was the alternate screen
+
+Reported from use: AI → summarize this session answered "nothing in the scrollback to
+summarize yet". Not a false alarm — a real hole, and an instructive one.
+
+While a full-screen app is up, the primary screen is PARKED and `scrollback_text`
+returns only the scrollback ring. That is correct and must stay: the alternate screen
+is not history, and letting a minute of htop into the scrollback would evict
+everything worth keeping. But it means a pane that entered vim, htop or Claude Code
+early has almost nothing to offer, and the summary of a working session came back
+empty.
+
+Three changes, in increasing order of how obvious they should have been:
+- The parked primary screen is now included — it is precisely what the pane was doing
+  before the app took over.
+- A session is the WINDOW, not one pane: with the focused pane empty, the rest of the
+  tab is used.
+- When there really is nothing, the message says WHICH nothing: a full-screen app with
+  no history behind it, or a window where no command has run yet. Those need different
+  things from the user.
+
+Reproduced from inside htop with real work behind it, and verified the summary now
+starts instead of refusing.
+
 ## Gotchas (do not re-learn)
 
 - The board must be put back even if runnir DIES. `sustain` (ms) on every ZSA paint is
@@ -2354,6 +2411,10 @@ flag rather than replacing the grid.
   desktop app: kontroll finds Keymapp's socket through it, so the usual test isolation
   silently disconnects the keyboard. Some features can only be verified in the real
   environment.
+- Anything reading a pane's history must decide what to do about the ALTERNATE
+  screen. `scrollback_text` excludes it by design; a feature that summarises or
+  exports history needs `parked_text` too, or it reports nothing for every pane
+  sitting in vim, htop or Claude Code.
 - `cargo test` does NOT refresh `target/release/runnir`. Rebuild before launching an
   instance to verify a change, or you are testing the previous build — it has already
   cost two debugging detours.
