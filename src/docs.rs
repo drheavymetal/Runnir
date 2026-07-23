@@ -648,6 +648,40 @@ Config: explorer.side (left/right), explorer.width in COLUMNS (not a fraction: a
 fraction on an ultrawide gives a 90-column tree), explorer.show_hidden. All three
 are in the settings panel too.
 
+# ZSA keyboard: lights and signals
+
+On a ZSA board (Moonlander, Voyager) runnir can drive the RGB, with no custom
+firmware and nothing running alongside it. Two separate things, both off by default.
+
+  keyboard.leader_lights   light the leader layer on the keys themselves
+  keyboard.ambient         flash the whole board where a notification would fire
+  keyboard.flash_ms        how long a flash lasts (also its own cleanup)
+
+Arming the leader with the lights on lights exactly the keys that do something at
+that level, in the which-key panel's own colours, and descending into a group
+repaints. The ambient flashes are amber for a watched word, green when a long
+command finishes, red when the guardian asks.
+
+runnir speaks to the board DIRECTLY, over its raw HID endpoint - ZSA publishes the
+protocol (the oryx QMK module, GPL-2.0) and it is the same one their own app speaks,
+so nothing has to be running. The endpoint is found by its report descriptor rather
+than by a remembered path, because hidraw numbering moves on every replug, and the
+permissions come from the udev rule ZSA already ships.
+
+Keymapp still has to have RUN ONCE, ever: the flashed layout lives in its database,
+and that is where runnir reads which key is which LED. After that the revision is
+remembered and Keymapp is never needed again. Reflash from Oryx and you will want to
+open it once more so runnir learns the new revision.
+
+Worth knowing before turning the lit layer on: it needs shine-through keycaps. With
+opaque caps the LED lights the gap around the cap and not the legend, so you see a
+region rather than a key - measured on a Moonlander with 33 keys lit, then 8, then
+those 8 at maximum brightness. The ambient flashes have no such problem, since they
+ask you to identify no key at all.
+
+RUNNIR_ZSA_DEBUG=1 says which step gave up. Silence is the design - a machine with no
+such keyboard must not be nagged about it - and that flag is the way out of it.
+
 # The map (and the screensaver)
 
 The map zooms the whole WINDOW out - every tab, not just the one you are looking at -
