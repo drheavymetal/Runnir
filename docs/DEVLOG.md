@@ -2714,8 +2714,46 @@ find were all PRE-EXISTING, surfaced by reading the seams the fixes had exposed.
 502 tests (was 498). Four rounds, twenty-four fixes; the curve — 9, 6, 5, 4, and the
 fourth all pre-existing — says the branch has converged.
 
+## 2026-07-23 - Two the audit could not see: the sidebar hid the leader, and trapped it
+
+Both found by USING the branch, not by reading it. Neither is reachable from a test:
+one is a paint order, the other is a hole in a keymap.
+
+- **The which-key drew UNDER the sidebar.** `app_draw` pushes grids in paint order,
+  and `whichkey_holder` went in before `explorer_holder`. The which-key runs the full
+  width of the window along the bottom; the sidebar is full height down the side; so
+  with the tree open the leader menu lost its left third and the hints went with it.
+  Moved the push after the sidebar. `explorer_keys` (the tree's own menu, same
+  position) stays last, so the two never fight over the same rows.
+- **The sidebar could not be closed from the keyboard AT ALL.** Three deliberate
+  decisions met and left no exit: with the tree focused the leader chord arms the
+  TREE's layer (`explorer_leader_key` answers before `leader_key`), so `leader e`
+  never reaches `ToggleExplorer`; that toggle closes only when the tree is `open &&
+  focused`, and re-focuses it otherwise; and inside the tree `q` was a second Escape
+  (unfocus, stay open). Escape → `leader e` → Escape → … forever. `q` now CLOSES and
+  reflows the panes; Escape still only hands the keyboard back. The tree's leader leaf
+  `q` is retitled from "Back to the pane" to "Close the sidebar" — it was the only
+  route out and it did not take one. The way out that existed was
+  `Ctrl+Shift+P` → the palette: the tree ignores chords carrying Ctrl/Alt/Super, so a
+  modified binding reaches the global keymap even from inside.
+
+A test asserts the tree's leader always offers a leaf whose title says *close*, on a
+file row and on a directory row, and that it presses the key the sidebar binds. The
+paint order is not testable here — it is verified on a real instance.
+
+503 tests (was 502).
+
 ## Gotchas (do not re-learn)
 
+- Chrome grids paint in PUSH order, and two of them can want the same rows. Anything
+  full-width along the bottom has to be pushed after anything full-height down a side,
+  or the side wins and the hint disappears under it.
+- A surface that grabs the leader chord has to carry its own way OUT. The global
+  toggle is unreachable from inside it by construction, and "unfocus" is not "close":
+  the sidebar had three sensible rules that together made it impossible to shut.
+- The one keyboard route into a focused sidebar is a chord with Ctrl/Alt/Super — it
+  deliberately ignores those and they fall through to the global keymap. Worth
+  remembering as the escape hatch when a surface traps itself.
 - The board must be put back even if runnir DIES. `sustain` (ms) on every ZSA paint is
   the only thing that survives `kill -9`; an explicit restore on exit is not enough.
 - Keymapp's API ships DISABLED (`api_enabled=0` in its sqlite) and its socket on Linux

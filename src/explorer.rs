@@ -612,7 +612,11 @@ pub static FILE_LEADER: &[FileEntry] = &[
             fleaf('b', "to the bottom", FKey(FCh('G'))),
         ]),
     },
-    fleaf('q', "Back to the pane", FKey(FCh('q'))),
+    // The only way OUT of the sidebar from the keyboard: while the tree is focused
+    // this chord arms this layer, so the window's `leader e` is out of reach, and
+    // that toggle re-focuses an open tree rather than hiding it. Escape hands the
+    // keyboard back without closing.
+    fleaf('q', "Close the sidebar", FKey(FCh('q'))),
 ];
 
 /// The sidebar's leader state, mirroring `GitPanel`'s.
@@ -1427,6 +1431,30 @@ mod tests {
         assert_eq!(n, 5, "the directory, script.sh, one, d and d/two");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_sidebar_leader_always_offers_the_way_out() {
+        // While the tree is focused this layer OWNS the leader chord, so the window's
+        // `leader e` never reaches the toggle — and that toggle re-focuses an open
+        // tree rather than hiding it. Without a leaf here the sidebar cannot be closed
+        // from the keyboard at all, which is exactly the bug this guards.
+        let mut e = Explorer::new(PathBuf::from("/r"), 30, Side::Left);
+        e.insert_children(PathBuf::from("/r"), vec![entry("src", true), entry("main.rs", false)]);
+        for cursor in [0, 1] {
+            e.set_cursor(cursor, 20);
+            e.arm_leader();
+            let out = e.leader_entries();
+            let (_, title, group) = out
+                .iter()
+                .find(|(k, _, _)| k == "q")
+                .unwrap_or_else(|| panic!("no way out of the tree at row {cursor}: {out:?}"));
+            assert!(!group, "the way out is a leaf, not a group");
+            assert!(title.to_lowercase().contains("close"), "it CLOSES, not unfocuses: {title}");
+            // And it presses the key the sidebar binds for closing.
+            assert_eq!(e.leader_key('q'), Some(FileKey::Ch('q')));
+            assert!(e.leader.is_none(), "a leaf ends the sequence");
+        }
     }
 
     #[test]

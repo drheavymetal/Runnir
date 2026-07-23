@@ -95,10 +95,13 @@ impl Gpu {
         if let Some((grid, ox, oy)) = &status_holder {
             panes.push(PaneDraw { grid, selection: None, origin: (*ox, *oy), tint: None, focused: true, cursor: None, search: Default::default(), transparent: false });
         }
-        if let Some((grid, ox, oy)) = &whichkey_holder {
+        if let Some((grid, ox, oy)) = &explorer_holder {
             panes.push(PaneDraw { grid, selection: None, origin: (*ox, *oy), tint: None, focused: true, cursor: None, search: Default::default(), transparent: false });
         }
-        if let Some((grid, ox, oy)) = &explorer_holder {
+        // AFTER the sidebar: the which-key runs the full width of the window along the
+        // bottom, so the sidebar's columns overlap it. Pushed first, the tree painted
+        // over the hints and the left third of the leader menu vanished.
+        if let Some((grid, ox, oy)) = &whichkey_holder {
             panes.push(PaneDraw { grid, selection: None, origin: (*ox, *oy), tint: None, focused: true, cursor: None, search: Default::default(), transparent: false });
         }
         if let Some((grid, ox, oy)) = &explorer_keys {
@@ -686,7 +689,7 @@ impl Gpu {
         let foot = match &e.message {
             Some(m) => format!("{m}{held}"),
             None if e.focused => {
-                format!("enter open \u{b7} e edit \u{b7} s sort \u{b7} . hidden{held}{sorted}")
+                format!("enter open \u{b7} e edit \u{b7} s sort \u{b7} . hidden \u{b7} q close{held}{sorted}")
             }
             None => format!("{} items{held}{sorted} \u{b7} leader e", e.rows.len()),
         };

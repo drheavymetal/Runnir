@@ -159,8 +159,9 @@ export const KEY_GROUPS = [
       { keys: ['s'], id: '', title: { es: 'Ordenar por nombre / por fecha de modificación', en: 'Sort by name / by date modified' } },
       { keys: ['.', 'I'], id: '', title: { es: 'Ficheros ocultos / ficheros que git ignora', en: 'Hidden files / files git ignores' } },
       { keys: ['y', 'R'], id: '', title: { es: 'Copiar la ruta / releer el árbol', en: 'Copy the path / reread the tree' } },
-      { keys: [{ es: 'Leader', en: 'Leader' }], id: '', title: { es: 'Menú de verbos del árbol: F fichero, D directorio, V vista, Q volver al panel', en: 'The tree’s menu of verbs: F file, D directory, V view, Q back to the pane' } },
-      { keys: ['Esc', 'q'], id: '', title: { es: 'Devolver el teclado al panel (la barra sigue visible)', en: 'Give the keyboard back to the pane (the sidebar stays up)' } },
+      { keys: [{ es: 'Leader', en: 'Leader' }], id: '', title: { es: 'Menú de verbos del árbol: F fichero, D directorio, V vista, Q cerrar la barra', en: 'The tree’s menu of verbs: F file, D directory, V view, Q close the sidebar' } },
+      { keys: ['Esc'], id: '', title: { es: 'Devolver el teclado al panel (la barra sigue visible)', en: 'Give the keyboard back to the pane (the sidebar stays up)' } },
+      { keys: ['q'], id: '', title: { es: 'Cerrar la barra. Con el árbol enfocado el leader arma SU propio menú, así que Leader E no llega al toggle desde dentro; y desde un panel ese toggle vuelve a enfocar el árbol en vez de ocultarlo', en: 'Close the sidebar. With the tree focused the leader arms its OWN menu, so Leader E cannot reach the toggle from in there; and from a pane that toggle re-focuses the tree rather than hiding it' } },
     ],
   },
   {

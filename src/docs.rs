@@ -568,13 +568,16 @@ application global hotkeys, so the toggle is the compositor's job. For Hyprland:
 
 Leader E opens a tree of the project beside the panes, and puts the keyboard in it.
 It is chrome, not a modal layer: it stays up while you work in the pane next to it,
-and it takes keys only while it has focus (Escape gives them back).
+and it takes keys only while it has focus (Escape gives them back). q closes it —
+with the tree focused the leader chord arms the tree's OWN menu, so Leader E cannot
+reach the toggle from in there, and from a pane that toggle re-focuses the tree
+rather than hiding it.
 
   j k / arrows      move            l or Enter   unfold a directory
   h                 fold, or go to the parent    g G   top, bottom
   .                 hidden files    I  files git ignores
   s                 sort by name / by date
-  y                 copy the path   Esc or q     back to the pane
+  y                 copy the path   Esc  back to the pane   q  close the sidebar
   Enter on a file   open it        e  $EDITOR    o  the desktop's handler
   p properties & permissions   a new file (a/ for a directory)
   r rename          d delete       R  reread the tree
@@ -635,7 +638,7 @@ resize it — the panes are only resized when you let go, because a PTY resized 
 every frame of a drag is one full-screen program redrawing itself into a corner.
 
 With the tree focused, the leader key opens a menu of file verbs, the same which-key
-the git panel uses: F file, D directory, V view, Q back to the pane. It offers only
+the git panel uses: F file, D directory, V view, Q close the sidebar. It offers only
 what the row under the cursor can do - the file verbs are not offered on a directory
 and the directory ones are not offered on a file - and every leaf presses a key the
 sidebar already binds.

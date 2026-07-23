@@ -1182,6 +1182,7 @@ impl Gpu {
         let mut delete = false;
         let mut props = false;
         let mut unfocus = false;
+        let mut close = false;
         {
             let Some(e) = self.tabs[self.active].explorer.as_mut() else { return false };
             e.message = None;
@@ -1263,11 +1264,28 @@ impl Gpu {
                     "e" => edit = selected.as_ref().filter(|r| r.more.is_none()).map(|r| r.entry.path.clone()),
                     "o" => system = selected.as_ref().filter(|r| r.more.is_none()).map(|r| r.entry.path.clone()),
                     "y" => copy = selected.map(|r| r.entry.path.display().to_string()),
-                    "q" => unfocus = true,
+                    // `q` CLOSES, Escape only hands the keyboard back. It used to be a
+                    // second Escape, which left the sidebar with no way out at all:
+                    // the leader chord arms the tree's own layer while it is focused,
+                    // so `leader e` never reaches the global toggle, and that toggle
+                    // re-focuses an open-but-unfocused tree rather than hiding it.
+                    "q" => close = true,
                     _ => {}
                 },
                 _ => {}
             }
+        }
+        if close {
+            if let Some(e) = self.tabs[self.active].explorer.as_mut() {
+                e.open = false;
+                e.focused = false;
+                e.cancel_leader();
+            }
+            // The panes just got their columns back: their PTYs have to be told.
+            let area = self.active_area();
+            self.tabs[self.active].reflow(area);
+            self.window.request_redraw();
+            return true;
         }
         if unfocus {
             if let Some(e) = self.tabs[self.active].explorer.as_mut() {
