@@ -2225,6 +2225,10 @@ impl ClipHistoryPicker {
 /// thing it said.
 pub struct MapCard {
     pub pane: u64,
+    /// Which tab this pane lives in, and what that tab is called. The map spans the
+    /// whole window, so a card has to say where it would take you.
+    pub tab: usize,
+    pub tab_title: String,
     /// Cell-space rectangle of the pane, in the SESSION's coordinates.
     pub col: usize,
     pub row: usize,
@@ -2246,11 +2250,155 @@ pub struct MapCard {
 pub struct MapPanel {
     cards: Vec<MapCard>,
     cursor: usize,
+    rain: Rain,
+    /// Wall clock as `HH:MM`, refreshed with the cards rather than per frame.
+    clock: String,
+}
+
+/// A single falling column of runes.
+#[derive(Clone, Copy)]
+struct Drop {
+    col: u16,
+    /// Head position in rows, in tenths so a column can fall slower than one row per
+    /// frame without the whole thing marching in lockstep.
+    head: i32,
+    speed: i32,
+    len: u16,
+    /// Seed for this column's glyphs, so the same column keeps the same runes as it
+    /// falls instead of reshuffling every frame into noise.
+    seed: u32,
+}
+
+/// The rune rain behind the map.
+///
+/// Elder Futhark rather than digits: runnir is named for them, and a terminal called
+/// after runes raining numbers would be a missed joke. Drawn dimmed and BEHIND the
+/// cards — the cards are what is read, the rain is what makes it a screensaver rather
+/// than a dialog you left open.
+///
+/// Deterministic, with no RNG dependency and no clock: the state is a step counter, so
+/// the same session draws the same rain and a test can assert on any frame of it.
+pub struct Rain {
+    drops: Vec<Drop>,
+    step: u32,
+}
+
+impl Rain {
+    pub fn new(cols: usize, rows: usize) -> Rain {
+        let n = (cols / 3).clamp(1, 96);
+        let drops = (0..n)
+            .map(|i| {
+                let seed = splitmix(i as u32 + 1);
+                Drop {
+                    col: (spread(seed, cols)) as u16,
+                    // Staggered above the top so nothing starts mid-screen, and the
+                    // first frame is already rain rather than a row of heads.
+                    head: -((spread(seed >> 8, rows.max(1) * 2)) as i32),
+                    speed: 1 + (seed >> 16) as i32 % 3,
+                    len: 4 + (seed >> 20) as u16 % 12,
+                    seed,
+                }
+            })
+            .collect();
+        Rain { drops, step: 0 }
+    }
+
+    pub fn tick(&mut self, rows: usize) {
+        self.step = self.step.wrapping_add(1);
+        let bottom = (rows as i32 + 24) * 10;
+        for d in &mut self.drops {
+            d.head += d.speed;
+            if d.head * 10 > bottom {
+                d.head = -(d.len as i32) - (spread(d.seed ^ self.step, 20) as i32);
+            }
+        }
+    }
+
+    /// `(row, col, rune, brightness 0..=3)` for everything lit this frame. Brightness
+    /// falls off behind the head, which is what makes it read as falling rather than
+    /// as a set of static bars.
+    pub fn cells(&self, cols: usize, rows: usize) -> Vec<(usize, usize, char, u8)> {
+        let mut out = Vec::new();
+        for d in &self.drops {
+            let col = d.col as usize;
+            if col >= cols {
+                continue;
+            }
+            for back in 0..d.len as i32 {
+                let row = d.head - back;
+                if row < 0 || row as usize >= rows {
+                    continue;
+                }
+                // The rune is a function of the column and the ROW, not of time, so a
+                // glyph does not flicker as the tail slides over it.
+                let rune = crate::font::RUNES
+                    [(splitmix(d.seed ^ (row as u32).wrapping_mul(2654435761)) as usize)
+                        % crate::font::RUNES.len()];
+                let bright = match back {
+                    0 => 3,
+                    1..=2 => 2,
+                    _ if back * 3 < d.len as i32 => 1,
+                    _ => 0,
+                };
+                out.push((row as usize, col, rune, bright));
+            }
+        }
+        out
+    }
+}
+
+/// Local `HH:MM`. Shelled out to `date` because that is how runnir already reads the
+/// wall clock elsewhere, and the alternative is a timezone database as a dependency to
+/// print four digits. Called with the cards, about once a second — never per frame.
+fn clock_now() -> String {
+    std::process::Command::new("date")
+        .arg("+%H:%M")
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default()
+}
+
+/// A cheap deterministic mixer. Not cryptography and not trying to be: it exists so
+/// the rain looks unpatterned without pulling in an RNG or reading a clock.
+fn splitmix(mut x: u32) -> u32 {
+    x = x.wrapping_add(0x9E37_79B9);
+    x = (x ^ (x >> 16)).wrapping_mul(0x21F0_AAAD);
+    x = (x ^ (x >> 15)).wrapping_mul(0x735A_2D97);
+    x ^ (x >> 15)
+}
+
+fn spread(seed: u32, n: usize) -> usize {
+    if n == 0 { 0 } else { (seed as usize) % n }
 }
 
 impl MapPanel {
     pub fn new(cards: Vec<MapCard>) -> Self {
-        Self { cards, cursor: 0 }
+        Self { cards, cursor: 0, rain: Rain::new(200, 60), clock: clock_now() }
+    }
+
+    /// One frame of rain. Cheap by construction — no clock, no RNG, no allocation
+    /// beyond the drops that already exist.
+    pub fn tick_rain(&mut self, rows: usize) {
+        self.rain.tick(rows);
+    }
+
+    /// New readings for the cards, keeping the cursor on the same PANE rather than the
+    /// same index: panes come and go while the map is up, and a selection that slid to
+    /// a different pane under a still hand is the kind of thing that gets a
+    /// screensaver turned off.
+    pub fn refresh(&mut self, cards: Vec<MapCard>) {
+        let on = self.selected_pane();
+        self.cards = cards;
+        self.clock = clock_now();
+        self.cursor = on
+            .and_then(|p| self.cards.iter().position(|c| c.pane == p))
+            .unwrap_or(self.cursor.min(self.cards.len().saturating_sub(1)));
+    }
+
+    /// Which tab the selection would take you to.
+    pub fn selected_tab(&self) -> Option<usize> {
+        self.cards.get(self.cursor).map(|c| c.tab)
     }
 
     pub fn up(&mut self) {
@@ -2277,7 +2425,30 @@ impl MapPanel {
         // over the text they summarise. Without it the cards read as debris.
         let mut back = panel_grid(cols, rows.saturating_sub(1), theme);
         back.fill(Pen { bg: Color::Rgb(0x0b, 0x0b, 0x0e), ..Pen::default() });
-        write(&mut back, 0, 2, "MAP \u{b7} the session zoomed out", accent());
+
+        // The rain goes down FIRST, so everything after it draws over the top. It is
+        // backdrop, not decoration on the cards: what is read is the cards.
+        let bg = Color::Rgb(0x0b, 0x0b, 0x0e);
+        for (row, col, rune, bright) in self.rain.cells(cols, rows.saturating_sub(1)) {
+            // Four steps, all well under the cards' foreground. The head is the only
+            // one that reads as bright, and even it stays a backdrop: a screensaver
+            // you cannot read the screen through is a screensaver you turn off.
+            let fg = match bright {
+                3 => Color::Rgb(0x6f, 0xc9, 0x8f),
+                2 => Color::Rgb(0x3f, 0x7d, 0x59),
+                1 => Color::Rgb(0x2a, 0x50, 0x3b),
+                _ => Color::Rgb(0x1a, 0x2f, 0x24),
+            };
+            back.write_str(row, col, &rune.to_string(), Pen { fg, bg, ..Pen::default() });
+        }
+
+        write(&mut back, 0, 2, "MAP \u{b7} the whole window, zoomed out", accent());
+        // The clock earns its place by what this is FOR: something left up while you
+        // are away, glanced at on the way past.
+        if !self.clock.is_empty() {
+            let at = cols.saturating_sub(self.clock.chars().count() + 2);
+            write(&mut back, 0, at, &self.clock, accent());
+        }
         write(
             &mut back,
             rows.saturating_sub(2),
@@ -2305,7 +2476,16 @@ impl MapPanel {
             g.write_str(0, 0, &" ".repeat(w), head_pen);
             let tag: String = format!("{:<8}", c.tag).chars().take(w).collect();
             g.write_str(0, 1, &tag, head_pen);
-            let title: String = c.title.chars().take(w.saturating_sub(11)).collect();
+            // Which tab the pane is in, on the card itself: the map spans the window
+            // now, so "which one is this" became a question a card has to answer — but
+            // only when there is more than one tab to be confused between.
+            let many = self.cards.iter().any(|o| o.tab != c.tab);
+            let title = if many {
+                format!("{} \u{b7} {}", c.tab_title, c.title)
+            } else {
+                c.title.clone()
+            };
+            let title: String = title.chars().take(w.saturating_sub(11)).collect();
             g.write_str(0, 10.min(w.saturating_sub(1)), &title, title_pen);
 
             let body = Pen { bg, fg: Color::Rgb(0xb8, 0xba, 0xc0), ..Pen::default() };

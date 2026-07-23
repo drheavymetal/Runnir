@@ -808,6 +808,9 @@ struct Gpu {
     /// a command block to another pane, a middle CLICK still pastes the primary
     /// selection.
     middle_press: Option<PhysicalPosition<f64>>,
+    /// Frame counter for the map's screensaver, so the rain and the re-readings can
+    /// run at different rates off one wake-up.
+    map_frame: u32,
     /// What this project is really worked with, learned from successful commands.
     /// Loaded once; only written when it changes.
     verbs: verbs::Verbs,
@@ -1102,6 +1105,7 @@ impl App {
                 .flatten(),
 
             middle_press: None,
+            map_frame: 0,
             verbs: verbs::Verbs::load(),
             last_pty_key: Instant::now(),
             baseline: catchup::Baseline::default(),
@@ -1412,6 +1416,18 @@ impl ApplicationHandler<UserEvent> for App {
                 ));
                 return;
             }
+        }
+
+        // The map is a screensaver, so it has to keep moving on an idle terminal: the
+        // rain falls, the clock ticks over, and the cards are re-read so what you
+        // glance at on the way past is what is happening NOW, not what was happening
+        // when you opened it.
+        if gpu.tick_map() {
+            gpu.window.request_redraw();
+            event_loop.set_control_flow(ControlFlow::WaitUntil(
+                Instant::now() + Duration::from_millis(90),
+            ));
+            return;
         }
 
         // An armed leader expires on a deadline nothing else wakes us for: on an idle

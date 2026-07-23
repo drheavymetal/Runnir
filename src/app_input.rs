@@ -3549,11 +3549,19 @@ impl Gpu {
                 Key::Named(NamedKey::ArrowUp) | Key::Named(NamedKey::ArrowLeft) => p.up(),
                 Key::Named(NamedKey::ArrowDown) | Key::Named(NamedKey::ArrowRight) => p.down(),
                 Key::Named(NamedKey::Enter) => {
-                    let pane = p.selected_pane();
+                    // The map spans every tab, so opening a card has to GO to its tab
+                    // first. Focusing by pane id alone would silently do nothing for
+                    // three quarters of the cards on screen.
+                    let (pane, tab) = (p.selected_pane(), p.selected_tab());
                     self.overlay = None;
+                    if let Some(i) = tab.filter(|i| *i < self.tabs.len()) {
+                        self.active = i;
+                    }
                     if let Some(id) = pane {
                         self.focus_pane(id);
                     }
+                    let area = self.active_area();
+                    self.tabs[self.active].reflow(area);
                 }
                 Key::Character(c) => match c.as_str() {
                     "k" | "h" => p.up(),
@@ -6100,47 +6108,93 @@ impl Gpu {
     /// zooming cannot scale the text without resizing every program in the session.
     /// What zoom CAN do is change what is drawn — headlines instead of unreadable
     /// glyphs — which is the part that makes a session readable at a glance.
+    /// One frame of the map, if it is up. Returns whether it is.
+    ///
+    /// The rain moves every frame; the readings are re-taken about once a second,
+    /// because a `catch_up_snapshot` per pane ten times a second is a lot of work for
+    /// a screen nobody is typing at.
+    fn tick_map(&mut self) -> bool {
+        if !matches!(self.overlay, Some(Overlay::Map(_))) {
+            return false;
+        }
+        self.map_frame = self.map_frame.wrapping_add(1);
+        let refresh = self.map_frame % 11 == 0;
+        let cards = refresh.then(|| self.map_cards());
+        let rows = (self.surface_config.height as f32 / self.renderer.cell_size().1).floor() as usize;
+        if let Some(Overlay::Map(p)) = &mut self.overlay {
+            p.tick_rain(rows.max(1));
+            if let Some(cards) = cards {
+                p.refresh(cards);
+            }
+        }
+        true
+    }
+
     fn show_map(&mut self) {
+        let cards = self.map_cards();
+        self.overlay = Some(Overlay::Map(overlay::MapPanel::new(cards)));
+        self.window.request_redraw();
+    }
+
+    /// One card per pane in the WHOLE WINDOW, tabs included.
+    ///
+    /// Every tab and not just the active one, because the active tab is the thing you
+    /// are already looking at: a map of it answers a question you did not have. What
+    /// nothing else in runnir answers is "what is running anywhere in here" — the
+    /// catch-up is the active tab too — and that is the question this now takes.
+    ///
+    /// Cards keep each tab's own geometry, and tabs stack downwards: re-flowing
+    /// everything into one neat grid would make you re-learn the shape of a session
+    /// you already know by its shape.
+    fn map_cards(&self) -> Vec<overlay::MapCard> {
         let area = self.active_area();
         let (cw, ch) = self.renderer.cell_size();
-        // Not `visible_rects`: that honours zoom, and the map of a session with one
-        // pane zoomed would be a single card — exactly the hole the cards exist to
-        // close. Zooming out to see everything must show everything.
-        let rects = self.tabs[self.active].map_layout(area);
         let waiting = matches!(&self.overlay, Some(Overlay::Prompt(_)))
             .then(|| self.tabs[self.active].focus);
 
-        let mut cards: Vec<overlay::MapCard> = rects
-            .iter()
-            .filter_map(|(id, r)| {
-                let pane = self.tabs[self.active].panes.get(id)?;
+        let mut cards: Vec<overlay::MapCard> = Vec::new();
+        // Where the next tab's block starts, in rows. Each tab is laid out in its own
+        // coordinates and then pushed below the one before it.
+        let mut row_offset = 0usize;
+        for (index, tab) in self.tabs.iter().enumerate() {
+            // Not the visible layout: that honours zoom, and the map of a session with
+            // one pane zoomed would be a single card — exactly the hole the cards
+            // exist to close. Zooming out to see everything must show everything.
+            let rects = tab.map_layout(area);
+            let mut tallest = 0usize;
+            for (id, r) in &rects {
+                let Some(pane) = tab.panes.get(id) else { continue };
                 let snap = pane.catch_up_snapshot(*id, waiting == Some(*id));
-                // Every pane gets a card, including the quiet ones: a map with holes
-                // in it is not a map. The catch-up omits them; this must not.
+                // Every pane gets a card, including the quiet ones: a map with holes in
+                // it is not a map. The catch-up omits them; this must not.
                 let head = crate::catchup::headline(&snap);
                 let (tag, detail) = match &head {
                     Some(h) => (h.state.tag().to_string(), h.detail.clone()),
                     None => ("idle".to_string(), "at a prompt".to_string()),
                 };
-                // The block's output, not the tail of the scrollback: the tail of a
-                // themed prompt is glyphs and a clock, and a map of clocks is no map.
-                let preview = pane.recent_output(3);
-                Some(overlay::MapCard {
+                let row = (r.y / ch).round() as usize;
+                let rows = (r.h / ch).round() as usize;
+                tallest = tallest.max(row + rows);
+                cards.push(overlay::MapCard {
                     pane: *id,
+                    tab: index,
+                    tab_title: tab.title(),
                     col: (r.x / cw).round() as usize,
-                    row: (r.y / ch).round() as usize,
+                    row: row_offset + row,
                     cols: (r.w / cw).round() as usize,
-                    rows: (r.h / ch).round() as usize,
+                    rows,
                     tag,
                     title: snap.title,
                     detail,
-                    preview,
-                })
-            })
-            .collect();
-        cards.sort_by_key(|c| (c.row, c.col));
-        self.overlay = Some(Overlay::Map(overlay::MapPanel::new(cards)));
-        self.window.request_redraw();
+                    // The block's output, not the tail of the scrollback: the tail of a
+                    // themed prompt is glyphs and a clock, and a map of clocks is no map.
+                    preview: pane.recent_output(3),
+                });
+            }
+            row_offset += tallest;
+        }
+        cards.sort_by_key(|c| (c.tab, c.row, c.col));
+        cards
     }
 
     /// Arranges the window around an operation: a status watch and one log pane per
