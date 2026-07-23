@@ -2259,8 +2259,8 @@ pub struct MapPanel {
 #[derive(Clone, Copy)]
 struct Drop {
     col: u16,
-    /// Head position in rows, in tenths so a column can fall slower than one row per
-    /// frame without the whole thing marching in lockstep.
+    /// Head position in HUNDREDTHS of a row. Tenths were too coarse a step to fall
+    /// slowly in: the smallest non-zero speed was already more than a row a second.
     head: i32,
     speed: i32,
     len: u16,
@@ -2285,7 +2285,9 @@ pub struct Rain {
 
 impl Rain {
     pub fn new(cols: usize, rows: usize) -> Rain {
-        let n = (cols / 3).clamp(1, 96);
+        // More drops than there are columns, so some columns carry two at different
+        // depths. One per column reads as a comb; this reads as rain.
+        let n = (cols * 3 / 2).clamp(1, 600);
         let drops = (0..n)
             .map(|i| {
                 let seed = splitmix(i as u32 + 1);
@@ -2293,9 +2295,12 @@ impl Rain {
                     col: (spread(seed, cols)) as u16,
                     // Staggered above the top so nothing starts mid-screen, and the
                     // first frame is already rain rather than a row of heads.
-                    head: -((spread(seed >> 8, rows.max(1) * 2)) as i32),
-                    speed: 1 + (seed >> 16) as i32 % 3,
-                    len: 4 + (seed >> 20) as u16 % 12,
+                    head: -((spread(seed >> 8, rows.max(1) * 100)) as i32),
+                    // Hundredths of a row per frame at ~11 fps: between a third of a
+                    // row and four fifths of one per second, so a rune takes a couple
+                    // of seconds to move its own height.
+                    speed: 3 + (seed >> 16) as i32 % 5,
+                    len: 8 + (seed >> 20) as u16 % 21,
                     seed,
                 }
             })
@@ -2305,11 +2310,11 @@ impl Rain {
 
     pub fn tick(&mut self, rows: usize) {
         self.step = self.step.wrapping_add(1);
-        let bottom = (rows as i32 + 24) * 10;
+        let bottom = (rows as i32 + d_max_len()) * 100;
         for d in &mut self.drops {
             d.head += d.speed;
-            if d.head * 10 > bottom {
-                d.head = -(d.len as i32) - (spread(d.seed ^ self.step, 20) as i32);
+            if d.head > bottom {
+                d.head = -((d.len as i32 + spread(d.seed ^ self.step, 60) as i32) * 100);
             }
         }
     }
@@ -2324,8 +2329,9 @@ impl Rain {
             if col >= cols {
                 continue;
             }
+            let head_row = d.head.div_euclid(100);
             for back in 0..d.len as i32 {
-                let row = d.head - back;
+                let row = head_row - back;
                 if row < 0 || row as usize >= rows {
                     continue;
                 }
@@ -2357,6 +2363,115 @@ fn clock_now() -> String {
         .ok()
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_default()
+}
+
+/// The clock's digits, carved rather than typeset.
+///
+/// Six columns by seven rows each, drawn with full blocks and quadrant blocks at the
+/// corners. The chamfers are the whole point: Elder Futhark has no curves — it is a
+/// script made to be cut into wood and stone with straight strokes — so a clock that
+/// belongs beside it cannot have round shoulders. Authored by hand rather than derived
+/// from a bitmap font, because "looks carved" is not a property a font query has.
+const DIGITS: [[&str; 7]; 10] = [
+    [
+        "\u{2597}\u{2588}\u{2588}\u{2588}\u{2588}\u{2596}",
+        "\u{2588}\u{2588}  \u{2588}\u{2588}",
+        "\u{2588}\u{2588}  \u{2588}\u{2588}",
+        "\u{2588}\u{2588}  \u{2588}\u{2588}",
+        "\u{2588}\u{2588}  \u{2588}\u{2588}",
+        "\u{2588}\u{2588}  \u{2588}\u{2588}",
+        "\u{259D}\u{2588}\u{2588}\u{2588}\u{2588}\u{2598}",
+    ],
+    [
+        "  \u{2588}\u{2588}  ",
+        "\u{2597}\u{2588}\u{2588}\u{2588}  ",
+        "  \u{2588}\u{2588}  ",
+        "  \u{2588}\u{2588}  ",
+        "  \u{2588}\u{2588}  ",
+        "  \u{2588}\u{2588}  ",
+        "\u{259D}\u{2588}\u{2588}\u{2588}\u{2588}\u{2598}",
+    ],
+    [
+        "\u{2597}\u{2588}\u{2588}\u{2588}\u{2588}\u{2596}",
+        "\u{2588}\u{2588}  \u{2588}\u{2588}",
+        "    \u{2588}\u{2588}",
+        "  \u{2597}\u{2588}\u{2588}\u{2598}",
+        " \u{2588}\u{2588}  ",
+        "\u{2588}\u{2588}    ",
+        "\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}",
+    ],
+    [
+        "\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2596}",
+        "    \u{2588}\u{2588}",
+        "  \u{2588}\u{2588}\u{2598}",
+        "  \u{2588}\u{2588}\u{2596}",
+        "    \u{2588}\u{2588}",
+        "\u{2588}\u{2588}  \u{2588}\u{2588}",
+        "\u{259D}\u{2588}\u{2588}\u{2588}\u{2588}\u{2598}",
+    ],
+    [
+        "\u{2588}\u{2588}  \u{2588}\u{2588}",
+        "\u{2588}\u{2588}  \u{2588}\u{2588}",
+        "\u{2588}\u{2588}  \u{2588}\u{2588}",
+        "\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}",
+        "    \u{2588}\u{2588}",
+        "    \u{2588}\u{2588}",
+        "    \u{2588}\u{2588}",
+    ],
+    [
+        "\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}",
+        "\u{2588}\u{2588}    ",
+        "\u{2588}\u{2588}\u{2588}\u{2588}\u{2596} ",
+        "    \u{2588}\u{2588}",
+        "    \u{2588}\u{2588}",
+        "\u{2588}\u{2588}  \u{2588}\u{2588}",
+        "\u{259D}\u{2588}\u{2588}\u{2588}\u{2588}\u{2598}",
+    ],
+    [
+        "\u{2597}\u{2588}\u{2588}\u{2588}\u{2588}\u{2596}",
+        "\u{2588}\u{2588}    ",
+        "\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2596}",
+        "\u{2588}\u{2588}  \u{2588}\u{2588}",
+        "\u{2588}\u{2588}  \u{2588}\u{2588}",
+        "\u{2588}\u{2588}  \u{2588}\u{2588}",
+        "\u{259D}\u{2588}\u{2588}\u{2588}\u{2588}\u{2598}",
+    ],
+    [
+        "\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}",
+        "\u{2588}\u{2588}  \u{2588}\u{2588}",
+        "    \u{2588}\u{2588}",
+        "   \u{2588}\u{2588} ",
+        "  \u{2588}\u{2588}  ",
+        "  \u{2588}\u{2588}  ",
+        "  \u{2588}\u{2588}  ",
+    ],
+    [
+        "\u{2597}\u{2588}\u{2588}\u{2588}\u{2588}\u{2596}",
+        "\u{2588}\u{2588}  \u{2588}\u{2588}",
+        "\u{2588}\u{2588}  \u{2588}\u{2588}",
+        " \u{2588}\u{2588}\u{2588}\u{2588} ",
+        "\u{2588}\u{2588}  \u{2588}\u{2588}",
+        "\u{2588}\u{2588}  \u{2588}\u{2588}",
+        "\u{259D}\u{2588}\u{2588}\u{2588}\u{2588}\u{2598}",
+    ],
+    [
+        "\u{2597}\u{2588}\u{2588}\u{2588}\u{2588}\u{2596}",
+        "\u{2588}\u{2588}  \u{2588}\u{2588}",
+        "\u{2588}\u{2588}  \u{2588}\u{2588}",
+        "\u{259D}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}",
+        "    \u{2588}\u{2588}",
+        "    \u{2588}\u{2588}",
+        "\u{259D}\u{2588}\u{2588}\u{2588}\u{2588}\u{2598}",
+    ],
+];
+
+/// The separator, blinking off on odd minutes would need a clock we do not read that
+/// often; it simply stays lit. Two square studs, like rivets.
+const COLON: [&str; 7] = ["  ", "\u{2588}\u{2588}", "\u{2588}\u{2588}", "  ", "\u{2588}\u{2588}", "\u{2588}\u{2588}", "  "];
+
+/// The longest a tail can be, so a drop is only recycled once it is fully off screen.
+fn d_max_len() -> i32 {
+    29
 }
 
 /// A cheap deterministic mixer. Not cryptography and not trying to be: it exists so
@@ -2426,29 +2541,8 @@ impl MapPanel {
         let mut back = panel_grid(cols, rows.saturating_sub(1), theme);
         back.fill(Pen { bg: Color::Rgb(0x0b, 0x0b, 0x0e), ..Pen::default() });
 
-        // The rain goes down FIRST, so everything after it draws over the top. It is
-        // backdrop, not decoration on the cards: what is read is the cards.
-        let bg = Color::Rgb(0x0b, 0x0b, 0x0e);
-        for (row, col, rune, bright) in self.rain.cells(cols, rows.saturating_sub(1)) {
-            // Four steps, all well under the cards' foreground. The head is the only
-            // one that reads as bright, and even it stays a backdrop: a screensaver
-            // you cannot read the screen through is a screensaver you turn off.
-            let fg = match bright {
-                3 => Color::Rgb(0x6f, 0xc9, 0x8f),
-                2 => Color::Rgb(0x3f, 0x7d, 0x59),
-                1 => Color::Rgb(0x2a, 0x50, 0x3b),
-                _ => Color::Rgb(0x1a, 0x2f, 0x24),
-            };
-            back.write_str(row, col, &rune.to_string(), Pen { fg, bg, ..Pen::default() });
-        }
 
         write(&mut back, 0, 2, "MAP \u{b7} the whole window, zoomed out", accent());
-        // The clock earns its place by what this is FOR: something left up while you
-        // are away, glanced at on the way past.
-        if !self.clock.is_empty() {
-            let at = cols.saturating_sub(self.clock.chars().count() + 2);
-            write(&mut back, 0, at, &self.clock, accent());
-        }
         write(
             &mut back,
             rows.saturating_sub(2),
@@ -2456,7 +2550,7 @@ impl MapPanel {
             "j k move \u{b7} enter opens that pane full size \u{b7} esc back",
             dim(),
         );
-        out.push(Panel { grid: back, col: 0, row: 0 });
+        let mut cards: Vec<(Grid, usize, usize)> = Vec::new();
 
         for (i, c) in self.cards.iter().enumerate() {
             // Cards keep the panes' own geometry: the map is spatial, and a card that
@@ -2496,10 +2590,110 @@ impl MapPanel {
                 let line: String = line.trim().chars().take(w.saturating_sub(2)).collect();
                 g.write_str(3 + n, 1, &line, faint);
             }
-            out.push(Panel { grid: g, col: c.col, row: c.row });
+            cards.push((g, c.row, c.col));
         }
+
+        // Cards go INTO the backdrop rather than beside it, so one pass can tell a
+        // cell with something in it from a cell without. Drawn as separate panels the
+        // rain could only ever appear in the strip above them — which is what it did,
+        // and it looked like a bug because it was one.
+        for (g, row0, col0) in &cards {
+            for r in 0..g.rows() {
+                for c in 0..g.cols() {
+                    let (tr, tc) = (row0 + r, col0 + c);
+                    if tr < back.rows() && tc < back.cols() {
+                        let cell = g.cell(r, c);
+                        back.write_str(tr, tc, &cell.ch.to_string(), cell.pen);
+                    }
+                }
+            }
+        }
+
+        // The rain LAST, and only where nothing was written: it falls the whole height
+        // of the window, through the gaps between cards and through the empty parts of
+        // the cards themselves, which is what makes it read as behind them rather than
+        // as a band along the top.
+        for (row, col, rune, bright) in self.rain.cells(cols, rows.saturating_sub(1)) {
+            if row >= back.rows() || col >= back.cols() {
+                continue;
+            }
+            // Over the text as well as through the gaps. Occluding a card for the
+            // moment a column crosses it is what makes this rain rather than a
+            // pattern behind a window — and the cell is back a frame later, which is
+            // exactly how long anything is hidden for.
+            let under = back.cell(row, col);
+            // Four steps, all well under the cards' foreground. Even the head stays a
+            // backdrop: a screensaver you cannot read the screen through is one you
+            // turn off.
+            let fg = match bright {
+                3 => Color::Rgb(0x6f, 0xc9, 0x8f),
+                2 => Color::Rgb(0x3f, 0x7d, 0x59),
+                1 => Color::Rgb(0x2a, 0x50, 0x3b),
+                _ => Color::Rgb(0x1a, 0x2f, 0x24),
+            };
+            back.write_str(row, col, &rune.to_string(), Pen { fg, bg: under.pen.bg, ..Pen::default() });
+        }
+
+        // The clock LAST and dead centre, over cards and rain alike.
+        //
+        // Centred on the WINDOW rather than placed in whatever gap the panes leave: a
+        // clock that moves with the layout is one you have to look for, and the whole
+        // point of it is being read without looking. It is what this is FOR — a thing
+        // left up while you are away and glanced at on the way past.
+        if let Some((art, w)) = clock_art(&self.clock) {
+            let h = art.len();
+            let top = rows.saturating_sub(h + 1) / 2;
+            let left = cols.saturating_sub(w) / 2;
+            // Bone against the green: the rain is the background even where it crosses
+            // this, and two greens would read as one surface.
+            let carved = Color::Rgb(0xe8, 0xdc, 0xc0);
+            let shadow = Color::Rgb(0x2b, 0x27, 0x1e);
+            for (r, line) in art.iter().enumerate() {
+                for (c, ch) in line.chars().enumerate() {
+                    if ch == ' ' {
+                        continue;
+                    }
+                    let (tr, tc) = (top + r, left + c);
+                    if tr >= back.rows() || tc >= back.cols() {
+                        continue;
+                    }
+                    back.write_str(tr, tc, &ch.to_string(), Pen { fg: carved, bg: shadow, ..Pen::default() });
+                }
+            }
+        }
+
+        out.push(Panel { grid: back, col: 0, row: 0 });
         out
     }
+}
+
+/// `HH:MM` as carved rows, and how wide they are. `None` when the clock could not be
+/// read, in which case the map simply has no clock rather than a row of blanks.
+fn clock_art(hhmm: &str) -> Option<(Vec<String>, usize)> {
+    let mut cells: Vec<[&str; 7]> = Vec::new();
+    for ch in hhmm.chars() {
+        match ch {
+            '0'..='9' => cells.push(DIGITS[ch as usize - '0' as usize]),
+            ':' => cells.push(COLON),
+            _ => return None,
+        }
+    }
+    if cells.is_empty() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(7);
+    for r in 0..7 {
+        let mut line = String::new();
+        for (i, cell) in cells.iter().enumerate() {
+            if i > 0 {
+                line.push_str("  ");
+            }
+            line.push_str(cell[r]);
+        }
+        out.push(line);
+    }
+    let w = out.iter().map(|l| l.chars().count()).max().unwrap_or(0);
+    Some((out, w))
 }
 
 /// The verbs panel: how this repository is actually built, tested and deployed,
