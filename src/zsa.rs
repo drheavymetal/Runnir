@@ -371,11 +371,24 @@ impl Hid {
         let mut report = [0u8; REPORT];
         let n = body.len().min(REPORT);
         report[..n].copy_from_slice(&body[..n]);
-        let file = self.file()?;
-        file.write_all(&report).map_err(|e| {
+        let debug = std::env::var("RUNNIR_ZSA_DEBUG").is_ok();
+        let file = match self.file() {
+            Ok(f) => f,
+            Err(e) => {
+                if debug {
+                    eprintln!("zsa: no device ({e})");
+                }
+                return Err(e);
+            }
+        };
+        let out = file.write_all(&report).map_err(|e| {
             self.file = None;
             format!("write: {e}")
-        })
+        });
+        if debug {
+            eprintln!("zsa: -> {} = {out:?}", body.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" "));
+        }
+        out
     }
 }
 
@@ -479,20 +492,22 @@ impl Board {
         if self.layout.lock().is_ok_and(|l| l.is_some()) {
             return;
         }
-        // No socket, no Keymapp: skip the subprocess entirely. This runs on every
-        // arming of the leader while the board is dark, and spawning a `kontroll`
-        // only to watch it fail is a cost paid on a keystroke for nothing.
-        //
-        // Said out loud under the debug flag: this is now the commonest reason the
-        // board stays dark, and a silent early return here is exactly the blindness
-        // that made the original bug take a session to see.
-        if !socket_path().is_some_and(|p| p.exists()) {
+        let keymapp_up = socket_path().is_some_and(|p| p.exists());
+        // Nothing to go on: Keymapp is not up to be asked and nothing was ever
+        // remembered, so there is no way to know WHICH flashed layout to light. Said
+        // out loud under the debug flag — a silent early return here is exactly the
+        // blindness that made the startup bug take a session to find.
+        if !keymapp_up && remembered_revision().is_none() {
             if std::env::var("RUNNIR_ZSA_DEBUG").is_ok() {
-                eprintln!("zsa: no Keymapp socket yet; will retry on the next leader");
+                eprintln!("zsa: no Keymapp and no revision remembered yet; open it once");
             }
             return;
         }
-        ask_layout(self.layout.clone(), self.asking_layout.clone(), read_status);
+        // With Keymapp down, do not spawn a `kontroll` only to watch it fail: this
+        // runs on every arming of the leader while the board is dark. The reader that
+        // answers `None` sends `ask_layout` straight to what it remembers.
+        let read: fn() -> Option<Status> = if keymapp_up { read_status } else { || None };
+        ask_layout(self.layout.clone(), self.asking_layout.clone(), read, remembered_revision);
     }
 
     /// The layer to resolve keys against right now, without asking the board.
@@ -722,13 +737,39 @@ fn ask_layout(
     layout: Arc<Mutex<Option<Layout>>>,
     asking: Arc<AtomicBool>,
     read: impl FnOnce() -> Option<Status> + Send + 'static,
+    // Injected rather than read straight from disk: a fallback that reaches for a real
+    // file makes every test of this function a test of the MACHINE it runs on, which
+    // is a trap this repo has already paid for once.
+    recall: impl FnOnce() -> Option<String> + Send + 'static,
 ) {
     if asking.swap(true, Ordering::SeqCst) {
         return;
     }
     std::thread::spawn(move || {
         let debug = std::env::var("RUNNIR_ZSA_DEBUG").is_ok();
-        match read().and_then(|s| Some((default_db()?, s.revision))) {
+        // The revision, from the board if anything can be asked, and otherwise from
+        // the last time something could. Painting no longer needs Keymapp, but knowing
+        // WHICH flashed layout to light still does — and Keymapp must have run at some
+        // point regardless, because its database is where the layout is read from.
+        // Remembering the answer is what turns "Keymapp has to be open" into "Keymapp
+        // has to have been open once".
+        let revision = match read() {
+            Some(status) => {
+                remember_revision(&status.revision);
+                Some(status.revision)
+            }
+            None => {
+                let cached = recall();
+                if debug {
+                    match &cached {
+                        Some(r) => eprintln!("zsa: board not answering; using remembered revision {r}"),
+                        None => eprintln!("zsa: board not answering and no revision remembered yet"),
+                    }
+                }
+                cached
+            }
+        };
+        match revision.and_then(|r| Some((default_db()?, r))) {
             Some((db, revision)) => {
                 let got = read_layout(&db, &revision);
                 if debug {
@@ -748,6 +789,32 @@ fn ask_layout(
         }
         asking.store(false, Ordering::SeqCst);
     });
+}
+
+/// Where the last known flashed revision is kept, so the lights survive Keymapp not
+/// being open. Derived state, not configuration: it is re-learnt the moment anything
+/// can ask the board again, and losing it costs one session of no lights, not data.
+fn revision_cache() -> Option<PathBuf> {
+    Some(dirs::data_dir()?.join("runnir/zsa-revision"))
+}
+
+fn remember_revision(revision: &str) {
+    let Some(path) = revision_cache() else { return };
+    if remembered_revision().as_deref() == Some(revision) {
+        return;
+    }
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(path, revision);
+}
+
+/// The remembered revision, validated the same way a fresh one is: this string reaches
+/// a SQL statement, and a cache file is a thing a user can edit.
+fn remembered_revision() -> Option<String> {
+    let text = std::fs::read_to_string(revision_cache()?).ok()?;
+    let revision = text.trim().to_string();
+    (!revision.is_empty() && revision.chars().all(|c| c.is_ascii_alphanumeric())).then_some(revision)
 }
 
 /// Where Keymapp listens on Linux. The port 50051 its own window names is Windows
@@ -796,7 +863,7 @@ mod tests {
         let asking = Arc::new(AtomicBool::new(false));
 
         // Keymapp down: no status, so no layout — and nothing latched.
-        ask_layout(slot.clone(), asking.clone(), || None);
+        ask_layout(slot.clone(), asking.clone(), || None, || None);
         for _ in 0..200 {
             if !asking.load(Ordering::SeqCst) {
                 break;
@@ -811,10 +878,15 @@ mod tests {
         asking.store(true, Ordering::SeqCst);
         let ran = Arc::new(AtomicBool::new(false));
         let seen = ran.clone();
-        ask_layout(slot.clone(), asking.clone(), move || {
-            seen.store(true, Ordering::SeqCst);
-            None
-        });
+        ask_layout(
+            slot.clone(),
+            asking.clone(),
+            move || {
+                seen.store(true, Ordering::SeqCst);
+                None
+            },
+            || None,
+        );
         std::thread::sleep(std::time::Duration::from_millis(30));
         assert!(!ran.load(Ordering::SeqCst), "a second reading must not start while one is out");
     }
