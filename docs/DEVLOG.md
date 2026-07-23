@@ -2780,6 +2780,83 @@ command set, and pre-2026 knowledge of this API has already been wrong here once
 
 504 tests (was 503).
 
+## DESIGN, NOT YET BUILT — talk to the keyboard directly, drop Keymapp (2026-07-23)
+
+**Why.** The lights only work while Keymapp is open. That is the whole complaint, and
+it is not a bug we can fix from our side: `kontroll` talks to Keymapp's socket, not to
+the keyboard, and Keymapp has no headless mode. It also costs 215 MB of RSS and a
+process spawn per LED.
+
+**What makes it possible.** The protocol is published. `zsa/qmk_modules`, GPL-2.0,
+module `oryx` — the same module Pedro's board is flashed with, since that is what
+Keymapp drives. The command codes map one-to-one onto the gRPC surface we already use:
+
+    ORYX_SET_RGB_LED       [cmd, led, r, g, b]
+    ORYX_SET_RGB_LED_ALL
+    ORYX_RGB_CONTROL       param[0] != 0 -> set_webhid_effect(), 0 -> clear_webhid_effect()
+    ORYX_SET_LAYER         (the only one behind the pairing gate)
+    ORYX_GET_FW_VERSION
+    ORYX_GET_PROTOCOL_VERSION = 0xFE
+
+Keymapp is a thin proxy: gRPC in, raw HID out. It adds no logic we need. The pairing
+gate is not a gate — `PAIRING_INIT` sets `paired = true` unconditionally, `PAIRING_VALIDATE`
+is a no-op kept for backwards compatibility, and the RGB commands are not gated at all.
+
+**Transport.** `/dev/hidrawN`, plain file I/O — no `hidapi`, no new crate. The right
+endpoint is found by report descriptor: usage page `0xFF60` (`06 60 ff`), which on this
+machine is `hidraw3`. Access is permanent and unprivileged: ZSA ships
+`50-oryx.rules` with `TAG+="uaccess"` for vendor `3297`.
+
+**What we lose, and what replaces it.** `sustain` is in Keymapp's `.proto` but NOT in
+the firmware — the opcode carries no time field. It is Keymapp's own timer, and it is
+the dead-man switch that today guarantees a `kill -9` cannot leave the board painted.
+Direct HID has none. Replacement, decided with Pedro:
+
+- a timer in runnir (the leader already lapses; that lapse restores),
+- restore on disarm / focus loss / exit — already implemented,
+- **restore on STARTUP**, which is the new piece: it covers the only case a
+  self-owned timer cannot, namely runnir being killed outright while armed.
+
+Residual risk after that: killed hard inside the ~10 s armed window AND never opened
+again. Unplugging also clears it. Judged acceptable.
+
+Worth checking while building: whether the webhid effect lapses on its own after
+inactivity. If it does, the whole dead-man question is moot.
+
+**Layer tracking.** `known_layer` comes from `kontroll status` today. The oryx module
+PUSHES layer changes to the host, so reading the same fd is strictly better than
+polling a subprocess. Until that lands, layer 0 is the existing and correct fallback —
+`effective()` walks transparent keys down to base anyway.
+
+**Layout.** Unchanged, and note it does NOT depend on Keymapp running: the layout is
+read from `~/.config/.keymapp/keymapp.sqlite3`, a file on disk. Only the revision id
+came from Keymapp; `ORYX_GET_FW_VERSION` supplies it instead.
+
+**Shape of the change.** `Runner` is already a trait with a mock behind it, so the
+worker, the burst coalescing and the tests survive. What changes is the trait's
+vocabulary: it is CLI-shaped (`&["set-rgb", "-l", ...]`) and becomes intent-shaped
+(`set_led`, `set_all`, `control`). The `Kontroll` impl and its whole text-parsing layer
+— and the three bugs that layer cost us — are deleted rather than kept as a fallback.
+
+**Phases.** 1: find the endpoint and confirm `0xFE` against the real board, changing
+nothing. 2: the intent-shaped trait plus the HID impl behind it, kontroll still in
+place. 3: swap the transport, restore-on-startup, delete kontroll. 4: layer tracking
+from the push channel.
+
+### Phase 1 done — measured against Pedro's board, 2026-07-23
+
+Nothing was changed on the keyboard; `0xFE` is a query.
+
+    endpoint  /dev/hidraw3     (found by descriptor prefix 06 60 ff, not hardcoded)
+    sent      fe 00 00 ...     (32 bytes, NO report-id byte)
+    got       fe 04 fe 00 00 00 00 00
+
+Three unknowns closed at once: the `oryx` module IS in this flashed firmware and
+answers; the report is 32 bytes with **no leading report-id**, which was the open
+question about Linux hidraw; and the protocol version is `0x04`, so the upstream enum
+is the right one to code against. The endpoint must keep being found by descriptor —
+the hidraw numbering is not stable across replugs.
+
 ## Gotchas (do not re-learn)
 
 - An optional external dependency needs a RETRY, not a verdict at startup. "Absent
