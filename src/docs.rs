@@ -43,11 +43,12 @@ Straight away, no group — the things you do constantly:
 @ Leader hjkl      focus the pane left/down/up/right
 @ Leader HJKL      resize the focused pane (arrows do this too)
 @ Leader U         catch up: one headline per pane after time away
-@ Leader M         the map: every pane zoomed out to a card — its state, what it
-@                        last ran and the tail of what that printed. J/K (or the
-@                        arrows) move, Enter goes to that pane, Escape comes back.
-@                        The cards keep the panes' own places, so the session looks
-@                        like itself: the zoom is what you read, not where things are.
+@ Leader M         the map: every pane in the WINDOW — every tab — zoomed out to a
+@                        card with its state, what it last ran and the tail of what
+@                        that printed. J/K (or the arrows) move, Enter goes to that
+@                        pane, Escape comes back. The cards keep the panes' own
+@                        places, so the session looks like itself. It doubles as a
+@                        screensaver; see 'The map' below.
 @ Leader V         clipboard history
 @ Leader G         the git panel
 @ Leader D         the docker panel
@@ -646,6 +647,34 @@ sidebar already binds.
 Config: explorer.side (left/right), explorer.width in COLUMNS (not a fraction: a
 fraction on an ultrawide gives a 90-column tree), explorer.show_hidden. All three
 are in the settings panel too.
+
+# The map (and the screensaver)
+
+The map zooms the whole WINDOW out - every tab, not just the one you are looking at -
+and draws each pane as a card carrying its state, the command it last ran and the tail
+of what that printed. J K move, Enter goes to that pane (switching tab if it is in
+another one), Esc comes back.
+
+Cards keep each tab's own geometry and the tabs stack downwards, rather than
+re-flowing into a neat grid: a session is recognised by its shape, and a map that
+rearranges it makes you re-learn it every time.
+
+It doubles as a screensaver. Elder Futhark rains behind and across the cards, and the
+time is carved in the middle of the window - centred on the WINDOW, not on whatever
+gap the panes leave, because a clock that moves with the layout is one you have to
+look for. The readings are re-taken about once a second, so what you glance at is
+what is happening now.
+
+  behaviour.screensaver_after_secs   put it up by itself after this long with
+                                     nothing typed. 0 (the default) never does.
+
+'Nothing typed' means no keystroke has reached a pane - the same clock the catch-up
+uses. Window focus is not consulted, in either direction: a focused window on a
+second monitor is not attention, and the pointer crossing another window is not
+absence. When it puts itself up, ANY key dismisses it and that key does nothing else.
+
+The rune font is bundled with runnir, so this works on a machine with nothing
+installed. See assets/fonts/NOTICE.md for what ships and under which licence.
 
 # Docker panel
 

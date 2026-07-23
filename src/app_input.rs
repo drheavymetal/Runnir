@@ -546,6 +546,21 @@ impl Gpu {
         keymap: &Keymap,
         event_loop: &ActiveEventLoop,
     ) -> bool {
+        // A screensaver dismisses on ANY key, and that key does nothing else. It put
+        // itself on screen, so the keystroke was meant for whatever it covered — and a
+        // window that acts on a key aimed at the shell underneath is worse than one
+        // that ignores it.
+        if self.screensaver {
+            self.screensaver = false;
+            self.overlay = None;
+            // Dismissing IS activity. Without this the idle clock is still expired the
+            // moment the overlay closes, so it reopens on the very next frame and the
+            // keyboard appears dead — which is exactly what it did.
+            self.last_pty_key = Instant::now();
+            self.window.request_redraw();
+            return true;
+        }
+
         // An overlay swallows all keys while open.
         if self.overlay.is_some() {
             self.overlay_key(key, mods, config);
@@ -3106,6 +3121,9 @@ impl Gpu {
             "cols": cols,
             "rows": rows,
             "leader_armed": self.leader_armed.is_some(),
+            // Whether the overlay on screen put itself there. A script cannot tell an
+            // idle window from a covered one otherwise, and neither can a test.
+            "screensaver": self.screensaver,
             // The toast is user-visible state, so a script has to be able to read it:
             // without this, every message runnir shows is invisible from outside and
             // a test cannot tell "it refused and said why" from "nothing happened".
@@ -6108,6 +6126,19 @@ impl Gpu {
     /// zooming cannot scale the text without resizing every program in the session.
     /// What zoom CAN do is change what is drawn — headlines instead of unreadable
     /// glyphs — which is the part that makes a session readable at a glance.
+    /// How long since anything was typed at a pane. The catch-up's notion of away.
+    pub fn idle_for(&self) -> std::time::Duration {
+        self.last_pty_key.elapsed()
+    }
+
+    /// Puts the map up unasked. Marked as such, so the first key dismisses it rather
+    /// than acting: a screensaver that eats the keystroke meant for the shell — or
+    /// worse, acts on it — is one nobody forgives twice.
+    pub fn show_map_as_screensaver(&mut self) {
+        self.show_map();
+        self.screensaver = true;
+    }
+
     /// One frame of the map, if it is up. Returns whether it is.
     ///
     /// The rain moves every frame; the readings are re-taken about once a second,
@@ -6131,6 +6162,7 @@ impl Gpu {
     }
 
     fn show_map(&mut self) {
+        self.screensaver = false;
         let cards = self.map_cards();
         self.overlay = Some(Overlay::Map(overlay::MapPanel::new(cards)));
         self.window.request_redraw();
@@ -7040,7 +7072,16 @@ impl Gpu {
                         })
                     })
                     .collect();
-                ControlResponse::ok(json!({ "active": active, "tabs": tabs }))
+                // The UI state travels with `ls` because it is the only request that
+                // does not ACT. Everything else that reports it does so after pressing
+                // a key, which is useless for anything a key changes — the screensaver
+                // is dismissed by any key at all, so the only probe that could see it
+                // was the one that destroyed it first.
+                ControlResponse::ok(json!({
+                    "active": active,
+                    "tabs": tabs,
+                    "ui": self.ui_state(),
+                }))
             }
 
             ControlRequest::GetText { target } => match self.control_pane(target) {

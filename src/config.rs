@@ -248,6 +248,14 @@ pub struct Behaviour {
     /// Zero disables.
     pub notify_after_secs: u64,
     pub confirm_close: bool,
+    /// Open the map by itself after this many seconds with nothing typed, as a
+    /// screensaver. Zero disables it.
+    ///
+    /// Measured from the last keystroke that reached a PTY, the same clock the
+    /// catch-up uses and for the same reason: window focus lies in both directions —
+    /// a focused window on a second monitor is not attention, and the pointer
+    /// crossing another window is not absence.
+    pub screensaver_after_secs: u64,
     /// Restore the window you closed last, when this is the only window running.
     ///
     /// The snapshot (tabs, layout, directories, scrollback) belongs to the NEXT
@@ -298,6 +306,9 @@ impl Default for Behaviour {
             context_tint: true,
             notify_after_secs: 20,
             confirm_close: true,
+            // Off by default: a terminal that covers itself up unasked is a terminal
+            // people turn a setting off in, and finding which setting is the work.
+            screensaver_after_secs: 0,
             restore_session: true,
             command_guardian: true,
             smooth_scroll: true,

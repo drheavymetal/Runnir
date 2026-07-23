@@ -811,6 +811,9 @@ struct Gpu {
     /// Frame counter for the map's screensaver, so the rain and the re-readings can
     /// run at different rates off one wake-up.
     map_frame: u32,
+    /// Whether the map on screen put itself there. An unasked overlay must not eat
+    /// the keystroke that dismisses it.
+    screensaver: bool,
     /// What this project is really worked with, learned from successful commands.
     /// Loaded once; only written when it changes.
     verbs: verbs::Verbs,
@@ -1106,6 +1109,7 @@ impl App {
 
             middle_press: None,
             map_frame: 0,
+            screensaver: false,
             verbs: verbs::Verbs::load(),
             last_pty_key: Instant::now(),
             baseline: catchup::Baseline::default(),
@@ -1416,6 +1420,17 @@ impl ApplicationHandler<UserEvent> for App {
                 ));
                 return;
             }
+        }
+
+        // Nothing typed for long enough: put the map up by itself. A screensaver you
+        // have to ask for is a contradiction, and runnir already knows what "away"
+        // means without believing window focus.
+        let after = self.config.behaviour.screensaver_after_secs;
+        if after > 0
+            && gpu.overlay.is_none()
+            && gpu.idle_for() >= Duration::from_secs(after)
+        {
+            gpu.show_map_as_screensaver();
         }
 
         // The map is a screensaver, so it has to keep moving on an idle terminal: the

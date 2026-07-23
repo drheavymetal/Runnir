@@ -26,6 +26,7 @@ pub enum SettingId {
     WheelLines,
     ContextTint,
     NotifyAfter,
+    ScreensaverAfter,
     ConfirmClose,
     RestoreSession,
     CommandGuardian,
@@ -86,6 +87,7 @@ pub fn rows() -> Vec<Row> {
         row!("Behaviour", "Wheel lines", WheelLines, Float),
         row!("Behaviour", "Context tint", ContextTint, Bool),
         row!("Behaviour", "Notify after (s)", NotifyAfter, Int),
+        row!("Behaviour", "Screensaver after (s)", ScreensaverAfter, Int),
         row!("Behaviour", "Confirm close", ConfirmClose, Bool),
         row!("Behaviour", "Restore last closed window", RestoreSession, Bool),
         row!("Behaviour", "Command guardian", CommandGuardian, Bool),
@@ -129,6 +131,7 @@ pub fn value(cfg: &Config, id: SettingId) -> String {
         WheelLines => format!("{:.0}", cfg.behaviour.wheel_lines),
         ContextTint => onoff(cfg.behaviour.context_tint),
         NotifyAfter => cfg.behaviour.notify_after_secs.to_string(),
+        ScreensaverAfter => cfg.behaviour.screensaver_after_secs.to_string(),
         ConfirmClose => onoff(cfg.behaviour.confirm_close),
         RestoreSession => onoff(cfg.behaviour.restore_session),
         CommandGuardian => onoff(cfg.behaviour.command_guardian),
@@ -203,6 +206,12 @@ pub fn adjust(cfg: &mut Config, id: SettingId, dir: i32) {
         NotifyAfter => {
             cfg.behaviour.notify_after_secs =
                 (cfg.behaviour.notify_after_secs as i64 + dir as i64 * 5).clamp(0, 600) as u64
+        }
+        // Steps of thirty: the useful settings here are minutes, and stepping a
+        // ten-minute screensaver in fives is a hundred and twenty keypresses.
+        ScreensaverAfter => {
+            cfg.behaviour.screensaver_after_secs =
+                (cfg.behaviour.screensaver_after_secs as i64 + dir as i64 * 30).clamp(0, 3600) as u64
         }
         ConfirmClose => cfg.behaviour.confirm_close = up,
         RestoreSession => cfg.behaviour.restore_session = up,
