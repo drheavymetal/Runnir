@@ -27,6 +27,12 @@ const FALLBACK_FAMILIES: &[&str] = &[
     // advances even in the fallback.
     "Noto Sans Mono CJK HK",
     "Noto Color Emoji",
+    // Elder Futhark (U+16A0..), for the map's rune rain. No monospace face on a
+    // normal system carries the Runic block at all — checked: of everything
+    // installed here only this and FreeMono cover the 24 letters — so the choice is
+    // a proportional fallback or empty boxes. Last in the chain, so it is reached
+    // only by codepoints nothing above it can draw.
+    "Noto Sans Runic",
 ];
 
 /// Which of the four faces a cell needs. Bold and italic are separate files, not
@@ -121,13 +127,30 @@ impl FontAtlas {
         db.load_system_fonts();
 
         let family = std::env::var("RUNNIR_FONT").unwrap_or_else(|_| family.to_string());
-        let faces = load_family(&db, &family)
-            .or_else(|| load_family(&db, DEFAULT_FAMILY))
+        // The system's copy always wins. The bundled faces are only registered once
+        // nothing installed can answer, so a user who has their own JetBrains Mono —
+        // or has deliberately replaced it — keeps theirs, and nobody carries two
+        // copies of the same outlines in memory.
+        let mut faces = load_family(&db, &family).or_else(|| load_family(&db, DEFAULT_FAMILY));
+        if faces.is_none() {
+            embed_default_family(&mut db);
+            faces = load_family(&db, DEFAULT_FAMILY);
+        }
+        let faces = faces
             .or_else(|| load_family(&db, "monospace"))
             .ok_or_else(|| anyhow::anyhow!("no monospace font found (tried {family})"))?;
 
-        let fallbacks: Vec<Face> =
+        let mut fallbacks: Vec<Face> =
             FALLBACK_FAMILIES.iter().filter_map(|f| load_one(&db, f)).collect();
+        // Runic is the one block that is genuinely absent rather than merely
+        // different: no monospace face on a normal system has it, so without this the
+        // map's rain draws as empty boxes. Same rule as above — only if nothing
+        // installed covers it.
+        if !fallbacks.iter().any(|f| f.has('\u{16A0}')) {
+            if let Some(face) = embed_runic(&mut db) {
+                fallbacks.push(face);
+            }
+        }
 
         let (cell_w, cell_h, ascent, underline_y, strike_y, stroke) = {
             let font = faces[0].font().ok_or_else(|| anyhow::anyhow!("unusable font"))?;
@@ -378,6 +401,50 @@ impl FontAtlas {
 
 /// Loads regular/bold/italic/bold-italic for `family`. A family with no regular
 /// face is not usable; missing bold or italic just reuse the regular one.
+/// The four faces of the default family, compiled in.
+///
+/// Bundled so a machine that has just run `install.sh` looks the way the terminal was
+/// designed to look, rather than the way its distro's default monospace looks. Licence
+/// notes — these are multi-licence, the outlines and the patched-in icons differing —
+/// are in `assets/fonts/NOTICE.md`.
+const EMBEDDED_FAMILY: &[&[u8]] = &[
+    include_bytes!("../assets/fonts/JetBrainsMonoNerdFontMono-Regular.ttf"),
+    include_bytes!("../assets/fonts/JetBrainsMonoNerdFontMono-Bold.ttf"),
+    include_bytes!("../assets/fonts/JetBrainsMonoNerdFontMono-Italic.ttf"),
+    include_bytes!("../assets/fonts/JetBrainsMonoNerdFontMono-BoldItalic.ttf"),
+];
+
+/// Elder Futhark, compiled in. 9.6 KB, and the only way the rune rain is runes.
+const EMBEDDED_RUNIC: &[u8] = include_bytes!("../assets/fonts/NotoSansRunic-Regular.ttf");
+
+/// The 24 letters of Elder Futhark, which is what the map's rain falls in.
+///
+/// Elder Futhark and not the later rows: it is the 24-letter one, it is the one whose
+/// shapes read as "runes" at a glance, and the block holds later additions that would
+/// look like noise mixed in. Lives here because this module owns the question of which
+/// codepoints have to be drawable at all.
+pub const RUNES: [char; 24] = [
+    '\u{16A0}', '\u{16A2}', '\u{16A6}', '\u{16A8}', '\u{16B1}', '\u{16B2}',
+    '\u{16B7}', '\u{16B9}', '\u{16BB}', '\u{16BE}', '\u{16C1}', '\u{16C3}',
+    '\u{16C7}', '\u{16C8}', '\u{16C9}', '\u{16CA}', '\u{16CF}', '\u{16D2}',
+    '\u{16D6}', '\u{16D7}', '\u{16DA}', '\u{16DC}', '\u{16DE}', '\u{16DF}',
+];
+
+/// Registers the bundled default family, so the ordinary query path finds it.
+fn embed_default_family(db: &mut fontdb::Database) {
+    for data in EMBEDDED_FAMILY {
+        db.load_font_data(data.to_vec());
+    }
+}
+
+/// Registers the bundled runic face and hands it back, or `None` if it will not load —
+/// in which case the rain simply has no runes, which is the same soft failure every
+/// other missing glyph gets.
+fn embed_runic(db: &mut fontdb::Database) -> Option<Face> {
+    db.load_font_data(EMBEDDED_RUNIC.to_vec());
+    load_one(db, "Noto Sans Runic")
+}
+
 fn load_family(db: &fontdb::Database, family: &str) -> Option<Vec<Face>> {
     let regular = load(db, family, fontdb::Weight::NORMAL, fontdb::Style::Normal)?;
     let bold = load(db, family, fontdb::Weight::BOLD, fontdb::Style::Normal);
@@ -443,6 +510,33 @@ fn query(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every Elder Futhark letter the rain draws has to be IN the bundled face.
+    ///
+    /// Bundled precisely because no monospace face on a normal system carries the
+    /// Runic block, so this is the only thing standing between the rain and a screen
+    /// of empty boxes. It reads the compiled-in bytes and nothing else, so it says the
+    /// same thing on a machine with no fonts installed at all — which is exactly the
+    /// machine the bundle exists for.
+    #[test]
+    fn the_bundled_runic_face_has_every_rune_the_rain_uses() {
+        let face = Face { data: EMBEDDED_RUNIC.to_vec(), index: 0 };
+        assert!(face.font().is_some(), "the bundled runic face does not parse");
+        let missing: Vec<char> = RUNES.iter().copied().filter(|c| !face.has(*c)).collect();
+        assert!(missing.is_empty(), "runes the bundled face cannot draw: {missing:?}");
+        assert_eq!(RUNES.len(), 24, "Elder Futhark is 24 letters");
+    }
+
+    /// The default family is bundled too, and a corrupt or truncated copy would only
+    /// show up on the machine that has nothing installed — the one nobody tests on.
+    #[test]
+    fn every_bundled_face_of_the_default_family_parses() {
+        for (i, data) in EMBEDDED_FAMILY.iter().enumerate() {
+            let face = Face { data: data.to_vec(), index: 0 };
+            assert!(face.font().is_some(), "bundled face {i} does not parse");
+            assert!(face.has('M'), "bundled face {i} cannot draw an M");
+        }
+    }
 
     /// Not an assertion, a lens: prints what fontdb actually indexed for CJK.
     /// fontconfig and fontdb disagree about `.ttc` collections often enough that

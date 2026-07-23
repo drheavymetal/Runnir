@@ -31,6 +31,12 @@ pub enum Overlay {
     Viewer(FileViewer),
     /// One path's properties, with its permission bits editable.
     Props(PropsPanel),
+    /// The catch-up: one headline per pane after a while away.
+    CatchUp(CatchUpPanel),
+    /// This repository's real verbs, learned from what is typed here.
+    Verbs(VerbsPanel),
+    /// Zoomed out: the session as a map of headlines rather than of text.
+    Map(MapPanel),
 }
 
 impl Overlay {
@@ -53,6 +59,9 @@ impl Overlay {
             Overlay::Docker(p) => p.render(cols, rows, theme),
             Overlay::Viewer(v) => v.render(cols, rows, theme),
             Overlay::Props(p) => p.render(cols, rows, theme),
+            Overlay::CatchUp(p) => p.render(cols, rows, theme),
+            Overlay::Verbs(p) => p.render(cols, rows, theme),
+            Overlay::Map(p) => p.render(cols, rows, theme),
         }
     }
 }
@@ -2209,6 +2218,657 @@ impl ClipHistoryPicker {
     }
 }
 
+
+
+
+/// One pane as it appears on the map: where it sits, what it is doing, and the last
+/// thing it said.
+pub struct MapCard {
+    pub pane: u64,
+    /// Which tab this pane lives in, and what that tab is called. The map spans the
+    /// whole window, so a card has to say where it would take you.
+    pub tab: usize,
+    pub tab_title: String,
+    /// Cell-space rectangle of the pane, in the SESSION's coordinates.
+    pub col: usize,
+    pub row: usize,
+    pub cols: usize,
+    pub rows: usize,
+    pub tag: String,
+    pub title: String,
+    pub detail: String,
+    pub preview: Vec<String>,
+}
+
+/// The map: the session zoomed out.
+///
+/// Zooming out cannot shrink the terminals — the PTY's size in rows and columns is
+/// not a view property, and resizing it per zoom step would tear apart every
+/// full-screen program running in the session. So the map does not draw small text:
+/// it draws each pane as a card carrying the same headline the catch-up uses. That is
+/// what "semantic zoom" means here, and it is the half of the idea that pays.
+pub struct MapPanel {
+    cards: Vec<MapCard>,
+    cursor: usize,
+    rain: Rain,
+    /// Wall clock as `HH:MM`, refreshed with the cards rather than per frame.
+    clock: String,
+}
+
+/// A single falling column of runes.
+#[derive(Clone, Copy)]
+struct Drop {
+    col: u16,
+    /// Head position in HUNDREDTHS of a row. Tenths were too coarse a step to fall
+    /// slowly in: the smallest non-zero speed was already more than a row a second.
+    head: i32,
+    speed: i32,
+    len: u16,
+    /// Seed for this column's glyphs, so the same column keeps the same runes as it
+    /// falls instead of reshuffling every frame into noise.
+    seed: u32,
+}
+
+/// The rune rain behind the map.
+///
+/// Elder Futhark rather than digits: runnir is named for them, and a terminal called
+/// after runes raining numbers would be a missed joke. Drawn dimmed and BEHIND the
+/// cards — the cards are what is read, the rain is what makes it a screensaver rather
+/// than a dialog you left open.
+///
+/// Deterministic, with no RNG dependency and no clock: the state is a step counter, so
+/// the same session draws the same rain and a test can assert on any frame of it.
+pub struct Rain {
+    drops: Vec<Drop>,
+    step: u32,
+}
+
+impl Rain {
+    pub fn new(cols: usize, rows: usize) -> Rain {
+        // More drops than there are columns, so some columns carry two at different
+        // depths. One per column reads as a comb; this reads as rain.
+        let n = (cols * 3 / 2).clamp(1, 600);
+        let drops = (0..n)
+            .map(|i| {
+                let seed = splitmix(i as u32 + 1);
+                Drop {
+                    col: (spread(seed, cols)) as u16,
+                    // Staggered above the top so nothing starts mid-screen, and the
+                    // first frame is already rain rather than a row of heads.
+                    head: -((spread(seed >> 8, rows.max(1) * 100)) as i32),
+                    // Hundredths of a row per frame at ~11 fps: between a third of a
+                    // row and four fifths of one per second, so a rune takes a couple
+                    // of seconds to move its own height.
+                    speed: 3 + (seed >> 16) as i32 % 5,
+                    len: 8 + (seed >> 20) as u16 % 21,
+                    seed,
+                }
+            })
+            .collect();
+        Rain { drops, step: 0 }
+    }
+
+    pub fn tick(&mut self, rows: usize) {
+        self.step = self.step.wrapping_add(1);
+        let bottom = (rows as i32 + d_max_len()) * 100;
+        for d in &mut self.drops {
+            d.head += d.speed;
+            if d.head > bottom {
+                d.head = -((d.len as i32 + spread(d.seed ^ self.step, 60) as i32) * 100);
+            }
+        }
+    }
+
+    /// `(row, col, rune, brightness 0..=3)` for everything lit this frame. Brightness
+    /// falls off behind the head, which is what makes it read as falling rather than
+    /// as a set of static bars.
+    pub fn cells(&self, cols: usize, rows: usize) -> Vec<(usize, usize, char, u8)> {
+        let mut out = Vec::new();
+        for d in &self.drops {
+            let col = d.col as usize;
+            if col >= cols {
+                continue;
+            }
+            let head_row = d.head.div_euclid(100);
+            for back in 0..d.len as i32 {
+                let row = head_row - back;
+                if row < 0 || row as usize >= rows {
+                    continue;
+                }
+                // The rune is a function of the column and the ROW, not of time, so a
+                // glyph does not flicker as the tail slides over it.
+                let rune = crate::font::RUNES
+                    [(splitmix(d.seed ^ (row as u32).wrapping_mul(2654435761)) as usize)
+                        % crate::font::RUNES.len()];
+                let bright = match back {
+                    0 => 3,
+                    1..=2 => 2,
+                    _ if back * 3 < d.len as i32 => 1,
+                    _ => 0,
+                };
+                out.push((row as usize, col, rune, bright));
+            }
+        }
+        out
+    }
+}
+
+/// Local `HH:MM`. Shelled out to `date` because that is how runnir already reads the
+/// wall clock elsewhere, and the alternative is a timezone database as a dependency to
+/// print four digits. Called with the cards, about once a second — never per frame.
+fn clock_now() -> String {
+    std::process::Command::new("date")
+        .arg("+%H:%M")
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default()
+}
+
+/// The clock's digits, carved rather than typeset.
+///
+/// Six columns by seven rows each, drawn with full blocks and quadrant blocks at the
+/// corners. The chamfers are the whole point: Elder Futhark has no curves — it is a
+/// script made to be cut into wood and stone with straight strokes — so a clock that
+/// belongs beside it cannot have round shoulders. Authored by hand rather than derived
+/// from a bitmap font, because "looks carved" is not a property a font query has.
+const DIGITS: [[&str; 7]; 10] = [
+    [
+        "\u{2597}\u{2588}\u{2588}\u{2588}\u{2588}\u{2596}",
+        "\u{2588}\u{2588}  \u{2588}\u{2588}",
+        "\u{2588}\u{2588}  \u{2588}\u{2588}",
+        "\u{2588}\u{2588}  \u{2588}\u{2588}",
+        "\u{2588}\u{2588}  \u{2588}\u{2588}",
+        "\u{2588}\u{2588}  \u{2588}\u{2588}",
+        "\u{259D}\u{2588}\u{2588}\u{2588}\u{2588}\u{2598}",
+    ],
+    [
+        "  \u{2588}\u{2588}  ",
+        "\u{2597}\u{2588}\u{2588}\u{2588}  ",
+        "  \u{2588}\u{2588}  ",
+        "  \u{2588}\u{2588}  ",
+        "  \u{2588}\u{2588}  ",
+        "  \u{2588}\u{2588}  ",
+        "\u{259D}\u{2588}\u{2588}\u{2588}\u{2588}\u{2598}",
+    ],
+    [
+        "\u{2597}\u{2588}\u{2588}\u{2588}\u{2588}\u{2596}",
+        "\u{2588}\u{2588}  \u{2588}\u{2588}",
+        "    \u{2588}\u{2588}",
+        "  \u{2597}\u{2588}\u{2588}\u{2598}",
+        " \u{2588}\u{2588}  ",
+        "\u{2588}\u{2588}    ",
+        "\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}",
+    ],
+    [
+        "\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2596}",
+        "    \u{2588}\u{2588}",
+        "  \u{2588}\u{2588}\u{2598}",
+        "  \u{2588}\u{2588}\u{2596}",
+        "    \u{2588}\u{2588}",
+        "\u{2588}\u{2588}  \u{2588}\u{2588}",
+        "\u{259D}\u{2588}\u{2588}\u{2588}\u{2588}\u{2598}",
+    ],
+    [
+        "\u{2588}\u{2588}  \u{2588}\u{2588}",
+        "\u{2588}\u{2588}  \u{2588}\u{2588}",
+        "\u{2588}\u{2588}  \u{2588}\u{2588}",
+        "\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}",
+        "    \u{2588}\u{2588}",
+        "    \u{2588}\u{2588}",
+        "    \u{2588}\u{2588}",
+    ],
+    [
+        "\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}",
+        "\u{2588}\u{2588}    ",
+        "\u{2588}\u{2588}\u{2588}\u{2588}\u{2596} ",
+        "    \u{2588}\u{2588}",
+        "    \u{2588}\u{2588}",
+        "\u{2588}\u{2588}  \u{2588}\u{2588}",
+        "\u{259D}\u{2588}\u{2588}\u{2588}\u{2588}\u{2598}",
+    ],
+    [
+        "\u{2597}\u{2588}\u{2588}\u{2588}\u{2588}\u{2596}",
+        "\u{2588}\u{2588}    ",
+        "\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2596}",
+        "\u{2588}\u{2588}  \u{2588}\u{2588}",
+        "\u{2588}\u{2588}  \u{2588}\u{2588}",
+        "\u{2588}\u{2588}  \u{2588}\u{2588}",
+        "\u{259D}\u{2588}\u{2588}\u{2588}\u{2588}\u{2598}",
+    ],
+    [
+        "\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}",
+        "\u{2588}\u{2588}  \u{2588}\u{2588}",
+        "    \u{2588}\u{2588}",
+        "   \u{2588}\u{2588} ",
+        "  \u{2588}\u{2588}  ",
+        "  \u{2588}\u{2588}  ",
+        "  \u{2588}\u{2588}  ",
+    ],
+    [
+        "\u{2597}\u{2588}\u{2588}\u{2588}\u{2588}\u{2596}",
+        "\u{2588}\u{2588}  \u{2588}\u{2588}",
+        "\u{2588}\u{2588}  \u{2588}\u{2588}",
+        " \u{2588}\u{2588}\u{2588}\u{2588} ",
+        "\u{2588}\u{2588}  \u{2588}\u{2588}",
+        "\u{2588}\u{2588}  \u{2588}\u{2588}",
+        "\u{259D}\u{2588}\u{2588}\u{2588}\u{2588}\u{2598}",
+    ],
+    [
+        "\u{2597}\u{2588}\u{2588}\u{2588}\u{2588}\u{2596}",
+        "\u{2588}\u{2588}  \u{2588}\u{2588}",
+        "\u{2588}\u{2588}  \u{2588}\u{2588}",
+        "\u{259D}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}",
+        "    \u{2588}\u{2588}",
+        "    \u{2588}\u{2588}",
+        "\u{259D}\u{2588}\u{2588}\u{2588}\u{2588}\u{2598}",
+    ],
+];
+
+/// The separator, blinking off on odd minutes would need a clock we do not read that
+/// often; it simply stays lit. Two square studs, like rivets.
+const COLON: [&str; 7] = ["  ", "\u{2588}\u{2588}", "\u{2588}\u{2588}", "  ", "\u{2588}\u{2588}", "\u{2588}\u{2588}", "  "];
+
+/// The longest a tail can be, so a drop is only recycled once it is fully off screen.
+fn d_max_len() -> i32 {
+    29
+}
+
+/// A cheap deterministic mixer. Not cryptography and not trying to be: it exists so
+/// the rain looks unpatterned without pulling in an RNG or reading a clock.
+fn splitmix(mut x: u32) -> u32 {
+    x = x.wrapping_add(0x9E37_79B9);
+    x = (x ^ (x >> 16)).wrapping_mul(0x21F0_AAAD);
+    x = (x ^ (x >> 15)).wrapping_mul(0x735A_2D97);
+    x ^ (x >> 15)
+}
+
+fn spread(seed: u32, n: usize) -> usize {
+    if n == 0 { 0 } else { (seed as usize) % n }
+}
+
+impl MapPanel {
+    pub fn new(cards: Vec<MapCard>) -> Self {
+        Self { cards, cursor: 0, rain: Rain::new(200, 60), clock: clock_now() }
+    }
+
+    /// One frame of rain. Cheap by construction — no clock, no RNG, no allocation
+    /// beyond the drops that already exist.
+    pub fn tick_rain(&mut self, rows: usize) {
+        self.rain.tick(rows);
+    }
+
+    /// New readings for the cards, keeping the cursor on the same PANE rather than the
+    /// same index: panes come and go while the map is up, and a selection that slid to
+    /// a different pane under a still hand is the kind of thing that gets a
+    /// screensaver turned off.
+    pub fn refresh(&mut self, cards: Vec<MapCard>) {
+        let on = self.selected_pane();
+        self.cards = cards;
+        self.clock = clock_now();
+        self.cursor = on
+            .and_then(|p| self.cards.iter().position(|c| c.pane == p))
+            .unwrap_or(self.cursor.min(self.cards.len().saturating_sub(1)));
+    }
+
+    /// Which tab the selection would take you to.
+    pub fn selected_tab(&self) -> Option<usize> {
+        self.cards.get(self.cursor).map(|c| c.tab)
+    }
+
+    pub fn up(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    pub fn down(&mut self) {
+        if self.cursor + 1 < self.cards.len() {
+            self.cursor += 1;
+        }
+    }
+
+    pub fn selected_pane(&self) -> Option<u64> {
+        self.cards.get(self.cursor).map(|c| c.pane)
+    }
+
+    pub fn rows(&self) -> Vec<(u64, String, String)> {
+        self.cards.iter().map(|c| (c.pane, c.tag.clone(), c.title.clone())).collect()
+    }
+
+    fn render(&self, cols: usize, rows: usize, theme: &Theme) -> Vec<Panel> {
+        let mut out = Vec::new();
+        // A backdrop the size of the session: the map is a PLACE, not panels floating
+        // over the text they summarise. Without it the cards read as debris.
+        let mut back = panel_grid(cols, rows.saturating_sub(1), theme);
+        back.fill(Pen { bg: Color::Rgb(0x0b, 0x0b, 0x0e), ..Pen::default() });
+
+
+        write(&mut back, 0, 2, "MAP \u{b7} the whole window, zoomed out", accent());
+        write(
+            &mut back,
+            rows.saturating_sub(2),
+            2,
+            "j k move \u{b7} enter opens that pane full size \u{b7} esc back",
+            dim(),
+        );
+        let mut cards: Vec<(Grid, usize, usize)> = Vec::new();
+
+        for (i, c) in self.cards.iter().enumerate() {
+            // Cards keep the panes' own geometry: the map is spatial, and a card that
+            // moved would make you re-learn the session's shape every time you zoom.
+            let w = c.cols.clamp(14, cols.saturating_sub(c.col).max(14));
+            let h = c.rows.clamp(4, rows.saturating_sub(c.row).max(4));
+            let sel = i == self.cursor;
+            let mut g = Grid::new(w, h);
+            // A card needs its own surface, or it is just text on the backdrop. The
+            // selected one is lighter still rather than outlined: a border costs two
+            // rows and two columns out of a card that may only have four.
+            let bg = if sel { Color::Rgb(0x24, 0x2a, 0x36) } else { Color::Rgb(0x16, 0x17, 0x1c) };
+            g.fill(Pen { bg, ..Pen::default() });
+            let head_bg = if sel { Color::Rgb(0x33, 0x3d, 0x4d) } else { Color::Rgb(0x1e, 0x20, 0x27) };
+            let head_pen = Pen { bg: head_bg, fg: Color::Rgb(0xf5, 0xf5, 0x43), ..Pen::default() };
+            let title_pen = Pen { bg: head_bg, fg: Color::Rgb(0xd4, 0xd6, 0xd9), ..Pen::default() };
+            g.write_str(0, 0, &" ".repeat(w), head_pen);
+            let tag: String = format!("{:<8}", c.tag).chars().take(w).collect();
+            g.write_str(0, 1, &tag, head_pen);
+            // Which tab the pane is in, on the card itself: the map spans the window
+            // now, so "which one is this" became a question a card has to answer — but
+            // only when there is more than one tab to be confused between.
+            let many = self.cards.iter().any(|o| o.tab != c.tab);
+            let title = if many {
+                format!("{} \u{b7} {}", c.tab_title, c.title)
+            } else {
+                c.title.clone()
+            };
+            let title: String = title.chars().take(w.saturating_sub(11)).collect();
+            g.write_str(0, 10.min(w.saturating_sub(1)), &title, title_pen);
+
+            let body = Pen { bg, fg: Color::Rgb(0xb8, 0xba, 0xc0), ..Pen::default() };
+            let faint = Pen { bg, fg: Color::Rgb(0x6a, 0x6d, 0x74), ..Pen::default() };
+            let detail: String = c.detail.chars().take(w.saturating_sub(2)).collect();
+            g.write_str(1, 1, &detail, body);
+            for (n, line) in c.preview.iter().take(h.saturating_sub(3)).enumerate() {
+                let line: String = line.trim().chars().take(w.saturating_sub(2)).collect();
+                g.write_str(3 + n, 1, &line, faint);
+            }
+            cards.push((g, c.row, c.col));
+        }
+
+        // Cards go INTO the backdrop rather than beside it, so one pass can tell a
+        // cell with something in it from a cell without. Drawn as separate panels the
+        // rain could only ever appear in the strip above them — which is what it did,
+        // and it looked like a bug because it was one.
+        for (g, row0, col0) in &cards {
+            for r in 0..g.rows() {
+                for c in 0..g.cols() {
+                    let (tr, tc) = (row0 + r, col0 + c);
+                    if tr < back.rows() && tc < back.cols() {
+                        let cell = g.cell(r, c);
+                        back.write_str(tr, tc, &cell.ch.to_string(), cell.pen);
+                    }
+                }
+            }
+        }
+
+        // The rain LAST, and only where nothing was written: it falls the whole height
+        // of the window, through the gaps between cards and through the empty parts of
+        // the cards themselves, which is what makes it read as behind them rather than
+        // as a band along the top.
+        for (row, col, rune, bright) in self.rain.cells(cols, rows.saturating_sub(1)) {
+            if row >= back.rows() || col >= back.cols() {
+                continue;
+            }
+            // Over the text as well as through the gaps. Occluding a card for the
+            // moment a column crosses it is what makes this rain rather than a
+            // pattern behind a window — and the cell is back a frame later, which is
+            // exactly how long anything is hidden for.
+            let under = back.cell(row, col);
+            // Four steps, all well under the cards' foreground. Even the head stays a
+            // backdrop: a screensaver you cannot read the screen through is one you
+            // turn off.
+            let fg = match bright {
+                3 => Color::Rgb(0x6f, 0xc9, 0x8f),
+                2 => Color::Rgb(0x3f, 0x7d, 0x59),
+                1 => Color::Rgb(0x2a, 0x50, 0x3b),
+                _ => Color::Rgb(0x1a, 0x2f, 0x24),
+            };
+            back.write_str(row, col, &rune.to_string(), Pen { fg, bg: under.pen.bg, ..Pen::default() });
+        }
+
+        // The clock LAST and dead centre, over cards and rain alike.
+        //
+        // Centred on the WINDOW rather than placed in whatever gap the panes leave: a
+        // clock that moves with the layout is one you have to look for, and the whole
+        // point of it is being read without looking. It is what this is FOR — a thing
+        // left up while you are away and glanced at on the way past.
+        if let Some((art, w)) = clock_art(&self.clock) {
+            let h = art.len();
+            let top = rows.saturating_sub(h + 1) / 2;
+            let left = cols.saturating_sub(w) / 2;
+            // Bone against the green: the rain is the background even where it crosses
+            // this, and two greens would read as one surface.
+            let carved = Color::Rgb(0xe8, 0xdc, 0xc0);
+            let shadow = Color::Rgb(0x2b, 0x27, 0x1e);
+            for (r, line) in art.iter().enumerate() {
+                for (c, ch) in line.chars().enumerate() {
+                    if ch == ' ' {
+                        continue;
+                    }
+                    let (tr, tc) = (top + r, left + c);
+                    if tr >= back.rows() || tc >= back.cols() {
+                        continue;
+                    }
+                    back.write_str(tr, tc, &ch.to_string(), Pen { fg: carved, bg: shadow, ..Pen::default() });
+                }
+            }
+        }
+
+        out.push(Panel { grid: back, col: 0, row: 0 });
+        out
+    }
+}
+
+/// `HH:MM` as carved rows, and how wide they are. `None` when the clock could not be
+/// read, in which case the map simply has no clock rather than a row of blanks.
+fn clock_art(hhmm: &str) -> Option<(Vec<String>, usize)> {
+    let mut cells: Vec<[&str; 7]> = Vec::new();
+    for ch in hhmm.chars() {
+        match ch {
+            '0'..='9' => cells.push(DIGITS[ch as usize - '0' as usize]),
+            ':' => cells.push(COLON),
+            _ => return None,
+        }
+    }
+    if cells.is_empty() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(7);
+    for r in 0..7 {
+        let mut line = String::new();
+        for (i, cell) in cells.iter().enumerate() {
+            if i > 0 {
+                line.push_str("  ");
+            }
+            line.push_str(cell[r]);
+        }
+        out.push(line);
+    }
+    let w = out.iter().map(|l| l.chars().count()).max().unwrap_or(0);
+    Some((out, w))
+}
+
+/// The verbs panel: how this repository is actually built, tested and deployed,
+/// ranked by how often each verb succeeded here.
+pub struct VerbsPanel {
+    repo: String,
+    verbs: Vec<(String, u32)>,
+    cursor: usize,
+}
+
+impl VerbsPanel {
+    pub fn new(repo: String, verbs: Vec<(String, u32)>) -> Self {
+        Self { repo, verbs, cursor: 0 }
+    }
+
+    pub fn up(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    pub fn down(&mut self) {
+        if self.cursor + 1 < self.verbs.len() {
+            self.cursor += 1;
+        }
+    }
+
+    /// The verb under the cursor, for staging at the prompt.
+    pub fn selected(&self) -> Option<String> {
+        self.verbs.get(self.cursor).map(|(v, _)| v.clone())
+    }
+
+    pub fn repo(&self) -> &str {
+        &self.repo
+    }
+
+    /// For the remote control, so a script can assert what was learned.
+    pub fn rows(&self) -> Vec<(String, u32)> {
+        self.verbs.clone()
+    }
+
+    fn render(&self, cols: usize, rows: usize, theme: &Theme) -> Vec<Panel> {
+        let w = (cols * 6 / 10).clamp(34, 76).min(cols.saturating_sub(2));
+        let visible = 10.min(self.verbs.len().max(1)).max(1);
+        let h = visible + 4;
+        let mut g = panel_grid(w, h, theme);
+
+        // Saturating: `w` is clamped to the window, so a narrow one leaves less room
+        // than the title takes and the header simply loses its path.
+        let head =
+            format!("How this repo is worked  \u{b7}  {}", short_path(&self.repo, w.saturating_sub(28)));
+        write(&mut g, 0, 2, &head, accent());
+
+        if self.verbs.is_empty() {
+            write(&mut g, 2, 2, "nothing learned here yet", dim());
+        }
+        for (i, (verb, count)) in self.verbs.iter().take(visible).enumerate() {
+            let row = 2 + i;
+            let sel = i == self.cursor;
+            if sel {
+                write(&mut g, row, 0, &" ".repeat(w), selected());
+            }
+            let pen = if sel { selected() } else { normal() };
+            write(&mut g, row, 2, verb, pen);
+            // The count is the evidence: it is why this line is here at all.
+            let times = format!("{count}\u{d7}");
+            let at = w.saturating_sub(times.chars().count() + 2);
+            write(&mut g, row, at, &times, if sel { selected() } else { dim() });
+        }
+
+        let hint = if self.verbs.is_empty() {
+            "esc  close"
+        } else {
+            "j k move \u{b7} enter puts it at the prompt (does not run it) \u{b7} esc"
+        };
+        write(&mut g, h - 1, 2, hint, dim());
+
+        let col = (cols.saturating_sub(w)) / 2;
+        let row = (rows.saturating_sub(h)) / 3;
+        vec![Panel { grid: g, col, row }]
+    }
+}
+
+/// A path shortened from the LEFT: the tail (the project) identifies it, the head
+/// (somebody's home directory) does not.
+fn short_path(p: &str, max: usize) -> String {
+    let len = p.chars().count();
+    if len <= max {
+        return p.to_string();
+    }
+    // The ellipsis costs a cell of its own. With none to spare there is nothing
+    // honest to draw — and a panic here would take the whole window with it.
+    let Some(keep) = max.checked_sub(1) else { return String::new() };
+    let tail: String = p.chars().skip(len - keep).collect();
+    format!("\u{2026}{tail}")
+}
+
+/// The catch-up panel: one line per pane that has something to say, most urgent
+/// first, with the pane ids kept so Enter can jump to the one you pick.
+pub struct CatchUpPanel {
+    lines: Vec<crate::catchup::Headline>,
+    cursor: usize,
+    /// How long the user was away, already worded for a human.
+    away: String,
+}
+
+impl CatchUpPanel {
+    pub fn new(lines: Vec<crate::catchup::Headline>, away: String) -> Self {
+        Self { lines, cursor: 0, away }
+    }
+
+    pub fn up(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    pub fn down(&mut self) {
+        if self.cursor + 1 < self.lines.len() {
+            self.cursor += 1;
+        }
+    }
+
+    /// The pane the cursor is on, for Enter.
+    pub fn selected_pane(&self) -> Option<u64> {
+        self.lines.get(self.cursor).map(|h| h.pane)
+    }
+
+    /// For the remote control's UI state, so a script can assert what the panel says
+    /// without a screenshot.
+    pub fn rows(&self) -> Vec<(u64, String, String, String)> {
+        self.lines
+            .iter()
+            .map(|h| (h.pane, h.state.tag().to_string(), h.title.clone(), h.detail.clone()))
+            .collect()
+    }
+
+    fn render(&self, cols: usize, rows: usize, theme: &Theme) -> Vec<Panel> {
+        let w = (cols * 7 / 10).clamp(34, 92).min(cols.saturating_sub(2));
+        let visible = 12.min(self.lines.len().max(1)).max(1);
+        let h = visible + 4;
+        let mut g = panel_grid(w, h, theme);
+
+        write(&mut g, 0, 2, &format!("While you were away ({})", self.away), accent());
+
+        if self.lines.is_empty() {
+            write(&mut g, 2, 2, "nothing happened", dim());
+        }
+
+        for (line, hl) in self.lines.iter().take(visible).enumerate() {
+            let row = 2 + line;
+            let sel = line == self.cursor;
+            if sel {
+                write(&mut g, row, 0, &" ".repeat(w), selected());
+            }
+            let pen = if sel { selected() } else { normal() };
+            // The tag is the thing the eye lands on, so it goes first and keeps a
+            // fixed width: a ragged left edge makes a list you have to read twice.
+            let tag = format!("{:<8}", hl.state.tag());
+            write(&mut g, row, 2, &tag, if sel { selected() } else { accent() });
+            let text = format!("{}  {}", hl.title, hl.detail);
+            let room = w.saturating_sub(12);
+            let clipped: String = text.chars().take(room).collect();
+            write(&mut g, row, 11, &clipped, pen);
+        }
+
+        let hint = if self.lines.is_empty() {
+            "esc  close"
+        } else {
+            "j k move \u{b7} enter jump to that pane \u{b7} esc close"
+        };
+        write(&mut g, h - 1, 2, hint, dim());
+
+        let col = (cols.saturating_sub(w)) / 2;
+        let row = (rows.saturating_sub(h)) / 3;
+        vec![Panel { grid: g, col, row }]
+    }
+}
+
 /// A one-line, length-capped preview of a clipboard entry for the picker list: the
 /// first non-blank line, trimmed, with a marker when more lines follow.
 fn clip_preview(entry: &str) -> String {
@@ -3594,6 +4254,33 @@ mod tests {
             .collect();
         assert!(row.contains('\u{2026}'), "a clipped field must say so: {row:?}");
         assert!(row.trim_end().ends_with('a'), "the end of the input must be visible: {row:?}");
+    }
+
+    /// A shortened path has to fit the room it was given, including when that room
+    /// is nothing at all: the panel is clamped to the window, so a narrow window
+    /// leaves the header less than its title takes. Getting this wrong is an
+    /// underflow, and a panic here takes the window and every shell in it.
+    #[test]
+    fn a_shortened_path_never_outgrows_the_room_it_was_given() {
+        let p = "/home/pedro/projects/runnir";
+        for max in 0..40 {
+            let short = short_path(p, max);
+            assert!(short.chars().count() <= max, "{max} cells: {short:?} does not fit");
+        }
+        assert_eq!(short_path(p, 40), p, "with room to spare the path is left alone");
+        assert!(short_path(p, 12).ends_with("runnir"), "the tail is what identifies it");
+    }
+
+    /// …and the panel that asks for it renders at any window width, however silly.
+    #[test]
+    fn the_verbs_panel_renders_in_a_window_narrower_than_itself() {
+        let p = VerbsPanel::new(
+            "/home/pedro/projects/runnir".into(),
+            vec![("cargo test".into(), 7), ("git push".into(), 3)],
+        );
+        for cols in 1..40 {
+            assert_eq!(p.render(cols, 24, &Theme::default()).len(), 1, "{cols} columns");
+        }
     }
 
     #[test]

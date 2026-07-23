@@ -63,6 +63,16 @@ pub enum Action {
     ToggleImageWatch,
     /// Show/hide the file explorer sidebar, and put the keyboard in it.
     ToggleExplorer,
+    /// One headline per pane, for coming back after a while away.
+    CatchUp,
+    /// The verbs this repository is actually worked with.
+    RepoVerbs,
+    /// Zoom out: the session as a map of headlines.
+    Map,
+    /// Arrange the window around a deploy: watches, and the deploy staged.
+    WarRoom,
+    /// Take the war room down, keeping any pane the user typed in.
+    WarRoomClose,
     SetImageWatchDir,
     SaveProjectSession,
     RestoreProjectSession,
@@ -156,6 +166,11 @@ impl Action {
             FoldOutput => "fold_output",
             ToggleImageWatch => "toggle_image_watch",
             ToggleExplorer => "toggle_explorer",
+            CatchUp => "catch_up",
+            RepoVerbs => "repo_verbs",
+            Map => "map",
+            WarRoom => "war_room",
+            WarRoomClose => "war_room_close",
             SetImageWatchDir => "set_image_watch_dir",
             SaveProjectSession => "save_project_session",
             RestoreProjectSession => "restore_project_session",
@@ -242,6 +257,11 @@ impl Action {
             FoldOutput => "Fold / unfold all command output",
             ToggleImageWatch => "Auto-preview images: toggle on this pane's dir",
             ToggleExplorer => "File explorer sidebar (tree of the project)",
+            CatchUp => "Catch up: one headline per pane after time away",
+            RepoVerbs => "How this repo is worked (learned verbs)",
+            Map => "Map: the session zoomed out to one headline per pane",
+            WarRoom => "War room: arrange the window around a deploy",
+            WarRoomClose => "War room: close it, keeping panes you typed in",
             SetImageWatchDir => "Auto-preview images: set / clear watched dir",
             SaveProjectSession => "Save session for this project",
             RestoreProjectSession => "Restore session for this project",
@@ -331,6 +351,11 @@ impl Action {
             "fold_output" => FoldOutput,
             "toggle_image_watch" => ToggleImageWatch,
             "toggle_explorer" => ToggleExplorer,
+            "catch_up" => CatchUp,
+            "repo_verbs" => RepoVerbs,
+            "map" => Map,
+            "war_room" => WarRoom,
+            "war_room_close" => WarRoomClose,
             "set_image_watch_dir" => SetImageWatchDir,
             "save_project_session" => SaveProjectSession,
             "restore_project_session" => RestoreProjectSession,
@@ -430,6 +455,11 @@ impl Action {
             FoldOutput,
             ToggleImageWatch,
             ToggleExplorer,
+            CatchUp,
+            RepoVerbs,
+            Map,
+            WarRoom,
+            WarRoomClose,
             SetImageWatchDir,
             SaveProjectSession,
             RestoreProjectSession,
@@ -927,6 +957,11 @@ fn default_leader_bindings() -> HashMap<Chord, LeaderNode> {
     // `e` for the explorer, beside `g` for git: both are a whole surface, both are
     // one key. It is also the letter LazyVim uses for the same sidebar.
     leaf(&mut m, "e", ToggleExplorer);
+    // `u` for "update me": the catch-up is read on arrival, so it earns a top-level
+    // key rather than a group nobody walks into when they just sat down.
+    leaf(&mut m, "u", CatchUp);
+    // `m` for map: zoom out to see the whole session at once.
+    leaf(&mut m, "m", Map);
     // Font size, where every terminal already puts it — but +, - and = are not all
     // one keypress on every layout (on the Spanish one `=` is shift+0), so the
     // letters are the binding that always works and the symbols are the alias.
@@ -939,6 +974,10 @@ fn default_leader_bindings() -> HashMap<Chord, LeaderNode> {
 
     // --- Groups. The letter is the noun: t=tabs, p=panes, c=clipboard, f=find,
     // a=ai, l=launch, o=open, s=session.
+    group(&mut m, "w", "War room", |g| {
+        leaf(g, "w", WarRoom);
+        leaf(g, "q", WarRoomClose);
+    });
     group(&mut m, "t", "Tabs", |g| {
         leaf(g, "t", NewTab);
         leaf(g, "n", NextTab);
@@ -1005,6 +1044,7 @@ fn default_leader_bindings() -> HashMap<Chord, LeaderNode> {
         leaf(g, "l", LaunchLayout);
     });
     group(&mut m, "o", "Open", |g| {
+        leaf(g, "v", RepoVerbs);
         leaf(g, "c", OpenConfig);
         leaf(g, "t", OpenThemePicker);
         leaf(g, "d", ShowDocs);
@@ -1166,6 +1206,22 @@ mod chord_roundtrip_tests {
         let (key, _) = chord_to_key("shift+]").unwrap();
         assert_eq!(key, Key::Character("]".into()), "punctuation is not upper-cased");
     }
+
+    /// The high function keys are the ones no compositor claims, so they are the ones
+    /// worth binding — and a binding a script cannot press is a binding nothing can
+    /// test. Every name the config accepts has to reach a real key.
+    #[test]
+    fn every_key_the_config_accepts_can_also_be_pressed_by_a_script() {
+        for n in 1..=24 {
+            let spec = format!("f{n}");
+            let (key, mods) = chord_to_key(&spec)
+                .unwrap_or_else(|| panic!("{spec} parses in a config but not for the remote"));
+            assert_eq!(Chord::from_event(&key, mods), Chord::parse(&spec), "{spec} did not round-trip");
+        }
+        // …with the modifiers a ZSA layer actually sends alongside them.
+        let (key, mods) = chord_to_key("ctrl+shift+f19").unwrap();
+        assert_eq!(Chord::from_event(&key, mods), Chord::parse("ctrl+shift+f19"));
+    }
 }
 
 /// Turns a chord spec into the key and modifiers a real press of it would carry.
@@ -1224,6 +1280,20 @@ fn named_key(id: &str) -> Option<NamedKey> {
         "f10" => NamedKey::F10,
         "f11" => NamedKey::F11,
         "f12" => NamedKey::F12,
+        // F13-F24 too, or the remote control cannot press the very keys the ZSA work
+        // exists for: a binding on `f13` would be one no script could ever exercise.
+        "f13" => NamedKey::F13,
+        "f14" => NamedKey::F14,
+        "f15" => NamedKey::F15,
+        "f16" => NamedKey::F16,
+        "f17" => NamedKey::F17,
+        "f18" => NamedKey::F18,
+        "f19" => NamedKey::F19,
+        "f20" => NamedKey::F20,
+        "f21" => NamedKey::F21,
+        "f22" => NamedKey::F22,
+        "f23" => NamedKey::F23,
+        "f24" => NamedKey::F24,
         _ => return None,
     })
 }
@@ -1679,5 +1749,145 @@ mod tests {
         let map = Keymap::new(&HashMap::new(), DEFAULT_LEADER);
         let chord = Chord::parse("ctrl+shift+p").unwrap();
         assert_eq!(map.bindings.get(&chord), Some(&Action::CommandPalette));
+    }
+}
+
+#[cfg(test)]
+mod manual_tests {
+    use super::*;
+    use crate::docs::HELP;
+
+    /// One thing the manual teaches: the chord exactly as it is WRITTEN in the
+    /// manual, the action pressing it must run, and a word every line naming that
+    /// chord has to carry.
+    ///
+    /// That last column is the one that catches a manual which has drifted. A chord
+    /// is only ever written down beside the thing it does, so a line offering
+    /// Ctrl+Shift+F as hint mode — it is the scrollback search — fails here, instead
+    /// of misleading whoever pressed F1 to find out.
+    const TAUGHT: &[(&str, Action, &str)] = &[
+        // Tabs
+        ("Ctrl+Shift+T", Action::NewTab, "new tab"),
+        ("Ctrl+Shift+W", Action::CloseTab, "close tab"),
+        ("Ctrl+Tab", Action::NextTab, "tab"),
+        ("Ctrl+Shift+Tab", Action::PrevTab, "tab"),
+        ("Ctrl+PageUp", Action::PrevTab, "tab"),
+        ("Ctrl+Shift+R", Action::RenameTab, "rename"),
+        ("Ctrl+Shift+U", Action::ReopenClosed, "closed"),
+        // Panes
+        ("Ctrl+Shift+D", Action::SplitHorizontal, "split"),
+        ("Ctrl+Shift+E", Action::SplitVertical, "split"),
+        ("Ctrl+Shift+X", Action::ClosePane, "close"),
+        ("Ctrl+Shift+Z", Action::ToggleZoom, "zoom"),
+        ("Ctrl+Shift+B", Action::ToggleBroadcast, "broadcast"),
+        // Clipboard and scrollback
+        ("Ctrl+Shift+C", Action::Copy, "cop"),
+        ("Alt+Shift+V", Action::ClipboardHistory, "clipboard"),
+        ("Ctrl+Shift+O", Action::CopyLastOutput, "output"),
+        ("Ctrl+Shift+F", Action::SearchScrollback, "search"),
+        ("Ctrl+Shift+Q", Action::OpenScrollbackInEditor, "scrollback"),
+        ("Shift+PageUp", Action::ScrollPageUp, "scroll"),
+        ("Ctrl+Shift+Home", Action::ScrollToTop, "top"),
+        ("Ctrl+Shift+Up", Action::JumpPrevPrompt, "command"),
+        // The assistant, and the two keys most often confused with it
+        ("Ctrl+Shift+A", Action::ToggleAi, "assistant"),
+        ("Ctrl+Shift+G", Action::AskAiAboutError, "last command"),
+        ("Alt+Shift+G", Action::FixLastCommand, "fix"),
+        ("Ctrl+Shift+M", Action::AiCommand, "command"),
+        ("Ctrl+Shift+Y", Action::AiExplain, "explain"),
+        ("Ctrl+Shift+I", Action::SummarizeSession, "summarize"),
+        ("Ctrl+Shift+N", Action::LaunchClaude, "claude"),
+        ("Ctrl+Shift+Enter", Action::Whisper, "whisper"),
+        // The rest of the flat layer
+        ("Ctrl+Shift+S", Action::QuickConnect, "connect"),
+        ("Ctrl+Shift+Space", Action::HintMode, "hint"),
+        ("Ctrl+Shift+P", Action::CommandPalette, "palette"),
+        ("Alt+Shift+S", Action::OpenSnippets, "saved command"),
+        ("Alt+Shift+P", Action::NowPlaying, "now-playing"),
+        ("Ctrl+0", Action::FontReset, "reset"),
+        // The leader layer: the top-level keys, and the deeper paths the manual
+        // spells out in prose where a wrong one is hardest to notice.
+        ("Leader V", Action::ClipboardHistory, "clipboard"),
+        ("Leader G", Action::GitPanel, "git"),
+        ("Leader D", Action::DockerPanel, "docker"),
+        ("Leader E", Action::ToggleExplorer, "tree"),
+        ("Leader U", Action::CatchUp, "catch up"),
+        ("Leader M", Action::Map, "map"),
+        ("Leader 0", Action::FontReset, "font"),
+        ("Leader W W", Action::WarRoom, "war room"),
+        ("Leader W Q", Action::WarRoomClose, "war room"),
+        ("Leader F I", Action::HintMode, "hint"),
+        ("Leader O C", Action::OpenConfig, "settings"),
+        ("Leader O P", Action::CommandPalette, "palette"),
+        ("Leader O V", Action::RepoVerbs, "verbs"),
+    ];
+
+    /// The manual ships inside the binary so it can never be out of step with the
+    /// build — which only helps if it is out of step with nothing else either. A
+    /// chord that moved, or a line that names the wrong one, is a bug the same way a
+    /// broken key is: someone reads it, presses it, and gets something else.
+    #[test]
+    fn the_manual_names_the_key_that_really_runs_each_thing() {
+        let flat = default_bindings();
+        let leader = default_leader_bindings();
+        for (written, action, about) in TAUGHT {
+            assert_eq!(
+                resolve(written, &flat, &leader).as_ref(),
+                Some(action),
+                "the manual says {written}, but that is not what runs {action:?}"
+            );
+            let naming: Vec<&str> = HELP.lines().filter(|line| names(line, written)).collect();
+            assert!(!naming.is_empty(), "the manual no longer teaches {written} at all");
+            for line in naming {
+                assert!(
+                    line.to_lowercase().contains(about),
+                    "{written} runs {action:?}, but the manual offers it for something else:\n  {}",
+                    line.trim()
+                );
+            }
+        }
+    }
+
+    /// What a chord written the manual's way actually runs. `Leader X Y` walks the
+    /// layer step by step; anything else is one chord in the flat table.
+    fn resolve(
+        written: &str,
+        flat: &HashMap<Chord, Action>,
+        leader: &HashMap<Chord, LeaderNode>,
+    ) -> Option<Action> {
+        let Some(path) = written.strip_prefix("Leader ") else {
+            return flat.get(&Chord::parse(written)?).cloned();
+        };
+        let mut level = leader;
+        let mut steps = path.split_whitespace().peekable();
+        while let Some(step) = steps.next() {
+            // The manual capitalises the leader steps for readability; the bindings
+            // are on the unshifted key, which is what `parse` folds them to. The
+            // shifted ones (`Leader J` resizes where `Leader j` moves focus) are
+            // therefore not written this way and are not taught here.
+            match level.get(&Chord::parse(step)?)? {
+                LeaderNode::Run(action) => {
+                    return steps.next().is_none().then(|| action.clone());
+                }
+                LeaderNode::Group { keys, .. } => level = keys,
+            }
+        }
+        None
+    }
+
+    /// Whether this line names exactly this chord. A line saying `Ctrl+Shift+Up` does
+    /// not name `Ctrl+Shift+U`, and `Ctrl+Shift+Tab` does not name `Ctrl+Shift+T` —
+    /// half the flat layer would otherwise be checked against the wrong lines.
+    fn names(line: &str, chord: &str) -> bool {
+        let edge = |c: Option<char>| !c.is_some_and(|c| c.is_ascii_alphanumeric() || c == '+');
+        let mut from = 0;
+        while let Some(at) = line[from..].find(chord) {
+            let (start, end) = (from + at, from + at + chord.len());
+            if edge(line[..start].chars().next_back()) && edge(line[end..].chars().next()) {
+                return true;
+            }
+            from = end;
+        }
+        false
     }
 }

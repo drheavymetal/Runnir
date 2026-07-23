@@ -105,6 +105,30 @@ impl Tab {
         }
     }
 
+    /// Every pane's rectangle for the session map, including the ones the screen is
+    /// not showing.
+    ///
+    /// `layout` answers what is drawn, and in `Stack` that is one pane — right for
+    /// rendering, wrong for a map: a map of the session that omits the panes you
+    /// cannot see is a map of the screen. `Stack` has no arrangement of its own, so
+    /// the panes are placed where the tree puts them, which is the arrangement
+    /// switching back to `Splits` would restore.
+    pub fn map_layout(&self, area: Rect) -> Vec<(PaneId, Rect)> {
+        let inner = pad(area, self.padding);
+        let rects = match self.mode {
+            LayoutMode::Stack => self.tree.layout(inner, self.gap),
+            _ => self.layout(area),
+        };
+        // A pane left without a rect is the hole this exists to prevent, and the tree
+        // can outlive a pane that failed to spawn. A grid of everything is a poorer
+        // likeness of the session than the real arrangement, but it is a complete one.
+        if rects.len() == self.panes.len() {
+            rects
+        } else {
+            crate::layout::grid(&self.order, inner, self.gap)
+        }
+    }
+
     /// Cycles to the next layout mode and returns it, reflowing so every pane's PTY
     /// learns the size the new arrangement gives it.
     pub fn cycle_layout(&mut self, area: Rect) -> LayoutMode {
@@ -145,12 +169,17 @@ impl Tab {
         config: &Config,
         id: PaneId,
         wake: impl Fn() + Send + Clone + 'static,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<bool> {
         self.split_running_with_id(area, axis, config, id, Vec::new(), wake)
     }
 
     /// Like `split_with_id`, but runs `command` in the new pane instead of a shell.
     /// An empty command means a shell.
+    ///
+    /// Returns whether a pane was really created: in `Splits` a pane already at the
+    /// minimum size is not divided at all, and that is not an error. A caller building
+    /// a room out of several panes has to be told, or it announces work it never put
+    /// on screen.
     pub fn split_running_with_id(
         &mut self,
         area: Rect,
@@ -159,7 +188,7 @@ impl Tab {
         id: PaneId,
         command: Vec<String>,
         wake: impl Fn() + Send + Clone + 'static,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<bool> {
         let inner = pad(area, self.padding);
         // The tree's minimum-size gate only governs the manual `Splits` mode. The
         // algorithmic modes redistribute space among all panes, so a new pane always
@@ -168,7 +197,7 @@ impl Tab {
         if self.mode == LayoutMode::Splits
             && !self.tree.can_split(self.focus, axis, inner, self.gap)
         {
-            return Ok(()); // Too small to divide usefully; ignore rather than error.
+            return Ok(false); // Too small to divide usefully; refused, not failed.
         }
 
         let spawn = Spawn {
@@ -208,7 +237,7 @@ impl Tab {
         self.panes.insert(id, pane);
         self.focus = id;
         self.reflow(area);
-        Ok(())
+        Ok(true)
     }
 
     /// The rect the active mode would give pane `id`, computed once `id` is already
@@ -219,6 +248,29 @@ impl Tab {
 
     /// Closes the focused pane. Returns false when it was the last one — the caller
     /// decides whether that closes the tab.
+    /// The first pane in insertion order, for callers that need "the one at the top
+    /// left" without knowing the tree.
+    pub fn first_pane(&self) -> Option<PaneId> {
+        self.order.first().copied()
+    }
+
+    /// Closes one pane by id, wherever it is. `close_focused` is the interactive
+    /// path; this is for a caller taking down several panes it opened itself, which
+    /// must not depend on focus wandering as each one goes.
+    pub fn close_pane(&mut self, id: PaneId, area: Rect) -> bool {
+        if self.order.len() <= 1 || !self.panes.contains_key(&id) {
+            return false;
+        }
+        self.tree.close(id);
+        self.order.retain(|&p| p != id);
+        self.panes.remove(&id);
+        if self.focus == id {
+            self.focus = self.order[0];
+        }
+        self.reflow(area);
+        true
+    }
+
     pub fn close_focused(&mut self, area: Rect) -> bool {
         if self.order.len() <= 1 {
             return false;
@@ -645,6 +697,62 @@ mod tests {
             "in Tall the same point is the middle of a pane; grabbing there would \
              swallow the click and rewrite the hidden Splits arrangement"
         );
+    }
+
+    /// A window too small to divide refuses the split, and says so instead of
+    /// answering `Ok`. A caller opening a pane per service builds a room with holes in
+    /// it otherwise, and then announces the services it never put on screen.
+    #[test]
+    fn a_refused_split_says_so_instead_of_reporting_success() {
+        let config = crate::config::Config::default();
+        let mut tab = Tab::new(AREA, (10.0, 20.0), &config, 1, &Spawn::default(), || {})
+            .expect("a tab spawns its first shell");
+        assert_eq!(tab.mode, LayoutMode::Splits, "the gate only governs the manual mode");
+
+        // Two panes fit in a thousand pixels; nothing fits in forty.
+        assert!(
+            tab.split_with_id(AREA, Axis::Horizontal, &config, 2, || {}).unwrap(),
+            "there is room for a second pane"
+        );
+        assert_eq!(tab.panes.len(), 2);
+
+        let cramped = Rect { x: 0.0, y: 0.0, w: 40.0, h: 40.0 };
+        assert!(
+            !tab.split_with_id(cramped, Axis::Horizontal, &config, 3, || {}).unwrap(),
+            "refused, not failed — and not silently successful either"
+        );
+        assert!(!tab.panes.contains_key(&3), "a refused split leaves no pane behind");
+        assert_eq!(tab.panes.len(), 2);
+    }
+
+    /// The map is how a session is read at a glance, so it owes a place to every pane
+    /// in the tab — including the ones the screen is hiding. In `Stack` the screen
+    /// shows one; a map that agreed would say the session has one pane.
+    #[test]
+    fn every_pane_has_a_place_on_the_map_even_when_the_screen_hides_it() {
+        let config = crate::config::Config::default();
+        let mut tab = Tab::new(AREA, (10.0, 20.0), &config, 1, &Spawn::default(), || {})
+            .expect("a tab spawns its first shell");
+        for id in 2..=3 {
+            assert!(tab.split_with_id(AREA, Axis::Horizontal, &config, id, || {}).unwrap());
+        }
+        assert_eq!(tab.panes.len(), 3);
+
+        for mode in [LayoutMode::Splits, LayoutMode::Stack, LayoutMode::Tall, LayoutMode::Grid] {
+            tab.mode = mode;
+            let map = tab.map_layout(AREA);
+            assert_eq!(map.len(), 3, "{mode:?} left a hole in the map");
+            for id in tab.panes.keys() {
+                assert!(map.iter().any(|(p, _)| p == id), "{mode:?} lost pane {id}");
+            }
+            // A place, not a point: a card with no size cannot carry a headline.
+            for (id, r) in &map {
+                assert!(r.w > 0.0 && r.h > 0.0, "{mode:?} gave pane {id} nothing to draw in");
+            }
+        }
+        // Stack draws one pane; only the map disagrees.
+        tab.mode = LayoutMode::Stack;
+        assert_eq!(tab.layout(AREA).len(), 1, "the screen still shows one pane at a time");
     }
 
     #[test]

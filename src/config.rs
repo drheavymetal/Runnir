@@ -26,6 +26,9 @@ pub struct Config {
     /// Now-playing media overlay (album art, transport, waveform).
     #[serde(default)]
     pub media: Media,
+    /// Learning this project's real verbs from what is typed here.
+    #[serde(default)]
+    pub verbs: VerbsCfg,
     /// The ZSA keyboard's lights.
     #[serde(default)]
     pub keyboard: Keyboard,
@@ -95,6 +98,7 @@ impl Default for Config {
             ai: Ai::default(),
             watch: Watch::default(),
             media: Media::default(),
+            verbs: VerbsCfg::default(),
             keyboard: Keyboard::default(),
             explorer: Explorer::default(),
             keys: HashMap::new(),
@@ -244,6 +248,14 @@ pub struct Behaviour {
     /// Zero disables.
     pub notify_after_secs: u64,
     pub confirm_close: bool,
+    /// Open the map by itself after this many seconds with nothing typed, as a
+    /// screensaver. Zero disables it.
+    ///
+    /// Measured from the last keystroke that reached a PTY, the same clock the
+    /// catch-up uses and for the same reason: window focus lies in both directions —
+    /// a focused window on a second monitor is not attention, and the pointer
+    /// crossing another window is not absence.
+    pub screensaver_after_secs: u64,
     /// Restore the window you closed last, when this is the only window running.
     ///
     /// The snapshot (tabs, layout, directories, scrollback) belongs to the NEXT
@@ -294,6 +306,9 @@ impl Default for Behaviour {
             context_tint: true,
             notify_after_secs: 20,
             confirm_close: true,
+            // Off by default: a terminal that covers itself up unasked is a terminal
+            // people turn a setting off in, and finding which setting is the work.
+            screensaver_after_secs: 0,
             restore_session: true,
             command_guardian: true,
             smooth_scroll: true,
@@ -365,6 +380,28 @@ pub struct Media {
 impl Default for Media {
     fn default() -> Self {
         Self { waveform: true, bars: 24, art_cells: 18 }
+    }
+}
+
+// ---- verbs ------------------------------------------------------------------
+
+/// Learning the commands a repository is actually worked with.
+///
+/// OFF by default and per-machine: this watches what you type. Only the verb is ever
+/// stored — never arguments — and never inside the repo, but even so it is not the
+/// kind of thing to switch on for someone.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct VerbsCfg {
+    pub enabled: bool,
+    /// How many successful runs before a command counts as a verb. Two is an
+    /// experiment; the default is three.
+    pub threshold: u32,
+}
+
+impl Default for VerbsCfg {
+    fn default() -> Self {
+        Self { enabled: false, threshold: crate::verbs::DEFAULT_THRESHOLD }
     }
 }
 
@@ -934,6 +971,21 @@ mod tests {
         assert_eq!(crate::leader_timeout(&cfg), None);
         cfg.leader_timeout = 45;
         assert_eq!(crate::leader_timeout(&cfg), Some(std::time::Duration::from_secs(45)));
+    }
+
+    /// The lapse is one question asked in two places (the deadline wake and the
+    /// half-second sweep), and both have to answer it the same way — a layer that
+    /// one of them thinks is still armed is a keyboard still painted.
+    #[test]
+    fn a_leader_lapses_only_when_it_is_armed_and_its_step_ran_out() {
+        use std::time::{Duration, Instant};
+        let long_ago = Instant::now() - Duration::from_secs(30);
+        assert!(crate::leader_lapsed(Some(long_ago), Some(Duration::from_secs(10))));
+        // Nothing armed cannot lapse…
+        assert!(!crate::leader_lapsed(None, Some(Duration::from_secs(10))));
+        // …and with the timeout off the layer waits as long as the user does.
+        assert!(!crate::leader_lapsed(Some(long_ago), None));
+        assert!(!crate::leader_lapsed(Some(Instant::now()), Some(Duration::from_secs(10))));
     }
 
     #[test]

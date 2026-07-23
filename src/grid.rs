@@ -516,9 +516,30 @@ impl Grid {
         self.display_offset
     }
 
-    /// Absolute row currently drawn at viewport row `row`.
+    /// Absolute row currently drawn at viewport row `row`, ignoring folds.
     pub fn abs_row(&self, row: usize) -> usize {
-        self.scrollback.len() - self.display_offset + row
+        // Saturating because a wrong answer here is a mis-selected row, while a wrong
+        // subtraction is a panic — and a panic in this process takes the shells with it.
+        self.scrollback.len().saturating_sub(self.display_offset) + row
+    }
+
+    /// The buffer row shown at viewport row `row`, or `None` when that row shows no
+    /// buffer line at all: a fold summary, or blank space past the end.
+    ///
+    /// Every "what is under the pointer" question has to come through here. With
+    /// folds active the viewport is not the buffer shifted by the scroll — arithmetic
+    /// that assumes it is picks a row belonging to a different command, which is how
+    /// a dragged block hands over somebody else's output.
+    pub fn row_at_view(&self, row: usize) -> Option<usize> {
+        let row = row.min(self.rows.saturating_sub(1));
+        if self.has_folds() {
+            match self.display_plan().get(row) {
+                Some(PlanRow::Real(abs)) => Some(*abs),
+                _ => None,
+            }
+        } else {
+            Some(self.abs_row(row))
+        }
     }
 
     pub fn abs_cell(&self, abs_row: usize, col: usize) -> Cell {
@@ -602,6 +623,31 @@ impl Grid {
                 lines.push(row_text(&self.cells[start..start + self.cols]));
             }
         }
+        while lines.last().is_some_and(|l| l.is_empty()) {
+            lines.pop();
+        }
+        lines
+    }
+
+    /// The primary screen as it was parked when a full-screen app took over.
+    ///
+    /// It is deliberately NOT part of `scrollback_text` — the alternate screen is not
+    /// history and must never enter the scrollback. But it IS what the pane was
+    /// doing before the app started, which is exactly the context a session summary
+    /// wants when the pane has been sitting in vim or Claude Code ever since.
+    pub fn parked_text(&self) -> Vec<String> {
+        let Some((primary, _)) = &self.parked else { return Vec::new() };
+        let mut lines: Vec<String> = (0..self.rows)
+            .map(|row| {
+                let start = row * self.cols;
+                let s: String = primary[start..start + self.cols]
+                    .iter()
+                    .filter(|c| !c.is_spacer())
+                    .map(|c| c.ch)
+                    .collect();
+                s.trim_end().to_string()
+            })
+            .collect();
         while lines.last().is_some_and(|l| l.is_empty()) {
             lines.pop();
         }
@@ -821,6 +867,80 @@ impl Grid {
         self.text_range((start_row, 0), (cur, last_col))
     }
 
+    /// The local row range of the command block containing `row`: from its prompt
+    /// mark down to just before the next one (or the end of the buffer).
+    ///
+    /// A block — the command line plus everything it printed — is the unit a person
+    /// means by "that output", which is why OSC 133 marks are what make dragging one
+    /// possible at all. Without marks there is no answer, and the caller must say so
+    /// rather than guess a range.
+    pub fn block_at(&self, row: usize) -> Option<(usize, usize)> {
+        let mut marks: Vec<usize> =
+            self.prompt_marks.iter().filter_map(|&s| self.stable_to_local(s)).collect();
+        marks.sort_unstable();
+        let start = *marks.iter().filter(|&&m| m <= row).next_back()?;
+        let end = marks
+            .iter()
+            .find(|&&m| m > row)
+            .map(|&m| m.saturating_sub(1))
+            .unwrap_or_else(|| self.scrollback.len() + self.rows.saturating_sub(1));
+        Some((start, end.max(start)))
+    }
+
+    /// The OUTPUT of a block, for handing it to another pane: the block without its
+    /// first row, which is the prompt and the command that produced it.
+    ///
+    /// "As stdin" means the output, not the prompt: a shell prompt is full of powerline
+    /// glyphs and a hostname, and neither is data. A prompt wrapped over more than one
+    /// row still leaves a line behind — accepted, because the alternative is guessing
+    /// where a themed prompt ends.
+    pub fn block_text(&self, range: (usize, usize)) -> String {
+        let first_output = (range.0 + 1).min(range.1);
+        self.text_range((first_output, 0), (range.1, self.cols.saturating_sub(1)))
+    }
+
+    /// The last `n` non-blank lines of the CURRENT block's output — what the pane
+    /// last printed, with the prompt that produced it left out.
+    ///
+    /// The map wants a glimpse of the work, and the tail of the scrollback is mostly
+    /// prompt: a themed prompt is three lines of powerline glyphs and a clock, which
+    /// says nothing about the pane. Without marks there is no block, and the honest
+    /// answer is the tail as it is.
+    pub fn recent_output(&self, n: usize) -> Vec<String> {
+        // Which block is "the work" depends on whether anything is running. With a
+        // command in flight the cursor's own block is it; at a prompt the cursor sits
+        // in a block that has printed nothing yet, and showing THAT is how a map ends
+        // up full of powerline glyphs instead of output.
+        let cur = self.cursor_abs();
+        let row = if self.command_running() {
+            Some(cur)
+        } else {
+            let mut marks: Vec<usize> =
+                self.prompt_marks.iter().filter_map(|&s| self.stable_to_local(s)).collect();
+            marks.sort_unstable();
+            // The block to show starts at the mark BEFORE the one the cursor's own
+            // block starts at. Measuring from the cursor row instead is a block out
+            // with a one-line prompt, where the cursor sits ON the newest mark: it
+            // would show the command before last, and the very first command not at
+            // all. With no earlier mark there is nothing finished to show, and the
+            // cursor's own (empty) block is the honest answer.
+            marks
+                .iter()
+                .rev()
+                .find(|&&m| m <= cur)
+                .and_then(|&start| marks.iter().rev().find(|&&m| m < start).copied())
+                .or(Some(cur))
+        };
+        let lines: Vec<String> = match row.and_then(|r| self.block_at(r)) {
+            Some(range) => self.block_text(range).lines().map(str::to_string).collect(),
+            None => self.scrollback_text(),
+        };
+        let mut tail: Vec<String> =
+            lines.into_iter().filter(|l| !l.trim().is_empty()).rev().take(n).collect();
+        tail.reverse();
+        tail
+    }
+
     /// The stable index one past the last row that actually holds output — the
     /// cursor's row — for the keyword watcher's high-water mark. Using the cursor
     /// row (not the screen height) means blank rows below the cursor are not counted
@@ -958,6 +1078,23 @@ impl Grid {
         let offset = self.scrollback.len().saturating_sub(target_top);
         self.display_offset = offset.min(self.scrollback.len());
         self.dirty = true;
+    }
+
+    /// The last line with anything on it, for panes with no shell integration: the
+    /// catch-up shows it verbatim rather than inventing a status it cannot know.
+    ///
+    /// Searched from the bottom of `scrollback ++ screen` upwards, because that is
+    /// the space rows are numbered in. Counting the first `rows()` of them instead
+    /// reads the OLDEST history a pane holds, so a pane past its first screenful gets
+    /// a headline quoting the first line it ever printed — and a wrong headline is
+    /// worse than none.
+    pub fn last_nonblank_line(&self) -> Option<String> {
+        let last = self.total_rows().saturating_sub(1);
+        (0..=last).rev().find_map(|abs| {
+            let text = self.text_range((abs, 0), (abs, self.cols.saturating_sub(1)));
+            let trimmed = text.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        })
     }
 
     /// Text of the rows in `[from, to]` absolute range, trailing blanks trimmed.
@@ -2471,6 +2608,26 @@ mod tests {
         assert!(text.contains(&"one".to_string()));
     }
 
+    /// The catch-up quotes this line for panes with no shell integration, and rows
+    /// are numbered across history AND screen. Counting only the first screenful of
+    /// that space answers with the oldest line the pane ever printed, presented as
+    /// what it is doing now.
+    #[test]
+    fn the_last_line_is_the_newest_one_not_the_oldest_in_history() {
+        let mut g = Grid::new(20, 3);
+        feed(&mut g, "the first line ever\r\n");
+        for i in 0..8 {
+            feed(&mut g, &format!("line {i}\r\n"));
+        }
+        assert!(g.total_rows() > g.rows(), "this pane is past its first screenful");
+        assert_eq!(g.last_nonblank_line().as_deref(), Some("line 7"));
+
+        // A blank screen is not "nothing to say" either: the search carries on into
+        // history and answers with the newest line still there.
+        feed(&mut g, "\x1b[2J");
+        assert_eq!(g.last_nonblank_line().as_deref(), Some("line 5"));
+    }
+
     #[test]
     fn scrolled_off_lines_reach_scrollback() {
         let mut g = Grid::new(4, 2);
@@ -2721,6 +2878,37 @@ mod tests {
         assert!(g.display_plan().iter().all(|p| !matches!(p, PlanRow::Fold { .. })));
     }
 
+    /// What a screen row shows is the plan's business once anything is folded. A
+    /// pointer answered with the scroll arithmetic instead lands rows away from what
+    /// the hand is on — and the block it grabs is another command's output.
+    #[test]
+    fn a_screen_row_maps_to_the_buffer_row_it_actually_shows() {
+        let mut g = Grid::new(20, 8);
+        feed(&mut g, "\x1b]133;A\x07$ one\r\n\x1b]133;C\x07a\r\nb\r\nc\r\n\x1b]133;D;0\x07");
+        feed(&mut g, "\x1b]133;A\x07$ two\r\n\x1b]133;C\x07gamma\r\n\x1b]133;D;0\x07");
+        // Unfolded, the view is the buffer shifted by the scroll and nothing else.
+        for row in 0..g.rows() {
+            assert_eq!(g.row_at_view(row), Some(g.abs_row(row)));
+        }
+
+        g.fold_all();
+        let plan = g.display_plan();
+        for (row, entry) in plan.iter().enumerate() {
+            match entry {
+                PlanRow::Real(abs) => assert_eq!(g.row_at_view(row), Some(*abs)),
+                // A fold summary and the padding past the end are not buffer lines,
+                // and answering with one anyway is how a drag stages the wrong block.
+                _ => assert_eq!(g.row_at_view(row), None, "row {row} shows no buffer line"),
+            }
+        }
+        // …and the two answers really do differ: folding shortens the view, so a
+        // screen row now shows a buffer row the scroll arithmetic would never name.
+        assert!(
+            (0..g.rows()).any(|r| g.row_at_view(r) != Some(g.abs_row(r))),
+            "folded, the view is no longer the buffer shifted by the scroll: {plan:?}"
+        );
+    }
+
     #[test]
     fn clear_drops_live_screen_folds() {
         let mut g = Grid::new(20, 6);
@@ -2750,6 +2938,96 @@ mod tests {
             plan.iter().any(|p| matches!(p, PlanRow::Real(a) if *a == cur)),
             "the live prompt row must survive folding: {plan:?}"
         );
+    }
+
+
+    /// The unit a person means by "that output" is the command BLOCK, delimited by
+    /// the prompt marks OSC 133 already provides. Without those there is no answer,
+    /// and the caller has to be told rather than handed a guess.
+    #[test]
+    fn a_block_runs_from_one_prompt_to_the_next() {
+        let mut g = Grid::new(20, 8);
+        feed(&mut g, "\x1b]133;A\x07$ one\r\n\x1b]133;C\x07alpha\r\nbeta\r\n\x1b]133;D;0\x07");
+        feed(&mut g, "\x1b]133;A\x07$ two\r\n\x1b]133;C\x07gamma\r\n\x1b]133;D;0\x07");
+
+        // A row inside the first command belongs to the first block, and its text is
+        // the OUTPUT: the prompt line that produced it is not data.
+        let first = g.block_at(1).expect("row 1 is inside the first block");
+        let text = g.block_text(first);
+        assert!(text.contains("alpha") && text.contains("beta"), "{text:?}");
+        assert!(!text.contains("$ one"), "the command line is not stdin: {text:?}");
+        assert!(!text.contains("gamma"), "the next command is a different block: {text:?}");
+
+        // …and a row inside the second belongs to the second.
+        let second = g.block_at(4).expect("row 4 is inside the second block");
+        assert!(g.block_text(second).contains("gamma"));
+        assert_ne!(first, second);
+    }
+
+    /// The map's glimpse must be the OUTPUT of the last command, not the prompt that
+    /// came after it. Sitting at a fresh prompt, the cursor's own block has printed
+    /// nothing — reading it is how a map fills with powerline glyphs.
+    #[test]
+    fn a_glimpse_of_a_pane_is_its_output_not_the_prompt_after_it() {
+        let mut g = Grid::new(20, 8);
+        feed(&mut g, "\x1b]133;A\x07$ one\r\n\x1b]133;C\x07alpha\r\nbeta\r\n\x1b]133;D;0\x07");
+        // No newline after the new prompt: a shell waiting for input leaves the
+        // cursor sitting on the row it just marked.
+        feed(&mut g, "\x1b]133;A\x07$ ");
+
+        let seen = g.recent_output(2);
+        assert!(seen.iter().any(|l| l.contains("beta")), "{seen:?}");
+        assert!(!seen.iter().any(|l| l.trim() == "$"), "read the new prompt: {seen:?}");
+
+        // …while a command in flight IS the cursor's own block: what it has printed so
+        // far is exactly what someone glancing at the map wants.
+        feed(&mut g, "two\r\n\x1b]133;C\x07gamma\r\n");
+        assert!(g.recent_output(2).iter().any(|l| l.contains("gamma")));
+    }
+
+    /// The prompt's shape is the shell's business, not the map's: whether the cursor
+    /// ends on the marked row (one line) or below it (a themed two-line prompt), the
+    /// glimpse is the last command's output — never the one before it.
+    #[test]
+    fn the_glimpse_is_the_last_command_whatever_shape_the_prompt_has() {
+        let two_commands = "\x1b]133;A\x07$ one\r\n\x1b]133;C\x07alpha\r\n\x1b]133;D;0\x07\
+                            \x1b]133;A\x07$ two\r\n\x1b]133;C\x07beta\r\n\x1b]133;D;0\x07";
+
+        // One-line prompt: the cursor lands on the newest mark itself.
+        let mut one_line = Grid::new(20, 10);
+        feed(&mut one_line, two_commands);
+        feed(&mut one_line, "\x1b]133;A\x07$ ");
+        let seen = one_line.recent_output(3);
+        assert!(seen.iter().any(|l| l.contains("beta")), "the last command: {seen:?}");
+        assert!(!seen.iter().any(|l| l.contains("alpha")), "a block too far back: {seen:?}");
+
+        // Two-line prompt: the mark is on the first row, the cursor a row below it.
+        let mut two_line = Grid::new(20, 10);
+        feed(&mut two_line, two_commands);
+        feed(&mut two_line, "\x1b]133;A\x07\u{250c}\u{2500} ~/runnir\r\n$ ");
+        let seen = two_line.recent_output(3);
+        assert!(seen.iter().any(|l| l.contains("beta")), "the last command: {seen:?}");
+        assert!(!seen.iter().any(|l| l.contains("alpha")), "a block too far back: {seen:?}");
+
+        // And with a single command behind it, that command's output is what shows —
+        // the case where stepping back from the cursor row ran out of marks entirely.
+        let mut first = Grid::new(20, 10);
+        feed(&mut first, "\x1b]133;A\x07$ one\r\n\x1b]133;C\x07alpha\r\n\x1b]133;D;0\x07");
+        feed(&mut first, "\x1b]133;A\x07$ ");
+        assert!(
+            first.recent_output(3).iter().any(|l| l.contains("alpha")),
+            "the only command that ever ran: {:?}",
+            first.recent_output(3)
+        );
+    }
+
+    /// A pane with no shell integration has no blocks at all, and saying so is the
+    /// only honest answer — a guessed range hands over somebody else's output.
+    #[test]
+    fn without_marks_there_is_no_block() {
+        let mut g = Grid::new(20, 4);
+        feed(&mut g, "just some output\r\nwith no marks\r\n");
+        assert!(g.block_at(0).is_none());
     }
 
     #[test]

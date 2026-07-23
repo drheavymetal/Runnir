@@ -26,6 +26,7 @@ pub enum SettingId {
     WheelLines,
     ContextTint,
     NotifyAfter,
+    ScreensaverAfter,
     ConfirmClose,
     RestoreSession,
     CommandGuardian,
@@ -37,6 +38,8 @@ pub enum SettingId {
     KeyboardFlashMs,
     KeyboardLeaderLights,
     AiProvider,
+    VerbsEnabled,
+    VerbsThreshold,
 }
 
 /// How a setting is edited, which drives the key handling and the value hint.
@@ -84,6 +87,7 @@ pub fn rows() -> Vec<Row> {
         row!("Behaviour", "Wheel lines", WheelLines, Float),
         row!("Behaviour", "Context tint", ContextTint, Bool),
         row!("Behaviour", "Notify after (s)", NotifyAfter, Int),
+        row!("Behaviour", "Screensaver after (s)", ScreensaverAfter, Int),
         row!("Behaviour", "Confirm close", ConfirmClose, Bool),
         row!("Behaviour", "Restore last closed window", RestoreSession, Bool),
         row!("Behaviour", "Command guardian", CommandGuardian, Bool),
@@ -92,6 +96,8 @@ pub fn rows() -> Vec<Row> {
         row!("Explorer", "Width (columns)", ExplorerWidth, Int),
         row!("Explorer", "Show hidden files", ExplorerHidden, Bool),
         row!("AI", "Provider", AiProvider, Enum),
+        row!("Repo", "Learn this repo\u{2019}s verbs", VerbsEnabled, Bool),
+        row!("Repo", "Runs before it counts", VerbsThreshold, Int),
         row!("Keyboard", "Flash the ZSA board", KeyboardAmbient, Bool),
         row!("Keyboard", "Flash length (ms)", KeyboardFlashMs, Int),
         row!("Keyboard", "Light the leader on the keys", KeyboardLeaderLights, Bool),
@@ -125,6 +131,7 @@ pub fn value(cfg: &Config, id: SettingId) -> String {
         WheelLines => format!("{:.0}", cfg.behaviour.wheel_lines),
         ContextTint => onoff(cfg.behaviour.context_tint),
         NotifyAfter => cfg.behaviour.notify_after_secs.to_string(),
+        ScreensaverAfter => cfg.behaviour.screensaver_after_secs.to_string(),
         ConfirmClose => onoff(cfg.behaviour.confirm_close),
         RestoreSession => onoff(cfg.behaviour.restore_session),
         CommandGuardian => onoff(cfg.behaviour.command_guardian),
@@ -146,6 +153,8 @@ pub fn value(cfg: &Config, id: SettingId) -> String {
                 None => format!("{} (not configured)", cfg.ai.default),
             }
         }
+        VerbsEnabled => onoff(cfg.verbs.enabled),
+        VerbsThreshold => cfg.verbs.threshold.to_string(),
         KeyboardAmbient => onoff(cfg.keyboard.ambient),
         KeyboardFlashMs => cfg.keyboard.flash_ms.to_string(),
         KeyboardLeaderLights => onoff(cfg.keyboard.leader_lights),
@@ -198,6 +207,12 @@ pub fn adjust(cfg: &mut Config, id: SettingId, dir: i32) {
             cfg.behaviour.notify_after_secs =
                 (cfg.behaviour.notify_after_secs as i64 + dir as i64 * 5).clamp(0, 600) as u64
         }
+        // Steps of thirty: the useful settings here are minutes, and stepping a
+        // ten-minute screensaver in fives is a hundred and twenty keypresses.
+        ScreensaverAfter => {
+            cfg.behaviour.screensaver_after_secs =
+                (cfg.behaviour.screensaver_after_secs as i64 + dir as i64 * 30).clamp(0, 3600) as u64
+        }
         ConfirmClose => cfg.behaviour.confirm_close = up,
         RestoreSession => cfg.behaviour.restore_session = up,
         CommandGuardian => cfg.behaviour.command_guardian = up,
@@ -215,6 +230,11 @@ pub fn adjust(cfg: &mut Config, id: SettingId, dir: i32) {
         }
         ExplorerHidden => cfg.explorer.show_hidden = up,
         AiProvider => cfg.ai.default = next_provider(cfg, dir),
+        VerbsEnabled => cfg.verbs.enabled = up,
+        VerbsThreshold => {
+            let t = cfg.verbs.threshold as i32 + dir;
+            cfg.verbs.threshold = t.clamp(2, 50) as u32;
+        }
         KeyboardAmbient => cfg.keyboard.ambient = up,
         KeyboardLeaderLights => cfg.keyboard.leader_lights = up,
         KeyboardFlashMs => {

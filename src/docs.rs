@@ -42,14 +42,29 @@ Straight away, no group — the things you do constantly:
 @ Leader 1..9      jump to tab N
 @ Leader hjkl      focus the pane left/down/up/right
 @ Leader HJKL      resize the focused pane (arrows do this too)
+@ Leader U         catch up: one headline per pane after time away
+@ Leader M         the map: every pane in the WINDOW — every tab — zoomed out to a
+@                        card with its state, what it last ran and the tail of what
+@                        that printed. J/K (or the arrows) move, Enter goes to that
+@                        pane, Escape comes back. The cards keep the panes' own
+@                        places, so the session looks like itself. It doubles as a
+@                        screensaver; see 'The map' below.
 @ Leader V         clipboard history
-@ Leader G         fix the last failed command
+@ Leader G         the git panel
+@ Leader D         the docker panel
+@ Leader E         the file tree beside the panes
 @ Leader Z / Shift+Z  font bigger / smaller (+, = and - work too; the letters
 @                        are the binding that survives a layout where = is shifted)
 @ Leader 0         reset the font size
 
 Then the groups. The letter is the noun:
 
+@ Leader W W       war room: a tab that arranges itself around a deploy — one log
+                   pane per service from the compose file, a status watch, and the
+                   deploy itself LEFT AT THE PROMPT for you to fire. Nothing is run
+                   for you and nothing is asked of you; the compose file already says
+                   what the project is made of.
+@ Leader W Q       close the war room, keeping any pane you typed in
 @ Leader T ...     tabs: T new, N/P next/prev, W close, R rename, U reopen,
 @                        H/L (or the arrows) move the tab in the bar
 @ Leader P ...     panes: D split left/right, E split up/down, X close, Z zoom,
@@ -65,6 +80,11 @@ Then the groups. The letter is the noun:
 @                        M run a described command, E explain, S summarise
 @ Leader R ...     run & launch: C Claude, W whisper, S ssh, M now playing,
 @                        L a saved layout
+@ Leader O V       how this repo is worked: the verbs learned from what you
+                   actually type here. Enter puts one at the prompt (never runs it),
+                   X forgets everything learned about this repo. Off until you set
+                   verbs.enabled: only the verb is ever stored, never arguments, and
+                   never inside the repo.
 @ Leader O ...     open: C config, T theme, D these docs, S snippets,
 @                        P the palette, I/W image watch
 @ Leader S ...     session: S save, R restore, C clear, Q quit
@@ -89,6 +109,7 @@ which stays the way to find a command you have not memorised.
 @ Ctrl+Shift+T     new tab
 @ Ctrl+Shift+W     close tab
 @ Ctrl+PageUp/Dn   previous / next tab
+@ Ctrl+Tab / Ctrl+Shift+Tab  next / previous tab
 @ Ctrl+Shift+Left/Right  move the current tab left / right in the bar
 @ Leader 1..9      jump to tab N
 @ Ctrl+Shift+R     rename the current tab
@@ -119,6 +140,12 @@ whatever order you built the splits in.
 @ Ctrl+Shift+C / V          copy / paste
 @ Alt+Shift+V               clipboard history: re-paste a recent copy (see below)
 @ middle click              paste the primary selection (the last text selected)
+@ middle DRAG               tactile pipe: grab a command's output block and drop it
+                            on another pane. The output is written to a private file
+                            and its path is left at that pane's prompt for you to
+                            use — it is never run for you. Needs shell integration
+                            (the blocks come from the OSC 133 marks); a pane running
+                            a full-screen app refuses the drop.
 @ Ctrl+Shift+Home/End       jump to top / live output
 @ Ctrl+Shift+F              search the scrollback; Enter/Up next/prev, Esc closes
 @ Ctrl+Shift+Q              dump the scrollback to $EDITOR in a new split
@@ -213,9 +240,9 @@ docker blue. It launches the real ssh, so your ~/.ssh/config, jump hosts and
 
 # Hint mode (keyboard, no mouse)
 
-@ Ctrl+Shift+F     label every URL, path and git hash on screen; type a label to
-                   open or copy it. This removes most of the reasons to reach for
-                   the mouse.
+@ Ctrl+Shift+Space hint mode: label every URL, path and git hash on screen; type a
+                   label to open or copy it. This removes most of the reasons to
+                   reach for the mouse.
 
 Hovering the pointer over a URL or path also underlines it; Ctrl+click opens a URL
 in the browser or copies a path/hash, without entering hint mode. OSC 8 hyperlinks
@@ -240,9 +267,9 @@ Keys are never stored in the config. Each provider names an ENVIRONMENT VARIABLE
 (api_key_env) and runnir reads the key from there, so the config file is safe to
 keep in a dotfile repo.
 
-Switch provider without editing anything: Ctrl+Shift+, opens the settings panel,
-and the AI row cycles through every provider you have configured, showing which
-model is behind each one.
+Switch provider without editing anything: Leader O C opens the settings panel, and
+the AI row cycles through every provider you have configured, showing which model
+is behind each one.
 
 You can also route ONE TASK to a different provider than the rest, which is about
 cost rather than taste: summarising a whole session is long and cheap on a flat-rate
@@ -262,7 +289,10 @@ when the config loads rather than silently falling back for ever.
                    at the prompt for you to review and run (never run for you). For
                    example, after mkdr foo fails it types mkdir foo at the prompt.
 @ Ctrl+Shift+Y     explain the current selection in the assistant panel
-@ Ctrl+Shift+I     summarize this session (commands, results, errors and fixes)
+@ Ctrl+Shift+I     summarize this session (commands, results, errors and fixes).
+                   Reads the whole window, not just the focused pane, and includes
+                   the screen parked behind a full-screen app — so asking from
+                   inside vim or Claude Code summarises the work, not nothing.
 
 # Whisper — talk to the terminal
 
@@ -387,7 +417,7 @@ a + / - column, so the code stays aligned with its context.
 
 # Hint mode knows git
 
-Hint mode (Ctrl+Shift+Space, or Leader I) labels every URL, path and commit hash on
+Hint mode (Ctrl+Shift+Space, or Leader F I) labels every URL, path and commit hash on
 screen, and in a repository it also labels branch names - by name, against the real
 ref list, so only a branch this repo actually has is a target. Paths git prints
 relatively (src/main.rs, and src/main.rs:412 from a compiler) are labelled too.
@@ -539,13 +569,16 @@ application global hotkeys, so the toggle is the compositor's job. For Hyprland:
 
 Leader E opens a tree of the project beside the panes, and puts the keyboard in it.
 It is chrome, not a modal layer: it stays up while you work in the pane next to it,
-and it takes keys only while it has focus (Escape gives them back).
+and it takes keys only while it has focus (Escape gives them back). q closes it —
+with the tree focused the leader chord arms the tree's OWN menu, so Leader E cannot
+reach the toggle from in there, and from a pane that toggle re-focuses the tree
+rather than hiding it.
 
   j k / arrows      move            l or Enter   unfold a directory
   h                 fold, or go to the parent    g G   top, bottom
   .                 hidden files    I  files git ignores
   s                 sort by name / by date
-  y                 copy the path   Esc or q     back to the pane
+  y                 copy the path   Esc  back to the pane   q  close the sidebar
   Enter on a file   open it        e  $EDITOR    o  the desktop's handler
   p properties & permissions   a new file (a/ for a directory)
   r rename          d delete       R  reread the tree
@@ -606,7 +639,7 @@ resize it — the panes are only resized when you let go, because a PTY resized 
 every frame of a drag is one full-screen program redrawing itself into a corner.
 
 With the tree focused, the leader key opens a menu of file verbs, the same which-key
-the git panel uses: F file, D directory, V view, Q back to the pane. It offers only
+the git panel uses: F file, D directory, V view, Q close the sidebar. It offers only
 what the row under the cursor can do - the file verbs are not offered on a directory
 and the directory ones are not offered on a file - and every leaf presses a key the
 sidebar already binds.
@@ -614,6 +647,68 @@ sidebar already binds.
 Config: explorer.side (left/right), explorer.width in COLUMNS (not a fraction: a
 fraction on an ultrawide gives a 90-column tree), explorer.show_hidden. All three
 are in the settings panel too.
+
+# ZSA keyboard: lights and signals
+
+On a ZSA board (Moonlander, Voyager) runnir can drive the RGB, with no custom
+firmware and nothing running alongside it. Two separate things, both off by default.
+
+  keyboard.leader_lights   light the leader layer on the keys themselves
+  keyboard.ambient         flash the whole board where a notification would fire
+  keyboard.flash_ms        how long a flash lasts (also its own cleanup)
+
+Arming the leader with the lights on lights exactly the keys that do something at
+that level, in the which-key panel's own colours, and descending into a group
+repaints. The ambient flashes are amber for a watched word, green when a long
+command finishes, red when the guardian asks.
+
+runnir speaks to the board DIRECTLY, over its raw HID endpoint - ZSA publishes the
+protocol (the oryx QMK module, GPL-2.0) and it is the same one their own app speaks,
+so nothing has to be running. The endpoint is found by its report descriptor rather
+than by a remembered path, because hidraw numbering moves on every replug, and the
+permissions come from the udev rule ZSA already ships.
+
+Keymapp still has to have RUN ONCE, ever: the flashed layout lives in its database,
+and that is where runnir reads which key is which LED. After that the revision is
+remembered and Keymapp is never needed again. Reflash from Oryx and you will want to
+open it once more so runnir learns the new revision.
+
+Worth knowing before turning the lit layer on: it needs shine-through keycaps. With
+opaque caps the LED lights the gap around the cap and not the legend, so you see a
+region rather than a key - measured on a Moonlander with 33 keys lit, then 8, then
+those 8 at maximum brightness. The ambient flashes have no such problem, since they
+ask you to identify no key at all.
+
+RUNNIR_ZSA_DEBUG=1 says which step gave up. Silence is the design - a machine with no
+such keyboard must not be nagged about it - and that flag is the way out of it.
+
+# The map (and the screensaver)
+
+The map zooms the whole WINDOW out - every tab, not just the one you are looking at -
+and draws each pane as a card carrying its state, the command it last ran and the tail
+of what that printed. J K move, Enter goes to that pane (switching tab if it is in
+another one), Esc comes back.
+
+Cards keep each tab's own geometry and the tabs stack downwards, rather than
+re-flowing into a neat grid: a session is recognised by its shape, and a map that
+rearranges it makes you re-learn it every time.
+
+It doubles as a screensaver. Elder Futhark rains behind and across the cards, and the
+time is carved in the middle of the window - centred on the WINDOW, not on whatever
+gap the panes leave, because a clock that moves with the layout is one you have to
+look for. The readings are re-taken about once a second, so what you glance at is
+what is happening now.
+
+  behaviour.screensaver_after_secs   put it up by itself after this long with
+                                     nothing typed. 0 (the default) never does.
+
+'Nothing typed' means no keystroke has reached a pane - the same clock the catch-up
+uses. Window focus is not consulted, in either direction: a focused window on a
+second monitor is not attention, and the pointer crossing another window is not
+absence. When it puts itself up, ANY key dismisses it and that key does nothing else.
+
+The rune font is bundled with runnir, so this works on a machine with nothing
+installed. See assets/fonts/NOTICE.md for what ships and under which licence.
 
 # Docker panel
 

@@ -17,6 +17,8 @@
 //! file, which is what makes it testable with no hardware attached.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 /// LEDs on a Moonlander MK1, and therefore keys per layer in its layout.
 ///
@@ -264,42 +266,147 @@ pub fn read_layout(db: &Path, revision: &str) -> Option<Layout> {
 
 // ---- driving the board ------------------------------------------------------
 
-/// How the board is actually painted: one `kontroll` process per call.
+/// What the board is asked to do, in the board's own vocabulary.
 ///
-/// A trait so the failure modes below can be tested without a keyboard on the desk.
-/// Every one of them was seen for real in one session, and none of them is reachable
-/// from a test that needs hardware.
+/// Intent-shaped rather than command-line-shaped. The previous version spoke
+/// `&["set-rgb", "-l", "19", ...]` because the only transport was a `kontroll`
+/// subprocess, which meant every failure had to be recovered from ENGLISH PROSE on
+/// stdout — the source of three separate bugs: a refusal that said `Failed` while
+/// meaning success, a failure reported on stderr with a zero exit, and a blank first
+/// line that swallowed a whole reply. None of them can exist against a byte protocol.
+///
+/// A trait so the failure modes can be tested with no keyboard on the desk.
 trait Runner: Send {
-    /// Runs `kontroll <args>`, returning its output or the reason it failed.
-    fn run(&mut self, args: &[&str]) -> Result<String, String>;
-    /// Whether Keymapp is up at all. Its socket appearing and vanishing mid-session
-    /// is normal: Keymapp exits on its own, and it is the user's app, not ours.
+    /// Hands the RGB matrix to the host, or back to the firmware. Nothing painted is
+    /// visible until this is on, and turning it off IS the restore: the board goes
+    /// back to the colours its own layout asks for, with nothing for us to replay.
+    fn control(&mut self, on: bool) -> Result<(), String>;
+    /// Every key one colour.
+    fn set_all(&mut self, colour: crate::config::Rgb) -> Result<(), String>;
+    /// One key, by LED index.
+    fn set_led(&mut self, led: u8, colour: crate::config::Rgb) -> Result<(), String>;
+    /// Whether the keyboard is there at all. Unplugging mid-session is normal.
     fn alive(&self) -> bool;
 }
 
-struct Kontroll {
-    bin: PathBuf,
-    socket: PathBuf,
+// ---- the raw HID transport --------------------------------------------------
+
+/// Command codes of ZSA's `oryx` QMK module (`zsa/qmk_modules`, GPL-2.0) — the module
+/// Keymapp itself drives, so these are what the board is already listening for.
+///
+/// Implemented from the published source, not copied from it: what is taken is a wire
+/// protocol. Confirmed against the board rather than assumed — it answers
+/// `fe 04 fe` to `ProtocolVersion`, which is
+/// `[ORYX_EVT_GET_PROTOCOL_VERSION, ORYX_PROTOCOL_VERSION, ORYX_STOP_BIT]` and pins
+/// this firmware to exactly this revision of the source.
+#[repr(u8)]
+enum Op {
+    RgbControl = 5,
+    SetRgbLed = 6,
+    SetRgbLedAll = 9,
 }
 
-impl Runner for Kontroll {
-    fn run(&mut self, args: &[&str]) -> Result<String, String> {
-        let out = std::process::Command::new(&self.bin)
-            .args(args)
-            .output()
-            .map_err(|e| format!("kontroll: {e}"))?;
-        let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
-        // kontroll reports its failures on stdout with a zero exit code, so the exit
-        // status alone would call every one of them a success.
-        if !out.status.success() || text.starts_with("Failed") || text.contains("not found") {
-            return Err(if text.is_empty() { err } else { text });
+/// Report size the firmware expects (`RAW_EPSIZE`). Measured: exactly 32 bytes and NO
+/// leading report-id byte, the detail Linux hidraw makes easy to get wrong either way.
+const REPORT: usize = 32;
+
+/// Usage page `0xFF60` — QMK's raw HID channel, as a report descriptor opens.
+const RAW_USAGE_PAGE: [u8; 3] = [0x06, 0x60, 0xff];
+
+/// ZSA's USB vendor id, as `uevent` spells it.
+const ZSA_VENDOR: &str = "3297";
+
+/// The board, spoken to directly: no Keymapp, no subprocess, no text to parse.
+struct Hid {
+    file: Option<std::fs::File>,
+}
+
+impl Hid {
+    fn new() -> Hid {
+        Hid { file: None }
+    }
+
+    /// Finds the raw endpoint by DESCRIPTOR, never by a remembered path: `hidrawN`
+    /// numbering is handed out in plug order and moves the moment the keyboard is
+    /// unplugged, so a cached `/dev/hidraw3` is a path to somebody else's device.
+    fn find() -> Option<PathBuf> {
+        let mut found: Vec<PathBuf> = Vec::new();
+        for entry in std::fs::read_dir("/sys/class/hidraw").ok()?.flatten() {
+            let dev = entry.path().join("device");
+            if !std::fs::read_to_string(dev.join("uevent")).is_ok_and(|u| u.contains(ZSA_VENDOR)) {
+                continue;
+            }
+            if std::fs::read(dev.join("report_descriptor"))
+                .unwrap_or_default()
+                .starts_with(&RAW_USAGE_PAGE)
+            {
+                found.push(PathBuf::from("/dev").join(entry.file_name()));
+            }
         }
-        Ok(text)
+        // Sorted so a board exposing two raw endpoints is answered the same way every
+        // run, rather than by whatever order the directory happened to be read in.
+        found.sort();
+        found.into_iter().next()
+    }
+
+    /// The open device, opening it on first use and again after it has gone away.
+    fn file(&mut self) -> Result<&mut std::fs::File, String> {
+        if self.file.is_none() {
+            let path = Self::find().ok_or("no ZSA raw HID endpoint")?;
+            self.file = Some(
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&path)
+                    .map_err(|e| format!("{}: {e}", path.display()))?,
+            );
+        }
+        self.file.as_mut().ok_or_else(|| "no device".to_string())
+    }
+
+    /// One report. A failed write drops the handle so the next call reopens, which is
+    /// the whole reconnect story now that no daemon sits in the middle.
+    fn send(&mut self, body: &[u8]) -> Result<(), String> {
+        use std::io::Write;
+        let mut report = [0u8; REPORT];
+        let n = body.len().min(REPORT);
+        report[..n].copy_from_slice(&body[..n]);
+        let debug = std::env::var("RUNNIR_ZSA_DEBUG").is_ok();
+        let file = match self.file() {
+            Ok(f) => f,
+            Err(e) => {
+                if debug {
+                    eprintln!("zsa: no device ({e})");
+                }
+                return Err(e);
+            }
+        };
+        let out = file.write_all(&report).map_err(|e| {
+            self.file = None;
+            format!("write: {e}")
+        });
+        if debug {
+            eprintln!("zsa: -> {} = {out:?}", body.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" "));
+        }
+        out
+    }
+}
+
+impl Runner for Hid {
+    fn control(&mut self, on: bool) -> Result<(), String> {
+        self.send(&[Op::RgbControl as u8, u8::from(on)])
+    }
+
+    fn set_all(&mut self, c: crate::config::Rgb) -> Result<(), String> {
+        self.send(&[Op::SetRgbLedAll as u8, c.0, c.1, c.2])
+    }
+
+    fn set_led(&mut self, led: u8, c: crate::config::Rgb) -> Result<(), String> {
+        self.send(&[Op::SetRgbLed as u8, led, c.0, c.1, c.2])
     }
 
     fn alive(&self) -> bool {
-        self.socket.exists()
+        self.file.is_some() || Hid::find().is_some()
     }
 }
 
@@ -320,22 +427,107 @@ enum Cmd {
 /// and the UI thread cannot spend that.
 pub struct Board {
     tx: std::sync::mpsc::Sender<Cmd>,
+    /// The layer the board last said it was on. Kept here because asking costs a
+    /// subprocess and the answer is wanted on a keystroke; see `refresh_layer`.
+    layer: Arc<AtomicUsize>,
+    /// Whether a reading of that is already out.
+    asking: Arc<AtomicBool>,
+    /// The flashed layout, once it has been read. `None` until Keymapp answers —
+    /// which it cannot do while it is not running, and it is the USER's app: it
+    /// starts after us, it exits on its own, and the keyboard gets unplugged. Held
+    /// here rather than beside the window so that a failed reading is a state to
+    /// retry, not a verdict for the life of the process.
+    layout: Arc<Mutex<Option<Layout>>>,
+    /// Whether a reading of THAT is already out.
+    asking_layout: Arc<AtomicBool>,
 }
 
 impl Board {
-    /// Starts the worker, or `None` when this machine has no keyboard integration —
-    /// no `kontroll` on PATH. Absent tools are not errors here, the same rule docker
-    /// and the credential helper follow: the feature simply does not exist.
+    /// Starts the worker, or `None` when there is no ZSA board on this machine.
+    ///
+    /// Absence is not an error, the same rule docker and the credential helper follow:
+    /// the feature simply does not exist. What is gone from this check is Keymapp —
+    /// the board is reached through its own HID endpoint now, so nothing has to be
+    /// running for the lights to work.
     pub fn start() -> Option<Board> {
-        let bin = kontroll_path()?;
-        let socket = dirs::config_dir()?.join(".keymapp/keymapp.sock");
-        Some(Board::with_runner(Box::new(Kontroll { bin, socket })))
+        Hid::find()?;
+        let board = Board::with_runner(Box::new(Hid::new()));
+        // Take off whatever a previous runnir left on the board. It is the half of the
+        // dead-man switch a timer of our own cannot cover: killed outright while the
+        // leader was armed, nothing ran to put the colours back, and they would sit
+        // there until something did. This is that something.
+        board.restore();
+        Some(board)
     }
 
     fn with_runner(runner: Box<dyn Runner>) -> Board {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || worker(rx, runner));
-        Board { tx }
+        Board {
+            tx,
+            layer: Arc::new(AtomicUsize::new(0)),
+            asking: Arc::new(AtomicBool::new(false)),
+            layout: Arc::new(Mutex::new(None)),
+            asking_layout: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// The flashed layout, if one has been read. Never blocks and never asks.
+    pub fn known_layout(&self) -> Option<Layout> {
+        self.layout.lock().ok()?.clone()
+    }
+
+    /// Starts a reading of the layout in the background, for the NEXT paint.
+    ///
+    /// Costs two blocking calls (`kontroll status`, then the sqlite read), so it can
+    /// never be done inline: this runs on the leader's arming keystroke, and Keymapp
+    /// wedges — its socket stays on disk while it answers nothing. Doing it here on
+    /// the UI thread is the freeze the layer reading already had to be moved off.
+    ///
+    /// Retried rather than done once at startup, because "Keymapp was not up when
+    /// this window opened" is the normal case, not a broken one: it is the user's
+    /// app, so it starts late, quits on its own, and follows the keyboard in and out
+    /// of its socket. A window that gave up at launch stayed dark for hours.
+    pub fn refresh_layout(&self) {
+        if self.layout.lock().is_ok_and(|l| l.is_some()) {
+            return;
+        }
+        let keymapp_up = socket_path().is_some_and(|p| p.exists());
+        // Nothing to go on: Keymapp is not up to be asked and nothing was ever
+        // remembered, so there is no way to know WHICH flashed layout to light. Said
+        // out loud under the debug flag — a silent early return here is exactly the
+        // blindness that made the startup bug take a session to find.
+        if !keymapp_up && remembered_revision().is_none() {
+            if std::env::var("RUNNIR_ZSA_DEBUG").is_ok() {
+                eprintln!("zsa: no Keymapp and no revision remembered yet; open it once");
+            }
+            return;
+        }
+        // With Keymapp down, do not spawn a `kontroll` only to watch it fail: this
+        // runs on every arming of the leader while the board is dark. The reader that
+        // answers `None` sends `ask_layout` straight to what it remembers.
+        let read: fn() -> Option<Status> = if keymapp_up { read_status } else { || None };
+        ask_layout(self.layout.clone(), self.asking_layout.clone(), read, remembered_revision);
+    }
+
+    /// The layer to resolve keys against right now, without asking the board.
+    ///
+    /// Layer 0 until something says otherwise, which is the base layer and also the
+    /// right answer for any layer above it that leaves the letters transparent —
+    /// `effective` walks down to it. That makes "we have not been told yet" and the
+    /// ordinary case the same paint, so nothing has to wait to light correctly.
+    pub fn known_layer(&self) -> usize {
+        self.layer.load(Ordering::Relaxed)
+    }
+
+    /// Starts a reading of the current layer in the background, for the NEXT paint.
+    ///
+    /// `status` is a `kontroll` subprocess with no timeout, and Keymapp does wedge —
+    /// its socket stays on disk while it answers nothing. Called from the leader's
+    /// arming keystroke, so doing it inline froze the whole window on the keypress
+    /// that was supposed to light the keyboard up.
+    pub fn refresh_layer(&self) {
+        ask_layer(self.layer.clone(), self.asking.clone(), read_status);
     }
 
     /// Lights `leds` over a `dim` background. `sustain_ms` is a DEAD-MAN SWITCH: after
@@ -382,111 +574,97 @@ fn kontroll_path() -> Option<PathBuf> {
         .find(|p| p.is_file())
 }
 
+/// Drives the board, and owns the dead-man switch now that Keymapp does not.
+///
+/// `sustain` was a field on Keymapp's request and a timer inside Keymapp: the board
+/// came back on its own even if runnir died mid-paint. The firmware has no such thing
+/// — its opcode carries no time — so the deadline is kept here, and the wait for the
+/// next command doubles as the wait for it to expire. What a timer of our own cannot
+/// survive is runnir being killed outright, which is what the restore at startup is
+/// for.
 fn worker(rx: std::sync::mpsc::Receiver<Cmd>, mut runner: Box<dyn Runner>) {
-    let mut connected = false;
-    while let Ok(first) = rx.recv() {
+    // Paint is on the board and must come off at this instant unless something takes
+    // it off first. `None` means the board is showing its own colours.
+    let mut deadline: Option<std::time::Instant> = None;
+    loop {
+        let next = match deadline {
+            None => rx.recv().ok(),
+            Some(at) => {
+                let left = at.saturating_duration_since(std::time::Instant::now());
+                match rx.recv_timeout(left) {
+                    Ok(c) => Some(c),
+                    // Nothing came and the paint outlived its welcome: take it off.
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        restore(&mut *runner);
+                        deadline = None;
+                        continue;
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => None,
+                }
+            }
+        };
+        let Some(mut cmd) = next else { break };
         // Coalesce: a burst of paints while a level is being walked collapses to the
         // last one. Repainting 72 keys per keystroke is a race that cannot be won.
-        let mut cmd = first;
-        while let Ok(next) = rx.try_recv() {
-            cmd = next;
+        while let Ok(later) = rx.try_recv() {
+            cmd = later;
         }
         match cmd {
             Cmd::Stop => {
-                restore(&mut *runner, &mut connected);
+                restore(&mut *runner);
                 return;
             }
-            Cmd::Restore => restore(&mut *runner, &mut connected),
+            Cmd::Restore => {
+                restore(&mut *runner);
+                deadline = None;
+            }
             Cmd::Flash { colour, ms } => {
-                if ensure_connected(&mut *runner, &mut connected) {
-                    let (c, s) = (hex(colour), ms.to_string());
-                    attempt(&mut *runner, &mut connected, &["set-rgb-all", "-c", &c, "-s", &s]);
+                if take_control(&mut *runner) && runner.set_all(colour).is_ok() {
+                    deadline = Some(after(ms));
                 }
             }
             Cmd::Paint { leds, dim, sustain_ms } => {
-                if !ensure_connected(&mut *runner, &mut connected) {
+                if !take_control(&mut *runner) {
                     continue;
                 }
-                let s = sustain_ms.to_string();
-                let dim_hex = hex(dim);
                 // The background first, so a key that is no longer part of this level
                 // goes dark in the same pass that lights the ones that are.
-                let _ = attempt(&mut *runner, &mut connected, &["set-rgb-all", "-c", &dim_hex, "-s", &s]);
+                if runner.set_all(dim).is_err() {
+                    continue;
+                }
+                deadline = Some(after(sustain_ms));
                 for (led, colour) in &leds {
-                    let (n, c) = (led.to_string(), hex(*colour));
-                    if !attempt(&mut *runner, &mut connected, &["set-rgb", "-l", &n, "-c", &c, "-s", &s]) {
-                        // The board went away mid-paint (unplugged, Keymapp exited).
-                        // Finishing the loop would be 70 more processes for nothing.
+                    if runner.set_led(*led, *colour).is_err() {
+                        // The board went away mid-paint (unplugged). Finishing the
+                        // loop would be seventy more writes to a handle that is gone.
                         break;
                     }
                 }
             }
         }
     }
+    // The channel closed because the handle was dropped: put the board back before the
+    // thread ends, or the last paint outlives the window that asked for it.
+    restore(&mut *runner);
 }
 
-fn restore(runner: &mut dyn Runner, connected: &mut bool) {
+fn after(ms: u32) -> std::time::Instant {
+    std::time::Instant::now() + std::time::Duration::from_millis(ms.into())
+}
+
+/// Hands the RGB matrix back to the firmware. This IS the restore: the board returns
+/// to the colours its own layout asks for, with nothing to remember or replay.
+fn restore(runner: &mut dyn Runner) {
     if runner.alive() {
-        attempt(runner, connected, &["restore-rgb-leds"]);
+        let _ = runner.control(false);
     }
 }
 
-/// Runs one command, recovering from the two failures that are not really failures.
-///
-/// `no keyboard is connected` after an unplug: Keymapp does NOT reconnect by itself,
-/// so connect and try again. `keyboard requires an updated firmware` immediately after
-/// connecting: transient, and the very next call succeeds — seen live, with the retry
-/// working every time.
-fn attempt(runner: &mut dyn Runner, connected: &mut bool, args: &[&str]) -> bool {
-    if !runner.alive() {
-        *connected = false;
-        return false;
-    }
-    match runner.run(args) {
-        Ok(_) => true,
-        Err(e) if is_transient(&e) => {
-            if e.to_lowercase().contains("no keyboard") {
-                *connected = false;
-                if !ensure_connected(runner, connected) {
-                    return false;
-                }
-            }
-            runner.run(args).is_ok()
-        }
-        Err(_) => {
-            // Anything else: give up on this command and re-check the connection
-            // before the next paint rather than hammering a board that said no.
-            *connected = false;
-            false
-        }
-    }
-}
-
-fn is_transient(err: &str) -> bool {
-    let e = err.to_lowercase();
-    e.contains("no keyboard") || e.contains("updated firmware")
-}
-
-fn ensure_connected(runner: &mut dyn Runner, connected: &mut bool) -> bool {
-    if *connected {
-        return true;
-    }
-    if !runner.alive() {
-        return false;
-    }
-    *connected = match runner.run(&["connect-any"]) {
-        Ok(_) => true,
-        // `Failed to connect: keyboard already connected` is a SUCCESS wearing the
-        // word Failed. Reading it as an error meant the first call of every paint
-        // failed, the paint was dropped whole, and — the feature being silent by
-        // design — nothing anywhere said so. The board simply never lit.
-        Err(e) => e.to_lowercase().contains("already connected"),
-    };
-    *connected
-}
-
-fn hex(c: crate::config::Rgb) -> String {
-    format!("#{:02x}{:02x}{:02x}", c.0, c.1, c.2)
+/// Takes the matrix, so that what is painted next is visible at all. Sent every time
+/// rather than tracked: it is one report, and a remembered "we already own it" goes
+/// stale the moment the keyboard is unplugged and re-enumerated.
+fn take_control(runner: &mut dyn Runner) -> bool {
+    runner.alive() && runner.control(true).is_ok()
 }
 
 /// What the board says it is running: the flashed layout's revision, and the layer
@@ -528,37 +706,190 @@ fn parse_status(out: &str) -> Option<Status> {
     Some(Status { revision: revision?, layer })
 }
 
-impl Board {
-    /// Asks the board what it is running. Blocking, so it belongs at startup or on a
-    /// worker — never on the path of a keystroke.
-    pub fn status(&self) -> Option<Status> {
-        let bin = kontroll_path()?;
-        let out = std::process::Command::new(&bin).arg("status").output().ok()?;
-        let text = String::from_utf8_lossy(&out.stdout);
-        // kontroll reports a failed connection on STDERR with a non-zero exit, and
-        // reading only stdout turned that into an empty string and a shrug. Worth
-        // knowing that `XDG_CONFIG_HOME` decides where kontroll looks for Keymapp's
-        // socket, so a sandbox that redirects it cannot reach the keyboard at all.
-        if std::env::var("RUNNIR_ZSA_DEBUG").is_ok() {
-            let err = String::from_utf8_lossy(&out.stderr);
-            eprintln!(
-                "zsa: {} status (exit {:?})\n  out: {}\n  err: {}",
-                bin.display(),
-                out.status.code(),
-                text.trim_end(),
-                err.trim_end()
-            );
-        }
-        if !out.status.success() {
-            return None;
-        }
-        parse_status(&text)
+/// Reads one layer at a time into `layer`, on a thread, never twice at once.
+///
+/// The "never twice" is the point: with Keymapp wedged the read never returns, and
+/// one thread per arming keystroke would pile up threads on a tool that has already
+/// stopped answering. One is stuck, the layer keeps its last value, and the leader
+/// lights carry on painting where they last knew the keys to be.
+fn ask_layer(
+    layer: Arc<AtomicUsize>,
+    asking: Arc<AtomicBool>,
+    read: impl FnOnce() -> Option<Status> + Send + 'static,
+) {
+    if asking.swap(true, Ordering::SeqCst) {
+        return;
     }
+    std::thread::spawn(move || {
+        if let Some(status) = read() {
+            layer.store(status.layer, Ordering::Relaxed);
+        }
+        asking.store(false, Ordering::SeqCst);
+    });
+}
+
+/// Reads the flashed layout off Keymapp's database, on a thread of its own.
+///
+/// Mirrors `ask_layer`: one reading in flight at a time, and a failure leaves the
+/// slot empty so the next arming of the leader tries again. That retry is the whole
+/// point — the reading fails for as long as Keymapp is down, and then succeeds.
+fn ask_layout(
+    layout: Arc<Mutex<Option<Layout>>>,
+    asking: Arc<AtomicBool>,
+    read: impl FnOnce() -> Option<Status> + Send + 'static,
+    // Injected rather than read straight from disk: a fallback that reaches for a real
+    // file makes every test of this function a test of the MACHINE it runs on, which
+    // is a trap this repo has already paid for once.
+    recall: impl FnOnce() -> Option<String> + Send + 'static,
+) {
+    if asking.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    std::thread::spawn(move || {
+        let debug = std::env::var("RUNNIR_ZSA_DEBUG").is_ok();
+        // The revision, from the board if anything can be asked, and otherwise from
+        // the last time something could. Painting no longer needs Keymapp, but knowing
+        // WHICH flashed layout to light still does — and Keymapp must have run at some
+        // point regardless, because its database is where the layout is read from.
+        // Remembering the answer is what turns "Keymapp has to be open" into "Keymapp
+        // has to have been open once".
+        let revision = match read() {
+            Some(status) => {
+                remember_revision(&status.revision);
+                Some(status.revision)
+            }
+            None => {
+                let cached = recall();
+                if debug {
+                    match &cached {
+                        Some(r) => eprintln!("zsa: board not answering; using remembered revision {r}"),
+                        None => eprintln!("zsa: board not answering and no revision remembered yet"),
+                    }
+                }
+                cached
+            }
+        };
+        match revision.and_then(|r| Some((default_db()?, r))) {
+            Some((db, revision)) => {
+                let got = read_layout(&db, &revision);
+                if debug {
+                    match &got {
+                        Some(l) => eprintln!("zsa: layout {revision} loaded, {} layers", l.layers()),
+                        None => eprintln!("zsa: layout {revision} not in {}", db.display()),
+                    }
+                }
+                if let Ok(mut slot) = layout.lock() {
+                    *slot = got;
+                }
+            }
+            None if debug => {
+                eprintln!("zsa: kontroll status gave no revision (is Keymapp running?)")
+            }
+            None => {}
+        }
+        asking.store(false, Ordering::SeqCst);
+    });
+}
+
+/// Where the last known flashed revision is kept, so the lights survive Keymapp not
+/// being open. Derived state, not configuration: it is re-learnt the moment anything
+/// can ask the board again, and losing it costs one session of no lights, not data.
+fn revision_cache() -> Option<PathBuf> {
+    Some(dirs::data_dir()?.join("runnir/zsa-revision"))
+}
+
+fn remember_revision(revision: &str) {
+    let Some(path) = revision_cache() else { return };
+    if remembered_revision().as_deref() == Some(revision) {
+        return;
+    }
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(path, revision);
+}
+
+/// The remembered revision, validated the same way a fresh one is: this string reaches
+/// a SQL statement, and a cache file is a thing a user can edit.
+fn remembered_revision() -> Option<String> {
+    let text = std::fs::read_to_string(revision_cache()?).ok()?;
+    let revision = text.trim().to_string();
+    (!revision.is_empty() && revision.chars().all(|c| c.is_ascii_alphanumeric())).then_some(revision)
+}
+
+/// Where Keymapp listens on Linux. The port 50051 its own window names is Windows
+/// only — see the wiki page; assuming otherwise cost a session.
+pub fn socket_path() -> Option<PathBuf> {
+    Some(dirs::config_dir()?.join(".keymapp/keymapp.sock"))
+}
+
+/// Runs `kontroll status` and reads its answer. Blocking, with no timeout of its own.
+fn read_status() -> Option<Status> {
+    let bin = kontroll_path()?;
+    let out = std::process::Command::new(&bin).arg("status").output().ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    // kontroll reports a failed connection on STDERR with a non-zero exit, and
+    // reading only stdout turned that into an empty string and a shrug. Worth
+    // knowing that `XDG_CONFIG_HOME` decides where kontroll looks for Keymapp's
+    // socket, so a sandbox that redirects it cannot reach the keyboard at all.
+    if std::env::var("RUNNIR_ZSA_DEBUG").is_ok() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        eprintln!(
+            "zsa: {} status (exit {:?})\n  out: {}\n  err: {}",
+            bin.display(),
+            out.status.code(),
+            text.trim_end(),
+            err.trim_end()
+        );
+    }
+    if !out.status.success() {
+        return None;
+    }
+    parse_status(&text)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A failed layout reading has to leave the slot EMPTY and the in-flight flag
+    /// down, so the next arming of the leader asks again. This is the whole fix:
+    /// Keymapp is the user's app, so "not running yet" is the normal state at the
+    /// moment a window opens, and reading the layout once at startup meant such a
+    /// window never lit the board again for as long as it lived.
+    #[test]
+    fn a_layout_reading_that_fails_is_retried_not_final() {
+        let slot: Arc<Mutex<Option<Layout>>> = Arc::new(Mutex::new(None));
+        let asking = Arc::new(AtomicBool::new(false));
+
+        // Keymapp down: no status, so no layout — and nothing latched.
+        ask_layout(slot.clone(), asking.clone(), || None, || None);
+        for _ in 0..200 {
+            if !asking.load(Ordering::SeqCst) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(slot.lock().unwrap().is_none(), "nothing to show for a failed read");
+        assert!(!asking.load(Ordering::SeqCst), "the flag must come back down, or no retry ever runs");
+
+        // Only one reading at a time: a second ask while one is in flight is dropped
+        // rather than piling threads onto a tool that is already not answering.
+        asking.store(true, Ordering::SeqCst);
+        let ran = Arc::new(AtomicBool::new(false));
+        let seen = ran.clone();
+        ask_layout(
+            slot.clone(),
+            asking.clone(),
+            move || {
+                seen.store(true, Ordering::SeqCst);
+                None
+            },
+            || None,
+        );
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        assert!(!ran.load(Ordering::SeqCst), "a second reading must not start while one is out");
+    }
 
     /// Builds a layout JSON the way Keymapp stores one: `codes[layer][key]`, where an
     /// entry of `None` is a key with no tap action at all.
@@ -692,20 +1023,32 @@ mod tests {
     struct Fake {
         alive: bool,
         log: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
-        replies: std::collections::VecDeque<Result<String, String>>,
+        replies: std::collections::VecDeque<Result<(), String>>,
     }
 
     impl Fake {
-        fn new(replies: Vec<Result<String, String>>) -> (Fake, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        fn new(replies: Vec<Result<(), String>>) -> (Fake, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
             let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
             (Fake { alive: true, log: log.clone(), replies: replies.into() }, log)
         }
     }
 
+    impl Fake {
+        fn say(&mut self, what: String) -> Result<(), String> {
+            self.log.lock().unwrap().push(what);
+            self.replies.pop_front().unwrap_or(Ok(()))
+        }
+    }
+
     impl Runner for Fake {
-        fn run(&mut self, args: &[&str]) -> Result<String, String> {
-            self.log.lock().unwrap().push(args.join(" "));
-            self.replies.pop_front().unwrap_or_else(|| Ok(String::new()))
+        fn control(&mut self, on: bool) -> Result<(), String> {
+            self.say(format!("control {}", if on { "on" } else { "off" }))
+        }
+        fn set_all(&mut self, c: crate::config::Rgb) -> Result<(), String> {
+            self.say(format!("all #{:02x}{:02x}{:02x}", c.0, c.1, c.2))
+        }
+        fn set_led(&mut self, led: u8, c: crate::config::Rgb) -> Result<(), String> {
+            self.say(format!("led {led} #{:02x}{:02x}{:02x}", c.0, c.1, c.2))
         }
         fn alive(&self) -> bool {
             self.alive
@@ -731,7 +1074,7 @@ mod tests {
     }
 
     #[test]
-    fn a_paint_dims_everything_then_lights_the_keys_of_the_level() {
+    fn a_paint_takes_the_matrix_then_dims_everything_then_lights_the_level() {
         let (fake, _) = Fake::new(vec![]);
         let log = drive(
             vec![Cmd::Paint {
@@ -744,92 +1087,51 @@ mod tests {
         assert_eq!(
             log,
             vec![
-                "connect-any",
+                // Nothing the host paints is visible until the matrix is taken.
+                "control on",
                 // The background goes down first, so a key that left this level goes
                 // dark in the same pass that lights the ones that arrived.
-                "set-rgb-all -c #050510 -s 10000",
-                "set-rgb -l 19 -c #f5d543 -s 10000",
-                "set-rgb -l 12 -c #6bb1ff -s 10000",
+                "all #050510",
+                "led 19 #f5d543",
+                "led 12 #6bb1ff",
+                // The channel closed: put the board back rather than let the paint
+                // outlive the window that asked for it.
+                "control off",
             ]
         );
     }
 
-    /// The dead-man switch has to be on EVERY call, not just the first: sustain is
-    /// what puts the board back when runnir is killed before it can restore.
+    /// The dead-man switch, now that it is ours. Keymapp used to expire the board on
+    /// its own timer; the firmware has no such thing, so an armed leader that nobody
+    /// disarms has to come off here or the colours stay for good.
     #[test]
-    fn every_call_of_a_paint_carries_the_sustain() {
-        let (fake, _) = Fake::new(vec![]);
-        let log = drive(
-            vec![Cmd::Paint { leds: vec![(1, rgb(1, 2, 3))], dim: rgb(0, 0, 0), sustain_ms: 4242 }],
-            fake,
-        );
-        assert!(log.iter().filter(|c| c.starts_with("set-rgb")).all(|c| c.ends_with("-s 4242")), "{log:?}");
-    }
-
-    /// Unplug and replug: Keymapp keeps its socket but drops the keyboard, and does
-    /// NOT reconnect on its own. Seen live, and it is why `connect-any` is not just a
-    /// startup step.
-    #[test]
-    fn a_disconnected_keyboard_is_reconnected_and_the_call_retried() {
-        let (fake, _) = Fake::new(vec![
-            Ok("connected".into()),                                  // connect-any
-            Err("Failed to set rgb: no keyboard is connected".into()), // set-rgb-all
-            Ok("connected".into()),                                  // connect-any again
-            Ok("ok".into()),                                         // the retry
-        ]);
-        let log = drive(
-            vec![Cmd::Paint { leds: vec![], dim: rgb(0, 0, 0), sustain_ms: 0 }],
-            fake,
-        );
-        assert_eq!(
-            log,
-            vec!["connect-any", "set-rgb-all -c #000000 -s 0", "connect-any", "set-rgb-all -c #000000 -s 0"]
+    fn a_paint_nobody_takes_off_comes_off_by_itself() {
+        let (fake, log) = Fake::new(vec![]);
+        let (tx, rx) = std::sync::mpsc::channel();
+        // The sender is kept alive on purpose: closing it would restore for the wrong
+        // reason and prove nothing about the deadline.
+        tx.send(Cmd::Paint { leds: vec![(1, rgb(9, 9, 9))], dim: rgb(0, 0, 0), sustain_ms: 40 })
+            .unwrap();
+        let handle = std::thread::spawn(move || worker(rx, Box::new(fake)));
+        for _ in 0..100 {
+            if log.lock().unwrap().iter().any(|c| c == "control off") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let seen = log.lock().unwrap().clone();
+        drop(tx);
+        let _ = handle.join();
+        assert!(
+            seen.contains(&"control off".to_string()),
+            "the paint has to expire with nobody asking: {seen:?}"
         );
     }
 
-    /// The bug that made the whole feature look dead: Keymapp answers
-    /// `Failed to connect: keyboard already connected` when the board is ALREADY
-    /// connected. Read as an error, it failed the first call of every paint, dropped
-    /// the paint whole, and — the feature being silent by design — said nothing. The
-    /// keyboard just never lit, for an hour.
+    /// No keyboard, nothing written. The integration does not exist on a machine
+    /// without one, and it must not complain about that.
     #[test]
-    fn already_connected_is_a_success_wearing_the_word_failed() {
-        let (fake, _) = Fake::new(vec![
-            Err("Failed to connect: keyboard already connected".into()),
-            Ok("dimmed".into()),
-            Ok("lit".into()),
-        ]);
-        let log = drive(
-            vec![Cmd::Paint { leds: vec![(19, rgb(1, 2, 3))], dim: rgb(0, 0, 0), sustain_ms: 500 }],
-            fake,
-        );
-        assert_eq!(
-            log,
-            vec!["connect-any", "set-rgb-all -c #000000 -s 500", "set-rgb -l 19 -c #010203 -s 500"],
-            "the paint has to go ahead"
-        );
-    }
-
-    /// The transient one: right after connecting, the first call can answer
-    /// "keyboard requires an updated firmware" and the next one succeeds. Believing
-    /// the first answer would turn the feature off for the whole session.
-    #[test]
-    fn the_firmware_error_right_after_connecting_is_retried_once() {
-        let (fake, _) = Fake::new(vec![
-            Err("Failed to set rgb: keyboard requires an updated firmware".into()),
-            Ok("ok".into()),
-        ]);
-        let log = drive(vec![Cmd::Restore], fake);
-        // No connect-any: the board is connected, it just was not ready yet. A restore
-        // does not force a connection either — if it turns out there is no keyboard,
-        // the "no keyboard" branch handles that, and this is not that.
-        assert_eq!(log, vec!["restore-rgb-leds", "restore-rgb-leds"]);
-    }
-
-    /// Keymapp exits on its own — it did, mid-session. With no socket, nothing runs at
-    /// all: no processes spawned, no errors, no keyboard integration.
-    #[test]
-    fn with_keymapp_gone_nothing_is_spawned_at_all() {
+    fn with_no_keyboard_nothing_is_written_at_all() {
         let (mut fake, _) = Fake::new(vec![]);
         fake.alive = false;
         let log = drive(
@@ -843,21 +1145,20 @@ mod tests {
     }
 
     /// Walking three levels of the leader quickly must paint ONCE, at the level the
-    /// walk stopped on. 72 keys at ~4 ms a process is a race that cannot be won by
-    /// painting every step of the way.
+    /// walk stopped on.
     #[test]
     fn a_burst_of_paints_collapses_to_the_last_one() {
         let (fake, _) = Fake::new(vec![]);
         let log = drive(
             vec![
-                Cmd::Paint { leds: vec![(1, rgb(1, 1, 1))], dim: rgb(0, 0, 0), sustain_ms: 1 },
-                Cmd::Paint { leds: vec![(2, rgb(2, 2, 2))], dim: rgb(0, 0, 0), sustain_ms: 1 },
-                Cmd::Paint { leds: vec![(3, rgb(3, 3, 3))], dim: rgb(0, 0, 0), sustain_ms: 1 },
+                Cmd::Paint { leds: vec![(1, rgb(1, 1, 1))], dim: rgb(0, 0, 0), sustain_ms: 60_000 },
+                Cmd::Paint { leds: vec![(2, rgb(2, 2, 2))], dim: rgb(0, 0, 0), sustain_ms: 60_000 },
+                Cmd::Paint { leds: vec![(3, rgb(3, 3, 3))], dim: rgb(0, 0, 0), sustain_ms: 60_000 },
             ],
             fake,
         );
-        assert_eq!(log.iter().filter(|c| c.starts_with("set-rgb ")).count(), 1, "{log:?}");
-        assert!(log.iter().any(|c| c.starts_with("set-rgb -l 3")), "the LAST level, not the first: {log:?}");
+        assert_eq!(log.iter().filter(|c| c.starts_with("led ")).count(), 1, "{log:?}");
+        assert!(log.iter().any(|c| c == "led 3 #030303"), "the LAST level, not the first: {log:?}");
     }
 
     /// Stopping restores. A terminal that exits leaving the board in its colours is
@@ -866,21 +1167,21 @@ mod tests {
     fn stopping_puts_the_board_back() {
         let (fake, _) = Fake::new(vec![]);
         let log = drive(vec![Cmd::Stop], fake);
-        assert_eq!(log, vec!["restore-rgb-leds"]);
+        assert_eq!(log, vec!["control off"]);
     }
 
-    /// The board going away DURING a paint stops the paint: the alternative is 70 more
-    /// processes spawned at 4 ms each for a keyboard that is not there.
+    /// The board going away DURING a paint stops the paint: the alternative is seventy
+    /// more writes to a handle that is already gone.
     #[test]
     fn a_board_that_vanishes_mid_paint_does_not_finish_the_level() {
         let (fake, _) = Fake::new(vec![
-            Ok("connected".into()),
-            Ok("dimmed".into()),
-            Err("Failed to set rgb: some other problem".into()),
+            Ok(()),                       // control on
+            Ok(()),                       // the dim background
+            Err("write: No such device".into()), // the first key, and the last
         ]);
         let leds = (0..20).map(|i| (i, rgb(1, 1, 1))).collect();
         let log = drive(vec![Cmd::Paint { leds, dim: rgb(0, 0, 0), sustain_ms: 0 }], fake);
-        assert_eq!(log.len(), 3, "stopped at the first refusal: {log:?}");
+        assert_eq!(log.len(), 4, "stopped at the first refusal, then restored: {log:?}");
     }
 
     /// The status parser, against the shape kontroll really prints (measured on the
@@ -930,6 +1231,40 @@ mod tests {
         // LED 36 the INNER top-right one.
         assert_eq!(l.led_for("escape", 0), Some(0));
         assert_eq!(l.led_for("6", 0), Some(36));
+    }
+
+    /// The leader lights need the active layer, and the only way to learn it is a
+    /// `kontroll` subprocess with no timeout — on a keystroke, with Keymapp wedged,
+    /// that is the window frozen under the user's hand. So the arming key reads what
+    /// the board last said and asks for the next reading in the background, and a
+    /// second arming while the first is still out asks nothing at all.
+    #[test]
+    fn arming_the_leader_never_waits_for_the_keyboard_to_answer() {
+        let layer = Arc::new(AtomicUsize::new(3));
+        let asking = Arc::new(AtomicBool::new(false));
+        // Stands in for a wedged Keymapp: it answers when the test lets it, not before.
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let (answered, done) = std::sync::mpsc::channel::<()>();
+        ask_layer(layer.clone(), asking.clone(), move || {
+            held.recv().ok()?;
+            let _ = answered.send(());
+            Some(Status { revision: "Jad5YO".into(), layer: 1 })
+        });
+
+        // The arming key is already through: it paints on the layer it knew.
+        assert_eq!(layer.load(Ordering::SeqCst), 3, "the paint uses the last known layer");
+        // And every further arming while that one hangs starts nothing new.
+        for _ in 0..5 {
+            ask_layer(layer.clone(), asking.clone(), || panic!("a second reading was started"));
+        }
+
+        release.send(()).unwrap();
+        done.recv_timeout(std::time::Duration::from_secs(5)).expect("the reading finishes");
+        // The answer lands for the next paint, not for the one that asked.
+        while asking.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+        assert_eq!(layer.load(Ordering::SeqCst), 1, "the next paint uses what the board said");
     }
 
     /// A revision id reaches a SQL statement, so anything that is not what Keymapp

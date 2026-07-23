@@ -2202,8 +2202,727 @@ because `cargo test` builds the test harness and does NOT refresh
 `target/release/runnir`. That is the second time today a stale binary made working
 code look broken.
 
+## DESIGN, NOT YET BUILT — five candidates, picked 2026-07-22
+
+Pedro picked all four proposed candidates plus the canvas. Written up here before any
+code, the same ritual the explorer and the Docker panel went through. Implementation
+order below is by risk, lowest first — each one ships on its own before the next
+starts. Prose versions live in the qlaios wiki (*Ideas candidatas* I and II).
+
+### 1. The window catches you up  (`catch_up`)
+
+**What.** Come back after a while away and get ONE headline per pane instead of six
+scrollbacks: `cargo build · ok · 3 warnings · 1m12s`, `deploy · waiting for your
+confirmation · 12m`, `cargo test · 2 new failures`. Enter jumps to the pane that
+matters; Escape dismisses.
+
+**Leans on** what already exists: OSC 133 marks every command with its exit code and
+duration (`grid.command_seq`, `last_exit_code`, `Pane::take_completion`), the keyword
+watch already pulls relevant lines out of output, and the guardian already knows when
+a pane is blocked on a confirmation.
+
+**Decisions.**
+- **Explicit, never automatic.** It is an action (leader `u`), not a heuristic that
+  guesses you were away and rearranges your screen.
+- **What "away" means is NOT window focus.** Focus lies: a focused window on a second
+  monitor is not attention. The clock that matters is *time since the last keystroke
+  went to a PTY* — runnir already knows that exactly.
+- **A pane with nothing to say says nothing.** Four panes idle at a prompt produce a
+  four-line summary saying "nothing happened", which is worse than no feature. Only
+  panes whose state CHANGED while you were away get a line.
+
+**Traps.** A wrong headline is worse than no headline — when the state cannot be
+summarised (a full-screen app, a pane with no shell integration), say "no marks" and
+show the last line verbatim rather than inventing a status. Ranking matters more than
+completeness: something waiting on the user outranks a failure, which outranks a
+success.
+
+**Verified** headless: `--dump` a scripted session per pane, assert the headline text.
+The ranking is a pure function over `(exit code, waiting, duration, watch hits)` and
+gets unit tests.
+
+### 2. The real verbs of this repo  (`repo_verbs`)
+
+**What.** runnir sees what is actually typed in each project, and offers the five
+verbs that repo is really worked with — not the aliases someone defined, not the
+README nobody updated. A new dev opens the repo and the window already knows how it
+is built, tested and deployed.
+
+**Leans on** the per-command history with cwd and exit code, plus the repo root the
+git panel and explorer already compute.
+
+**Decisions.**
+- **Only commands that SUCCEEDED count.** A verb learned from failures teaches the
+  wrong thing.
+- **Arguments are never stored.** `curl -H "Authorization: Bearer …"` and
+  `scp ~/clients/acme/dump.sql` are commands people run; the head of the command is
+  the verb, the tail is private. This is the difference between a useful feature and
+  a leak, so it is enforced at the point of capture, not at display.
+- **A threshold, not a tally.** Two runs is not a habit. Below N occurrences a
+  command is not a verb.
+- **Opt-in, and per-repo.** Nothing is recorded until asked.
+
+**Traps.** The store is per-repo-root and lives beside runnir's data, never inside the
+repo — a `.runnir-verbs` file committed by accident would publish someone's shell
+history to the team. Sharing is an explicit export, never automatic.
+
+### 3. Tactile pipes: drag one pane's output into another  (`drag_output`)
+
+**What.** Grab the output block of a command and drop it on another pane: it arrives
+as that pane's stdin. Dropped on the AI panel it is context; dropped on the explorer
+it is saved as a file. The pipe you compose AFTER running, with your hand.
+
+**Leans on** `dnd.rs` (runnir speaks `wl_data_device` directly — winit does not do
+drag sources) and the OSC 133 segmentation that makes "which block am I grabbing"
+answerable at all.
+
+**Decisions.**
+- **A drop PROPOSES, never executes.** It leaves the line staged at the prompt and a
+  key confirms. A drag that runs something is a mouse slip that runs something.
+- **The grab target is a command BLOCK**, not a selection: the unit the user thinks in
+  is "the output of that command", which is exactly what OSC 133 delimits.
+- **Big outputs go through a file.** Past a threshold the drop writes to a temp file
+  (0600, the same private-write path the scrollback dump uses) and stages the path
+  instead of the bytes.
+
+**Traps.** Dropping onto a pane that is running a full-screen app must be refused, not
+typed into vim. And the source pane's output can contain secrets — the same rule as
+the scrollback dump: private file, no world-readable temp.
+
+### 4. The war room that assembles itself  (`war_room`)
+
+**What.** You declare "I am deploying this" and the window arranges itself around the
+operation: the deploy pane, the remote daemon's events, the logs of the services that
+will change, the healthcheck. When it finishes cleanly it takes itself down.
+
+**Leans on** the Docker panel (contexts, remote hosts over ssh), `docker-compose.yml`
+for which services exist, container labels for where the project lives, and the git
+remote for which repository this is. It asks the user nothing.
+
+**Decisions.**
+- **Explicitly started, like the catch-up.** A layout that appears unbidden is a
+  window that reorganises your work.
+- **Teardown never closes a pane you touched.** If you typed in it, it stays. The
+  test is literal: any pane that received a keystroke is exempt.
+- **Each pane paints when its data arrives.** Services can live on several machines;
+  half the room may be waiting on the network. Never one frame that waits for all.
+
+**Traps.** The biggest is scope: this is the only one of the five that depends on
+another panel's maturity, so it goes last of the four before the canvas. A war room
+that guesses wrong about which services are involved is worse than no war room —
+when compose is absent or ambiguous, say so and open the deploy pane alone.
+
+### 5. Canvas, not mosaic  (`canvas`)
+
+**What.** Panes stop living in a grid of rectangles and move onto an infinite canvas
+with zoom. Zoomed out, the session is a map; zoomed in, a pane is a terminal at full
+fidelity. Semantic zoom: from far away a pane does not draw unreadable text, it draws
+its headline — repo, running command, state.
+
+**Leans on** the renderer already drawing arbitrary grids at arbitrary positions
+(panes, chrome, overlays, images as textures) and the layout tree already separating
+"what area does each pane get" from its content.
+
+**Decisions.**
+- **Zoom is VISUAL; the PTY size is not.** A pane being zoomed cannot be resizing —
+  every zoom step would resize the pseudo-terminal and full-screen programs do not
+  survive that. The cell grid stays fixed; only the transform changes.
+- **The headline at low zoom is the catch-up's headline.** Feature 1 is a prerequisite,
+  not a coincidence: both need one line that says what a pane is doing.
+- **Home is always one key away.** Getting lost is the classic failure of this
+  interface, so "fit everything" and "back to the focused pane" are bound from the
+  start, not added later.
+
+**Traps.** This is the biggest change in the list and the only one that touches the
+layout tree everywhere, so it goes last. It also has to earn its place: if navigating
+the canvas is slower than the mosaic for the everyday case, it stays behind a config
+flag rather than replacing the grid.
+
+## 2026-07-22 - Candidate 1 built: the window catches you up
+
+`src/catchup.rs` plus a panel and a leader key (`leader u`). Six panes of scrollback
+is not a status report; this turns each pane into one line and ranks them so the
+first line you read is the one that wants you.
+
+**The ranking is the feature**, and it is a pure function with tests: waiting on you
+> failed > watched word > running > done. Ties break by pane id, because a list that
+reorders between two glances is one you have to read twice.
+
+**"Away" is not window focus.** Focus lies in both directions — a focused window on a
+second monitor is not attention, and the pointer crossing another window is not
+absence. The clock runs from the last keystroke that reached a PTY, which runnir
+already knows exactly. After a minute of that, every pane's command counter is marked;
+the catch-up then reports only what moved past its mark.
+
+**A pane with nothing to say says nothing.** Four idle panes producing four lines of
+"nothing happened" is worse than no feature, so a quiet prompt is omitted entirely —
+unless it is blocking on you, which is worth saying even when nothing moved.
+
+**An unmarked pane gets its last line, verbatim, labelled `no marks`** — never an
+invented status. "The terminal told me it was fine" is the worst way to be wrong.
+
+The headline names the COMMAND, not the shell's window title. The first live run
+showed `drheavymetal@drheavymetal:~ · exit 1`, which is a row that tells you nothing
+about what you missed; it now reads `ls /noexiste · exit 2`.
+
+Verified on a real instance over the control socket, with the panel exposed in
+`ui_state` so a script can assert it: a failing command and a long-running one, with
+the third pane silent. Two of my own test runs were wrong before the code was —
+commands typed into a pane that was busy sleeping, and a split action id that does not
+exist (`split_down`; they are `split_horizontal` / `split_vertical`).
+
+## 2026-07-22 - "Nothing to summarize" was the alternate screen
+
+Reported from use: AI → summarize this session answered "nothing in the scrollback to
+summarize yet". Not a false alarm — a real hole, and an instructive one.
+
+While a full-screen app is up, the primary screen is PARKED and `scrollback_text`
+returns only the scrollback ring. That is correct and must stay: the alternate screen
+is not history, and letting a minute of htop into the scrollback would evict
+everything worth keeping. But it means a pane that entered vim, htop or Claude Code
+early has almost nothing to offer, and the summary of a working session came back
+empty.
+
+Three changes, in increasing order of how obvious they should have been:
+- The parked primary screen is now included — it is precisely what the pane was doing
+  before the app took over.
+- A session is the WINDOW, not one pane: with the focused pane empty, the rest of the
+  tab is used.
+- When there really is nothing, the message says WHICH nothing: a full-screen app with
+  no history behind it, or a window where no command has run yet. Those need different
+  things from the user.
+
+Reproduced from inside htop with real work behind it, and verified the summary now
+starts instead of refusing.
+
+## 2026-07-22 - Candidate 2 built: the real verbs of this repo
+
+`src/verbs.rs` plus a panel (`leader o v`). Learns what a repository is actually
+worked with from commands that SUCCEEDED here, and offers them back: a newcomer opens
+the repo and the window already knows how it is built, tested and deployed.
+
+**The privacy line is enforced at CAPTURE, not at display.** `curl -H "Authorization:
+Bearer …"`, `scp ~/clients/acme/dump.sql host:` and `psql postgres://user:pass@…` are
+things people type; the head is the verb and the tail is private. Filtering at display
+would mean the secret is already on disk by the time anyone thinks about it. A test
+runs those exact three lines and asserts nothing survives but the verb.
+
+**Two words, never three.** `cargo` alone says nothing about whether this repo is
+built, tested or published, so a known tool keeps its subcommand — but only when the
+next word is really a subcommand from a fixed vocabulary. The tempting heuristic ("a
+bare word after a tool is a subcommand") turns `python train.py` into a verb
+containing somebody's filename and `ssh cloudmax` into one containing a hostname.
+
+**Only successes count**, because a verb learned from what does not work teaches the
+wrong thing. And a threshold, because two runs is an experiment, not a habit.
+
+**The first live run taught the list what it is not.** With everything working, the
+top entry was `cd`. Navigation and looking-around (`ls`, `cat`, `clear`, `sudo`…) are
+how anyone uses any directory and say nothing about this project — a list whose first
+line is `cd` teaches a newcomer nothing. They are filtered now.
+
+Verified on a real instance, and the claim checked where it matters — on DISK. After
+running a `scp` with a private path and a `git status --short` three times, the store
+contained exactly `{"git status": 3, "cargo": 1}` under the repo root: no arguments,
+no `--short`, no path, and the failed `scp` not recorded at all.
+
+**Still open before this can be shared with a team**, which the idea calls for: the
+store is keyed by absolute repo path, so an export would carry `/home/pedro/...`. The
+export step has to key by repo remote or name instead. Not built — sharing is not
+part of this slice.
+
+## 2026-07-22 - Candidate 3 built: tactile pipes
+
+Grab a command's output block with the MIDDLE button, drop it on another pane: the
+output is written to a private file and its path is staged at that pane's prompt. The
+pipe you compose after running, with your hand.
+
+**A drop proposes and never executes.** The path is left on the command line for a key
+to confirm — a gesture that runs something is a mouse slip that runs something, and
+this one starts from output the user has not necessarily read.
+
+**Always through a file, whatever the size.** Typing the text into a shell would run
+each line as a command, which is the opposite of "as stdin". The file is 0600 in the
+per-user runtime dir, the same private-write path the scrollback dump uses, because
+command output holds secrets often enough to assume it does.
+
+**Middle CLICK still pastes the primary selection.** The press only arms the gesture;
+the paste happens on release when the pointer never really moved (12 px). Breaking a
+decades-old mouse convention to add a new one would be a bad trade.
+
+**Dropping on a pane running a full-screen app is refused** — typing a path into vim
+is not a pipe. Dropping a block back on its own pane does nothing.
+
+Internal drag, deliberately: this needs no Wayland drag source at all, since both ends
+are runnir's own panes. Dragging OUT to another application would need
+`wl_data_device` as a source (dnd.rs currently only receives), and that is a separate
+piece of work.
+
+**Three of my own instruments lied before the code did**, which is the real lesson of
+this one:
+- `ui_state` did not expose the status toast, so every refusal and every success
+  message read as `null` from a script. The feature had been working for two rounds of
+  "it does nothing". It is exposed now — a message the user can see and a script
+  cannot is a message that cannot be tested.
+- The test window was tiled by Hyprland down to 22x5 cells, so the drag's two ends
+  landed in the same cell (correctly treated as a click) and later a split was refused
+  for want of room. Test windows for anything positional have to be floated and sized
+  first.
+- The coordinates came from a window that no longer existed, so the drop landed
+  outside the surface.
+
+**Known limitation**: block boundaries come from prompt marks, so a themed prompt
+spanning several rows leaves its extra rows in the payload. Stripping exactly one row
+is right for a one-line prompt and approximate otherwise; guessing where a powerline
+prompt ends is worse than the residue. Pinned by tests either way.
+
+## 2026-07-22 - Candidate 4 built: the war room
+
+`leader w w` opens a tab arranged around a deploy: a `docker compose ps` watch, one
+`logs -f` pane per service, and the deploy itself staged at the prompt. `leader w q`
+takes it down.
+
+**It asks nothing.** The compose file already lists the services, so `warroom.rs`
+reads it — hand-parsed rather than adding a YAML crate, because what is needed is one
+level of keys under `services:` and the parse is deliberately conservative: anything
+ambiguous is dropped, since a pane opened for `ports` or `pgdata` is a room that lies
+about the project. Tests cover four-space and tab indentation, `x-services:` (an
+extension field, not the section), and settings being mistaken for services.
+
+**Nothing it opens does anything but watch**, and a test asserts exactly that — no
+`up -d`, no `restart`, no `pull` in any generated command. The deploy is staged for
+the user to fire: a window that arranges itself is a convenience, one that deploys by
+itself is an accident waiting for a witness.
+
+**Teardown keeps what you touched.** Every pane records whether a keystroke ever
+reached it; the close only removes panes the room opened AND nobody typed in.
+Verified live: typed in one pane, closed the room, that pane survived and the rest
+went — including the one holding the staged deploy.
+
+**Two of my own mistakes, both worth keeping:**
+- The first run opened 2 panes instead of 5 and said nothing, because the splits were
+  failing and the code ignored the error with `let _ =`. A war room missing the
+  service you care about is worse than one that admits it — it reports now, and stops.
+- The window was tiled small again, which is what made the splits fail.
+
+**And a real gap closed on the way**: `press_key` never forwarded to the child, so a
+scripted key could open panels but not type a single letter — which is also why
+`touched` could not be set from a script. `keys::encode_key` now takes a bare `Key`
+(a scripted press cannot build a winit `KeyEvent`; `platform_specific` is private),
+and the scripted path types like the real one. That is the third time this session
+that `press_key` diverging from `on_key` cost a debugging round.
+
+## 2026-07-22 - Candidate 5 built: the map — and the half of it that is NOT built
+
+`leader m` zooms the whole session out: every pane becomes a card with its state, the
+command it last ran, and the tail of what that printed. J/K move, Enter goes to that
+pane, Escape comes back.
+
+**The cards keep the panes' own geometry.** A map that re-flows into a neat grid makes
+you re-learn the shape of your session every time you open it; here the zoom is what
+you read, not where things are, so the map looks like the window it describes.
+
+**What shipped is the SEMANTIC half of "lienzo, no mosaico".** The design asked for an
+infinite canvas: panes at free positions, pan around, zoom out to see everything. The
+free positions and the panning are **still not built**, and the reason is in the design
+itself — a pane is a PTY, and a PTY's size is rows and columns, not pixels. Zooming out
+"for real" would mean either resizing every child (which reflows vim, htop and every
+TUI in the session) or rendering text at a scale where it is not text any more. So the
+zoom is a VIEW: cards in the panes' places, at readable size. The canvas half stays
+designed-not-built rather than shipped as a lie.
+
+**Every pane gets a card, including the quiet ones.** `catchup::headline` returns
+`None` for a pane with nothing to say — right for the catch-up, wrong here, because a
+map with holes in it is not a map. Quiet panes fall back to `idle · at a prompt`.
+
+**The glimpse had to come from the BLOCK, not the scrollback.** The first version
+showed the last three non-blank lines, which on a themed prompt is powerline glyphs, a
+hostname and a clock — a map full of clocks. `Grid::recent_output` now reads the OSC
+133 block: the cursor's own when a command is running, the previous one when the pane
+sits at a fresh prompt (that block has printed nothing yet). Without marks it falls
+back to the raw tail, and says so by simply showing it.
+
+**Three visual passes, and the screenshots earned all three.** Rendered first with no
+card surface (text floating on the backdrop, the selected card a full-width blue bar),
+then with per-card backgrounds and a header row, then with the block-output glimpse.
+Verified live over the control socket AND by eye at 1400x900: `ok cargo --version`,
+`running sleep 500`, `failed ls /noexiste` with the real error underneath.
+
+## 2026-07-22 - Audit round on the five candidates: nine defects, two of them serious
+
+An adversarial read of everything added on `feat/ideas-candidatas`, then a separate
+pass to verify and fix. Eight findings were real, one was half right.
+
+**The two that mattered:**
+- `verbs.rs` promised in its own doc comment that arguments never reach disk, and then
+  wrote one. The environment-prefix skip stepped over exactly ONE assignment, so
+  `RUST_LOG=debug OPENAI_API_KEY=sk-live-… cargo run` recorded the KEY AND VALUE as
+  the verb and persisted it to `verbs.json`. Now every assignment is stepped over, and
+  a line that is only assignments yields no verb at all.
+- The war room interpolated the compose directory and the service names into a string
+  run with `sh -c`. `services_in` rejects quotes, braces and spaces but not `;`, `$(`
+  or backticks, so cloning a repo and pressing `leader w w` was arbitrary code
+  execution — including the staged `docker compose up -d`, one Enter away. Fixed by
+  QUOTING (`shell_quote`), not by filtering harder: a legal-but-odd service name still
+  deserves its pane, and a repo path with a space used to break every pane anyway.
+
+**The rest, each with a test that names the invariant:**
+- `recent_output` picked a block too far back on a ONE-LINE prompt, where the cursor
+  row equals the newest prompt mark. The map showed the output of the command before
+  the last one. My own test had passed only because it fed a trailing newline no shell
+  emits — the test was the bug's alibi.
+- `last_watch_hit` was set and never cleared, so one hit marked a pane "watch" forever
+  and hid every later failure (the headline checks the watch before the exit code). It
+  now clears where the catch-up window opens, and when the watch is taken off.
+- `pipe_output` mapped pointer row to buffer row by hand while `point_in` went through
+  the fold display plan: with outputs folded, a drag staged a different command's
+  output. Both paths share `Grid::row_at_view` now.
+- The leader lapse in `about_to_wait` cleared the three fields directly instead of
+  going through `end_leader`, so a leader that timed out left the KEYBOARD PAINTED
+  until the board's dead-man expired. Exactly the invariant `end_leader`'s doc comment
+  claims; written and then bypassed in another file.
+- `press_key` diverged from `on_key` for the FOURTH time — no kitty encoding, no copy
+  mode, no media keys, swallowed keys the explorer declined, and ran the sidebar in
+  the wrong order. Both now call one `route_key`. The lesson has repeated enough:
+  a second entry point into key handling is a bug generator, not a feature.
+- `open_war_room` ignored the tab-spawn result, so a failed spawn built the room in
+  the user's own tab and marked one of their panes as the room's property.
+- `short_path(w - 28)` could underflow on a narrow window (the clamp floor is 34, but
+  the following `.min(cols - 2)` goes under it).
+
+487 tests (was 477). Left for a separate look: `take_watch_hit` scans from the previous
+cursor row + 1, so the first line printed after a poll boundary is never matched —
+harmless with multi-line output, which is why nobody noticed.
+
+## 2026-07-22 - Second audit round: the first round's fix was not deep enough
+
+Six more, all real. The pattern of the round: each one lived one level below where
+the last round stopped looking.
+
+- **The verbs leak again, deeper.** Round one made the environment-prefix skip loop
+  over every assignment — but it recognised an assignment by `contains('=')` on a
+  whitespace token, so a QUOTED value with a space walked straight through:
+  `AUTH="Bearer sk-live-…" curl …` tokenises as `AUTH="Bearer`, `sk-live-…"`, `curl`,
+  and the second token became the verb and went to disk on the first run. The fix is a
+  quote-aware pass that also cuts the stage at an unquoted `|`, `;` or `&&`, and
+  returns NOTHING when a quote never closes: a missing verb costs nothing, a leaked
+  one is unrecoverable.
+- **The catch-up baseline was taken 60 seconds too late.** Absence was noticed a
+  minute after the last keystroke and the baseline was marked THEN, so a 30-second
+  deploy that failed while you were walking away was absorbed into the baseline and
+  could never be reported — the feature's flagship scenario, silently broken. The
+  baseline now sits at the last keystroke (armed on the key, consumed by the 500 ms
+  sweep; marking on the key itself would lock every pane's grid on every keypress).
+- **…and only the ACTIVE tab was marked**, while the watch scan in the same sweep
+  walked all of them. Every other tab kept a stale baseline and an uncleared watch hit
+  — round one's "watch hit never cleared" fix simply never ran there.
+- `last_nonblank_line` scanned rows `0..rows()` while `abs_cell` indexes
+  `scrollback ++ screen`, so with any history at all it answered with the OLDEST line
+  in the buffer. An unmarked pane's catch-up headline quoted the first line it ever
+  printed. Its tests only ever used grids with empty scrollback.
+- **The war room left a watcher running.** `close_war_room` ignored that `close_pane`
+  refuses to close a tab's LAST pane, so a room nobody typed in left one
+  `watch -n 2 docker compose ps` polling forever in a tab that looked empty — while
+  the toast said "0 panes kept". When nothing is kept the TAB goes now (and a plain
+  tab is created first if it was the only one: a teardown key must not close the
+  window). The kept count is read after closing, so it cannot lie.
+- `split_running_with_id` returns `Ok(())` WITHOUT splitting when the pane is too
+  small, so the war room dropped services silently on a small window — round one only
+  taught it to notice `Err`. Splits return `Result<bool>` now. The toast also claimed
+  `plan.services.len()` while the log panes are capped at 3; it reports what is on
+  screen.
+
+492 tests (was 487). Verified live: teardown removes the tab and leaves no watcher
+behind, and a command that fails seconds after the last keystroke IS in the catch-up.
+
+**A test-harness lesson, not a product one:** `kill -9` on a runnir whose binary has
+since been rebuilt does not match `readlink /proc/PID/exe` any more — the link reads
+`.../runnir (deleted)`. Twelve orphaned test instances had piled up, two still holding
+`watch` children. Match on the process environment (`XDG_DATA_HOME` under the
+scratchpad), not on the exe path.
+
+## 2026-07-23 - Third round: stop blacklisting shell syntax, and claim a pane on paste
+
+Five more. The verbs capture leaked for the THIRD round running — this time through
+command substitution: `TOKEN=$(cat secret-name.txt) cargo test` tokenises so that the
+assignment skip lands on `secret-name.txt)`, and trimming the stray `)` laundered it
+into an honest-looking verb.
+
+**The lesson is the fix.** Two rounds of blacklisting were each one shell feature
+behind. Now an assignment prefix is only stepped over when it is PLAIN
+(`NAME=value`, variable-shaped name, and a value with no `$`, backtick or parens),
+and a word can only be a verb when it is shaped like a program name. Anything the
+shell would have expanded means the line teaches nothing at all. `trim_matches` is
+gone: sanitising the ends of a word is what made a filename look like a command.
+
+- `split_running` was taught to report a refused split for the war room in the last
+  round — and every OTHER caller went on ignoring it. A git push that "reruns in a
+  split" ran nowhere on a cramped window; the control socket answered `ok` to
+  `launch --type split` with the OLD pane's id, so a script's next `send-text` typed
+  into the user's shell; `pipe_through` wrote its temp file for a filter that never
+  opened. One helper states the two failure wordings, and eleven call sites use it.
+- **Paste never claimed the pane.** `touched`, `last_pty_key` and the catch-up
+  baseline were set in `write_key_bytes` only, so a deploy PASTED into a war-room pane
+  (trailing newline, zero keystrokes) left the pane "untouched": `leader w q` then
+  removed the tab and `Pty::drop` killed the running deploy. Now a shared
+  `Pane::write_from_user` claims the pane and a shared `note_input_reached_child`
+  winds the window-wide clock; paste, middle-click, clipboard history, file drop,
+  broadcast (which never claimed anything either) and the AI's inserted command all go
+  through them. The war room stages its deploy TYPED BUT NOT CLAIMED — otherwise the
+  room could never be torn down at all.
+- `named_key` stopped at F12 while `named_id` and `canonical_named` went to F24, so
+  `runnir @ key --chord f13` could not press the very keys the ZSA work exists for.
+- The map was built from `visible_rects`, which honours zoom and Stack — so "the
+  session zoomed out" showed exactly ONE card when a pane was zoomed, breaking the
+  invariant written three lines above it. `Tab::map_layout` gives the arrangement the
+  tab would have without zoom, with a grid fallback rather than a map with holes.
+  Verified live: three panes, one zoomed, three cards.
+
+498 tests (was 492). Flagged, not fixed: control-socket `send-text` deliberately does
+NOT claim a pane (a script is not a person), which means a war-room pane driven only
+by a script still tears down under a running command.
+
+## 2026-07-23 - Fourth round: convergence, and the manual made honest
+
+The signal to stop: this round found nothing new in the feature code. The four it did
+find were all PRE-EXISTING, surfaced by reading the seams the fixes had exposed.
+
+- **The palette was a degraded twin of the keyboard for closing.** `route_key` killed
+  the on_key/press_key divergence for keys, but `run_action`/`run_palette_action` are
+  still two hand-kept copies — and their close arms had drifted: from the palette,
+  "close pane" on a tab's last pane and "close tab" on the last tab were SILENT
+  no-ops, while the keyboard collapsed the last pane into its tab and the last tab
+  into a window-close-with-confirm. One `closing_target` (pure) + one `close_something`
+  now decide it; both dispatches call them. The two dispatchers still differ only where
+  they must — `event_loop.exit()` versus `process::exit(0)` — which is exactly why the
+  pair cannot be merged wholesale.
+- **`paint_leader` blocked the UI thread on `kontroll status`** — a subprocess with no
+  timeout — on every leader arming and every group descent, the one path zsa.rs's own
+  comment says must never pay for a keystroke. With `leader_lights` on and Keymapp
+  wedged, arming the leader froze the window. The board now caches its layer in an
+  atomic and refreshes it on the worker; `paint_leader` reads the last-known layer and
+  paints layer 0 when none is known yet — `effective()` walks transparent upper-layer
+  keys down to base anyway, so the unknown case paints identically and nothing waits.
+- **The manual lied in four places** and once contradicted itself: `leader g` was
+  documented as "fix the last failed command" (it opens the git panel; the fix is
+  `leader a g`), hint mode was shown on Ctrl+Shift+F (that is search; hint mode is
+  Ctrl+Shift+Space), "Leader I" did not exist (it is `leader f i`), and settings had a
+  chord that was never bound. A test now parses EVERY chord the manual prints, walks it
+  through the real binding tables step by step, and asserts it lands on the action it
+  is shown beside — a lying manual cannot come back silently.
+
+502 tests (was 498). Four rounds, twenty-four fixes; the curve — 9, 6, 5, 4, and the
+fourth all pre-existing — says the branch has converged.
+
+## 2026-07-23 - Two the audit could not see: the sidebar hid the leader, and trapped it
+
+Both found by USING the branch, not by reading it. Neither is reachable from a test:
+one is a paint order, the other is a hole in a keymap.
+
+- **The which-key drew UNDER the sidebar.** `app_draw` pushes grids in paint order,
+  and `whichkey_holder` went in before `explorer_holder`. The which-key runs the full
+  width of the window along the bottom; the sidebar is full height down the side; so
+  with the tree open the leader menu lost its left third and the hints went with it.
+  Moved the push after the sidebar. `explorer_keys` (the tree's own menu, same
+  position) stays last, so the two never fight over the same rows.
+- **The sidebar could not be closed from the keyboard AT ALL.** Three deliberate
+  decisions met and left no exit: with the tree focused the leader chord arms the
+  TREE's layer (`explorer_leader_key` answers before `leader_key`), so `leader e`
+  never reaches `ToggleExplorer`; that toggle closes only when the tree is `open &&
+  focused`, and re-focuses it otherwise; and inside the tree `q` was a second Escape
+  (unfocus, stay open). Escape → `leader e` → Escape → … forever. `q` now CLOSES and
+  reflows the panes; Escape still only hands the keyboard back. The tree's leader leaf
+  `q` is retitled from "Back to the pane" to "Close the sidebar" — it was the only
+  route out and it did not take one. The way out that existed was
+  `Ctrl+Shift+P` → the palette: the tree ignores chords carrying Ctrl/Alt/Super, so a
+  modified binding reaches the global keymap even from inside.
+
+A test asserts the tree's leader always offers a leaf whose title says *close*, on a
+file row and on a directory row, and that it presses the key the sidebar binds. The
+paint order is not testable here — it is verified on a real instance.
+
+503 tests (was 502).
+
+## 2026-07-23 - The board gave up at startup and stayed dark for hours
+
+Reported as "the keyboard colours do not work". Nothing was misconfigured and nothing
+was down: Keymapp running, socket alive, kontroll connecting, board detected, and both
+`keyboard.ambient` and `keyboard.leader_lights` true. The diagnosis came from clocks:
+
+    Keymapp started   11:03:11
+    that runnir window 10:37:48   <- 25 minutes EARLIER
+
+The flashed layout was read once, in the constructor. With no socket at that instant
+`board_layout` stayed `None`, `paint_leader` bailed on its first line, and — the
+feature being silent by design — that window stayed dark for the rest of its life.
+Config hot-reload cannot help: it does not rebuild the board. Nothing anywhere retried.
+
+The design rule was "if Keymapp is not there the feature does not exist and does not
+nag". It was implemented as giving up PERMANENTLY, which is not the same thing.
+Keymapp is the user's app: it autostarts late, it quits on its own (it already did,
+mid-session, on the 22nd), and it follows the keyboard in and out of its socket. "Not
+up when this window opened" is the ORDINARY case, not a broken one.
+
+The layout now lives on the `Board` behind a mutex, is read on a worker the way the
+layer reading already had to be, and is asked for again on every arming of the leader
+that finds it missing. `refresh_layout` costs no subprocess while the socket is absent
+— that check is the `exists()` `alive()` already did — and says so under
+`RUNNIR_ZSA_DEBUG=1`. The first cut of the fix returned silently there and was caught
+in live verification: it had reintroduced exactly the blindness that made the original
+bug cost a session to see.
+
+Keymapp cannot be removed from the loop today: kontroll talks to its socket, not to the
+keyboard, and there is no headless mode. The hardware path is open, though — the board
+exposes four HID endpoints, all writable without root, and `hidraw3` is the raw one
+(descriptor `06 60 ff 09 61`, usage page 0xFF60, QMK Raw HID). That is the channel
+Keymapp itself uses. Speaking it directly means reverse-engineering ZSA's undocumented
+command set, and pre-2026 knowledge of this API has already been wrong here once.
+
+504 tests (was 503).
+
+## DESIGN, NOT YET BUILT — talk to the keyboard directly, drop Keymapp (2026-07-23)
+
+**Why.** The lights only work while Keymapp is open. That is the whole complaint, and
+it is not a bug we can fix from our side: `kontroll` talks to Keymapp's socket, not to
+the keyboard, and Keymapp has no headless mode. It also costs 215 MB of RSS and a
+process spawn per LED.
+
+**What makes it possible.** The protocol is published. `zsa/qmk_modules`, GPL-2.0,
+module `oryx` — the same module Pedro's board is flashed with, since that is what
+Keymapp drives. The command codes map one-to-one onto the gRPC surface we already use:
+
+    ORYX_SET_RGB_LED       [cmd, led, r, g, b]
+    ORYX_SET_RGB_LED_ALL
+    ORYX_RGB_CONTROL       param[0] != 0 -> set_webhid_effect(), 0 -> clear_webhid_effect()
+    ORYX_SET_LAYER         (the only one behind the pairing gate)
+    ORYX_GET_FW_VERSION
+    ORYX_GET_PROTOCOL_VERSION = 0xFE
+
+Keymapp is a thin proxy: gRPC in, raw HID out. It adds no logic we need. The pairing
+gate is not a gate — `PAIRING_INIT` sets `paired = true` unconditionally, `PAIRING_VALIDATE`
+is a no-op kept for backwards compatibility, and the RGB commands are not gated at all.
+
+**Transport.** `/dev/hidrawN`, plain file I/O — no `hidapi`, no new crate. The right
+endpoint is found by report descriptor: usage page `0xFF60` (`06 60 ff`), which on this
+machine is `hidraw3`. Access is permanent and unprivileged: ZSA ships
+`50-oryx.rules` with `TAG+="uaccess"` for vendor `3297`.
+
+**What we lose, and what replaces it.** `sustain` is in Keymapp's `.proto` but NOT in
+the firmware — the opcode carries no time field. It is Keymapp's own timer, and it is
+the dead-man switch that today guarantees a `kill -9` cannot leave the board painted.
+Direct HID has none. Replacement, decided with Pedro:
+
+- a timer in runnir (the leader already lapses; that lapse restores),
+- restore on disarm / focus loss / exit — already implemented,
+- **restore on STARTUP**, which is the new piece: it covers the only case a
+  self-owned timer cannot, namely runnir being killed outright while armed.
+
+Residual risk after that: killed hard inside the ~10 s armed window AND never opened
+again. Unplugging also clears it. Judged acceptable.
+
+Worth checking while building: whether the webhid effect lapses on its own after
+inactivity. If it does, the whole dead-man question is moot.
+
+**Layer tracking.** `known_layer` comes from `kontroll status` today. The oryx module
+PUSHES layer changes to the host, so reading the same fd is strictly better than
+polling a subprocess. Until that lands, layer 0 is the existing and correct fallback —
+`effective()` walks transparent keys down to base anyway.
+
+**Layout.** Unchanged, and note it does NOT depend on Keymapp running: the layout is
+read from `~/.config/.keymapp/keymapp.sqlite3`, a file on disk. Only the revision id
+came from Keymapp; `ORYX_GET_FW_VERSION` supplies it instead.
+
+**Shape of the change.** `Runner` is already a trait with a mock behind it, so the
+worker, the burst coalescing and the tests survive. What changes is the trait's
+vocabulary: it is CLI-shaped (`&["set-rgb", "-l", ...]`) and becomes intent-shaped
+(`set_led`, `set_all`, `control`). The `Kontroll` impl and its whole text-parsing layer
+— and the three bugs that layer cost us — are deleted rather than kept as a fallback.
+
+**Phases.** 1: find the endpoint and confirm `0xFE` against the real board, changing
+nothing. 2: the intent-shaped trait plus the HID impl behind it, kontroll still in
+place. 3: swap the transport, restore-on-startup, delete kontroll. 4: layer tracking
+from the push channel.
+
+### Phase 1 done — measured against Pedro's board, 2026-07-23
+
+Nothing was changed on the keyboard; `0xFE` is a query.
+
+    endpoint  /dev/hidraw3     (found by descriptor prefix 06 60 ff, not hardcoded)
+    sent      fe 00 00 ...     (32 bytes, NO report-id byte)
+    got       fe 04 fe 00 00 00 00 00
+
+Three unknowns closed at once: the `oryx` module IS in this flashed firmware and
+answers; the report is 32 bytes with **no leading report-id**, which was the open
+question about Linux hidraw; and the protocol version is `0x04`, so the upstream enum
+is the right one to code against. The endpoint must keep being found by descriptor —
+the hidraw numbering is not stable across replugs.
+
+## 2026-07-23 - Built: the board is driven directly, Keymapp is out of the loop
+
+The design above, built and verified on the real keyboard with Keymapp NOT RUNNING —
+no process, no socket. The remembered revision loads the layout, the matrix is taken,
+and the whole leader level is painted. Pedro confirmed the keys lit.
+
+What landed, beyond the design as written:
+
+- **The opcodes are known, not guessed.** The board answers `fe 04 fe` to the
+  protocol-version query, which is exactly
+  `[ORYX_EVT_GET_PROTOCOL_VERSION, ORYX_PROTOCOL_VERSION, ORYX_STOP_BIT]` for the
+  published source — `ORYX_PROTOCOL_VERSION` is `0x04` and `ORYX_STOP_BIT` is `-2`.
+  That pins this firmware to that revision of the module, which is what made it safe
+  to send RGB commands at all. Sending an opcode from an enum that might have been
+  reordered is the one genuinely risky thing here, and this is what closed it.
+- **`Runner` stopped being command-line-shaped.** It spoke `&["set-rgb", "-l", ...]`
+  because the only transport was a subprocess, which meant every failure came back as
+  ENGLISH PROSE on stdout. Three bugs came from that layer; all three, and their tests,
+  are deleted with it. They cannot exist against a byte protocol.
+- **The revision is remembered.** Painting stopped needing Keymapp, but knowing WHICH
+  flashed layout to light still did, so the lights still died with Keymapp closed —
+  one step short of the point. Sound rather than a shortcut: the layout is read out of
+  Keymapp's own database, so Keymapp must have run at some point regardless. This only
+  drops the requirement that it be running now.
+- **`sustain` is ours.** It was Keymapp's timer, not the firmware's — the opcode
+  carries no time field. The worker holds the deadline and its wait for the next
+  command doubles as the wait for it to expire; `Board::start` restores
+  unconditionally, covering the one case a timer of our own cannot.
+
+Cost, measured: Keymapp was 215 MB of RSS. A level was 34 processes and ~156 ms; it is
+now 39 writes and microseconds. No new dependency — hidraw is file I/O.
+
+Still not understood: `ORYX_CMD_GET_FW_VERSION` never answers, though the source shows
+it ungated and replying. Nothing depends on it now that the revision is remembered, and
+it is recorded here rather than papered over.
+
+501 tests (was 504): four kontroll-specific ones deleted with the code they guarded,
+one added for the deadline.
+
 ## Gotchas (do not re-learn)
 
+- A wire protocol read out of published firmware source still has to be CONFIRMED
+  against the board. An enum with implicit values is only right if the flashed build
+  matches that source, and the version query is what proves it. Everything else here
+  was safe to try; sending a guessed opcode was not.
+- A fallback that reads a real file makes every test of its caller a test of the
+  MACHINE. Inject it. This bit twice now — the second time within an hour of the first
+  being written down.
+- Probing another app's CLI is not read-only when that app is already running:
+  `keymapp --help` starts a second instance and killing it takes the running one's
+  socket with it.
+- An optional external dependency needs a RETRY, not a verdict at startup. "Absent
+  when we launched" and "absent forever" are different states, and a feature that is
+  silent by design cannot tell you it confused them.
+- `keymapp --help` is not a read-only probe: it starts a SECOND instance, and killing
+  that one takes the running instance's socket with it. The process survives, its API
+  does not, and kontroll then says `Keymapp socket not found`.
+- Chrome grids paint in PUSH order, and two of them can want the same rows. Anything
+  full-width along the bottom has to be pushed after anything full-height down a side,
+  or the side wins and the hint disappears under it.
+- A surface that grabs the leader chord has to carry its own way OUT. The global
+  toggle is unreachable from inside it by construction, and "unfocus" is not "close":
+  the sidebar had three sensible rules that together made it impossible to shut.
+- The one keyboard route into a focused sidebar is a chord with Ctrl/Alt/Super — it
+  deliberately ignores those and they fall through to the global keymap. Worth
+  remembering as the escape hatch when a surface traps itself.
 - The board must be put back even if runnir DIES. `sustain` (ms) on every ZSA paint is
   the only thing that survives `kill -9`; an explicit restore on exit is not enough.
 - Keymapp's API ships DISABLED (`api_enabled=0` in its sqlite) and its socket on Linux
@@ -2218,9 +2937,18 @@ code look broken.
   desktop app: kontroll finds Keymapp's socket through it, so the usual test isolation
   silently disconnects the keyboard. Some features can only be verified in the real
   environment.
+- Anything reading a pane's history must decide what to do about the ALTERNATE
+  screen. `scrollback_text` excludes it by design; a feature that summarises or
+  exports history needs `parked_text` too, or it reports nothing for every pane
+  sitting in vim, htop or Claude Code.
 - `cargo test` does NOT refresh `target/release/runnir`. Rebuild before launching an
   instance to verify a change, or you are testing the previous build — it has already
   cost two debugging detours.
+- Anything the user can SEE must be readable from `runnir @` — the status toast was
+  not, and two debugging rounds were spent on a feature that worked. If a script
+  cannot tell "it refused and said why" from "nothing happened", neither can a test.
+- A window tiled by the compositor can be far too small to exercise a positional
+  feature: float it and size it before dragging, splitting or clicking by coordinate.
 - A local mock HTTP server is the cheapest way to verify a wire format with no
   credentials: log the request to prove the headers, return a canned body to prove
   the parser. Both halves fail silently otherwise.

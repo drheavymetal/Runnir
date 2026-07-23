@@ -36,6 +36,20 @@ pub struct Pane {
     /// notifications. Tracked via OSC 133 marks when available, else the foreground.
     running_since: Option<(std::time::Instant, String)>,
     last_command_seq: u64,
+    /// The command counter when the user last stepped away, for the catch-up.
+    catch_up_seq: u64,
+    /// Opened by the war room, so teardown knows what it may close.
+    pub from_war_room: bool,
+    /// The user has typed in this pane. A pane someone worked in is theirs, whoever
+    /// opened it — teardown leaves it alone.
+    pub touched: bool,
+    /// The command counter already handed to the verb learner, so each command is
+    /// counted once and never twice.
+    verbs_seq: u64,
+    /// The last watched word this pane saw, kept for the catch-up because the
+    /// notification path consumes its own copy. Scoped to the current away window:
+    /// see [`Pane::mark_catch_up_point`].
+    last_watch_hit: Option<String>,
     last_bell: u64,
     /// Keyword to watch for in this pane's output (lowercased), or `None`. When set,
     /// a matching line raises a desktop notification (W4).
@@ -76,6 +90,11 @@ impl Pane {
             title_override: None,
             running_since: None,
             last_command_seq: 0,
+            catch_up_seq: 0,
+            verbs_seq: 0,
+            from_war_room: false,
+            touched: false,
+            last_watch_hit: None,
             last_bell: 0,
             watch: None,
             watch_stable: 0,
@@ -112,6 +131,75 @@ impl Pane {
             self.running_since = None;
         }
         done
+    }
+
+
+    /// The facts the catch-up needs about this pane, gathered under one lock.
+    ///
+    /// `seen_seq` is the command counter as of the moment the user went away, which
+    /// is what makes "changed while you were gone" answerable — a pane that has been
+    /// sitting at a prompt reports the same number and gets no headline.
+    pub fn catch_up_snapshot(&self, id: u64, waiting: bool) -> crate::catchup::Snapshot {
+        let g = self.grid.lock().unwrap();
+        let marked = g.command_seq() > 0;
+        let running = g.command_running();
+        crate::catchup::Snapshot {
+            pane: id,
+            // What happened here is the COMMAND, not the shell's window title: a row
+            // reading "drheavymetal@host:~" tells you nothing about what you missed.
+            // The running command's name wins while one runs; otherwise the last one
+            // the shell marked; the pane title is the last resort, for panes with no
+            // shell integration at all.
+            title: self
+                .running_since
+                .as_ref()
+                .map(|(_, name)| name.clone())
+                .or_else(|| g.last_command_line().map(|c| c.trim().to_string()))
+                .filter(|c| !c.is_empty())
+                .unwrap_or_else(|| {
+                    self.title_override.clone().unwrap_or_else(|| self.title.clone())
+                }),
+            // Anything that finished since we started watching, or is running now, is
+            // news. A quiet prompt is not.
+            changed: running || g.command_seq() > self.catch_up_seq,
+            waiting,
+            running,
+            exit: g.last_exit(),
+            secs: self.running_since.as_ref().map(|(t, _)| t.elapsed().as_secs()),
+            watch_hit: self.last_watch_hit.clone(),
+            last_line: g.last_nonblank_line(),
+            marked,
+        }
+    }
+
+    /// Hands over a command that just finished, once, with its exit code.
+    ///
+    /// Separate counter from `take_completion` on purpose: two consumers sharing one
+    /// "have I seen this" marker means whichever polls first eats the other's event.
+    pub fn take_finished_command(&mut self) -> Option<(String, i32)> {
+        let g = self.grid.lock().unwrap();
+        let seq = g.command_seq();
+        if seq <= self.verbs_seq || g.command_running() {
+            return None;
+        }
+        drop(g);
+        self.verbs_seq = seq;
+        let g = self.grid.lock().unwrap();
+        Some((g.last_command_line()?, g.last_exit()?))
+    }
+
+    /// Marks the point the user stepped away from, so the next catch-up can tell
+    /// what moved. Called when the away clock starts, not when the panel opens —
+    /// otherwise every pane looks unchanged.
+    ///
+    /// The remembered watch hit goes with it: it is a fact about the absence that
+    /// just ended, measured from the same instant `changed` is. Kept past here it
+    /// would headline the pane "watch" for the rest of the session, and a watch
+    /// outranks an exit code — so the command that failed afterwards would never be
+    /// the line you read.
+    pub fn mark_catch_up_point(&mut self) {
+        self.catch_up_seq = self.grid.lock().unwrap().command_seq();
+        self.last_watch_hit = None;
     }
 
     pub fn alive(&self) -> bool {
@@ -161,8 +249,31 @@ impl Pane {
         crate::platform::cwd(self.pty.pid()?)
     }
 
+    /// The last `n` non-blank lines the pane printed, prompt excluded. See
+    /// [`Grid::recent_output`].
+    pub fn recent_output(&self, n: usize) -> Vec<String> {
+        self.grid.lock().unwrap().recent_output(n)
+    }
+
     pub fn scrollback_text(&self) -> Vec<String> {
         self.grid.lock().unwrap().scrollback_text()
+    }
+
+    /// Everything readable about this pane's history, for a summary: the scrollback,
+    /// plus the primary screen parked behind a full-screen app. A pane that has been
+    /// in vim or Claude Code since early on has almost nothing in its scrollback,
+    /// which is why asking to summarise it used to answer "nothing to summarise".
+    pub fn history_text(&self) -> Vec<String> {
+        let g = self.grid.lock().unwrap();
+        let mut lines = g.parked_text();
+        lines.extend(g.scrollback_text());
+        lines
+    }
+
+    /// Whether a full-screen app is up, so a summary can say what it is looking at
+    /// instead of silently summarising something else.
+    pub fn in_full_screen_app(&self) -> bool {
+        self.grid.lock().unwrap().alt_screen()
     }
 
     /// Whether a bell (BEL) has arrived since the last call. Drives the visual
@@ -182,6 +293,10 @@ impl Pane {
     /// fire a flood of stale matches.
     pub fn set_watch(&mut self, keyword: String) {
         let kw = keyword.trim();
+        // Whatever the old watch saw stops being news the moment the watch changes:
+        // reporting "saw ERROR" for a word nobody is watching any more is a headline
+        // about a pane the user has already moved on from.
+        self.last_watch_hit = None;
         if kw.is_empty() {
             self.watch = None;
         } else {
@@ -214,9 +329,18 @@ impl Pane {
             g.text_since_stable(self.watch_stable)
         };
         self.watch_stable = end;
-        text.lines()
+        let hit = text
+            .lines()
             .find(|l| l.to_lowercase().contains(&kw))
-            .map(|l| format!("{}: {}", self.title, l.trim()))
+            .map(|l| format!("{}: {}", self.title, l.trim()));
+        // Keep a copy for the catch-up. This method is a TAKING one — the
+        // notification path consumes the hit — so without this the catch-up could
+        // never report a watch that already fired while you were away, which is
+        // exactly the case it exists for.
+        if hit.is_some() {
+            self.last_watch_hit = Some(kw.clone());
+        }
+        hit
     }
 
     /// Toggles folding of every finished command's output (W2): folds all if none is
@@ -236,6 +360,18 @@ impl Pane {
     }
 
     pub fn write(&mut self, bytes: &[u8]) {
+        self.pty.write(bytes);
+    }
+
+    /// Bytes a PERSON put in this pane — typed, pasted, dropped on the window, chosen
+    /// from a picker, or broadcast into it from another pane.
+    ///
+    /// However they arrived, they make the pane theirs. A deploy pasted with its
+    /// trailing newline is running exactly as much as one that was typed key by key,
+    /// and counting only keystrokes is how the war room decides that pane was never
+    /// used and kills the deploy taking it down.
+    pub fn write_from_user(&mut self, bytes: &[u8]) {
+        self.touched = true;
         self.pty.write(bytes);
     }
 
@@ -441,6 +577,74 @@ mod tests {
             let (r, g, b) = host_colour(host);
             assert!(r < 130 && g < 130 && b < 130, "{host} tint too bright: {r},{g},{b}");
         }
+    }
+
+    /// A pane that will sit still for the length of the test, with a real PTY behind
+    /// it: the watch reads the grid, and the grid belongs to a pane.
+    fn quiet_pane() -> Pane {
+        let spawn = Spawn {
+            command: Some(vec!["sleep".into(), "30".into()]),
+            cwd: None,
+            ..Default::default()
+        };
+        Pane::new(20, 6, 100, (8.0, 16.0), &spawn, false, || {}).expect("spawn")
+    }
+
+    /// Output as a command would produce it: the echoed command line, then what it
+    /// printed. The watch starts scanning below the row the cursor was on, so a
+    /// keyword typed into the first row would not be a hit — nor should it be.
+    fn print(pane: &Pane, text: &str) {
+        vte::Parser::new().advance(&mut *pane.grid.lock().unwrap(), text.as_bytes());
+    }
+
+    /// The war room closes the panes it opened "and only those the user never typed
+    /// in", and a paste is not typing. A deploy pasted into a room pane with its
+    /// trailing newline is running; if the pane still counts as untouched, `leader w q`
+    /// takes the tab down and `Pty::drop` kills the deploy mid-flight.
+    #[test]
+    fn a_pasted_command_claims_the_pane_as_much_as_a_typed_one() {
+        let mut pane = quiet_pane();
+        assert!(!pane.touched, "a freshly opened pane is nobody's yet");
+
+        // No keystroke anywhere: this is the clipboard arriving whole.
+        pane.write_from_user(b"\x1b[200~./deploy.sh prod\n\x1b[201~");
+
+        assert!(pane.touched, "the pane a command was pasted into is the user's");
+    }
+
+    /// A watch hit is news about the stretch of absence it fired in. Kept past that,
+    /// a single old hit headlines the pane "watch" forever — and because a watch
+    /// outranks an exit code, the command that failed afterwards is never the line
+    /// the user reads.
+    #[test]
+    fn a_watch_hit_does_not_outlive_the_absence_it_fired_in() {
+        let mut pane = quiet_pane();
+        pane.set_watch("error".into());
+        print(&pane, "$ deploy\r\nbuild failed: ERROR 3\r\n");
+
+        assert!(pane.take_watch_hit().is_some(), "the watched word was printed");
+        assert_eq!(
+            pane.catch_up_snapshot(1, false).watch_hit.as_deref(),
+            Some("error"),
+            "the catch-up exists to report exactly this"
+        );
+
+        // Stepping away again opens a new window; what the last one saw is not in it.
+        pane.mark_catch_up_point();
+        assert_eq!(pane.catch_up_snapshot(1, false).watch_hit, None);
+    }
+
+    /// A word nobody is watching any more cannot be a headline about this pane.
+    #[test]
+    fn a_watch_taken_off_takes_what_it_saw_with_it() {
+        let mut pane = quiet_pane();
+        pane.set_watch("error".into());
+        print(&pane, "$ deploy\r\nbuild failed: ERROR 3\r\n");
+        assert!(pane.take_watch_hit().is_some());
+
+        pane.set_watch(String::new());
+        assert_eq!(pane.catch_up_snapshot(1, false).watch_hit, None);
+        assert!(pane.watching().is_none());
     }
 
     #[test]

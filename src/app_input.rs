@@ -404,7 +404,29 @@ impl Gpu {
                     self.copy_selection();
                 }
             }
-            (ElementState::Pressed, MouseButton::Middle) => self.paste_primary(),
+            // Middle press ARMS a possible pipe drag; the paste happens on release
+            // only if the pointer never really moved, so middle-click paste keeps
+            // working exactly as it did.
+            (ElementState::Pressed, MouseButton::Middle) => {
+                self.middle_press = Some(self.cursor_px);
+                if std::env::var("RUNNIR_PIPE_DEBUG").is_ok() {
+                    eprintln!("pipe: middle press at {:?}", self.cursor_px);
+                }
+            }
+            (ElementState::Released, MouseButton::Middle) => {
+                let from = self.middle_press.take();
+                let moved = from.is_some_and(|p| {
+                    (p.x - self.cursor_px.x).abs() > 12.0 || (p.y - self.cursor_px.y).abs() > 12.0
+                });
+                if std::env::var("RUNNIR_PIPE_DEBUG").is_ok() {
+                    eprintln!("pipe: middle release from={from:?} moved={moved} at {:?}", self.cursor_px);
+                }
+                match (from, moved) {
+                    (Some(start), true) => self.pipe_output(start, self.cursor_px, config),
+                    (Some(_), false) => self.paste_primary(),
+                    _ => {}
+                }
+            }
             _ => {}
         }
     }
@@ -430,7 +452,11 @@ impl Gpu {
         let col = (((pos.x as f32 - rect.x) / cw).floor().max(0.0)) as usize;
         let row = (((pos.y as f32 - rect.y) / ch).floor().max(0.0)) as usize;
         if let Some(bytes) = mouse::encode(mode, sgr, button, kind, col, row) {
-            self.tab().focused().write(&bytes);
+            // A click a TUI reads is somebody working in that pane as surely as a
+            // keystroke is; an afternoon spent in a mouse-driven program must not end
+            // with the catch-up reporting an absence.
+            self.note_input_reached_child();
+            self.tab().focused().write_from_user(&bytes);
             true
         } else {
             false
@@ -472,61 +498,9 @@ impl Gpu {
             return;
         }
 
-        // An overlay swallows all keys while open.
-        if self.overlay.is_some() {
-            self.overlay_key(&event.logical_key, mods, config);
-            return;
-        }
-
-        // Copy-mode owns the keyboard: vim motions drive a virtual cursor/selection.
-        if self.copy_mode.is_some() {
-            self.copy_mode_key(&event, mods);
-            return;
-        }
-
-        // With the tree focused its own leader answers first: the same chord, a tree
-        // of file verbs instead of the window's.
-        if self.explorer_leader_key(&event.logical_key, mods, config) {
-            return;
-        }
-        if self.leader_key(&event.logical_key, mods, config, keymap, event_loop) {
-            return;
-        }
-
-        // The sidebar takes the keyboard only while it has focus, and only after the
-        // leader layer and the bound chords: a tree that swallowed ctrl+shift+t would
-        // be a mode, and this is chrome.
-        if self.explorer_focused() && !mods.control_key() && !mods.alt_key() && !mods.super_key() {
-            if self.explorer_key(&event.logical_key, config) {
-                return;
-            }
-        }
-
-        // The XF86 media transport keys drive the media backend directly, wherever the
-        // focus is (no overlay needed). Volume media keys are left to the system.
-        if let Key::Named(n) = &event.logical_key {
-            let media = match n {
-                NamedKey::MediaPlayPause => Some(Action::MediaPlayPause),
-                NamedKey::MediaTrackNext => Some(Action::MediaNext),
-                NamedKey::MediaTrackPrevious => Some(Action::MediaPrev),
-                _ => None,
-            };
-            if let Some(a) = media {
-                self.run_action(a, config, event_loop);
-                return;
-            }
-        }
-
-        // A bound chord runs its action and never reaches the child.
-        if let Some(action) = keymap.resolve(&event.logical_key, mods) {
-            self.run_action(action.clone(), config, event_loop);
-            return;
-        }
-
-        // Command guardian: a plain Enter about to submit a destructive command
-        // opens a confirmation first. Only bare Enter (no modifiers) with the view
-        // at the live prompt is guarded, so history editing and TUIs are untouched.
-        if event.state.is_pressed() && self.guard_enter(&event.logical_key, mods, config) {
+        // Everything the window itself does with a key, in one order, shared with the
+        // scripted path.
+        if self.route_key(&event.logical_key, mods, config, keymap, event_loop) {
             return;
         }
 
@@ -556,9 +530,98 @@ impl Gpu {
         }
     }
 
+    /// Everything the window does with a key before the child sees it: the overlays,
+    /// copy-mode, both leader layers, the sidebar, the media keys, the bound chords
+    /// and the guardian. Returns whether the key was taken.
+    ///
+    /// One list, one order, one place. The real path and the scripted one each used
+    /// to carry their own copy, and every divergence between the two is either a key
+    /// that works from the keyboard and does nothing down the socket, or a test that
+    /// proves something the user never experiences.
+    fn route_key(
+        &mut self,
+        key: &Key,
+        mods: ModifiersState,
+        config: &Config,
+        keymap: &Keymap,
+        event_loop: &ActiveEventLoop,
+    ) -> bool {
+        // A screensaver dismisses on ANY key, and that key does nothing else. It put
+        // itself on screen, so the keystroke was meant for whatever it covered — and a
+        // window that acts on a key aimed at the shell underneath is worse than one
+        // that ignores it.
+        if self.screensaver {
+            self.screensaver = false;
+            self.overlay = None;
+            // Dismissing IS activity. Without this the idle clock is still expired the
+            // moment the overlay closes, so it reopens on the very next frame and the
+            // keyboard appears dead — which is exactly what it did.
+            self.last_pty_key = Instant::now();
+            self.window.request_redraw();
+            return true;
+        }
+
+        // An overlay swallows all keys while open.
+        if self.overlay.is_some() {
+            self.overlay_key(key, mods, config);
+            return true;
+        }
+
+        // Copy-mode owns the keyboard: vim motions drive a virtual cursor/selection.
+        if self.copy_mode.is_some() {
+            self.copy_mode_key(key, mods);
+            return true;
+        }
+
+        // With the tree focused its own leader answers first: the same chord, a tree
+        // of file verbs instead of the window's.
+        if self.explorer_leader_key(key, mods, config) {
+            return true;
+        }
+        if self.leader_key(key, mods, config, keymap, event_loop) {
+            return true;
+        }
+
+        // The sidebar takes the keyboard only while it has focus, and never a chord
+        // with a modifier: a tree that swallowed ctrl+shift+t would be a mode, and
+        // this is chrome. A key it does not use falls through to the rest.
+        if self.explorer_focused() && !mods.control_key() && !mods.alt_key() && !mods.super_key() {
+            if self.explorer_key(key, config) {
+                return true;
+            }
+        }
+
+        // The XF86 media transport keys drive the media backend directly, wherever the
+        // focus is (no overlay needed). Volume media keys are left to the system.
+        if let Key::Named(n) = key {
+            let media = match n {
+                NamedKey::MediaPlayPause => Some(Action::MediaPlayPause),
+                NamedKey::MediaTrackNext => Some(Action::MediaNext),
+                NamedKey::MediaTrackPrevious => Some(Action::MediaPrev),
+                _ => None,
+            };
+            if let Some(a) = media {
+                self.run_action(a, config, event_loop);
+                return true;
+            }
+        }
+
+        // A bound chord runs its action and never reaches the child.
+        if let Some(action) = keymap.resolve(key, mods) {
+            self.run_action(action.clone(), config, event_loop);
+            return true;
+        }
+
+        // Command guardian: a plain Enter about to submit a destructive command
+        // opens a confirmation first. Only bare Enter (no modifiers) with the view
+        // at the live prompt is guarded, so history editing and TUIs are untouched.
+        self.guard_enter(key, mods, config)
+    }
+
     /// Sends encoded key bytes to the focused pane (or all panes when broadcasting),
     /// snapping the view to the live output and clearing any selection first.
     fn write_key_bytes(&mut self, bytes: &[u8]) {
+        self.note_input_reached_child();
         self.scroll_glide = None;
         if self.tab().focused().snap_to_bottom() {
             self.window.request_redraw();
@@ -567,8 +630,64 @@ impl Gpu {
         if self.broadcast {
             self.broadcast_bytes(bytes);
         } else {
-            self.tab().focused().write(bytes);
+            self.tab().focused().write_from_user(bytes);
         }
+    }
+
+    /// The window-wide half of "input reached a child": the away clock and the mark
+    /// the catch-up measures everything from. (The per-pane half is `write_from_user`,
+    /// which claims the pane the bytes actually landed in — with broadcast on that is
+    /// several panes, not the focused one.)
+    ///
+    /// Every path that puts the user's bytes into a shell owes this, not just the
+    /// keyboard: window focus lies (a focused window on another monitor is not
+    /// attention), and so does a clock that only keys wind. An hour of pasting and
+    /// mouse-driven work would end with the catch-up announcing an absence that never
+    /// happened.
+    fn note_input_reached_child(&mut self) {
+        self.last_pty_key = Instant::now();
+        self.baseline.key_reached_a_child();
+    }
+
+    /// Performs `CloseTab` / `ClosePane`, and answers whether the window itself must
+    /// now go.
+    ///
+    /// The keyboard and the palette both come here. They used to close things
+    /// separately, and the palette's copy quietly lost every case that is not the
+    /// easy one: its "close pane" did nothing at all on a tab's last pane, and its
+    /// "close tab" did nothing at all on the last tab — two commands that answered a
+    /// deliberate choice from a menu with silence. Closing is one behaviour, so it is
+    /// written once; the callers differ only in how they leave, because the keyboard
+    /// has an `ActiveEventLoop` to exit and the palette has not.
+    fn close_something(&mut self, action: &Action, config: &Config) -> bool {
+        let Some(target) = closing_target(action, self.tabs.len(), self.tab().tree.len()) else {
+            return false;
+        };
+        match target {
+            Closing::Pane => {
+                let area = self.active_area();
+                self.tab().close_focused(area);
+            }
+            Closing::Tab => {
+                // Snapshotted before the removal, and while the tab still holds the
+                // pane the user was closing, so ReopenClosed brings back what was
+                // there rather than an empty tab.
+                self.closed_tabs.push(self.tabs[self.active].to_session());
+                self.tabs.remove(self.active);
+                self.active = self.active.min(self.tabs.len() - 1);
+                self.reflow_all();
+            }
+            Closing::Window => {
+                // Closing the last thing open IS closing the window; it asks the same
+                // question, or a habit of ctrl+w would still kill running work.
+                if !self.request_close(config) {
+                    return false;
+                }
+                self.save_session(config);
+                return true;
+            }
+        }
+        false
     }
 
     fn run_action(&mut self, action: Action, config: &Config, event_loop: &ActiveEventLoop) {
@@ -591,20 +710,8 @@ impl Gpu {
                     self.reflow_all();
                 }
             }
-            Action::CloseTab => {
-                if self.tabs.len() > 1 {
-                    // Remember it so ReopenClosed can bring it back.
-                    self.closed_tabs.push(self.tabs[self.active].to_session());
-                    self.tabs.remove(self.active);
-                    self.active = self.active.min(self.tabs.len() - 1);
-                    self.reflow_all();
-                } else {
-                    // Closing the last tab IS closing the window; it asks the same
-                    // question, or a habit of ctrl+w would still kill running work.
-                    if !self.request_close(config) {
-                        return;
-                    }
-                    self.save_session(config);
+            Action::CloseTab | Action::ClosePane => {
+                if self.close_something(&action, config) {
                     event_loop.exit();
                 }
             }
@@ -632,19 +739,6 @@ impl Gpu {
                 let axis = action.split_axis().unwrap();
                 let id = self.new_pane_id();
                 let _ = self.tab().split_with_id(area, axis, config, id, wake);
-            }
-            Action::ClosePane => {
-                if !self.tab().close_focused(area) && self.tabs.len() > 1 {
-                    self.tabs.remove(self.active);
-                    self.active = self.active.min(self.tabs.len() - 1);
-                    self.reflow_all();
-                } else if self.tabs.len() == 1 && self.tab().tree.len() == 1 {
-                    if !self.request_close(config) {
-                        return;
-                    }
-                    self.save_session(config);
-                    event_loop.exit();
-                }
             }
             a if a.focus_dir().is_some() => {
                 self.tab().focus_dir(area, a.focus_dir().unwrap());
@@ -728,6 +822,11 @@ impl Gpu {
             Action::FoldOutput => self.tab().focused().toggle_fold_all(),
             Action::ToggleImageWatch => self.toggle_image_watch(config),
             Action::ToggleExplorer => self.toggle_explorer(config),
+            Action::CatchUp => self.show_catch_up(),
+            Action::RepoVerbs => self.show_repo_verbs(config),
+            Action::Map => self.show_map(),
+            Action::WarRoom => self.open_war_room(config),
+            Action::WarRoomClose => self.close_war_room(config),
             Action::SetImageWatchDir => self.set_image_watch_dir(),
             Action::SaveProjectSession => self.save_project_session_cmd(),
             Action::RestoreProjectSession => self.restore_project_session_cmd(config),
@@ -1098,6 +1197,7 @@ impl Gpu {
         let mut delete = false;
         let mut props = false;
         let mut unfocus = false;
+        let mut close = false;
         {
             let Some(e) = self.tabs[self.active].explorer.as_mut() else { return false };
             e.message = None;
@@ -1179,11 +1279,28 @@ impl Gpu {
                     "e" => edit = selected.as_ref().filter(|r| r.more.is_none()).map(|r| r.entry.path.clone()),
                     "o" => system = selected.as_ref().filter(|r| r.more.is_none()).map(|r| r.entry.path.clone()),
                     "y" => copy = selected.map(|r| r.entry.path.display().to_string()),
-                    "q" => unfocus = true,
+                    // `q` CLOSES, Escape only hands the keyboard back. It used to be a
+                    // second Escape, which left the sidebar with no way out at all:
+                    // the leader chord arms the tree's own layer while it is focused,
+                    // so `leader e` never reaches the global toggle, and that toggle
+                    // re-focuses an open-but-unfocused tree rather than hiding it.
+                    "q" => close = true,
                     _ => {}
                 },
                 _ => {}
             }
+        }
+        if close {
+            if let Some(e) = self.tabs[self.active].explorer.as_mut() {
+                e.open = false;
+                e.focused = false;
+                e.cancel_leader();
+            }
+            // The panes just got their columns back: their PTYs have to be told.
+            let area = self.active_area();
+            self.tabs[self.active].reflow(area);
+            self.window.request_redraw();
+            return true;
         }
         if unfocus {
             if let Some(e) = self.tabs[self.active].explorer.as_mut() {
@@ -1402,11 +1519,12 @@ impl Gpu {
             e.focused = false;
         }
         if busy {
-            self.split_running(config, cmd);
+            self.split_running_or_say_why(config, cmd);
             return;
         }
         let line = cmd.iter().map(|a| shell_quote(a)).collect::<Vec<_>>().join(" ");
-        self.tab().focused().write(format!("{line}\r").as_bytes());
+        self.note_input_reached_child();
+        self.tab().focused().write_from_user(format!("{line}\r").as_bytes());
         self.window.request_redraw();
     }
 
@@ -2822,12 +2940,6 @@ impl Gpu {
         false
     }
 
-    /// A keypress with no `KeyEvent` behind it, for the remote-control `key`
-    /// command: overlays, the leader layer and the bound actions, in the order
-    /// `on_key` tries them.
-    ///
-    /// It deliberately stops short of the pane: text for the child goes through
-    /// `send-text`, which does not have to guess an encoding.
     /// Leaves the leader layer AND gives the keyboard back. Every exit from the layer
     /// goes through here: a key that acts, a miss, Escape, or the timeout lapsing.
     /// Missing one of them is how the board ends up holding a level nobody is in.
@@ -2836,36 +2948,24 @@ impl Gpu {
         self.unpaint_leader(config);
     }
 
-    /// Reads the flashed layout once, so a keystroke never pays for it.
+    /// Asks for the flashed layout, in the background.
     ///
-    /// Both halves can be absent and that is normal: no board, no Keymapp, no
-    /// `sqlite3`, a revision Keymapp has never seen. Any of them simply leaves the
-    /// leader lights off, with nothing said — the same rule the rest of this follows.
-    fn load_board_layout(&mut self) {
-        // RUNNIR_ZSA_DEBUG=1 says which step gave up. The feature is silent by design,
-        // and silence is exactly what makes it impossible to tell "no keyboard here"
-        // from "broken" — this is the same escape hatch RUNNIR_KEYLOG is.
-        let debug = std::env::var("RUNNIR_ZSA_DEBUG").is_ok();
+    /// Called at startup and again on every arming of the leader that finds the board
+    /// dark, because the reading fails for as long as Keymapp is down and then starts
+    /// succeeding. Doing it once at startup meant a window opened before Keymapp — the
+    /// ordinary case, since Keymapp is the user's app and autostarts late — never lit
+    /// the board again for as long as it lived, with nothing anywhere saying why.
+    ///
+    /// Absence stays normal and stays silent: no board, no Keymapp, no `sqlite3`, a
+    /// revision Keymapp has never seen. `RUNNIR_ZSA_DEBUG=1` says which step gave up.
+    fn refresh_board_layout(&self) {
         let Some(board) = &self.board else {
-            if debug {
+            if std::env::var("RUNNIR_ZSA_DEBUG").is_ok() {
                 eprintln!("zsa: no board (kontroll missing, or the feature is off)");
             }
             return;
         };
-        let Some(status) = board.status() else {
-            if debug {
-                eprintln!("zsa: kontroll status gave no revision (keyboard connected?)");
-            }
-            return;
-        };
-        let Some(db) = crate::zsa::default_db() else { return };
-        self.board_layout = crate::zsa::read_layout(&db, &status.revision);
-        if debug {
-            match &self.board_layout {
-                Some(l) => eprintln!("zsa: layout {} loaded, {} layers", status.revision, l.layers()),
-                None => eprintln!("zsa: {} not readable from {}", status.revision, db.display()),
-            }
-        }
+        board.refresh_layout();
     }
 
     /// Lights the leader level the user is standing on: every key that does something
@@ -2878,8 +2978,23 @@ impl Gpu {
         if !config.keyboard.leader_lights {
             return;
         }
-        let (Some(board), Some(layout)) = (&self.board, &self.board_layout) else { return };
-        let layer = board.status().map_or(0, |s| s.layer);
+        let Some(board) = &self.board else { return };
+        // No layout yet means Keymapp was not up when we last asked. Ask again — this
+        // is the retry that lets a window opened before Keymapp ever light at all —
+        // and light nothing this once. It costs no subprocess when the socket is
+        // absent, and the answer lands well before the next arming.
+        let Some(layout) = board.known_layout() else {
+            board.refresh_layout();
+            return;
+        };
+        // The layer the board last reported, not a fresh reading: this runs on the
+        // arming keystroke and on every descent into a group, and asking the board
+        // is a `kontroll` subprocess that never times out — with Keymapp wedged the
+        // window froze under the hand that armed the leader. The reading is asked
+        // for in the background instead, so a layer change costs one paint aimed at
+        // the layer before it, and never a frozen window.
+        let layer = board.known_layer();
+        board.refresh_layer();
         let keys = keymap.leader_level_keys(&self.leader_path);
         let groups: std::collections::HashSet<&str> =
             keys.iter().filter(|(_, g)| *g).map(|(s, _)| s.as_str()).collect();
@@ -2938,6 +3053,11 @@ impl Gpu {
         true
     }
 
+    /// A keypress with no `KeyEvent` behind it, for the remote-control `key` command.
+    ///
+    /// It stands in for a hand on the keyboard, so it goes through the same routing
+    /// and reaches the same child: a script that could open panels but not type a
+    /// letter would be a script that cannot exercise the thing being tested.
     fn press_key(
         &mut self,
         key: &Key,
@@ -2946,29 +3066,25 @@ impl Gpu {
         keymap: &Keymap,
         event_loop: &ActiveEventLoop,
     ) {
-        if self.overlay.is_some() {
-            self.overlay_key(key, mods, config);
+        // The same routing the keyboard goes through, in the same order — see
+        // `route_key` for why this is not a second copy of the list.
+        if self.route_key(key, mods, config, keymap, event_loop) {
             return;
         }
-        if self.explorer_leader_key(key, mods, config) {
-            return;
-        }
-        if self.leader_key(key, mods, config, keymap, event_loop) {
-            return;
-        }
-        if let Some(action) = keymap.resolve(key, mods) {
-            let action = action.clone();
-            self.run_action(action, config, event_loop);
-            return;
-        }
-        if self.guard_enter(key, mods, config) {
-            return;
-        }
-        // Same order as `on_key`: the sidebar takes what the leader and the bound
-        // chords did not. Leaving this out is what made a scripted `j` do nothing
-        // while the same key worked from the keyboard.
-        if !mods.control_key() && !mods.alt_key() && !mods.super_key() {
-            self.explorer_key(key, config);
+        // And finally the child process, spoken to the way the pane asked to be
+        // spoken to: a pane that pushed kitty flags gets CSI-u here exactly as it
+        // would from the keyboard. A scripted key that quietly downgraded to the
+        // legacy encoding sends different bytes than the hand it stands in for,
+        // which makes every test driven this way prove the wrong thing.
+        let flags = self.tab().focused().keyboard_flags();
+        let bytes = if flags != 0 {
+            keys::encode_kitty_key(key, mods, flags)
+        } else {
+            let mode = keys::KeyMode { app_cursor: self.tab().focused().app_cursor() };
+            keys::encode_key(key, mods, mode)
+        };
+        if let Some(bytes) = bytes {
+            self.write_key_bytes(&bytes);
         }
     }
 
@@ -2995,6 +3111,9 @@ impl Gpu {
             Some(Overlay::Docs(_)) => "docs",
             Some(Overlay::Viewer(_)) => "viewer",
             Some(Overlay::Props(_)) => "props",
+            Some(Overlay::CatchUp(_)) => "catch_up",
+            Some(Overlay::Verbs(_)) => "verbs",
+            Some(Overlay::Map(_)) => "map",
             Some(_) => "other",
         };
         let mut out = json!({
@@ -3002,6 +3121,13 @@ impl Gpu {
             "cols": cols,
             "rows": rows,
             "leader_armed": self.leader_armed.is_some(),
+            // Whether the overlay on screen put itself there. A script cannot tell an
+            // idle window from a covered one otherwise, and neither can a test.
+            "screensaver": self.screensaver,
+            // The toast is user-visible state, so a script has to be able to read it:
+            // without this, every message runnir shows is invisible from outside and
+            // a test cannot tell "it refused and said why" from "nothing happened".
+            "status": self.status.clone(),
         });
         if let Some(Overlay::Props(p)) = &self.overlay {
             out["props"] = json!({
@@ -3015,6 +3141,28 @@ impl Gpu {
                 "contents": p.props.contents.map(|(f, d)| json!({"files": f, "dirs": d})),
                 "link_target": p.props.link_target.as_ref().map(|t| t.display().to_string()),
             });
+        }
+        if let Some(Overlay::CatchUp(p)) = &self.overlay {
+            out["catch_up"] = json!(
+                p.rows()
+                    .into_iter()
+                    .map(|(pane, state, title, detail)| json!({
+                        "pane": pane, "state": state, "title": title, "detail": detail
+                    }))
+                    .collect::<Vec<_>>()
+            );
+        }
+        if let Some(Overlay::Map(p)) = &self.overlay {
+            out["map"] = json!(
+                p.rows().into_iter().map(|(pane, tag, title)| json!({
+                    "pane": pane, "state": tag, "title": title
+                })).collect::<Vec<_>>()
+            );
+        }
+        if let Some(Overlay::Verbs(p)) = &self.overlay {
+            out["verbs"] = json!(
+                p.rows().into_iter().map(|(v, n)| json!({"verb": v, "count": n})).collect::<Vec<_>>()
+            );
         }
         if let Some(Overlay::Prompt(p)) = &self.overlay {
             out["prompt"] = json!({ "label": p.label, "input": p.input });
@@ -3412,6 +3560,90 @@ impl Gpu {
                 }
                 _ => {}
             },
+            // The map: move between cards, Enter opens that pane at full size —
+            // which is all "zooming in" can mean when the terminals never resized.
+            Overlay::Map(p) => match key {
+                Key::Named(NamedKey::Escape) => self.overlay = None,
+                Key::Named(NamedKey::ArrowUp) | Key::Named(NamedKey::ArrowLeft) => p.up(),
+                Key::Named(NamedKey::ArrowDown) | Key::Named(NamedKey::ArrowRight) => p.down(),
+                Key::Named(NamedKey::Enter) => {
+                    // The map spans every tab, so opening a card has to GO to its tab
+                    // first. Focusing by pane id alone would silently do nothing for
+                    // three quarters of the cards on screen.
+                    let (pane, tab) = (p.selected_pane(), p.selected_tab());
+                    self.overlay = None;
+                    if let Some(i) = tab.filter(|i| *i < self.tabs.len()) {
+                        self.active = i;
+                    }
+                    if let Some(id) = pane {
+                        self.focus_pane(id);
+                    }
+                    let area = self.active_area();
+                    self.tabs[self.active].reflow(area);
+                }
+                Key::Character(c) => match c.as_str() {
+                    "k" | "h" => p.up(),
+                    "j" | "l" => p.down(),
+                    "q" => self.overlay = None,
+                    _ => {}
+                },
+                _ => {}
+            },
+            // The verbs panel: Enter STAGES the verb at the prompt and never runs
+            // it. A list learned from what you typed, typing itself back, is exactly
+            // the place where a stray Enter must not execute anything.
+            Overlay::Verbs(p) => match key {
+                Key::Named(NamedKey::Escape) => self.overlay = None,
+                Key::Named(NamedKey::ArrowUp) => p.up(),
+                Key::Named(NamedKey::ArrowDown) => p.down(),
+                Key::Named(NamedKey::Enter) => {
+                    let verb = p.selected();
+                    self.overlay = None;
+                    if let Some(v) = verb {
+                        self.insert_command(v);
+                    }
+                }
+                Key::Character(c) => match c.as_str() {
+                    "k" => p.up(),
+                    "j" => p.down(),
+                    "q" => self.overlay = None,
+                    // Forget everything learned about this repo. A record of what
+                    // somebody typed needs a way out that does not involve finding a
+                    // JSON file, so it lives on the panel that shows the record.
+                    "X" => {
+                        let repo = std::path::PathBuf::from(p.repo());
+                        self.verbs.forget(&repo);
+                        self.verbs.save();
+                        self.overlay = None;
+                        self.status = Some("forgot this repo's verbs".into());
+                        self.status_expiry = Some(Instant::now() + Duration::from_secs(3));
+                    }
+                    _ => {}
+                },
+                _ => {}
+            },
+            // The catch-up: j/k or the arrows move, Enter focuses that pane, Esc
+            // closes. No search box on purpose — the list is at most one line per
+            // pane, and anything you would filter you can already see.
+            Overlay::CatchUp(p) => match key {
+                Key::Named(NamedKey::Escape) => self.overlay = None,
+                Key::Named(NamedKey::ArrowUp) => p.up(),
+                Key::Named(NamedKey::ArrowDown) => p.down(),
+                Key::Named(NamedKey::Enter) => {
+                    let pane = p.selected_pane();
+                    self.overlay = None;
+                    if let Some(id) = pane {
+                        self.focus_pane(id);
+                    }
+                }
+                Key::Character(c) => match c.as_str() {
+                    "k" => p.up(),
+                    "j" => p.down(),
+                    "q" => self.overlay = None,
+                    _ => {}
+                },
+                _ => {}
+            },
             Overlay::ClipHistory(p) => match key {
                 Key::Named(NamedKey::Escape) => self.overlay = None,
                 Key::Named(NamedKey::ArrowUp) => p.up(),
@@ -3679,6 +3911,11 @@ impl Gpu {
             Action::FoldOutput => self.tab().focused().toggle_fold_all(),
             Action::ToggleImageWatch => self.toggle_image_watch(config),
             Action::ToggleExplorer => self.toggle_explorer(config),
+            Action::CatchUp => self.show_catch_up(),
+            Action::RepoVerbs => self.show_repo_verbs(config),
+            Action::Map => self.show_map(),
+            Action::WarRoom => self.open_war_room(config),
+            Action::WarRoomClose => self.close_war_room(config),
             Action::SetImageWatchDir => self.set_image_watch_dir(),
             Action::SaveProjectSession => self.save_project_session_cmd(),
             Action::RestoreProjectSession => self.restore_project_session_cmd(config),
@@ -3723,21 +3960,18 @@ impl Gpu {
                     self.set_clipboard(text);
                 }
             }
-            Action::CloseTab => {
-                if self.tabs.len() > 1 {
-                    self.closed_tabs.push(self.tabs[self.active].to_session());
-                    self.tabs.remove(self.active);
-                    self.active = self.active.min(self.tabs.len() - 1);
-                    self.reflow_all();
+            // Same closing the keyboard does, down to the confirm on the last one:
+            // picking this from a menu is as deliberate as pressing the key, so it
+            // cannot be the version that gives up early and says nothing.
+            Action::CloseTab | Action::ClosePane => {
+                if self.close_something(&action, config) {
+                    std::process::exit(0);
                 }
             }
             Action::ReopenClosed => self.reopen_closed(config),
             Action::NextTab => self.active = (self.active + 1) % self.tabs.len(),
             Action::PrevTab => {
                 self.active = (self.active + self.tabs.len() - 1) % self.tabs.len()
-            }
-            Action::ClosePane => {
-                self.tab().close_focused(area);
             }
             Action::CycleLayout => self.cycle_layout(area),
             Action::ScrollToTop => {
@@ -3845,7 +4079,7 @@ impl Gpu {
         self.window.request_redraw();
     }
 
-    fn copy_mode_key(&mut self, event: &winit::event::KeyEvent, mods: ModifiersState) {
+    fn copy_mode_key(&mut self, key: &Key, mods: ModifiersState) {
         use winit::keyboard::{Key, NamedKey};
         // A modified chord (Ctrl+C, Ctrl+Q, …) leaves copy-mode rather than being
         // mis-read as a motion key, and hands control back to the shell/bindings.
@@ -3879,7 +4113,7 @@ impl Gpu {
         cm.dropped = dropped;
         let (mut yank, mut exit) = (false, false);
 
-        match &event.logical_key {
+        match key {
             Key::Named(NamedKey::Escape) => exit = true,
             Key::Named(NamedKey::Enter) => yank = true,
             Key::Named(NamedKey::ArrowLeft) => cm.cur.1 = cm.cur.1.saturating_sub(1),
@@ -4048,7 +4282,7 @@ impl Gpu {
             }
             PromptKind::QuickConnect => {
                 if !value.is_empty() {
-                    self.split_running(config, vec!["ssh".into(), value]);
+                    self.split_running_or_say_why(config, vec!["ssh".into(), value]);
                 }
             }
             PromptKind::AiCommand => {
@@ -4142,10 +4376,11 @@ impl Gpu {
                 // already typed in the shell, so this is just the Enter we withheld —
                 // broadcast it to the group if broadcast is on, exactly as the
                 // original keystroke would have gone.
+                self.note_input_reached_child();
                 if self.broadcast {
                     self.broadcast_bytes(b"\r");
                 } else {
-                    self.tab().focused().write(b"\r");
+                    self.tab().focused().write_from_user(b"\r");
                 }
             }
             PromptKind::HistoryInsert => {
@@ -5151,9 +5386,15 @@ impl Gpu {
             }
         }
         if let Some(cmd) = rerun {
-            self.split_running(config, cmd);
+            // The panel says what really happened to the handover. Claiming the push
+            // is "rerunning in a split" when the split was refused leaves someone
+            // watching for a prompt that never appears, on a push nobody sent.
+            let said = match self.split_running(config, cmd) {
+                Ok(_) => "needs a terminal — rerunning in a split".to_string(),
+                Err(why) => format!("needs a terminal, and {why}"),
+            };
             if let Some(Overlay::Git(p)) = &mut self.overlay {
-                p.message = Err("needs a terminal — rerunning in a split".into());
+                p.message = Err(said);
             }
         }
         if reload {
@@ -5541,7 +5782,7 @@ impl Gpu {
             self.set_clipboard(text);
         }
         if let Some(cmd) = split {
-            self.split_running(config, cmd);
+            self.split_running_or_say_why(config, cmd);
             self.overlay = None;
         }
         if let Some(dir) = open_dir {
@@ -5586,7 +5827,7 @@ impl Gpu {
         match crate::hints::act(&h.text, h.kind, false) {
             crate::hints::HintAct::Copy(text) => self.set_clipboard(text),
             crate::hints::HintAct::Done => {}
-            crate::hints::HintAct::Split(cmd) => self.split_running(config, cmd),
+            crate::hints::HintAct::Split(cmd) => self.split_running_or_say_why(config, cmd),
         }
         true
     }
@@ -5597,17 +5838,9 @@ impl Gpu {
         let row = (((pos.y as f32 - rect.y) / ch).floor().max(0.0)) as usize;
         let pane = self.tabs[self.active].panes.get(&id)?;
         let grid = pane.grid.lock().unwrap();
-        let row = row.min(grid.rows().saturating_sub(1));
         // With folds active a screen row maps through the display plan; a click on a
         // fold summary or blank padding is not a real cell (returns None).
-        let abs = if grid.has_folds() {
-            match grid.display_plan().get(row) {
-                Some(crate::grid::PlanRow::Real(a)) => *a,
-                _ => return None,
-            }
-        } else {
-            grid.abs_row(row)
-        };
+        let abs = grid.row_at_view(row)?;
         Some((abs, col.min(grid.cols().saturating_sub(1))))
     }
 
@@ -5653,7 +5886,9 @@ impl Gpu {
         let scoped = self.tab().panes.values().any(|p| p.in_group);
         for pane in self.tab().panes.values_mut() {
             if !scoped || pane.in_group {
-                pane.write(bytes);
+                // Broadcasting into a pane is typing in it: each one it reaches is a
+                // pane somebody is working in, not one to tidy away behind them.
+                pane.write_from_user(bytes);
             }
         }
     }
@@ -5721,14 +5956,17 @@ impl Gpu {
             .chars()
             .filter(|&c| c == '\t' || c == '\n' || c == '\r' || !c.is_control())
             .collect();
+        self.note_input_reached_child();
         let bracketed = self.tab().focused().bracketed_paste();
         let pane = self.tab().focused();
+        // `write_from_user` throughout: a pasted line runs, and the pane it ran in is
+        // the user's however few keys were pressed to get it there.
         if bracketed {
-            pane.write(b"\x1b[200~");
-            pane.write(text.as_bytes());
-            pane.write(b"\x1b[201~");
+            pane.write_from_user(b"\x1b[200~");
+            pane.write_from_user(text.as_bytes());
+            pane.write_from_user(b"\x1b[201~");
         } else {
-            pane.write(text.as_bytes());
+            pane.write_from_user(text.as_bytes());
         }
     }
 
@@ -5877,7 +6115,407 @@ impl Gpu {
             return;
         }
         argv.push(path.to_string_lossy().into_owned());
-        self.split_running(config, argv);
+        self.split_running_or_say_why(config, argv);
+    }
+
+    /// Zooms out: every pane as a card carrying its headline, in the geometry it
+    /// already occupies.
+    ///
+    /// This is the half of "canvas, not mosaic" that can exist while a pane is a
+    /// pseudo-terminal: the PTY's size in rows and columns is not a view property, so
+    /// zooming cannot scale the text without resizing every program in the session.
+    /// What zoom CAN do is change what is drawn — headlines instead of unreadable
+    /// glyphs — which is the part that makes a session readable at a glance.
+    /// How long since anything was typed at a pane. The catch-up's notion of away.
+    pub fn idle_for(&self) -> std::time::Duration {
+        self.last_pty_key.elapsed()
+    }
+
+    /// Puts the map up unasked. Marked as such, so the first key dismisses it rather
+    /// than acting: a screensaver that eats the keystroke meant for the shell — or
+    /// worse, acts on it — is one nobody forgives twice.
+    pub fn show_map_as_screensaver(&mut self) {
+        self.show_map();
+        self.screensaver = true;
+    }
+
+    /// One frame of the map, if it is up. Returns whether it is.
+    ///
+    /// The rain moves every frame; the readings are re-taken about once a second,
+    /// because a `catch_up_snapshot` per pane ten times a second is a lot of work for
+    /// a screen nobody is typing at.
+    fn tick_map(&mut self) -> bool {
+        if !matches!(self.overlay, Some(Overlay::Map(_))) {
+            return false;
+        }
+        self.map_frame = self.map_frame.wrapping_add(1);
+        let refresh = self.map_frame % 11 == 0;
+        let cards = refresh.then(|| self.map_cards());
+        let rows = (self.surface_config.height as f32 / self.renderer.cell_size().1).floor() as usize;
+        if let Some(Overlay::Map(p)) = &mut self.overlay {
+            p.tick_rain(rows.max(1));
+            if let Some(cards) = cards {
+                p.refresh(cards);
+            }
+        }
+        true
+    }
+
+    fn show_map(&mut self) {
+        self.screensaver = false;
+        let cards = self.map_cards();
+        self.overlay = Some(Overlay::Map(overlay::MapPanel::new(cards)));
+        self.window.request_redraw();
+    }
+
+    /// One card per pane in the WHOLE WINDOW, tabs included.
+    ///
+    /// Every tab and not just the active one, because the active tab is the thing you
+    /// are already looking at: a map of it answers a question you did not have. What
+    /// nothing else in runnir answers is "what is running anywhere in here" — the
+    /// catch-up is the active tab too — and that is the question this now takes.
+    ///
+    /// Cards keep each tab's own geometry, and tabs stack downwards: re-flowing
+    /// everything into one neat grid would make you re-learn the shape of a session
+    /// you already know by its shape.
+    fn map_cards(&self) -> Vec<overlay::MapCard> {
+        let area = self.active_area();
+        let (cw, ch) = self.renderer.cell_size();
+        let waiting = matches!(&self.overlay, Some(Overlay::Prompt(_)))
+            .then(|| self.tabs[self.active].focus);
+
+        let mut cards: Vec<overlay::MapCard> = Vec::new();
+        // Where the next tab's block starts, in rows. Each tab is laid out in its own
+        // coordinates and then pushed below the one before it.
+        let mut row_offset = 0usize;
+        for (index, tab) in self.tabs.iter().enumerate() {
+            // Not the visible layout: that honours zoom, and the map of a session with
+            // one pane zoomed would be a single card — exactly the hole the cards
+            // exist to close. Zooming out to see everything must show everything.
+            let rects = tab.map_layout(area);
+            let mut tallest = 0usize;
+            for (id, r) in &rects {
+                let Some(pane) = tab.panes.get(id) else { continue };
+                let snap = pane.catch_up_snapshot(*id, waiting == Some(*id));
+                // Every pane gets a card, including the quiet ones: a map with holes in
+                // it is not a map. The catch-up omits them; this must not.
+                let head = crate::catchup::headline(&snap);
+                let (tag, detail) = match &head {
+                    Some(h) => (h.state.tag().to_string(), h.detail.clone()),
+                    None => ("idle".to_string(), "at a prompt".to_string()),
+                };
+                let row = (r.y / ch).round() as usize;
+                let rows = (r.h / ch).round() as usize;
+                tallest = tallest.max(row + rows);
+                cards.push(overlay::MapCard {
+                    pane: *id,
+                    tab: index,
+                    tab_title: tab.title(),
+                    col: (r.x / cw).round() as usize,
+                    row: row_offset + row,
+                    cols: (r.w / cw).round() as usize,
+                    rows,
+                    tag,
+                    title: snap.title,
+                    detail,
+                    // The block's output, not the tail of the scrollback: the tail of a
+                    // themed prompt is glyphs and a clock, and a map of clocks is no map.
+                    preview: pane.recent_output(3),
+                });
+            }
+            row_offset += tallest;
+        }
+        cards.sort_by_key(|c| (c.tab, c.row, c.col));
+        cards
+    }
+
+    /// Arranges the window around an operation: a status watch and one log pane per
+    /// service, with the deploy itself STAGED at the prompt rather than run.
+    ///
+    /// Nothing is asked of the user — the compose file already says what the project
+    /// is made of. Explicitly started, never guessed: a layout that appears unbidden
+    /// is a window that reorganises your work.
+    fn open_war_room(&mut self, config: &Config) {
+        let cwd = self.tab().focused().cwd();
+        let Some(cwd) = cwd else {
+            self.note_pipe("cannot tell where this pane is");
+            return;
+        };
+        let root = crate::git::repo_root(&cwd);
+        let Some(file) = crate::warroom::find_compose(&cwd, root.as_deref()) else {
+            // Say so instead of opening an empty room: a war room that guesses wrong
+            // about a project is worse than none.
+            self.note_pipe("no compose file here — nothing to build a war room from");
+            return;
+        };
+        let Some(plan) = crate::warroom::plan_from(&file) else {
+            self.note_pipe("that compose file lists no services");
+            return;
+        };
+
+        // A tab of its own: the room is a place you go to, and it must not rearrange
+        // the panes you were already working in.
+        let n = plan.services.len();
+        let opened = self.control_new_tab(config, Vec::new());
+        if !opened.ok {
+            // Without a tab of its own the room would be built around the panes the
+            // user is working in, and every one of them would be marked as the room's
+            // to close. Refuse rather than take over somebody's window.
+            let why = opened.error.unwrap_or_else(|| "the tab did not open".into());
+            self.note_pipe(&format!("war room: {why}"));
+            return;
+        }
+        if let Some(pane) = self.tabs[self.active].panes.values_mut().next() {
+            pane.from_war_room = true;
+        }
+        let mut opened = 0usize;
+        let mut refused: Option<String> = None;
+        for (_, cmd) in crate::warroom::watch_commands(&plan, 3) {
+            let id = self.new_pane_id();
+            let area = self.active_area();
+            let wake = wake_fn(self.proxy.clone());
+            let argv = vec!["sh".to_string(), "-c".to_string(), cmd];
+            let axis = if self.tabs[self.active].panes.len() % 2 == 0 {
+                Axis::Horizontal
+            } else {
+                Axis::Vertical
+            };
+            match self.tabs[self.active].split_running_with_id(area, axis, config, id, argv, wake) {
+                // Say which pane could not open rather than silently opening a room
+                // with holes in it: a war room missing the service you care about is
+                // worse than one that admits it.
+                Err(e) => {
+                    refused = Some(format!("could not open a pane ({e})"));
+                    break;
+                }
+                // A refused split is the same hole with a gentler cause — the tab will
+                // not divide a pane already at its minimum size — and silence about it
+                // is what lets the room claim services that are not on screen.
+                Ok(false) => {
+                    refused = Some("the window is too small for the rest".to_string());
+                    break;
+                }
+                Ok(true) => opened += 1,
+            }
+            if let Some(pane) = self.tabs[self.active].panes.get_mut(&id) {
+                pane.from_war_room = true;
+            }
+        }
+        // Back to the first pane and stage the deploy for the user to fire.
+        if let Some(first) = self.tabs[self.active].first_pane() {
+            self.tabs[self.active].focus = first;
+        }
+        // Quoted like the watch commands: this line is one Enter away from running,
+        // and the path came from wherever the repository was cloned to.
+        let dir = shell_quote(&file.parent().unwrap_or(std::path::Path::new(".")).to_string_lossy());
+        // Staged, not claimed: the room typed this line itself, so the pane is still
+        // untouched and teardown is still free to take it down.
+        self.type_command(format!("cd {dir} && docker compose up -d"), false);
+        // Counted from what is ON SCREEN, never from the file: the log panes are capped
+        // at three and a split can be refused, so the compose file's own count would be
+        // a promise the window does not keep. The first watch pane is the status board
+        // and the loop stops at the first refusal, so what opened is always a prefix.
+        let watching = opened.saturating_sub(1);
+        let note = match refused {
+            Some(why) => format!("war room: {watching} of {n} services \u{2014} {why}"),
+            None => format!(
+                "war room: {watching} of {n} services \u{2014} the deploy is at the prompt, not running"
+            ),
+        };
+        self.note_pipe(&note);
+    }
+
+    /// Takes the room down: closes the panes IT opened, and only those the user never
+    /// typed in. A pane somebody worked in is theirs.
+    fn close_war_room(&mut self, config: &Config) {
+        let doomed: Vec<u64> = self.tabs[self.active]
+            .panes
+            .iter()
+            .filter(|(_, p)| p.from_war_room && !p.touched)
+            .map(|(id, _)| *id)
+            .collect();
+        let total = self.tabs[self.active].panes.len();
+        match crate::warroom::teardown(total, doomed.len()) {
+            crate::warroom::Teardown::Nothing => {
+                self.note_pipe("no untouched war-room panes here");
+            }
+            crate::warroom::Teardown::Panes => {
+                let area = self.active_area();
+                for id in doomed {
+                    self.tabs[self.active].close_pane(id, area);
+                }
+                let kept = self.tabs[self.active].panes.len();
+                self.note_pipe(&format!("war room closed, {kept} panes kept"));
+            }
+            crate::warroom::Teardown::WholeTab => {
+                // Nobody worked in any of them, so there is nothing here to keep and
+                // nothing to reopen either. Taking the panes one at a time would leave
+                // the last one alive — a tab cannot be emptied — still watching docker
+                // in a tab nothing points at.
+                if self.tabs.len() == 1 {
+                    // Closing the only tab is closing the window, which a teardown key
+                    // must never do behind your back: a plain shell takes its place.
+                    let id = self.new_pane_id();
+                    let area = self.active_area();
+                    let wake = wake_fn(self.proxy.clone());
+                    let cell = self.renderer.cell_size();
+                    match Tab::new(area, cell, config, id, &Spawn::default(), wake) {
+                        Ok(tab) => self.tabs.push(tab),
+                        Err(e) => {
+                            self.note_pipe(&format!("war room: nothing to put in its place ({e})"));
+                            return;
+                        }
+                    }
+                }
+                self.tabs.remove(self.active);
+                self.active = self.active.min(self.tabs.len().saturating_sub(1));
+                self.reflow_all();
+                self.note_pipe("war room closed");
+            }
+        }
+        self.window.request_redraw();
+    }
+
+    /// A tactile pipe: the command block under `from` is handed to the pane under
+    /// `to`, as a path staged at its prompt.
+    ///
+    /// It PROPOSES and never executes — the path is left on the command line for a
+    /// key to confirm. A gesture that runs something is a mouse slip that runs
+    /// something, and this one starts with output the user did not necessarily read.
+    ///
+    /// Always through a file, whatever the size. Typing the text itself into a shell
+    /// would run each line as a command, which is the opposite of "as stdin"; and the
+    /// file is written 0600 in the per-user runtime dir, because command output holds
+    /// secrets often enough to assume it does.
+    fn pipe_output(&mut self, from: PhysicalPosition<f64>, to: PhysicalPosition<f64>, config: &Config) {
+        let area = self.active_area();
+        let (Some((src_id, src_rect)), Some((dst_id, _))) =
+            (self.pane_at(from, area), self.pane_at(to, area))
+        else {
+            if std::env::var("RUNNIR_PIPE_DEBUG").is_ok() {
+                eprintln!("pipe: no pane under one end ({from:?} -> {to:?}); area={area:?}");
+                for (id, r) in self.visible_rects(area) {
+                    eprintln!("   pane {id}: x={} y={} w={} h={}", r.x, r.y, r.w, r.h);
+                }
+            }
+            return;
+        };
+        if std::env::var("RUNNIR_PIPE_DEBUG").is_ok() {
+            eprintln!("pipe: src={src_id} dst={dst_id}");
+        }
+        if src_id == dst_id {
+            // Dropping a block back on its own pane is a slip, not an instruction.
+            return;
+        }
+        let (_, ch) = self.renderer.cell_size();
+        let row_in_pane = ((from.y as f32 - src_rect.y) / ch).floor().max(0.0) as usize;
+
+        let text = {
+            let src = &self.tabs[self.active].panes[&src_id];
+            let g = src.grid.lock().unwrap();
+            // The row under the pointer is a VIEW row; blocks are addressed in the
+            // buffer, and with output folded the two do not differ by the scroll
+            // alone. The same mapping the click path uses, or a drag over a folded
+            // pane stages a different command's output than the one under the hand.
+            let Some(abs) = g.row_at_view(row_in_pane) else {
+                drop(g);
+                self.note_pipe("that row is a fold — unfold it to grab its output");
+                return;
+            };
+            let Some(range) = g.block_at(abs) else {
+                drop(g);
+                self.note_pipe("that pane has no command marks to grab a block from");
+                return;
+            };
+            g.block_text(range)
+        };
+        if text.trim().is_empty() {
+            self.note_pipe("nothing in that block");
+            return;
+        }
+        if self.tabs[self.active].panes[&dst_id].in_full_screen_app() {
+            // Typing a path into vim is not a pipe, it is vandalism.
+            self.note_pipe("that pane is running a full-screen app");
+            return;
+        }
+
+        let dir = std::env::var_os("XDG_RUNTIME_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let path = dir.join(format!("runnir-pipe-{}-{}.txt", std::process::id(), src_id));
+        if let Err(e) = write_private(&path, text.as_bytes()) {
+            self.note_pipe(&format!("could not stage that output: {e}"));
+            return;
+        }
+        let lines = text.lines().filter(|l| !l.trim().is_empty()).count();
+        self.tabs[self.active].focus = dst_id;
+        self.insert_command(shell_quote(&path.to_string_lossy()));
+        self.note_pipe(&format!("{lines} lines staged \u{2014} press Enter to use it"));
+        let _ = config;
+    }
+
+    fn note_pipe(&mut self, text: &str) {
+        self.status = Some(text.to_string());
+        self.status_expiry = Some(Instant::now() + Duration::from_secs(4));
+        self.window.request_redraw();
+    }
+
+    /// Opens the verbs panel for the focused pane's repository.
+    fn show_repo_verbs(&mut self, config: &Config) {
+        let root = self.tab().focused().cwd().and_then(|d| crate::git::repo_root(&d));
+        let Some(root) = root else {
+            self.status = Some("not inside a git repository".into());
+            self.status_expiry = Some(Instant::now() + Duration::from_secs(3));
+            self.window.request_redraw();
+            return;
+        };
+        if !config.verbs.enabled {
+            // Say what to switch on rather than showing an empty panel: nothing was
+            // ever recorded, and an empty list reads as "this repo has no verbs".
+            self.status = Some("learning is off — enable verbs.enabled to collect them".into());
+            self.status_expiry = Some(Instant::now() + Duration::from_secs(5));
+            self.window.request_redraw();
+            return;
+        }
+        let list = self.verbs.top(&root, config.verbs.threshold, 8);
+        self.overlay = Some(Overlay::Verbs(overlay::VerbsPanel::new(
+            root.to_string_lossy().into_owned(),
+            list,
+        )));
+        self.window.request_redraw();
+    }
+
+    /// Builds the catch-up from what every pane knows and opens it.
+    ///
+    /// "Away" is measured from the last keystroke that reached a PTY, not from window
+    /// focus: a focused window on a second monitor is not attention, and a window
+    /// that lost focus because the pointer crossed it is not absence.
+    fn show_catch_up(&mut self) {
+        let away = self.last_pty_key.elapsed();
+        let waiting_pane = match &self.overlay {
+            // A guardian confirm belongs to the pane that was focused when it opened.
+            Some(Overlay::Prompt(_)) => Some(self.tabs[self.active].focus),
+            _ => None,
+        };
+        let snaps: Vec<crate::catchup::Snapshot> = self.tabs[self.active]
+            .panes
+            .iter()
+            .map(|(id, pane)| pane.catch_up_snapshot(*id, waiting_pane == Some(*id)))
+            .collect();
+        let lines = crate::catchup::catch_up(&snaps);
+        self.overlay =
+            Some(Overlay::CatchUp(overlay::CatchUpPanel::new(lines, human_away(away))));
+        self.window.request_redraw();
+    }
+
+    /// Focuses a pane by id, wherever it is in the tree. Used by the catch-up, whose
+    /// whole promise is "enter takes you to the one that matters".
+    fn focus_pane(&mut self, id: u64) {
+        let tab = &mut self.tabs[self.active];
+        if tab.panes.contains_key(&id) {
+            tab.focus = id;
+            self.window.request_redraw();
+        }
     }
 
     /// Flashes the whole keyboard, if there is one and the config asked for it.
@@ -5942,7 +6580,9 @@ impl Gpu {
             "runnir-pipe".to_string(),
             path.to_string_lossy().into_owned(),
         ];
-        self.split_running(config, argv);
+        // The captured text is already on disk; if the filter's pane never opens, the
+        // file is all there is, and silence would look exactly like an empty result.
+        self.split_running_or_say_why(config, argv);
     }
 
     /// Opens the layout picker (W3): choose a named layout from the config and it
@@ -5990,7 +6630,7 @@ impl Gpu {
         if snip.run_now {
             // insert_command already snapped to the bottom and typed the line; this is
             // just the Enter, sent to the same focused pane it was typed into.
-            self.tab().focused().write(b"\r");
+            self.tab().focused().write_from_user(b"\r");
         }
     }
 
@@ -6039,12 +6679,32 @@ impl Gpu {
         self.window.request_redraw();
     }
 
-    fn split_running(&mut self, config: &Config, command: Vec<String>) {
+    /// Splits the focused pane and runs `command` in the new one. `Ok` carries the new
+    /// pane's id.
+    ///
+    /// The outcome is returned rather than swallowed because a split can simply not
+    /// happen — the tab refuses to divide a pane already at its minimum size — and a
+    /// caller that assumes success then announces a command nobody is running, hands
+    /// out the OLD pane's id, or drops the command in silence.
+    fn split_running(&mut self, config: &Config, command: Vec<String>) -> Result<u64, String> {
         let area = self.active_area();
         let id = self.new_pane_id();
         let wake = wake_fn(self.proxy.clone());
-        let _ = self.tab().split_running_with_id(area, Axis::Horizontal, config, id, command, wake);
+        let done = self.tab().split_running_with_id(area, Axis::Horizontal, config, id, command, wake);
         self.window.request_redraw();
+        match split_refusal(done) {
+            None => Ok(id),
+            Some(why) => Err(why),
+        }
+    }
+
+    /// The same, for the callers whose only sensible answer to a refusal is to say so
+    /// out loud. Saying nothing is what leaves somebody watching a pane that never
+    /// opened for output that is never coming.
+    fn split_running_or_say_why(&mut self, config: &Config, command: Vec<String>) {
+        if let Err(why) = self.split_running(config, command) {
+            self.note_pipe(&why);
+        }
     }
 
     fn open_quick_connect(&mut self) {
@@ -6058,7 +6718,7 @@ impl Gpu {
 
     fn launch_claude(&mut self, config: &Config) {
         let cmd = ai::claude_launch_command(config);
-        self.split_running(config, cmd);
+        self.split_running_or_say_why(config, cmd);
     }
 
     // ------------------------------------------------------------------
@@ -6343,18 +7003,24 @@ impl Gpu {
                 self.window.request_redraw();
                 ControlResponse::ok(self.ui_state())
             }
-            ControlRequest::Drag { col, row, to_col, to_row } => {
+            ControlRequest::Drag { col, row, to_col, to_row, button } => {
+                let btn = match button.as_deref() {
+                    None | Some("left") => MouseButton::Left,
+                    Some("middle") => MouseButton::Middle,
+                    Some("right") => MouseButton::Right,
+                    Some(other) => return ControlResponse::error(format!("unknown button {other:?}")),
+                };
                 let from = self.cell_centre(col, row);
                 let to = self.cell_centre(to_col, to_row.unwrap_or(row));
                 self.cursor_px = from;
-                self.on_click(ElementState::Pressed, MouseButton::Left, ModifiersState::empty(), config);
+                self.on_click(ElementState::Pressed, btn, ModifiersState::empty(), config);
                 // Two steps, because a drag handler is allowed to care about motion
                 // rather than about the final position — one jump would not exercise
                 // what a hand does.
                 let mid = PhysicalPosition::new((from.x + to.x) / 2.0, (from.y + to.y) / 2.0);
                 self.on_cursor(mid, ModifiersState::empty());
                 self.on_cursor(to, ModifiersState::empty());
-                self.on_click(ElementState::Released, MouseButton::Left, ModifiersState::empty(), config);
+                self.on_click(ElementState::Released, btn, ModifiersState::empty(), config);
                 self.window.request_redraw();
                 ControlResponse::ok(self.ui_state())
             }
@@ -6406,7 +7072,16 @@ impl Gpu {
                         })
                     })
                     .collect();
-                ControlResponse::ok(json!({ "active": active, "tabs": tabs }))
+                // The UI state travels with `ls` because it is the only request that
+                // does not ACT. Everything else that reports it does so after pressing
+                // a key, which is useless for anything a key changes — the screensaver
+                // is dismissed by any key at all, so the only probe that could see it
+                // was the one that destroyed it first.
+                ControlResponse::ok(json!({
+                    "active": active,
+                    "tabs": tabs,
+                    "ui": self.ui_state(),
+                }))
             }
 
             ControlRequest::GetText { target } => match self.control_pane(target) {
@@ -6431,11 +7106,13 @@ impl Gpu {
                 let argv = cmd.as_deref().map(argv_of).unwrap_or_default();
                 match target {
                     LaunchTarget::Tab => self.control_new_tab(config, argv),
-                    LaunchTarget::Split => {
-                        self.split_running(config, argv);
-                        let id = self.tab().focused_ptr();
-                        ControlResponse::ok(json!({ "pane": id }))
-                    }
+                    // The id has to be the pane that was really opened. Answering `ok`
+                    // with the focused pane after a refused split hands the script the
+                    // OLD pane, and its next `send-text` types into the user's shell.
+                    LaunchTarget::Split => match self.split_running(config, argv) {
+                        Ok(id) => ControlResponse::ok(json!({ "pane": id })),
+                        Err(why) => ControlResponse::error(why),
+                    },
                 }
             }
 
@@ -6529,6 +7206,69 @@ impl Gpu {
 /// What to tell the user when no editor could be found at all — the same sentence
 /// wherever an "open this file" key gives up, since the fix is always the same.
 const NO_EDITOR: &str = "no editor found — set $EDITOR (e.g. EDITOR=nvim)";
+
+/// What a close key actually takes down.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Closing {
+    /// One pane; its tab has others and survives.
+    Pane,
+    /// The whole tab: either the tab was asked for, or the pane was the tab's last.
+    Tab,
+    /// Nothing would be left behind it, so this is the window closing.
+    Window,
+}
+
+/// Which of the three a close key means, given how much is open.
+///
+/// Split out from the closing itself because the cases that matter are the ones
+/// nobody exercises by hand — the last pane of the last tab, the last tab of the
+/// window — and because both dispatches ask this one question, so neither can
+/// answer it differently from the other.
+fn closing_target(action: &Action, tabs: usize, panes_in_tab: usize) -> Option<Closing> {
+    match action {
+        // The tab goes, unless it is the only one and there is nothing left to be a
+        // window around.
+        Action::CloseTab if tabs > 1 => Some(Closing::Tab),
+        Action::CloseTab => Some(Closing::Window),
+        // A pane with siblings just goes. The last pane of a tab takes the tab with
+        // it, and the last pane of the last tab takes the window: asking the tab to
+        // close its own last pane leaves an empty tab nothing can be typed into.
+        Action::ClosePane if panes_in_tab > 1 => Some(Closing::Pane),
+        Action::ClosePane if tabs > 1 => Some(Closing::Tab),
+        Action::ClosePane => Some(Closing::Window),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod closing_tests {
+    use super::{closing_target, Closing};
+    use crate::actions::Action;
+
+    /// Walking down to nothing has to end in the window closing, once, at the bottom.
+    /// The palette used to stop one step early on both keys — its "close pane" left
+    /// the last pane alone and said nothing, and its "close tab" did the same with
+    /// the last tab — which reads as a broken command rather than as a refusal.
+    #[test]
+    fn closing_the_last_pane_closes_its_tab_and_the_last_tab_closes_the_window() {
+        let pane = &Action::ClosePane;
+        let tab = &Action::CloseTab;
+        assert_eq!(closing_target(pane, 2, 3), Some(Closing::Pane));
+        assert_eq!(closing_target(pane, 2, 1), Some(Closing::Tab), "the tab's last pane takes the tab");
+        assert_eq!(closing_target(pane, 1, 1), Some(Closing::Window), "and the last of those, the window");
+        assert_eq!(closing_target(tab, 2, 1), Some(Closing::Tab));
+        assert_eq!(closing_target(tab, 1, 4), Some(Closing::Window), "panes do not keep the last tab open");
+        assert_eq!(closing_target(&Action::NewTab, 1, 1), None, "nothing else closes anything");
+    }
+
+    /// The count that decides is the panes there are BEFORE the key, not after it.
+    /// Reading it afterwards saw the one pane left of two and asked to close the
+    /// window — so splitting a window and closing one half offered to quit.
+    #[test]
+    fn closing_one_of_two_panes_never_offers_to_close_the_window() {
+        assert_eq!(closing_target(&Action::ClosePane, 1, 2), Some(Closing::Pane));
+    }
+}
 
 /// Whether a foreground process name is just the pane's shell sitting at its
 /// prompt. Login shells arrive as `-fish`, so the leading dash is stripped first.
@@ -6644,6 +7384,35 @@ fn shell_quote(s: &str) -> String {
     out
 }
 
+/// Why a split produced no pane, or `None` when it did produce one.
+///
+/// A refusal and a failed spawn leave the caller in the same place — holding a command
+/// nobody is running — and differ only in what there is to tell the user. Stated once,
+/// here, so no caller has to decide that a `false` was good enough.
+fn split_refusal(done: anyhow::Result<bool>) -> Option<String> {
+    match done {
+        Ok(true) => None,
+        Ok(false) => Some("no room to split — resize the window or close a pane".into()),
+        Err(e) => Some(format!("could not open a pane: {e}")),
+    }
+}
+
+#[cfg(test)]
+mod split_outcome_tests {
+    use super::split_refusal;
+
+    /// Every way a split can fail to put a pane on screen has to read as a failure.
+    /// `Ok(false)` is the one that looks like success and is not: the tab declined to
+    /// divide a pane already at its smallest, and nothing is running anywhere.
+    #[test]
+    fn a_split_that_opened_no_pane_never_passes_for_success() {
+        assert_eq!(split_refusal(Ok(true)), None);
+        assert!(split_refusal(Ok(false)).is_some(), "a refused split is not a split");
+        let failed = split_refusal(Err(anyhow::anyhow!("no ptys left")));
+        assert!(failed.is_some_and(|why| why.contains("no ptys left")), "say what went wrong");
+    }
+}
+
 #[cfg(test)]
 mod shell_quote_tests {
     use super::shell_quote;
@@ -6699,5 +7468,15 @@ mod write_private_tests {
         assert_eq!(mode, 0o600, "the capture must be private, not the old file's mode");
         assert_eq!(std::fs::read(&path).unwrap(), b"secret");
         let _ = std::fs::remove_file(&path);
+    }
+}
+
+/// How long you were away, worded for someone who just sat back down.
+fn human_away(d: Duration) -> String {
+    let secs = d.as_secs();
+    match secs {
+        0..=89 => "just now".to_string(),
+        90..=3599 => format!("{} min", secs / 60),
+        _ => format!("{}h{:02}m", secs / 3600, (secs % 3600) / 60),
     }
 }

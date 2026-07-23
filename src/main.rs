@@ -1,6 +1,7 @@
 mod actions;
 mod ai;
 mod boxdraw;
+mod catchup;
 mod clipboard;
 mod config;
 mod control;
@@ -31,6 +32,8 @@ mod settings;
 mod shell_integration;
 mod tab;
 mod themes;
+mod verbs;
+mod warroom;
 mod watch;
 mod whisper;
 mod zsa;
@@ -65,6 +68,13 @@ const TABBAR_ROWS: f32 = 1.0;
 /// Escape, the way a tmux prefix does.
 pub fn leader_timeout(config: &Config) -> Option<Duration> {
     (config.leader_timeout > 0).then(|| Duration::from_secs(config.leader_timeout))
+}
+
+/// Whether an armed leader layer has outlived its step. Both halves have to be
+/// there: nothing armed is nothing to lapse, and no timeout means the layer waits
+/// as long as the user does.
+pub fn leader_lapsed(armed: Option<Instant>, timeout: Option<Duration>) -> bool {
+    matches!((armed, timeout), (Some(since), Some(limit)) if since.elapsed() >= limit)
 }
 
 /// Width of the minimap strip, in pixels. Like the tab bar, this is chrome that
@@ -794,9 +804,30 @@ struct Gpu {
     /// The ZSA keyboard, when there is one and the user asked for it. `None` covers
     /// both "no such keyboard" and "not enabled", which behave identically.
     board: Option<zsa::Board>,
+    /// Where the middle button went down, for the tactile pipe: a middle DRAG hands
+    /// a command block to another pane, a middle CLICK still pastes the primary
+    /// selection.
+    middle_press: Option<PhysicalPosition<f64>>,
+    /// Frame counter for the map's screensaver, so the rain and the re-readings can
+    /// run at different rates off one wake-up.
+    map_frame: u32,
+    /// Whether the map on screen put itself there. An unasked overlay must not eat
+    /// the keystroke that dismisses it.
+    screensaver: bool,
+    /// What this project is really worked with, learned from successful commands.
+    /// Loaded once; only written when it changes.
+    verbs: verbs::Verbs,
+    /// When a keystroke last reached a child process. The catch-up measures "away"
+    /// from here rather than from window focus, which lies in both directions.
+    last_pty_key: Instant,
+    /// Whether the panes still owe the catch-up a baseline. Marking has to happen at
+    /// the last KEYSTROKE, not when the panel opens (by then everything that moved has
+    /// already moved, and every pane looks unchanged) and not when the absence is
+    /// finally noticed either — see [`catchup::Baseline`].
+    baseline: catchup::Baseline,
     /// The flashed layout, read once at startup: which LED sits under which key.
     /// Only loaded when the leader lights are on, since nothing else needs it.
-    board_layout: Option<zsa::Layout>,
+
     proxy: EventLoopProxy<UserEvent>,
 }
 
@@ -1075,13 +1106,19 @@ impl App {
             board: (self.config.keyboard.ambient || self.config.keyboard.leader_lights)
                 .then(zsa::Board::start)
                 .flatten(),
-            board_layout: None,
+
+            middle_press: None,
+            map_frame: 0,
+            screensaver: false,
+            verbs: verbs::Verbs::load(),
+            last_pty_key: Instant::now(),
+            baseline: catchup::Baseline::default(),
             proxy: self.proxy.clone(),
         };
         // The flashed layout, read once. Blocking (two processes: kontroll status and
         // sqlite3), so it happens here at startup and never on a keystroke.
         if self.config.keyboard.leader_lights {
-            gpu.load_board_layout();
+            gpu.refresh_board_layout();
         }
         // Arm the image auto-preview watch at startup when the config asks for it and
         // names a directory. A snapshot of the directory is taken now, so files
@@ -1385,17 +1422,38 @@ impl ApplicationHandler<UserEvent> for App {
             }
         }
 
+        // Nothing typed for long enough: put the map up by itself. A screensaver you
+        // have to ask for is a contradiction, and runnir already knows what "away"
+        // means without believing window focus.
+        let after = self.config.behaviour.screensaver_after_secs;
+        if after > 0
+            && gpu.overlay.is_none()
+            && gpu.idle_for() >= Duration::from_secs(after)
+        {
+            gpu.show_map_as_screensaver();
+        }
+
+        // The map is a screensaver, so it has to keep moving on an idle terminal: the
+        // rain falls, the clock ticks over, and the cards are re-read so what you
+        // glance at on the way past is what is happening NOW, not what was happening
+        // when you opened it.
+        if gpu.tick_map() {
+            gpu.window.request_redraw();
+            event_loop.set_control_flow(ControlFlow::WaitUntil(
+                Instant::now() + Duration::from_millis(90),
+            ));
+            return;
+        }
+
         // An armed leader expires on a deadline nothing else wakes us for: on an idle
         // terminal the status-bar chip would stay lit long after the layer was gone.
-        // Clear it here and repaint once; the wake itself is folded into `extra_wake`
-        // below rather than returning early, which would stall the animations.
-        if let Some(limit) = gpu.leader_timeout {
-            if gpu.leader_armed.is_some_and(|t| t.elapsed() >= limit) {
-                gpu.leader_armed = None;
-                gpu.leader_path.clear();
-                gpu.leader_entries.clear();
-                gpu.window.request_redraw();
-            }
+        // Through `end_leader` like every other exit — clearing the fields here would
+        // leave the keyboard painted with a level nobody is in until the board's own
+        // dead-man expires. The wake itself is folded into `extra_wake` below rather
+        // than returning early, which would stall the animations.
+        if leader_lapsed(gpu.leader_armed, gpu.leader_timeout) {
+            gpu.end_leader(&self.config);
+            gpu.window.request_redraw();
         }
 
         // Animate a scroll glide (smooth scroll-to-top/bottom / jump-to-prompt).
@@ -1720,22 +1778,37 @@ impl Gpu {
         if self.last_context_refresh.elapsed() >= Duration::from_millis(500) {
             self.last_context_refresh = Instant::now();
             let focused = self.window.has_focus();
+            // The baseline the catch-up measures from: every pane's command counter as
+            // of the last keystroke. Taken here, on the first sweep after a key, rather
+            // than on the key itself — this loop already walks the panes, and locking
+            // every grid on every keypress would put the typing behind whatever a busy
+            // child is printing.
+            //
+            // EVERY tab, not just the active one: the watch scan below runs over all of
+            // them, so a pane left with the baseline it had two tabs ago reports work
+            // that finished yesterday as news, and an old watch hit outranks a real
+            // failure the moment you switch to it.
+            if self.baseline.take_due() {
+                for tab in &mut self.tabs {
+                    for pane in tab.panes.values_mut() {
+                        pane.mark_catch_up_point();
+                    }
+                }
+            }
             // The keyboard belongs to the whole desktop: runnir holds it only while
-            // it has the window focus, and only while the layer is actually armed.
-            // The lapse case matters as much as the focus one — the layer times out
-            // without any key arriving to notice, and the board would sit lit.
-            if self.leader_armed.is_some()
-                && (!focused
-                    || self.leader_timeout.is_some_and(|d| {
-                        self.leader_armed.is_some_and(|t| t.elapsed() >= d)
-                    }))
-            {
+            // it has the window focus. The lapse itself is not checked here — it has
+            // its own deadline wake in `about_to_wait`, which fires on the second
+            // rather than on this half-second tick.
+            if self.leader_armed.is_some() && !focused {
                 self.end_leader(config);
                 self.window.request_redraw();
             }
             // Collected rather than flashed inline: the panes are borrowed here, and
             // two signals in one sweep should be one flash, not a fight over the board.
             let mut flashes: Vec<config::Rgb> = Vec::new();
+            // Collected here, applied after the pane loop: recording borrows the
+            // window-level store while the panes are already borrowed.
+            let mut learned: Vec<(std::path::PathBuf, String)> = Vec::new();
             for tab in &mut self.tabs {
                 for pane in tab.panes.values_mut() {
                     pane.refresh_context(config);
@@ -1747,6 +1820,18 @@ impl Gpu {
                             flashes.push(FLASH_DONE);
                         }
                     }
+                    // Learn this repo's verbs from commands that SUCCEEDED. Failures
+                    // teach the wrong thing, and the verb is extracted (arguments
+                    // dropped) before anything reaches memory, let alone disk.
+                    if config.verbs.enabled {
+                        if let Some((line, 0)) = pane.take_finished_command() {
+                            if let Some(root) =
+                                pane.cwd().and_then(|d| crate::git::repo_root(&d))
+                            {
+                                learned.push((root, line));
+                            }
+                        }
+                    }
                     // Keyword watch (W4): fires whether focused or not — it is an
                     // explicit "tell me when this appears" on a monitored pane.
                     if pane.watching().is_some() {
@@ -1756,6 +1841,12 @@ impl Gpu {
                         }
                     }
                 }
+            }
+            if !learned.is_empty() {
+                for (root, line) in learned {
+                    self.verbs.record(&root, &line);
+                }
+                self.verbs.save();
             }
             // The board says ONE thing at a time: the most urgent colour of this
             // sweep wins. Ordering is by list position, so watch beats done.
