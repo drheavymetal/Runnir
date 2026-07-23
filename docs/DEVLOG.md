@@ -2743,8 +2743,51 @@ paint order is not testable here — it is verified on a real instance.
 
 503 tests (was 502).
 
+## 2026-07-23 - The board gave up at startup and stayed dark for hours
+
+Reported as "the keyboard colours do not work". Nothing was misconfigured and nothing
+was down: Keymapp running, socket alive, kontroll connecting, board detected, and both
+`keyboard.ambient` and `keyboard.leader_lights` true. The diagnosis came from clocks:
+
+    Keymapp started   11:03:11
+    that runnir window 10:37:48   <- 25 minutes EARLIER
+
+The flashed layout was read once, in the constructor. With no socket at that instant
+`board_layout` stayed `None`, `paint_leader` bailed on its first line, and — the
+feature being silent by design — that window stayed dark for the rest of its life.
+Config hot-reload cannot help: it does not rebuild the board. Nothing anywhere retried.
+
+The design rule was "if Keymapp is not there the feature does not exist and does not
+nag". It was implemented as giving up PERMANENTLY, which is not the same thing.
+Keymapp is the user's app: it autostarts late, it quits on its own (it already did,
+mid-session, on the 22nd), and it follows the keyboard in and out of its socket. "Not
+up when this window opened" is the ORDINARY case, not a broken one.
+
+The layout now lives on the `Board` behind a mutex, is read on a worker the way the
+layer reading already had to be, and is asked for again on every arming of the leader
+that finds it missing. `refresh_layout` costs no subprocess while the socket is absent
+— that check is the `exists()` `alive()` already did — and says so under
+`RUNNIR_ZSA_DEBUG=1`. The first cut of the fix returned silently there and was caught
+in live verification: it had reintroduced exactly the blindness that made the original
+bug cost a session to see.
+
+Keymapp cannot be removed from the loop today: kontroll talks to its socket, not to the
+keyboard, and there is no headless mode. The hardware path is open, though — the board
+exposes four HID endpoints, all writable without root, and `hidraw3` is the raw one
+(descriptor `06 60 ff 09 61`, usage page 0xFF60, QMK Raw HID). That is the channel
+Keymapp itself uses. Speaking it directly means reverse-engineering ZSA's undocumented
+command set, and pre-2026 knowledge of this API has already been wrong here once.
+
+504 tests (was 503).
+
 ## Gotchas (do not re-learn)
 
+- An optional external dependency needs a RETRY, not a verdict at startup. "Absent
+  when we launched" and "absent forever" are different states, and a feature that is
+  silent by design cannot tell you it confused them.
+- `keymapp --help` is not a read-only probe: it starts a SECOND instance, and killing
+  that one takes the running instance's socket with it. The process survives, its API
+  does not, and kontroll then says `Keymapp socket not found`.
 - Chrome grids paint in PUSH order, and two of them can want the same rows. Anything
   full-width along the bottom has to be pushed after anything full-height down a side,
   or the side wins and the hint disappears under it.
