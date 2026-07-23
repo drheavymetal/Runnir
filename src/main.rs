@@ -821,7 +821,7 @@ struct Gpu {
     baseline: catchup::Baseline,
     /// The flashed layout, read once at startup: which LED sits under which key.
     /// Only loaded when the leader lights are on, since nothing else needs it.
-    board_layout: Option<zsa::Layout>,
+
     proxy: EventLoopProxy<UserEvent>,
 }
 
@@ -1100,7 +1100,7 @@ impl App {
             board: (self.config.keyboard.ambient || self.config.keyboard.leader_lights)
                 .then(zsa::Board::start)
                 .flatten(),
-            board_layout: None,
+
             middle_press: None,
             verbs: verbs::Verbs::load(),
             last_pty_key: Instant::now(),
@@ -1110,7 +1110,7 @@ impl App {
         // The flashed layout, read once. Blocking (two processes: kontroll status and
         // sqlite3), so it happens here at startup and never on a keystroke.
         if self.config.keyboard.leader_lights {
-            gpu.load_board_layout();
+            gpu.refresh_board_layout();
         }
         // Arm the image auto-preview watch at startup when the config asks for it and
         // names a directory. A snapshot of the directory is taken now, so files

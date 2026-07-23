@@ -2933,36 +2933,24 @@ impl Gpu {
         self.unpaint_leader(config);
     }
 
-    /// Reads the flashed layout once, so a keystroke never pays for it.
+    /// Asks for the flashed layout, in the background.
     ///
-    /// Both halves can be absent and that is normal: no board, no Keymapp, no
-    /// `sqlite3`, a revision Keymapp has never seen. Any of them simply leaves the
-    /// leader lights off, with nothing said — the same rule the rest of this follows.
-    fn load_board_layout(&mut self) {
-        // RUNNIR_ZSA_DEBUG=1 says which step gave up. The feature is silent by design,
-        // and silence is exactly what makes it impossible to tell "no keyboard here"
-        // from "broken" — this is the same escape hatch RUNNIR_KEYLOG is.
-        let debug = std::env::var("RUNNIR_ZSA_DEBUG").is_ok();
+    /// Called at startup and again on every arming of the leader that finds the board
+    /// dark, because the reading fails for as long as Keymapp is down and then starts
+    /// succeeding. Doing it once at startup meant a window opened before Keymapp — the
+    /// ordinary case, since Keymapp is the user's app and autostarts late — never lit
+    /// the board again for as long as it lived, with nothing anywhere saying why.
+    ///
+    /// Absence stays normal and stays silent: no board, no Keymapp, no `sqlite3`, a
+    /// revision Keymapp has never seen. `RUNNIR_ZSA_DEBUG=1` says which step gave up.
+    fn refresh_board_layout(&self) {
         let Some(board) = &self.board else {
-            if debug {
+            if std::env::var("RUNNIR_ZSA_DEBUG").is_ok() {
                 eprintln!("zsa: no board (kontroll missing, or the feature is off)");
             }
             return;
         };
-        let Some(status) = board.status() else {
-            if debug {
-                eprintln!("zsa: kontroll status gave no revision (keyboard connected?)");
-            }
-            return;
-        };
-        let Some(db) = crate::zsa::default_db() else { return };
-        self.board_layout = crate::zsa::read_layout(&db, &status.revision);
-        if debug {
-            match &self.board_layout {
-                Some(l) => eprintln!("zsa: layout {} loaded, {} layers", status.revision, l.layers()),
-                None => eprintln!("zsa: {} not readable from {}", status.revision, db.display()),
-            }
-        }
+        board.refresh_layout();
     }
 
     /// Lights the leader level the user is standing on: every key that does something
@@ -2975,7 +2963,15 @@ impl Gpu {
         if !config.keyboard.leader_lights {
             return;
         }
-        let (Some(board), Some(layout)) = (&self.board, &self.board_layout) else { return };
+        let Some(board) = &self.board else { return };
+        // No layout yet means Keymapp was not up when we last asked. Ask again — this
+        // is the retry that lets a window opened before Keymapp ever light at all —
+        // and light nothing this once. It costs no subprocess when the socket is
+        // absent, and the answer lands well before the next arming.
+        let Some(layout) = board.known_layout() else {
+            board.refresh_layout();
+            return;
+        };
         // The layer the board last reported, not a fresh reading: this runs on the
         // arming keystroke and on every descent into a group, and asking the board
         // is a `kontroll` subprocess that never times out — with Keymapp wedged the

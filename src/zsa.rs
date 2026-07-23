@@ -18,7 +18,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// LEDs on a Moonlander MK1, and therefore keys per layer in its layout.
 ///
@@ -327,6 +327,14 @@ pub struct Board {
     layer: Arc<AtomicUsize>,
     /// Whether a reading of that is already out.
     asking: Arc<AtomicBool>,
+    /// The flashed layout, once it has been read. `None` until Keymapp answers —
+    /// which it cannot do while it is not running, and it is the USER's app: it
+    /// starts after us, it exits on its own, and the keyboard gets unplugged. Held
+    /// here rather than beside the window so that a failed reading is a state to
+    /// retry, not a verdict for the life of the process.
+    layout: Arc<Mutex<Option<Layout>>>,
+    /// Whether a reading of THAT is already out.
+    asking_layout: Arc<AtomicBool>,
 }
 
 impl Board {
@@ -335,7 +343,7 @@ impl Board {
     /// and the credential helper follow: the feature simply does not exist.
     pub fn start() -> Option<Board> {
         let bin = kontroll_path()?;
-        let socket = dirs::config_dir()?.join(".keymapp/keymapp.sock");
+        let socket = socket_path()?;
         Some(Board::with_runner(Box::new(Kontroll { bin, socket })))
     }
 
@@ -346,7 +354,45 @@ impl Board {
             tx,
             layer: Arc::new(AtomicUsize::new(0)),
             asking: Arc::new(AtomicBool::new(false)),
+            layout: Arc::new(Mutex::new(None)),
+            asking_layout: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// The flashed layout, if one has been read. Never blocks and never asks.
+    pub fn known_layout(&self) -> Option<Layout> {
+        self.layout.lock().ok()?.clone()
+    }
+
+    /// Starts a reading of the layout in the background, for the NEXT paint.
+    ///
+    /// Costs two blocking calls (`kontroll status`, then the sqlite read), so it can
+    /// never be done inline: this runs on the leader's arming keystroke, and Keymapp
+    /// wedges — its socket stays on disk while it answers nothing. Doing it here on
+    /// the UI thread is the freeze the layer reading already had to be moved off.
+    ///
+    /// Retried rather than done once at startup, because "Keymapp was not up when
+    /// this window opened" is the normal case, not a broken one: it is the user's
+    /// app, so it starts late, quits on its own, and follows the keyboard in and out
+    /// of its socket. A window that gave up at launch stayed dark for hours.
+    pub fn refresh_layout(&self) {
+        if self.layout.lock().is_ok_and(|l| l.is_some()) {
+            return;
+        }
+        // No socket, no Keymapp: skip the subprocess entirely. This runs on every
+        // arming of the leader while the board is dark, and spawning a `kontroll`
+        // only to watch it fail is a cost paid on a keystroke for nothing.
+        //
+        // Said out loud under the debug flag: this is now the commonest reason the
+        // board stays dark, and a silent early return here is exactly the blindness
+        // that made the original bug take a session to see.
+        if !socket_path().is_some_and(|p| p.exists()) {
+            if std::env::var("RUNNIR_ZSA_DEBUG").is_ok() {
+                eprintln!("zsa: no Keymapp socket yet; will retry on the next leader");
+            }
+            return;
+        }
+        ask_layout(self.layout.clone(), self.asking_layout.clone(), read_status);
     }
 
     /// The layer to resolve keys against right now, without asking the board.
@@ -559,17 +605,6 @@ fn parse_status(out: &str) -> Option<Status> {
     Some(Status { revision: revision?, layer })
 }
 
-impl Board {
-    /// Asks the board what it is running, and remembers the layer for the paints.
-    /// Blocking, so it belongs at startup or on a worker — never on the path of a
-    /// keystroke. `known_layer` is what a keystroke may read.
-    pub fn status(&self) -> Option<Status> {
-        let status = read_status()?;
-        self.layer.store(status.layer, Ordering::Relaxed);
-        Some(status)
-    }
-}
-
 /// Reads one layer at a time into `layer`, on a thread, never twice at once.
 ///
 /// The "never twice" is the point: with Keymapp wedged the read never returns, and
@@ -590,6 +625,49 @@ fn ask_layer(
         }
         asking.store(false, Ordering::SeqCst);
     });
+}
+
+/// Reads the flashed layout off Keymapp's database, on a thread of its own.
+///
+/// Mirrors `ask_layer`: one reading in flight at a time, and a failure leaves the
+/// slot empty so the next arming of the leader tries again. That retry is the whole
+/// point — the reading fails for as long as Keymapp is down, and then succeeds.
+fn ask_layout(
+    layout: Arc<Mutex<Option<Layout>>>,
+    asking: Arc<AtomicBool>,
+    read: impl FnOnce() -> Option<Status> + Send + 'static,
+) {
+    if asking.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    std::thread::spawn(move || {
+        let debug = std::env::var("RUNNIR_ZSA_DEBUG").is_ok();
+        match read().and_then(|s| Some((default_db()?, s.revision))) {
+            Some((db, revision)) => {
+                let got = read_layout(&db, &revision);
+                if debug {
+                    match &got {
+                        Some(l) => eprintln!("zsa: layout {revision} loaded, {} layers", l.layers()),
+                        None => eprintln!("zsa: layout {revision} not in {}", db.display()),
+                    }
+                }
+                if let Ok(mut slot) = layout.lock() {
+                    *slot = got;
+                }
+            }
+            None if debug => {
+                eprintln!("zsa: kontroll status gave no revision (is Keymapp running?)")
+            }
+            None => {}
+        }
+        asking.store(false, Ordering::SeqCst);
+    });
+}
+
+/// Where Keymapp listens on Linux. The port 50051 its own window names is Windows
+/// only — see the wiki page; assuming otherwise cost a session.
+pub fn socket_path() -> Option<PathBuf> {
+    Some(dirs::config_dir()?.join(".keymapp/keymapp.sock"))
 }
 
 /// Runs `kontroll status` and reads its answer. Blocking, with no timeout of its own.
@@ -620,6 +698,40 @@ fn read_status() -> Option<Status> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A failed layout reading has to leave the slot EMPTY and the in-flight flag
+    /// down, so the next arming of the leader asks again. This is the whole fix:
+    /// Keymapp is the user's app, so "not running yet" is the normal state at the
+    /// moment a window opens, and reading the layout once at startup meant such a
+    /// window never lit the board again for as long as it lived.
+    #[test]
+    fn a_layout_reading_that_fails_is_retried_not_final() {
+        let slot: Arc<Mutex<Option<Layout>>> = Arc::new(Mutex::new(None));
+        let asking = Arc::new(AtomicBool::new(false));
+
+        // Keymapp down: no status, so no layout — and nothing latched.
+        ask_layout(slot.clone(), asking.clone(), || None);
+        for _ in 0..200 {
+            if !asking.load(Ordering::SeqCst) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(slot.lock().unwrap().is_none(), "nothing to show for a failed read");
+        assert!(!asking.load(Ordering::SeqCst), "the flag must come back down, or no retry ever runs");
+
+        // Only one reading at a time: a second ask while one is in flight is dropped
+        // rather than piling threads onto a tool that is already not answering.
+        asking.store(true, Ordering::SeqCst);
+        let ran = Arc::new(AtomicBool::new(false));
+        let seen = ran.clone();
+        ask_layout(slot.clone(), asking.clone(), move || {
+            seen.store(true, Ordering::SeqCst);
+            None
+        });
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        assert!(!ran.load(Ordering::SeqCst), "a second reading must not start while one is out");
+    }
 
     /// Builds a layout JSON the way Keymapp stores one: `codes[layer][key]`, where an
     /// entry of `None` is a key with no tap action at all.
