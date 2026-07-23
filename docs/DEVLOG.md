@@ -2857,8 +2857,57 @@ question about Linux hidraw; and the protocol version is `0x04`, so the upstream
 is the right one to code against. The endpoint must keep being found by descriptor —
 the hidraw numbering is not stable across replugs.
 
+## 2026-07-23 - Built: the board is driven directly, Keymapp is out of the loop
+
+The design above, built and verified on the real keyboard with Keymapp NOT RUNNING —
+no process, no socket. The remembered revision loads the layout, the matrix is taken,
+and the whole leader level is painted. Pedro confirmed the keys lit.
+
+What landed, beyond the design as written:
+
+- **The opcodes are known, not guessed.** The board answers `fe 04 fe` to the
+  protocol-version query, which is exactly
+  `[ORYX_EVT_GET_PROTOCOL_VERSION, ORYX_PROTOCOL_VERSION, ORYX_STOP_BIT]` for the
+  published source — `ORYX_PROTOCOL_VERSION` is `0x04` and `ORYX_STOP_BIT` is `-2`.
+  That pins this firmware to that revision of the module, which is what made it safe
+  to send RGB commands at all. Sending an opcode from an enum that might have been
+  reordered is the one genuinely risky thing here, and this is what closed it.
+- **`Runner` stopped being command-line-shaped.** It spoke `&["set-rgb", "-l", ...]`
+  because the only transport was a subprocess, which meant every failure came back as
+  ENGLISH PROSE on stdout. Three bugs came from that layer; all three, and their tests,
+  are deleted with it. They cannot exist against a byte protocol.
+- **The revision is remembered.** Painting stopped needing Keymapp, but knowing WHICH
+  flashed layout to light still did, so the lights still died with Keymapp closed —
+  one step short of the point. Sound rather than a shortcut: the layout is read out of
+  Keymapp's own database, so Keymapp must have run at some point regardless. This only
+  drops the requirement that it be running now.
+- **`sustain` is ours.** It was Keymapp's timer, not the firmware's — the opcode
+  carries no time field. The worker holds the deadline and its wait for the next
+  command doubles as the wait for it to expire; `Board::start` restores
+  unconditionally, covering the one case a timer of our own cannot.
+
+Cost, measured: Keymapp was 215 MB of RSS. A level was 34 processes and ~156 ms; it is
+now 39 writes and microseconds. No new dependency — hidraw is file I/O.
+
+Still not understood: `ORYX_CMD_GET_FW_VERSION` never answers, though the source shows
+it ungated and replying. Nothing depends on it now that the revision is remembered, and
+it is recorded here rather than papered over.
+
+501 tests (was 504): four kontroll-specific ones deleted with the code they guarded,
+one added for the deadline.
+
 ## Gotchas (do not re-learn)
 
+- A wire protocol read out of published firmware source still has to be CONFIRMED
+  against the board. An enum with implicit values is only right if the flashed build
+  matches that source, and the version query is what proves it. Everything else here
+  was safe to try; sending a guessed opcode was not.
+- A fallback that reads a real file makes every test of its caller a test of the
+  MACHINE. Inject it. This bit twice now — the second time within an hour of the first
+  being written down.
+- Probing another app's CLI is not read-only when that app is already running:
+  `keymapp --help` starts a second instance and killing it takes the running one's
+  socket with it.
 - An optional external dependency needs a RETRY, not a verdict at startup. "Absent
   when we launched" and "absent forever" are different states, and a feature that is
   silent by design cannot tell you it confused them.
