@@ -186,13 +186,24 @@ pub fn plan(pref: &str, bit_perfect: bool, hw_devices: &[String]) -> Vec<Attempt
 /// this. Parts are fetched as they are needed rather than up front — a hi-res track is
 /// hundreds of megabytes and the first sample should not wait for the last byte.
 struct PartsReader {
-    parts: Vec<String>,
+    parts: Vec<Part>,
     next: usize,
     current: std::io::Cursor<Vec<u8>>,
 }
 
+/// One piece of a track. A local file is not something TIDAL ever sends: it exists so
+/// the decoder and the whole output chain can be exercised with a known file, on a
+/// machine with no subscription and no network. The audio path is the half of this
+/// feature that a unit test cannot reach, so it needs a way in that does not depend on
+/// a service being up.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Part {
+    Url(String),
+    File(std::path::PathBuf),
+}
+
 impl PartsReader {
-    fn new(parts: Vec<String>) -> Self {
+    fn new(parts: Vec<Part>) -> Self {
         Self { parts, next: 0, current: std::io::Cursor::new(Vec::new()) }
     }
 }
@@ -207,10 +218,13 @@ impl Read for PartsReader {
             if self.next >= self.parts.len() {
                 return Ok(0); // end of track
             }
-            let url = self.parts[self.next].clone();
+            let part = self.parts[self.next].clone();
             self.next += 1;
-            let bytes = tidal::fetch(&url, MAX_PART_BYTES)
-                .map_err(|e| std::io::Error::other(format!("fetch part: {e}")))?;
+            let bytes = match part {
+                Part::Url(url) => tidal::fetch(&url, MAX_PART_BYTES)
+                    .map_err(|e| std::io::Error::other(format!("fetch part: {e}")))?,
+                Part::File(path) => std::fs::read(path)?,
+            };
             self.current = std::io::Cursor::new(bytes);
         }
     }
@@ -234,18 +248,18 @@ impl symphonia::core::io::MediaSource for PartsReader {
     }
 }
 
-/// The URL list for a stream, in the order they must be read.
-pub fn parts_of(info: &StreamInfo) -> Result<Vec<String>, String> {
+/// The parts of a stream, in the order they must be read.
+pub fn parts_of(info: &StreamInfo) -> Result<Vec<Part>, String> {
     match info.media()? {
-        Media::Direct(urls) => Ok(urls.clone()),
+        Media::Direct(urls) => Ok(urls.iter().cloned().map(Part::Url).collect()),
         Media::Dash { init, segments } => {
             let mut parts = Vec::with_capacity(segments.len() + 1);
             // The initialisation segment carries the codec setup; without it first the
             // media segments are undecodable bytes.
             if let Some(init) = init {
-                parts.push(init.clone());
+                parts.push(Part::Url(init.clone()));
             }
-            parts.extend(segments.iter().cloned());
+            parts.extend(segments.iter().cloned().map(Part::Url));
             Ok(parts)
         }
     }
@@ -254,7 +268,7 @@ pub fn parts_of(info: &StreamInfo) -> Result<Vec<String>, String> {
 /// A file-extension hint for the demuxer, from what TIDAL said it was sending. Symphonia
 /// can probe without it, but a hint saves it guessing between FLAC-in-MP4 and raw FLAC,
 /// which look different only a few bytes in.
-fn hint_for(info: &StreamInfo) -> &'static str {
+pub fn hint_for(info: &StreamInfo) -> &'static str {
     if info.mime.contains("dash") {
         "mp4"
     } else if info.codec.contains("flac") || info.codec.is_empty() {
@@ -281,24 +295,38 @@ pub struct Played {
 /// version of this loop, which is why the decode and the output are already separated
 /// from the fetching.
 pub fn play(info: &StreamInfo, cfg: &TidalCfg) -> Result<Played, String> {
+    play_parts(parts_of(info)?, hint_for(info), &info.quality, cfg, true)
+}
+
+/// The whole audio path, from a list of parts to the DAC.
+///
+/// `output` off decodes and measures without opening a device — which is how the
+/// decoder gets checked on a machine where making noise would be rude, and how a
+/// stream that fails can be told apart from a device that refuses.
+pub fn play_parts(
+    parts: Vec<Part>,
+    hint_ext: &str,
+    quality: &str,
+    cfg: &TidalCfg,
+    output: bool,
+) -> Result<Played, String> {
     use symphonia::core::codecs::audio::AudioDecoderOptions;
     use symphonia::core::formats::probe::Hint;
     use symphonia::core::formats::{FormatOptions, TrackType};
     use symphonia::core::io::MediaSourceStream;
     use symphonia::core::meta::MetadataOptions;
 
-    let parts = parts_of(info)?;
     if parts.is_empty() {
         return Err("stream has no parts to play".into());
     }
     let source = Box::new(PartsReader::new(parts));
     let mss = MediaSourceStream::new(source, Default::default());
     let mut hint = Hint::new();
-    hint.with_extension(hint_for(info));
+    hint.with_extension(hint_ext);
 
     let mut format = symphonia::default::get_probe()
         .probe(&hint, mss, FormatOptions::default(), MetadataOptions::default())
-        .map_err(|e| format!("cannot read this stream ({}): {e}", hint_for(info)))?;
+        .map_err(|e| format!("cannot read this stream ({hint_ext}): {e}"))?;
 
     let track = format
         .first_track(TrackType::Audio)
@@ -316,6 +344,7 @@ pub fn play(info: &StreamInfo, cfg: &TidalCfg) -> Result<Played, String> {
         .map_err(|e| format!("no decoder for this codec: {e}"))?;
 
     let mut sink: Option<Sink> = None;
+    let mut opened_yet: Option<Want> = None;
     let mut played = Played::default();
 
     loop {
@@ -344,18 +373,28 @@ pub fn play(info: &StreamInfo, cfg: &TidalCfg) -> Result<Played, String> {
         // The device is opened on the FIRST decoded packet, not before: only now is the
         // real rate, channel count and sample width known, and opening a DAC for a
         // format we then discover is different is how you get a click before track one.
-        if sink.is_none() {
+        if opened_yet.is_none() {
             let want = Want {
                 rate: spec.rate(),
                 channels: spec.channels().count() as u32,
                 bits: sample_bits(&decoded),
             };
-            let opened = Sink::open(cfg, &want, &info.quality)?;
-            played.signal = opened.signal.clone();
-            sink = Some(opened);
+            played.signal.decoded_bits = want.bits;
+            played.signal.decoded_rate = want.rate;
+            played.signal.decoded_channels = want.channels;
+            played.signal.quality = quality.to_string();
+            if output {
+                let device = Sink::open(cfg, &want, quality)?;
+                played.signal = device.signal.clone();
+                sink = Some(device);
+            } else {
+                played.signal.device = "none (decode only)".into();
+            }
+            opened_yet = Some(want);
         }
-        let sink = sink.as_mut().expect("opened above");
-        played.underruns += sink.write(&decoded)?;
+        if let Some(sink) = sink.as_mut() {
+            played.underruns += sink.write(&decoded)?;
+        }
         played.frames += frames as u64;
     }
 
@@ -924,7 +963,7 @@ mod tests {
             ..Default::default()
         };
         let parts = parts_of(&info).unwrap();
-        assert_eq!(parts[0], "https://x/init.mp4");
+        assert_eq!(parts[0], Part::Url("https://x/init.mp4".into()));
         assert_eq!(parts.len(), 3);
         assert_eq!(hint_for(&info), "mp4");
     }

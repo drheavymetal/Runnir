@@ -200,6 +200,25 @@ fn main() {
         // `runnir --tidal-devices` — what the output chain would try, in order, for the
         // current config. Answers "why is it not bit-perfect" without playing anything.
         Some("--tidal-devices") => return tidal_devices(),
+        // `runnir --tidal-decode [--play] <file…>` — run local files through the same
+        // decoder and output chain a TIDAL stream takes. Several files are read as one
+        // stream, which is what a DASH init segment plus its media segments are.
+        //
+        // Without `--play` nothing is opened and nothing is heard: it measures the
+        // decode alone. That separation is the point — it tells "this stream does not
+        // decode" apart from "this device will not take it", which are otherwise the
+        // same silence.
+        Some("--tidal-decode") => {
+            let mut files: Vec<&str> = args[2..].iter().map(String::as_str).collect();
+            let play = files.first() == Some(&"--play");
+            if play {
+                files.remove(0);
+            }
+            if files.is_empty() {
+                return eprintln!("usage: runnir --tidal-decode [--play] <file…>");
+            }
+            return tidal_decode(&files, play);
+        }
         Some("--version" | "-v") => return println!("runnir {}", env!("CARGO_PKG_VERSION")),
         Some("--help" | "-h") => return print_help(),
         Some("--demo") => {
@@ -591,6 +610,32 @@ fn tidal_play(what: &str) {
             );
         }
         Err(e) => eprintln!("runnir: playback failed: {e}"),
+    }
+}
+
+/// Runs local files through the decoder, and optionally through the output chain.
+fn tidal_decode(files: &[&str], play: bool) {
+    let cfg = Config::load().tidal;
+    let parts: Vec<player::Part> =
+        files.iter().map(|f| player::Part::File(std::path::PathBuf::from(f))).collect();
+    // The first file names the container for the whole stream: an init segment and its
+    // media segments are one MP4, not several files that each stand alone.
+    let ext = std::path::Path::new(files[0])
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("flac");
+    let ext = if matches!(ext, "m4s" | "m4a" | "mp4") { "mp4" } else { ext };
+
+    match player::play_parts(parts, ext, "", &cfg, play) {
+        Ok(played) => {
+            let seconds = played.frames as f64 / played.signal.decoded_rate.max(1) as f64;
+            println!("  {}", played.signal.badge());
+            println!("  {} frames ({seconds:.2} s)", played.frames);
+            if played.underruns > 0 {
+                println!("  {} underruns", played.underruns);
+            }
+        }
+        Err(e) => eprintln!("runnir: {e}"),
     }
 }
 

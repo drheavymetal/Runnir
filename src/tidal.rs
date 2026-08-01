@@ -648,15 +648,85 @@ fn parse_mpd(xml: &str) -> Result<Mpd, String> {
     };
 
     let expand = |s: &str, number: Option<u64>| {
-        let mut out = s.replace("$RepresentationID$", &rep_id);
-        if let Some(n) = number {
-            out = out.replace("$Number$", &n.to_string());
+        let out = expand_identifier(s, "RepresentationID", |width| pad(&rep_id, width));
+        match number {
+            Some(n) => expand_identifier(&out, "Number", |width| pad(&n.to_string(), width)),
+            None => out,
         }
-        out
     };
-    let segments =
-        (0..count).map(|i| expand(&media, Some(start_number + i))).collect::<Vec<_>>();
-    Ok(Mpd { codec, init: init.map(|i| expand(&i, None)), segments })
+    // A manifest may name its segments relative to a <BaseURL>. TIDAL sends absolute
+    // URLs today, but a relative one silently becomes an unfetchable path rather than
+    // an error, so the base is honoured when it is there.
+    let base = between(xml, "<BaseURL>", "</BaseURL>")
+        .and_then(|b| b.strip_prefix("<BaseURL>"))
+        .map(str::trim)
+        .unwrap_or("");
+    let absolute = |u: String| {
+        if base.is_empty() || u.contains("://") {
+            u
+        } else if base.ends_with('/') {
+            format!("{base}{u}")
+        } else {
+            format!("{base}/{u}")
+        }
+    };
+
+    let segments = (0..count)
+        .map(|i| absolute(expand(&media, Some(start_number + i))))
+        .collect::<Vec<_>>();
+    Ok(Mpd { codec, init: init.map(|i| absolute(expand(&i, None))), segments })
+}
+
+/// Replaces one DASH identifier wherever it appears, with or without a width.
+///
+/// The spec allows `$Number$` and `$Number%05d$`, and encoders use both — ffmpeg writes
+/// the padded form by default. Handling only the bare one produces URLs that 404, which
+/// reads downstream as a truncated song rather than as a parsing bug, so it is worth
+/// doing properly rather than with two `replace` calls.
+fn expand_identifier(template: &str, name: &str, value: impl Fn(usize) -> String) -> String {
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+    let open = format!("${name}");
+    while let Some(at) = rest.find(&open) {
+        let after = &rest[at + open.len()..];
+        // What follows is either `$` (bare) or a `%0Nd$` width specifier. Anything else
+        // means this was a different identifier that merely starts the same way.
+        let (width, consumed) = if let Some(tail) = after.strip_prefix('$') {
+            let _ = tail;
+            (0usize, 1usize)
+        } else if let Some(spec_end) = after.find('$') {
+            let spec = &after[..spec_end];
+            match parse_width(spec) {
+                Some(w) => (w, spec_end + 1),
+                None => {
+                    out.push_str(&rest[..at + open.len()]);
+                    rest = &rest[at + open.len()..];
+                    continue;
+                }
+            }
+        } else {
+            break;
+        };
+        out.push_str(&rest[..at]);
+        out.push_str(&value(width));
+        rest = &after[consumed..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// `%05d` -> 5. Only the zero-padded integer form DASH defines.
+fn parse_width(spec: &str) -> Option<usize> {
+    let digits = spec.strip_prefix("%0")?.strip_suffix('d')?;
+    digits.parse().ok()
+}
+
+fn pad(value: &str, width: usize) -> String {
+    if value.len() >= width {
+        value.to_string()
+    } else {
+        format!("{}{}", "0".repeat(width - value.len()), value)
+    }
 }
 
 /// `mediaPresentationDuration="PT1234.5S"` — only the shapes TIDAL actually emits
@@ -814,6 +884,76 @@ mod tests {
                    media="https://x/$RepresentationID$-$Number$.mp4" />
  </Representation>
 </MPD>"#;
+
+    /// Written by ffmpeg, not by hand: it uses the padded `$Number%05d$` form and puts
+    /// `$RepresentationID$` in the initialisation name, which is exactly the pair that
+    /// a bare `$Number$` replacement gets wrong.
+    const MPD_FFMPEG: &str = r#"<?xml version="1.0" encoding="utf-8"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="static"
+     mediaPresentationDuration="PT6.0S" maxSegmentDuration="PT2.0S">
+ <Period id="0" start="PT0.0S">
+  <AdaptationSet id="0" contentType="audio">
+   <Representation id="0" mimeType="audio/mp4" codecs="flac" audioSamplingRate="96000">
+    <SegmentTemplate timescale="96000" initialization="init-stream$RepresentationID$.m4s"
+                     media="chunk-stream$RepresentationID$-$Number%05d$.m4s" startNumber="1">
+     <SegmentTimeline>
+      <S t="0" d="196608" r="1" />
+      <S d="182784" />
+     </SegmentTimeline>
+    </SegmentTemplate>
+   </Representation>
+  </AdaptationSet>
+ </Period>
+</MPD>"#;
+
+    #[test]
+    fn a_real_encoder_mpd_expands_to_the_files_that_exist() {
+        let mpd = parse_mpd(MPD_FFMPEG).unwrap();
+        assert_eq!(mpd.init.as_deref(), Some("init-stream0.m4s"));
+        assert_eq!(
+            mpd.segments,
+            [
+                "chunk-stream0-00001.m4s",
+                "chunk-stream0-00002.m4s",
+                "chunk-stream0-00003.m4s"
+            ]
+        );
+    }
+
+    #[test]
+    fn relative_segments_are_resolved_against_the_base_url() {
+        let mpd = MPD_FFMPEG.replace(
+            "<Period id=\"0\" start=\"PT0.0S\">",
+            "<BaseURL>https://cdn.example/audio/</BaseURL><Period id=\"0\" start=\"PT0.0S\">",
+        );
+        let parsed = parse_mpd(&mpd).unwrap();
+        assert_eq!(parsed.init.as_deref(), Some("https://cdn.example/audio/init-stream0.m4s"));
+        assert!(parsed.segments[0].starts_with("https://cdn.example/audio/chunk-"));
+    }
+
+    #[test]
+    fn an_absolute_segment_is_left_alone_even_with_a_base_url() {
+        let mpd = MPD_TIMELINE.replace(
+            "<Period>",
+            "<BaseURL>https://cdn.example/</BaseURL><Period>",
+        );
+        let parsed = parse_mpd(&mpd).unwrap();
+        assert_eq!(parsed.segments[0], "https://x/seg-1.mp4");
+    }
+
+    #[test]
+    fn a_width_specifier_pads_and_a_bare_identifier_does_not() {
+        assert_eq!(expand_identifier("s-$Number%05d$.m4s", "Number", |w| pad("7", w)),
+                   "s-00007.m4s");
+        assert_eq!(expand_identifier("s-$Number$.m4s", "Number", |w| pad("7", w)), "s-7.m4s");
+        // A number already wider than the field is not truncated.
+        assert_eq!(expand_identifier("$Number%02d$", "Number", |w| pad("12345", w)), "12345");
+        // An identifier that merely starts with the same letters is left alone.
+        assert_eq!(
+            expand_identifier("$NumberOfThings$", "Number", |w| pad("7", w)),
+            "$NumberOfThings$"
+        );
+    }
 
     #[test]
     fn timeline_repeats_count_as_segments() {

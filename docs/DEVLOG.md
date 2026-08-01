@@ -3146,8 +3146,80 @@ its own threads, so moving it to another process moves that channel onto a socke
 already exists. Skip this and the panel grows in-process assumptions that have to be
 torn out later; keep it and the daemon is one more phase rather than a rewrite.
 
+## 2026-08-01 - Phase 0: the risky half answered, and three things the design had wrong
+
+The question the whole design hung on — **does symphonia read FLAC inside fragmented
+MP4, from a stream that cannot seek?** — is answered: yes, exactly.
+
+    codec AudioCodecId(8192)
+    decoded S32 96000 Hz, 2 channels
+    frames 576000  (6.00 s at 96 kHz)
+
+Six seconds in, six seconds out, not a frame lost. Hi-res is therefore the same code
+path as everything else and the project does not grow. The fixture is a DASH stream
+made with ffmpeg (`-c:a flac -f dash`), read as init segment + three media segments
+through a reader that refuses to seek — the same shape TIDAL sends, on a machine with
+no subscription in the way.
+
+That last part is now permanent: `runnir --tidal-decode [--play] <file…>` runs local
+files through the real decoder and the real output chain. Without `--play` it opens no
+device and makes no sound. The split earns its place immediately — "this stream does
+not decode" and "this device will not take it" are otherwise the same silence.
+
+### What the real world corrected
+
+**The device flow does not work with a web player client id.** TIDAL answers
+`Client is not a Limited Input Device client` (`sub_status 1002`), and that is not a
+misconfiguration to report — it is "sign in the other way". `--tidal-login` now tries
+the device flow and, on that specific refusal, switches to PKCE by itself: it prints an
+authorize URL, the browser lands on a tidal.com page that looks broken, and the grant
+code is in its address bar. Pasting the whole address back finishes it. No local
+callback server, no port held open — a terminal catching a redirect by hand.
+
+**ALSA's hint iterator does not list `hw:` devices.** It returns `default`,
+`sysdefault:CARD=…`, `front:…`, `hdmi:…` — conversion and routing aliases, not one of
+them openable exclusively. The real cards are in `/proc/asound`: `cards` for the list,
+then each card's `pcmNp` directories for its playback devices. `pcmNc` is capture and
+must be skipped, or the chain offers a microphone as an output.
+
+**HDMI would have won `auto`, and that is the worst bug this feature could ship.** This
+machine has eight HDMI outputs across two cards. Every one of them accepts 48 kHz
+without complaint, so for a 48 kHz track an idle monitor could take the BIT-PERFECT
+rung — with the music going to a screen that may have no speakers while headphones sit
+in the jack. Silence that reports success. `auto` now never chooses a display; they are
+reachable only by name. A machine whose ONLY output is HDMI still uses it, because
+there the monitor is the speakers.
+
+**`$Number%05d$`.** The MPD ffmpeg wrote uses the padded form of the segment
+identifier, and the hand parser only replaced the bare `$Number$`. Every segment URL
+would have 404'd, which downstream looks like a truncated song rather than a parsing
+bug. The expander now handles both forms and any width, and `<BaseURL>` is honoured for
+manifests whose segments are relative. The ffmpeg manifest is a test fixture now:
+written by a real encoder rather than by the person who wrote the parser.
+
+### Where phase 0 stands
+
+Signed in: **not yet** — the browser half is Pedro's to do. Everything up to it is
+built and tested: 17 tests over the TIDAL module (manifests, PKCE, session refresh) and
+12 over the player (the chain order, the device enumeration, the badge).
+
+Unverified and unverifiable from here: **whether a DAC actually takes the stream
+untouched, and whether it sounds right.** That needs the hardware and an ear, and it is
+the reason the two verification commands exist rather than a test claiming to cover it.
+
 ## Gotchas (do not re-learn)
 
+- ALSA's `HintIter` does NOT list `hw:` devices — only aliases (`default`,
+  `sysdefault:`, `front:`, `hdmi:`), none of which can be opened exclusively. Real cards
+  come from `/proc/asound/cards` plus each card's `pcmNp` directories. `pcmNc` is
+  capture.
+- Any output that accepts 48 kHz can win a "best quality" search, including an HDMI port
+  with nothing plugged into it. Ranking outputs by what they ACCEPT is not enough; a
+  display has to be excluded from any automatic choice, or the music goes to a monitor
+  and the failure looks like success.
+- A DASH `SegmentTemplate` may write `$Number%05d$`, not just `$Number$`. Replacing only
+  the bare form yields URLs that 404, and a 404 segment reads as a short song rather
+  than as a bug in the parser.
 - A touchpad's `PixelDelta` is a FRACTION of a line arriving dozens of times a second.
   Rounding one event on its own — `.round()`, or a `.max(1.0)` floor — makes scroll
   speed a function of the device's report rate instead of the distance travelled. Every
