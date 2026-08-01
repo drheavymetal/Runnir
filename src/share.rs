@@ -258,25 +258,41 @@ fn stream_track(stream: &mut TcpStream, snapshot: &Snapshot) {
         }
     };
     let kind = if info.mime.contains("dash") { "audio/mp4" } else { "audio/flac" };
+
+    // The FIRST part is fetched before a single header goes out. Sending 200 and then
+    // failing leaves the listener with a page that says "playing" and a stream that
+    // never produces a byte — a worse lie than an error code, and the shape the
+    // previous version had.
+    let mut parts = parts.into_iter();
+    let Some(first) = parts.next() else {
+        respond(stream, "502 Bad Gateway", "text/plain", b"nothing to send");
+        return;
+    };
+    let first = match fetch_part(&first) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            eprintln!("runnir: share could not fetch the first part: {e}");
+            respond(stream, "502 Bad Gateway", "text/plain", b"cannot fetch the stream");
+            return;
+        }
+    };
+
     // Chunked would be more correct, but a browser playing a stream of unknown length
     // is happier with a plain close-delimited body, and that is what this is.
     let head = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: {kind}\r\nCache-Control: no-store\r\n\
          Connection: close\r\n\r\n"
     );
-    if stream.write_all(head.as_bytes()).is_err() {
+    if stream.write_all(head.as_bytes()).is_err() || stream.write_all(&first).is_err() {
         return;
     }
     for part in parts {
-        let bytes = match &part {
-            crate::player::Part::Url(url) => match tidal::fetch(url, 64 * 1024 * 1024) {
-                Ok(b) => b,
-                Err(_) => return,
-            },
-            crate::player::Part::File(path) => match std::fs::read(path) {
-                Ok(b) => b,
-                Err(_) => return,
-            },
+        let bytes = match fetch_part(&part) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("runnir: share stopped mid-track: {e}");
+                return;
+            }
         };
         // A listener who closed the tab ends the loop here, which is the only signal
         // there is and the only one needed.
@@ -285,6 +301,19 @@ fn stream_track(stream: &mut TcpStream, snapshot: &Snapshot) {
         }
     }
     let _ = stream.flush();
+}
+
+/// One part, with the same ceiling the player uses.
+///
+/// It used to be 64 MB here while the player allowed 512, so a single-file lossless
+/// track over about twelve minutes — or a few minutes of hi-res — failed for the
+/// listener and played fine locally. Two limits for the same bytes is two behaviours
+/// for the same track.
+fn fetch_part(part: &crate::player::Part) -> Result<Vec<u8>, String> {
+    match part {
+        crate::player::Part::Url(url) => tidal::fetch(url, crate::player::MAX_PART_BYTES),
+        crate::player::Part::File(path) => std::fs::read(path).map_err(|e| e.to_string()),
+    }
 }
 
 fn respond(stream: &mut TcpStream, status: &str, kind: &str, body: &[u8]) {
@@ -390,6 +419,9 @@ fn open_tunnel() -> Result<(std::process::Child, String), String> {
         Ok(url) => Ok((child, url)),
         Err(_) => {
             let _ = child.kill();
+            // Reaped, not just killed: without the wait every timed-out attempt leaves
+            // a zombie for the life of the daemon.
+            let _ = child.wait();
             Err(format!(
                 "cloudflared published no URL in {}s",
                 TUNNEL_TIMEOUT.as_secs()

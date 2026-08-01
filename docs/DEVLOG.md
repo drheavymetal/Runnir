@@ -3742,6 +3742,49 @@ is shared between drawing and hit-testing rather than computed twice.
 
 585 tests.
 
+## 2026-08-01 - The verifier: two of the fixes were not fixes
+
+A fifth reviewer, given only one job: assume every fix from the first round is
+incomplete or wrong until the code proves otherwise. Seven of the nine held. Two did
+not, and both were mine claiming more than they had done.
+
+**The share's 64 MB cap was named in the commit message and never changed.** The player
+was raised to 512 MB and the share was left where it was, so a single-file lossless
+track over about twelve minutes played locally and failed for the listener. Worse, the
+new error path made it uglier: the `200 OK` went out BEFORE the fetch, so the failure
+arrived as a page saying "playing" attached to a stream that never produced a byte.
+There is one ceiling now, used by both, and the first part is fetched before a single
+header goes out — an error code is a worse experience than music and a better one than a
+lie.
+
+**The dying-daemon race was narrowed, not closed.** Refusing new connections once the
+daemon is closing does nothing during the two hundred milliseconds before that flag is
+set, and a `connect` succeeds through the kernel backlog anyway. On the client side
+nothing recovered: the reader thread exited silently on EOF, `send` swallowed the write
+error, and the window cached that handle for ever. The comment claiming "the next
+command will report the real failure" was simply false.
+
+So the window can notice now. The reader marks the handle dead at EOF, `send` reports
+whether it got through, and a failed send drops the handle and builds another — which
+starts a fresh daemon if there is none. One retry, not a loop.
+
+Proved by doing the thing that used to break it: kill the last window, open another
+immediately, ask it to play. It plays.
+
+Also from the same pass: a timed-out `cloudflared` was killed but never reaped, leaving
+a zombie per attempt; and a test that unset `XDG_RUNTIME_DIR` was mutating a
+process-global variable while its neighbours read it — the rule is tested directly now
+instead.
+
+### What this round is really about
+
+Two rounds of reviewers found twenty-six defects. The verifier found that two of the
+twenty-six fixes were themselves wrong — and one of them made the failure worse than the
+bug had been. A fix is a change that has to be checked like any other, and the commit
+message saying it was done is not the check.
+
+585 tests.
+
 ## Gotchas (do not re-learn)
 
 - `runnir.json` WINS over `runnir.toml`. `Config::try_load` reads the JSON the settings
@@ -3785,6 +3828,10 @@ is shared between drawing and hit-testing rather than computed twice.
 - A hit test must know which VIEW is drawn, not just where the panel is. An overlay
   drawn over a list makes every row underneath unreachable, and a hit test that does not
   know it will action the row a click never saw.
+- Send the error BEFORE the body, or not at all. A 200 followed by a failure is a
+  stream that never produces a byte, which reads as a hang rather than as an error.
+- The same limit written in two places is two behaviours for the same input. Export the
+  constant.
 - Two kinds of request sharing one "pending" slot cancel each other. The second kind
   needs its own, or asking for one thing silently abandons the other.
 - In a hit-test, "inside the panel but on nothing" and "outside the panel" must be

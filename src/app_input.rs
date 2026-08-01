@@ -7088,6 +7088,11 @@ impl Gpu {
     /// nothing costs nothing but is still a thread. `None` means the credentials are
     /// missing, which is also the answer to "does this terminal have a music panel".
     fn player(&mut self, config: &Config) -> Option<&crate::daemon::Remote> {
+        // A handle whose daemon has gone is worse than no handle: it accepts everything
+        // and does nothing.
+        if self.jukebox.as_ref().is_some_and(|j| !j.is_alive()) {
+            self.jukebox = None;
+        }
         if self.jukebox.is_none() {
             if !config.tidal.configured() {
                 return None;
@@ -7116,9 +7121,28 @@ impl Gpu {
     /// Works with no panel open, which is the whole point of the transport living on
     /// the leader layer: the music is the window's, not the panel's.
     fn tidal_send(&mut self, cmd: crate::player::Cmd, config: &Config) {
-        match self.player(config) {
-            Some(jukebox) => jukebox.send(cmd),
-            None => self.toast_no_tidal(),
+        // One retry, and only one. A daemon that went away between the connect and the
+        // keypress — which is what closing the last window and opening a new one inside
+        // a quarter of a second does — leaves a handle that writes into nothing. The
+        // window drops it and builds another, which starts a fresh daemon if needed.
+        for attempt in 0..2 {
+            match self.player(config) {
+                Some(jukebox) => {
+                    if jukebox.send(cmd.clone()) {
+                        return;
+                    }
+                    self.jukebox = None;
+                    if attempt == 1 {
+                        self.toast("The player went away and would not come back", 6);
+                    }
+                }
+                None => {
+                    if attempt == 0 && config.tidal.configured() {
+                        continue; // connecting failed; try once more
+                    }
+                    return self.toast_no_tidal();
+                }
+            }
         }
     }
 

@@ -17,7 +17,7 @@ use crate::tidal::{self, Media, StreamInfo};
 /// How much of one URL we are willing to pull into memory. A hi-res track runs to a few
 /// hundred megabytes decoded but far less on the wire; this only guards against a
 /// redirect to something that is not a track at all.
-const MAX_PART_BYTES: usize = 512 * 1024 * 1024;
+pub const MAX_PART_BYTES: usize = 512 * 1024 * 1024;
 
 /// The rung of the output chain the audio actually came out on. This is what the status
 /// badge reports, and the whole point of naming them is that "bit-perfect" must mean

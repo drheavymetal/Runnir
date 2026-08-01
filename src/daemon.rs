@@ -40,13 +40,19 @@ fn runtime_dir() -> Option<PathBuf> {
     std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from)
 }
 
+/// The rule itself, separated from where it reads the environment so a test can check
+/// it without mutating a process-wide variable that its neighbours are reading.
+fn in_runtime_dir(dir: Option<PathBuf>, name: &str) -> Option<PathBuf> {
+    Some(dir?.join(name))
+}
+
 /// The socket every window looks for and at most one daemon owns.
 ///
 /// One per user, not one per window: the whole point is that they meet at the same
 /// place. `XDG_RUNTIME_DIR` is already 0700 per-user, which is the same trust boundary
 /// the control socket relies on.
 pub fn socket_path() -> Option<PathBuf> {
-    Some(runtime_dir()?.join("runnir-player.sock"))
+    in_runtime_dir(runtime_dir(), "runnir-player.sock")
 }
 
 /// Takes the single-daemon lock, or returns nothing if somebody else holds it.
@@ -325,6 +331,14 @@ fn serve(
 pub struct Remote {
     stream: Mutex<UnixStream>,
     state: Arc<Mutex<Snapshot>>,
+    /// Cleared when the connection dies — either because the reader saw the end of it
+    /// or because a write failed.
+    ///
+    /// Without this a window that connected during a daemon's last quarter-second kept
+    /// a handle to a process that had already gone: every key was written into a dead
+    /// socket and swallowed, for ever, with nothing on screen. Narrowing that race was
+    /// not enough; the window has to be able to notice.
+    alive: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Remote {
@@ -349,6 +363,8 @@ impl Remote {
         let state = Arc::new(Mutex::new(Snapshot::default()));
         let reader = stream.try_clone().map_err(|e| e.to_string())?;
         let shared = state.clone();
+        let alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let reader_alive = alive.clone();
         std::thread::Builder::new()
             .name("runnir-player-client".into())
             .spawn(move || {
@@ -361,19 +377,36 @@ impl Remote {
                     wake();
                 }
                 // The daemon went away. The window keeps its last snapshot rather than
-                // blanking: what was playing a second ago is closer to the truth than
-                // an empty panel, and the next command will report the real failure.
+                // blanking — what was playing a second ago is closer to the truth than
+                // an empty panel — but it stops claiming to be connected, so the next
+                // command reconnects instead of disappearing into a dead socket.
+                reader_alive.store(false, std::sync::atomic::Ordering::Relaxed);
+                wake();
             })
             .ok();
-        Ok(Remote { stream: Mutex::new(stream), state })
+        Ok(Remote { stream: Mutex::new(stream), state, alive })
     }
 
-    pub fn send(&self, cmd: Cmd) {
-        let Ok(line) = serde_json::to_string(&cmd) else { return };
-        if let Ok(mut stream) = self.stream.lock() {
-            let _ = writeln!(stream, "{line}");
-            let _ = stream.flush();
+    /// Sends one command. False when the connection is gone, so the caller can build a
+    /// new one rather than talking into a socket nobody is holding.
+    pub fn send(&self, cmd: Cmd) -> bool {
+        if !self.is_alive() {
+            return false;
         }
+        let Ok(line) = serde_json::to_string(&cmd) else { return true };
+        let sent = match self.stream.lock() {
+            Ok(mut stream) => writeln!(stream, "{line}").and_then(|()| stream.flush()).is_ok(),
+            Err(_) => false,
+        };
+        if !sent {
+            self.alive.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+        sent
+    }
+
+    /// Whether this handle still reaches a daemon.
+    pub fn is_alive(&self) -> bool {
+        self.alive.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn snapshot(&self) -> Snapshot {
@@ -392,7 +425,7 @@ impl Remote {
 /// guessing before this file existed. Truncated at each start so it stays small and
 /// always describes the run you are actually looking at.
 pub fn log_path() -> Option<PathBuf> {
-    Some(runtime_dir()?.join("runnir-player.log"))
+    in_runtime_dir(runtime_dir(), "runnir-player.log")
 }
 
 /// Starts a daemon from this same binary, detached from this window's lifetime.
@@ -456,16 +489,15 @@ mod tests {
         // Falling back to /tmp was the trust boundary disappearing: world-writable, so
         // another user pre-creates the socket, our bind fails, and the WINDOW connects
         // to theirs — sending them every command and drawing what they send back.
-        let saved = std::env::var_os("XDG_RUNTIME_DIR");
-        // SAFETY: single-threaded test, and the variable is put back below.
-        unsafe { std::env::remove_var("XDG_RUNTIME_DIR") };
-        let without = socket_path();
-        let log = log_path();
-        if let Some(saved) = saved {
-            unsafe { std::env::set_var("XDG_RUNTIME_DIR", saved) };
-        }
-        assert!(without.is_none(), "no runtime dir must mean no socket, not /tmp");
-        assert!(log.is_none());
+        //
+        // Checked on the rule rather than by unsetting the variable: tests share a
+        // process, and one that mutates the environment quietly changes what its
+        // neighbours see.
+        assert!(in_runtime_dir(None, "runnir-player.sock").is_none());
+        assert_eq!(
+            in_runtime_dir(Some(PathBuf::from("/run/user/1000")), "runnir-player.sock"),
+            Some(PathBuf::from("/run/user/1000/runnir-player.sock"))
+        );
     }
 
     #[test]
