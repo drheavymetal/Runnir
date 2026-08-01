@@ -688,8 +688,23 @@ mod linux {
                     }
                     self.write_packed24(&bytes)
                 }
-                // S24LE is 24 bits inside a 32-bit word, and S32LE is a full word: both
-                // are four bytes per sample and take the i32 path.
+                // 24 bits inside a 32-bit WORD. Two things make it its own case rather
+                // than part of the i32 path, and getting either wrong is silent:
+                // `io_i32` refuses a PCM configured for it (alsa checks the format and
+                // hands back an error, so every write failed while the device had
+                // already been chosen), and the samples must be justified into the low
+                // three bytes — symphonia's i32 is full-scale MSB-justified, so without
+                // the shift this plays full-scale noise while the badge says
+                // BIT-PERFECT.
+                Format::S24LE => {
+                    let mut buf = vec![0i32; samples];
+                    decoded.copy_to_slice_interleaved(&mut buf[..]);
+                    for sample in buf.iter_mut() {
+                        *sample >>= 8;
+                    }
+                    self.write_i32_s24(&buf)
+                }
+                // A full 32-bit word.
                 _ => {
                     let mut buf = vec![0i32; samples];
                     decoded.copy_to_slice_interleaved(&mut buf[..]);
@@ -705,6 +720,12 @@ mod linux {
 
         fn write_i32(&mut self, buf: &[i32]) -> Result<u32, String> {
             let io = self.pcm.io_i32().map_err(|e| e.to_string())?;
+            write_all(&self.pcm, buf, self.channels as usize, |b| io.writei(b))
+        }
+
+        /// 24-in-32. ALSA has its own accessor for this and refuses the plain one.
+        fn write_i32_s24(&mut self, buf: &[i32]) -> Result<u32, String> {
+            let io = self.pcm.io_i32_s24().map_err(|e| e.to_string())?;
             write_all(&self.pcm, buf, self.channels as usize, |b| io.writei(b))
         }
 
@@ -761,7 +782,10 @@ mod linux {
         let mut underruns = 0u32;
         while offset < buf.len() {
             match writei(&buf[offset..]) {
-                Ok(0) => break,
+                // Not `break`: that discarded the rest of the buffer, returned Ok, and
+                // still counted the whole packet as played. Losing audio with no
+                // evidence is the opposite of counting underruns.
+                Ok(0) => return Err("the device accepted no frames".into()),
                 Ok(frames) => offset += frames * per_frame,
                 Err(e) => {
                     // EPIPE is an underrun: the device ran dry while we were away.
@@ -823,7 +847,13 @@ mod linux {
         let out_bits = format_bits(format);
         let padded = (out_bits > want.bits).then_some((want.bits, out_bits));
         let resampled = (rate != want.rate).then_some((want.rate, rate));
-        let shared = attempt.device == "default" || attempt.device.starts_with("plug");
+        // Only a raw `hw:` device is exclusive. Everything else — `default`, `plughw`,
+        // `dmix`, `sysdefault`, `iec958` — goes through a plugin or a mixer that will
+        // happily accept the rate and format and then convert or share underneath.
+        // Testing for the shared ones by NAME let `output = "sysdefault:CARD=X"` earn a
+        // BIT-PERFECT badge through a software mixer, which is the one thing the badge
+        // promises never to do.
+        let shared = !attempt.device.starts_with("hw:");
         let rung = if shared && attempt.device == "default" {
             Rung::Shared
         } else if shared {
@@ -889,6 +919,12 @@ mod linux {
     /// Bits of real audio in a format, NOT the container size: ALSA's `S24LE` carries 24
     /// bits in a 32-bit word, and calling that 32 would report a promotion that never
     /// happened.
+    /// For the tests, which live outside this platform module.
+    #[cfg(test)]
+    pub(super) fn format_bits_for_test(f: Format) -> u32 {
+        format_bits(f)
+    }
+
     fn format_bits(f: Format) -> u32 {
         match f {
             Format::S16LE => 16,
@@ -1318,6 +1354,14 @@ fn play_queue(
                 // moves on. A queue where every track fails still stops, at the end.
                 set(state, wake, |s| s.error = Some(format!("{}: {why}", track.title)));
                 if !advance(state, wake, 1) {
+                    // …and stopping means SAYING so. Leaving `playing` set here left a
+                    // silent player claiming to play for ever: the bar showed a track,
+                    // the close guard warned about interrupting music that was not
+                    // there, and MPRIS told the desktop the same lie.
+                    set(state, wake, |s| {
+                        s.playing = false;
+                        s.paused = false;
+                    });
                     return false;
                 }
             }
@@ -1659,6 +1703,41 @@ mod tests {
         let plan = plan("auto", false, &devices());
         assert!(plan.iter().all(|a| !a.exact));
         assert!(plan.iter().all(|a| !a.same_rate));
+    }
+
+    #[test]
+    fn only_a_raw_hw_device_can_claim_bit_perfect() {
+        // Found by review: testing for the SHARED devices by name meant anything not
+        // called `default` or `plug*` was assumed exclusive. `sysdefault:CARD=X` and
+        // `dmix:...` are ordinary ALSA spellings for "shared", and both would have
+        // earned a BIT-PERFECT badge through a software mixer.
+        for shared in ["default", "plughw:1,0", "sysdefault:CARD=PCH", "dmix:CARD=PCH", "iec958:CARD=PCH"] {
+            assert!(!shared.starts_with("hw:"), "{shared} must not read as exclusive");
+        }
+        assert!("hw:2,0".starts_with("hw:"));
+    }
+
+    #[test]
+    fn a_24_in_32_device_is_its_own_write_path() {
+        // The bug: S24LE was offered as a widening candidate but every write went
+        // through io_i32, which alsa refuses for a PCM configured that way. The device
+        // opened, the chain committed to it, and then every track failed - on the SOF
+        // laptop cards whose format list is exactly S16_LE, S24_LE, S32_LE.
+        //
+        // The formats that need a path of their own, and the widths they carry:
+        assert_eq!(super::linux::format_bits_for_test(alsa::pcm::Format::S243LE), 24);
+        assert_eq!(super::linux::format_bits_for_test(alsa::pcm::Format::S24LE), 24);
+        assert_eq!(super::linux::format_bits_for_test(alsa::pcm::Format::S32LE), 32);
+        // …and the justification the 24-in-32 path applies: symphonia hands back
+        // full-scale MSB-justified samples, ALSA wants them in the low three bytes.
+        // Without the shift this plays full-scale noise while claiming bit-perfect.
+        // An ARITHMETIC shift, which is what a signed sample needs: it keeps the sign
+        // and lands the value in the low 24 bits. Division would round the other way on
+        // negatives, which is a different number on every negative sample.
+        assert_eq!(0x7fff_ff00i32 >> 8, 0x007f_ffff);
+        assert_eq!(-8_388_608i32 << 8 >> 8, -8_388_608, "a 24-bit value survives the trip");
+        let full_scale_negative: i32 = i32::MIN;
+        assert_eq!(full_scale_negative >> 8, -8_388_608, "still negative, still full scale");
     }
 
     #[test]

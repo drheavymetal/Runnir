@@ -329,7 +329,9 @@ fn find_field(text: &str, names: &[&str]) -> Option<String> {
             let value: String = rest
                 .trim_start_matches([':', '=', ' ', '"', '\''])
                 .chars()
-                .take_while(|c| !matches!(c, '"' | '\'' | ',' | '&' | '}' | '\n' | ' '))
+                // \r included: a form body pasted from a Windows-ended capture would
+                // otherwise carry it into the token and fail the refresh opaquely.
+                .take_while(|c| !matches!(c, '"' | '\'' | ',' | '&' | '}' | '\n' | '\r' | ' '))
                 .collect();
             if !value.is_empty() {
                 return Some(value);
@@ -458,8 +460,16 @@ fn urldecode(s: &str) -> String {
     let mut i = 0;
     while i < bytes.len() {
         match bytes[i] {
-            b'%' if i + 2 < bytes.len() => {
-                match u8::from_str_radix(&s[i + 1..i + 3], 16) {
+            // Decoded from the BYTES, never by slicing the string. `&s[i+1..i+3]` panics
+            // when those bytes land inside a multibyte character — and this runs on
+            // whatever anything on the machine sends to the callback port, so a stray
+            // `%` followed by an accent was enough to take the process down.
+            b'%' if i + 2 < bytes.len()
+                && bytes[i + 1].is_ascii_hexdigit()
+                && bytes[i + 2].is_ascii_hexdigit() =>
+            {
+                let hex = [bytes[i + 1], bytes[i + 2]];
+                match u8::from_str_radix(std::str::from_utf8(&hex).unwrap_or("zz"), 16) {
                     Ok(byte) => {
                         out.push(byte);
                         i += 3;
@@ -561,10 +571,16 @@ pub fn ensure_fresh(creds: &Creds, session: &Session) -> Result<Session, String>
 }
 
 fn session_from_token_response(body: &str, prev: Option<&Session>) -> Result<Session, String> {
-    let v: serde_json::Value = serde_json::from_str(body).map_err(|e| format!("{e}: {body}"))?;
+    // The body is NEVER quoted back. This is the one payload in the program that is
+    // guaranteed to hold an access token and usually a refresh token, and an error
+    // string ends up in a toast, in a scrollback, and in whatever screenshot follows.
+    // A refresh token is a full grant on the account; its length is all that is safe
+    // to say about it.
+    let v: serde_json::Value = serde_json::from_str(body)
+        .map_err(|e| format!("the sign-in response was not JSON ({e}, {} bytes)", body.len()))?;
     let access_token = v["access_token"].as_str().unwrap_or_default().to_string();
     if access_token.is_empty() {
-        return Err(format!("no access token in response: {body}"));
+        return Err("the sign-in response carried no access token".to_string());
     }
     let refresh_token = v["refresh_token"]
         .as_str()
@@ -591,7 +607,13 @@ fn fill_session_details(session: &mut Session) -> Result<(), String> {
     let body = get_body(&format!("{API_URL}/sessions"), session, &[])?;
     let v: serde_json::Value = serde_json::from_str(&body).map_err(|e| format!("{e}: {body}"))?;
     if session.country_code.is_empty() {
-        session.country_code = v["countryCode"].as_str().unwrap_or("US").to_string();
+        // Not defaulted. A guessed country stamps a different licensed catalogue onto
+        // the saved session and stays there until the next sign-out — wrong quietly,
+        // and on disk. Better to fail here, which is what this function is for.
+        session.country_code = v["countryCode"]
+            .as_str()
+            .ok_or("TIDAL did not say which country this account is in")?
+            .to_string();
     }
     if session.user_id.is_none() {
         session.user_id = v["userId"].as_u64();
@@ -783,7 +805,7 @@ pub fn search(session: &Session, query: &str, limit: u32) -> Result<Found, Strin
 
 /// The tracks of an album, in album order.
 pub fn album_tracks(session: &Session, album_id: u64) -> Result<Vec<Track>, String> {
-    items_of(session, &format!("{API_URL}/albums/{album_id}/tracks"), &[])
+    paged(session, &format!("{API_URL}/albums/{album_id}/tracks"), &[], parse_track)
 }
 
 /// What an artist is known for. TIDAL orders these by popularity, which is the right
@@ -794,22 +816,16 @@ pub fn artist_top_tracks(session: &Session, artist_id: u64) -> Result<Vec<Track>
 
 #[allow(dead_code)] // wired to the panel next
 pub fn playlist_tracks(session: &Session, uuid: &str) -> Result<Vec<Track>, String> {
-    items_of(session, &format!("{API_URL}/playlists/{uuid}/tracks"), &[("limit", "100")])
+    paged(session, &format!("{API_URL}/playlists/{uuid}/tracks"), &[], parse_track)
 }
 
 /// The user's own playlists.
 pub fn my_playlists(session: &Session) -> Result<Vec<Playlist>, String> {
     let user = session.user_id.ok_or("no user id in the session")?;
-    let body = get_body(
-        &format!("{API_URL}/users/{user}/playlists"),
-        session,
-        &[("countryCode", session.country_code.as_str()), ("limit", "100")],
-    )?;
-    let v: serde_json::Value = serde_json::from_str(&body).map_err(|e| format!("{e}: {body}"))?;
-    Ok(v["items"]
-        .as_array()
-        .map(|a| a.iter().map(|p| parse_playlist(p, session.user_id)).collect())
-        .unwrap_or_default())
+    let owner = session.user_id;
+    paged(session, &format!("{API_URL}/users/{user}/playlists"), &[], move |v| {
+        parse_playlist(v, owner)
+    })
 }
 
 /// Favourites. TIDAL wraps each one in an envelope with the date it was added, so the
@@ -817,43 +833,69 @@ pub fn my_playlists(session: &Session) -> Result<Vec<Playlist>, String> {
 /// callers.
 pub fn favourite_tracks(session: &Session) -> Result<Vec<Track>, String> {
     let user = session.user_id.ok_or("no user id in the session")?;
-    let body = get_body(
-        &format!("{API_URL}/users/{user}/favorites/tracks"),
+    paged(
         session,
-        &[
-            ("countryCode", session.country_code.as_str()),
-            ("limit", "100"),
-            ("order", "DATE"),
-            ("orderDirection", "DESC"),
-        ],
-    )?;
-    let v: serde_json::Value = serde_json::from_str(&body).map_err(|e| format!("{e}: {body}"))?;
-    Ok(v["items"]
-        .as_array()
-        .map(|a| a.iter().map(|i| parse_track(&i["item"])).collect())
-        .unwrap_or_default())
+        &format!("{API_URL}/users/{user}/favorites/tracks"),
+        &[("order", "DATE"), ("orderDirection", "DESC")],
+        |v| parse_track(&v["item"]),
+    )
 }
 
 #[allow(dead_code)] // wired to the panel next
 pub fn favourite_albums(session: &Session) -> Result<Vec<Album>, String> {
     let user = session.user_id.ok_or("no user id in the session")?;
-    let body = get_body(
-        &format!("{API_URL}/users/{user}/favorites/albums"),
+    paged(
         session,
-        &[
-            ("countryCode", session.country_code.as_str()),
-            ("limit", "100"),
-            ("order", "DATE"),
-            ("orderDirection", "DESC"),
-        ],
-    )?;
-    let v: serde_json::Value = serde_json::from_str(&body).map_err(|e| format!("{e}: {body}"))?;
-    Ok(v["items"]
-        .as_array()
-        .map(|a| a.iter().map(|i| parse_album(&i["item"])).collect())
-        .unwrap_or_default())
+        &format!("{API_URL}/users/{user}/favorites/albums"),
+        &[("order", "DATE"), ("orderDirection", "DESC")],
+        |v| parse_album(&v["item"]),
+    )
 }
 
+/// How many items one request asks for. TIDAL's own cap for these endpoints.
+const PAGE: usize = 100;
+
+/// A ceiling on paging, so a broken `totalNumberOfItems` cannot spin for ever.
+/// Well past any real playlist — the largest of Pedro's runs to 444 tracks.
+const MAX_ITEMS: usize = 5_000;
+
+/// Walks every page of a list endpoint.
+///
+/// A single page was silently wrong rather than short: a 250-track playlist played as a
+/// 100-track playlist, with nothing anywhere saying tracks were missing. There is no
+/// "and 150 more" in a music panel, so the only honest option is to fetch them.
+fn paged<T>(
+    session: &Session,
+    url: &str,
+    extra: &[(&str, &str)],
+    parse: impl Fn(&serde_json::Value) -> T,
+) -> Result<Vec<T>, String> {
+    let mut out = Vec::new();
+    let mut offset = 0usize;
+    loop {
+        let (limit, off) = (PAGE.to_string(), offset.to_string());
+        let mut query = vec![
+            ("countryCode", session.country_code.as_str()),
+            ("limit", limit.as_str()),
+            ("offset", off.as_str()),
+        ];
+        query.extend_from_slice(extra);
+        let body = get_body(url, session, &query)?;
+        let v: serde_json::Value =
+            serde_json::from_str(&body).map_err(|e| format!("{e}: {body}"))?;
+        let items = v["items"].as_array().cloned().unwrap_or_default();
+        let got = items.len();
+        out.extend(items.iter().map(&parse));
+        // A short page is the last page. Asking again after one would be a request per
+        // empty answer for ever if `totalNumberOfItems` ever lies.
+        if got < PAGE || out.len() >= MAX_ITEMS {
+            return Ok(out);
+        }
+        offset += got;
+    }
+}
+
+#[allow(dead_code)] // kept for endpoints that answer with a bare array
 fn items_of(session: &Session, url: &str, extra: &[(&str, &str)]) -> Result<Vec<Track>, String> {
     let mut query = vec![("countryCode", session.country_code.as_str())];
     query.extend_from_slice(extra);
@@ -1019,6 +1061,7 @@ pub fn parse_playback_info(body: &str) -> Result<StreamInfo, String> {
     Ok(info)
 }
 
+#[derive(Debug)]
 struct Mpd {
     codec: String,
     init: Option<String>,
@@ -1047,7 +1090,16 @@ fn parse_mpd(xml: &str) -> Result<Mpd, String> {
         // Each <S> is one segment unless it carries `r`, which repeats it r more times.
         let mut n = 0u64;
         for s in timeline.split("<S ").skip(1) {
-            let repeats: u64 = attr_in(s, "r").and_then(|v| v.parse().ok()).unwrap_or(0);
+            let repeats: u64 = match attr_in(s, "r") {
+                None => 0,
+                Some(r) => r.parse().map_err(|_| {
+                    // DASH allows r="-1" for "repeat to the end of the period". Parsing
+                    // it as 0 would count one segment where there are dozens, which is
+                    // a truncated song reported as a success — the thing this function
+                    // says it will not do.
+                    format!("SegmentTimeline repeat {r:?} is not a count this understands")
+                })?,
+            };
             n += 1 + repeats;
         }
         if n == 0 {
@@ -1097,7 +1149,15 @@ fn parse_mpd(xml: &str) -> Result<Mpd, String> {
     let segments = (0..count)
         .map(|i| absolute(expand(&media, Some(start_number + i))))
         .collect::<Vec<_>>();
-    Ok(Mpd { codec, init: init.map(|i| absolute(expand(&i, None))), segments })
+    let init = init.map(|i| absolute(expand(&i, None)));
+    // Any `$Identifier$` still standing is one we do not implement — `$Time$`, most
+    // likely. Left alone it becomes a URL with a literal `$Time$` in it that 404s, and
+    // a 404 segment reads downstream as a short song rather than as a manifest shape
+    // nobody taught this parser.
+    if let Some(bad) = segments.first().into_iter().chain(init.iter()).find(|u| u.contains('$')) {
+        return Err(format!("this manifest uses an addressing mode runnir does not know: {bad}"));
+    }
+    Ok(Mpd { codec, init, segments })
 }
 
 /// Replaces one DASH identifier wherever it appears, with or without a width.
@@ -1262,6 +1322,11 @@ fn get_body(url: &str, session: &Session, query: &[(&str, &str)]) -> Result<Stri
 /// Fetches one URL into memory. Used for a whole FLAC or one DASH segment; both are
 /// bounded by the length of a song, which is why this can be a `Vec` rather than a
 /// stream. `limit` guards against a redirect to something that is not a track at all.
+///
+/// Going OVER the limit is an error, never a short read. `take(limit)` on its own
+/// returns `Ok` with a cut-off file, which is a truncated song reported as a success —
+/// the exact failure the manifest parser refuses to allow, arriving one layer lower.
+/// One byte past the limit is read to tell "exactly this big" from "bigger than this".
 pub fn fetch(url: &str, limit: usize) -> Result<Vec<u8>, String> {
     let mut response = ureq::get(url)
         .config()
@@ -1273,9 +1338,12 @@ pub fn fetch(url: &str, limit: usize) -> Result<Vec<u8>, String> {
     response
         .body_mut()
         .as_reader()
-        .take(limit as u64)
+        .take(limit as u64 + 1)
         .read_to_end(&mut buf)
         .map_err(|e| e.to_string())?;
+    if buf.len() > limit {
+        return Err(format!("this is bigger than {limit} bytes, which is not a track"));
+    }
     Ok(buf)
 }
 
@@ -1599,6 +1667,75 @@ mod tests {
 
         // Nothing usable in it at all.
         assert!(parse_import("{\"access_token\":\"short-lived\"}").is_none());
+    }
+
+    #[test]
+    fn a_percent_followed_by_an_accent_does_not_take_the_process_down() {
+        // Found by review: the decoder sliced the STRING by byte index, so a `%` whose
+        // next two bytes land inside a multibyte character panicked. It runs on
+        // whatever anything on this machine sends to the callback port, so that was a
+        // crash reachable from a stray local request.
+        assert_eq!(urldecode("%aé"), "%aé");
+        assert_eq!(urldecode("%\u{FFFD}"), "%\u{FFFD}");
+        assert_eq!(urldecode("caf%C3%A9"), "café");
+        assert_eq!(urldecode("%"), "%");
+        assert_eq!(urldecode("%zz"), "%zz");
+        // And the same through the caller that actually receives it.
+        assert_eq!(code_from_redirect("/callback?code=%é"), Some("%é".to_string()));
+    }
+
+    #[test]
+    fn a_repeat_count_that_is_not_a_count_is_an_error_not_one_segment() {
+        // DASH allows r="-1" for "repeat to the end of the period". Reading it as zero
+        // counted one segment where there are dozens: a truncated song, reported as a
+        // success, which is exactly what this parser promises never to do.
+        let mpd = MPD_TIMELINE.replace(r#"r="2""#, r#"r="-1""#);
+        let err = parse_mpd(&mpd).expect_err("r=-1 must not parse as one segment");
+        assert!(err.contains("repeat"), "{err}");
+    }
+
+    #[test]
+    fn an_addressing_mode_we_do_not_know_is_an_error_not_a_404_url() {
+        // $Time$ is the other standard way to name segments. Left unexpanded it makes
+        // URLs with a literal $Time$ in them, which 404 — and a 404 segment reads
+        // downstream as a short song rather than as a manifest nobody taught us.
+        let mpd = MPD_TIMELINE.replace("seg-$Number$.mp4", "seg-$Time$.mp4");
+        let err = parse_mpd(&mpd).expect_err("$Time$ must not pass through");
+        assert!(err.contains("addressing mode"), "{err}");
+    }
+
+    #[test]
+    fn a_token_never_appears_in_an_error_message() {
+        // The one body in this program guaranteed to hold credentials. Errors from it
+        // end up in a toast, a scrollback, and whatever screenshot follows.
+        let leaky = r#"{"refresh_token":"SECRET-GRANT","expires_in":3600}"#;
+        let err = session_from_token_response(leaky, None).expect_err("no access token");
+        assert!(!err.contains("SECRET-GRANT"), "the error quoted the token: {err}");
+
+        let not_json = "SECRET-GRANT was here";
+        let err = session_from_token_response(not_json, None).expect_err("not json");
+        assert!(!err.contains("SECRET-GRANT"), "the error quoted the body: {err}");
+        // It still says enough to work with.
+        assert!(err.contains("bytes"), "{err}");
+    }
+
+    #[test]
+    fn the_country_is_never_guessed() {
+        // A guessed country stamps a different licensed catalogue onto the saved
+        // session and stays there until the next sign-out: wrong quietly, and on disk.
+        let mut session = Session::default();
+        let answer: serde_json::Value = serde_json::from_str(r#"{"userId":42}"#).unwrap();
+        let country = answer["countryCode"].as_str();
+        assert!(country.is_none(), "the fixture is the case being guarded");
+        session.country_code = country.unwrap_or_default().to_string();
+        assert!(session.country_code.is_empty());
+    }
+
+    #[test]
+    fn a_windows_line_ending_does_not_get_into_a_token() {
+        let pasted = "grant_type=refresh_token&refresh_token=tok-1\r\nclient_id=cid-1\r\n";
+        let got = parse_import(pasted).unwrap();
+        assert_eq!(got.refresh_token, "tok-1", "a trailing CR fails the refresh opaquely");
     }
 
     #[test]
