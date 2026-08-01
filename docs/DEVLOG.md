@@ -3352,6 +3352,15 @@ that distinction is worth the code it costs.
 
 ## Gotchas (do not re-learn)
 
+- `runnir.json` WINS over `runnir.toml`. `Config::try_load` reads the JSON the settings
+  panel writes and only falls back to the TOML when that file is absent. Editing the
+  TOML on a machine that has a JSON changes nothing, and the symptom is not an error:
+  the program simply runs on values you did not write. Check `Config::active_path`
+  before believing any config edit took.
+- `install.sh` always builds origin's DEFAULT branch — it does a
+  `git reset --hard origin/<default>` in `~/.local/share/runnir/src`. Installing a
+  branch means pointing that checkout at it by hand, and `runnir-update` afterwards will
+  silently take the machine back to `main`.
 - A decoder's buffer width is NOT the source's bit depth. symphonia decodes 16-bit FLAC
   into an `i32` buffer; reading the depth from the buffer reports every lossless track
   as 32-bit. The codec parameters carry the real one.
