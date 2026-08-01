@@ -3872,6 +3872,60 @@ screenshot did, immediately.
 
 587 tests.
 
+## 2026-08-01 - Asking PipeWire for the card, which is why bit-perfect kept losing it
+
+The music came out of the laptop again, and this time the diagnosis went the whole way
+down. `fuser` on the DAC:
+
+    /dev/snd/pcmC2D0p:  drheavymetal 2742 F...m pipewire
+
+**PipeWire holds every card it manages, idle or not.** The R4 was IDLE, nothing playing
+through it, and still held open at 48 kHz — so every exclusive attempt got `EBUSY` and
+the chain did what it was told and fell to the mixer. On a normal desktop the
+bit-perfect path could essentially never get a device; it worked earlier only in the
+windows where PipeWire happened to have let go.
+
+`pactl suspend-sink` does not help: it stops the sink and keeps the file descriptor,
+which is exactly as busy as before. Tested, not assumed.
+
+**The Device Reservation protocol is the answer**, and WirePlumber was already speaking
+it — it owned `org.freedesktop.ReserveDevice1.Audio0`, `Audio1` and `Audio2`, one per
+card. Taking that name with `ReplaceExisting` makes it close the card and stay off it.
+It is the mechanism JACK has used for years, and PipeWire implements the other side
+precisely so an application that wants the hardware can ask rather than fight.
+
+### Taking a name is only half of it
+
+The first version took the name and nothing else. It worked — `hw:2,0` opened, 24/192,
+BIT-PERFECT — and then **the card never came back**. The R4 vanished from PipeWire
+entirely: no sink, nobody owning the name, and nothing else on the machine able to use
+the DAC until wireplumber was restarted. A far worse bug than the one being fixed, and
+it only showed up because the state was checked afterwards rather than being assumed
+from a successful play.
+
+The protocol expects the holder to EXPORT `org.freedesktop.ReserveDevice1` on
+`/org/freedesktop/ReserveDevice1/Audio<N>`: a `RequestRelease` method and three
+properties saying who has the card. With the object exported, WirePlumber reclaims it
+the moment the name is dropped — verified: the sink comes back and WirePlumber owns the
+name again.
+
+`RequestRelease` always answers yes. A terminal playing music has no business keeping a
+sound card from an application the person actually reached for.
+
+Two smaller things fixed alongside, both mine:
+
+- The reservation was taken per ATTEMPT, so it was released again between rungs and
+  PipeWire took the card back in the gap. One reservation, held for the whole walk down
+  the chain, and moved into the sink when one of them works.
+- The busy patience was paid per attempt too: seven attempts on a machine where every
+  card is held meant ten seconds of silence before the first note — worse than the
+  wrong output it was added to prevent. It is a budget for the whole chain now.
+
+And the grace after taking the name is 900 ms because 400 was measured to be too short:
+the first open still found the card busy and only a later attempt succeeded.
+
+588 tests.
+
 ## Gotchas (do not re-learn)
 
 - `runnir.json` WINS over `runnir.toml`. `Config::try_load` reads the JSON the settings
@@ -3917,6 +3971,12 @@ screenshot did, immediately.
 - Closing and reopening an ALSA device between tracks makes it wait out its OWN
   release: the busy-patience that fixes wrong-output then costs a gap at every track
   change. Hold the device while the format stays the same.
+- PipeWire holds every card it manages, IDLE or not, so an exclusive open normally
+  fails. `pactl suspend-sink` does not release it. The Device Reservation protocol
+  does: take `org.freedesktop.ReserveDevice1.Audio<N>` with ReplaceExisting.
+- …and taking that name is only half the protocol. Export the interface object too, or
+  the previous owner never reclaims the card and the device disappears from the desktop
+  until the session is restarted.
 - ALSA frees a card a moment AFTER the process holding it dies. An exclusive open
   attempted immediately after another process let go gets `EBUSY` and, in a fallback
   chain, silently ends up somewhere else. Wait the card out before deciding it refused.

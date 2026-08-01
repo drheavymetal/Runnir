@@ -506,6 +506,13 @@ pub struct Tidal {
     /// Port the sign-in callback listens on. Fixed rather than chosen at random,
     /// because a redirect URI has to be predictable to be registered.
     pub callback_port: u16,
+    /// Ask PipeWire to let go of the sound card before opening it exclusively.
+    ///
+    /// On by default, because without it the exclusive path never gets a device on a
+    /// normal desktop: PipeWire holds every card it manages, idle or not. It is asked
+    /// through the Device Reservation protocol it implements for exactly this, not
+    /// taken — and it gets the card back when playback stops.
+    pub release_device: bool,
 }
 
 impl Default for Tidal {
@@ -519,6 +526,7 @@ impl Default for Tidal {
             bit_perfect: true,
             volume_normalization: false,
             callback_port: 8747,
+            release_device: true,
         }
     }
 }

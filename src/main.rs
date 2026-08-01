@@ -29,6 +29,7 @@ mod player;
 mod project_session;
 mod pty;
 mod render;
+mod reserve;
 mod selection;
 mod share;
 mod session;

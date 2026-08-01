@@ -28,6 +28,7 @@ ureq = { version = "3.3.0", features = ["json"] }
 vte = "0.15.0"
 wgpu = "30.0.0"
 winit = "0.30.13"
+zbus = { version = "5", default-features = false, features = ["blocking-api", "async-io"] }
 
 # Unix process/fs bits (O_NOFOLLOW, sysctl on macOS).
 [target.'cfg(unix)'.dependencies]

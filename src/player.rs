@@ -710,6 +710,9 @@ mod linux {
 
     pub struct Sink {
         pcm: PCM,
+        /// The card, taken from PipeWire for as long as this device is open. Dropped
+        /// with the sink, which is what gives the card back.
+        pub(super) _reservation: Option<crate::reserve::Reservation>,
         format: Format,
         channels: u32,
         /// Whether this device implements `snd_pcm_pause`. Asked once, at open, because
@@ -724,12 +727,35 @@ mod linux {
         pub fn open(cfg: &TidalCfg, want: &Want, quality: &str) -> Result<Sink, String> {
             let devices = hw_devices();
             let attempts = plan(&cfg.output, cfg.bit_perfect, &devices);
+            // Taken ONCE, for the card the chain would rather use, and held for the
+            // whole walk down it. Asking per attempt meant releasing it again between
+            // rungs — PipeWire took the card back in the gap, and the next attempt
+            // found it busy exactly as before.
+            let mut reservation = if cfg.release_device {
+                attempts
+                    .iter()
+                    .find_map(|a| crate::reserve::card_of(&a.device))
+                    .and_then(|card| match crate::reserve::take(card) {
+                        Ok(held) => held,
+                        Err(e) => {
+                            eprintln!("runnir: {e}");
+                            None
+                        }
+                    })
+            } else {
+                None
+            };
+
             let mut refused: Vec<(String, String)> = Vec::new();
+            let started = std::time::Instant::now();
             for attempt in &attempts {
-                match try_open(attempt, want) {
+                match try_open(attempt, want, busy_budget(started.elapsed())) {
                     Ok(mut sink) => {
                         sink.signal.quality = quality.to_string();
                         sink.signal.refused = refused;
+                        // The card stays ours for as long as the device is open, and
+                        // goes back the moment it is not.
+                        sink._reservation = reservation.take();
                         return Ok(sink);
                     }
                     // A busy device is the commonest failure here — PipeWire holding the
@@ -921,11 +947,26 @@ mod linux {
     /// busy for a fraction of a second is not a device that refuses, and treating it as
     /// one is the silent wrong-output failure this whole chain exists to avoid.
     const BUSY_PATIENCE: std::time::Duration = std::time::Duration::from_millis(1500);
+
+    /// The patience is a budget for the WHOLE chain, not for each rung of it.
+    ///
+    /// Paid per attempt it came to seven waits on a machine where PipeWire holds every
+    /// card — ten seconds of silence before the first note, which is worse than the
+    /// wrong output it was added to prevent. The first device gets the full wait; by
+    /// the time the chain is on its third candidate, a card that is still busy is busy
+    /// for a reason that will not pass in another second.
+    fn busy_budget(spent: std::time::Duration) -> std::time::Duration {
+        BUSY_PATIENCE.saturating_sub(spent)
+    }
     const BUSY_RETRY: std::time::Duration = std::time::Duration::from_millis(100);
 
     /// Opens one candidate, or explains why it could not be used.
-    fn try_open(attempt: &Attempt, want: &Want) -> Result<Sink, String> {
-        let pcm = open_waiting_for_busy(&attempt.device)?;
+    fn try_open(
+        attempt: &Attempt,
+        want: &Want,
+        patience: std::time::Duration,
+    ) -> Result<Sink, String> {
+        let pcm = open_waiting_for_busy(&attempt.device, patience)?;
         let (format, rate, can_pause) = {
             let hwp = HwParams::any(&pcm).map_err(|e| e.to_string())?;
             hwp.set_access(Access::RWInterleaved).map_err(|e| e.to_string())?;
@@ -980,6 +1021,8 @@ mod linux {
             channels: want.channels,
             can_pause,
             paused: false,
+            // Filled in by `open` when the chain settles on this device.
+            _reservation: None,
             signal: SignalPath {
                 device: attempt.device.clone(),
                 rung: Some(rung),
@@ -1047,9 +1090,9 @@ mod linux {
     /// Only real hardware is waited for: `default` and `plughw` go through the system
     /// mixer, which does not hand out exclusive access and so never answers busy for a
     /// reason that will pass.
-    fn open_waiting_for_busy(device: &str) -> Result<PCM, String> {
+    fn open_waiting_for_busy(device: &str, patience: std::time::Duration) -> Result<PCM, String> {
         let exclusive = device.starts_with("hw:");
-        let deadline = std::time::Instant::now() + BUSY_PATIENCE;
+        let deadline = std::time::Instant::now() + patience;
         loop {
             match PCM::new(device, Direction::Playback, false) {
                 Ok(pcm) => return Ok(pcm),
@@ -1060,7 +1103,7 @@ mod linux {
                             // Named for what it is. "Busy" is the commonest thing this
                             // chain ever reports and the one people need to recognise:
                             // something else is holding the card.
-                            format!("busy for over {}s ({e})", BUSY_PATIENCE.as_secs_f32())
+                            format!("busy ({e})")
                         } else {
                             e.to_string()
                         });
