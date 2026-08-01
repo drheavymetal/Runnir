@@ -370,6 +370,12 @@ pub fn play_parts(
         .ok_or("audio track has no codec parameters")?
         .clone();
 
+    // The depth the STREAM was encoded at, which is not the same as the width of the
+    // buffer the decoder hands back: symphonia decodes 16-bit FLAC into an i32 buffer,
+    // and believing the buffer would report every lossless track as 32-bit — turning
+    // the one number this whole feature exists to be honest about into a lie.
+    let declared_bits = params.bits_per_sample;
+
     let mut decoder = symphonia::default::get_codecs()
         .make_audio_decoder(&params, &AudioDecoderOptions::default())
         .map_err(|e| format!("no decoder for this codec: {e}"))?;
@@ -408,7 +414,7 @@ pub fn play_parts(
             let want = Want {
                 rate: spec.rate(),
                 channels: spec.channels().count() as u32,
-                bits: sample_bits(&decoded),
+                bits: source_bits(declared_bits, sample_bits(&decoded)),
             };
             played.signal.decoded_bits = want.bits;
             played.signal.decoded_rate = want.rate;
@@ -484,8 +490,21 @@ fn is_end_of_stream(e: &symphonia::core::errors::Error) -> bool {
     }
 }
 
-/// The bit depth the decoder actually produced, which is what bit-perfect is measured
-/// against — not what the metadata claimed.
+/// The source's real bit depth.
+///
+/// `declared` comes from the codec parameters and is the truth when it is there. The
+/// buffer width is only a fallback, and a poor one: it says how wide the decoder's
+/// container is, not how many bits carry audio. Widths outside what audio actually uses
+/// are ignored rather than trusted.
+fn source_bits(declared: Option<u32>, buffer_bits: u32) -> u32 {
+    match declared {
+        Some(bits) if (8..=32).contains(&bits) => bits,
+        _ => buffer_bits,
+    }
+}
+
+/// The width of the buffer the decoder handed back. See [`source_bits`] for why this is
+/// the fallback and not the answer.
 fn sample_bits(buf: &symphonia::core::audio::GenericAudioBufferRef<'_>) -> u32 {
     use symphonia::core::audio::GenericAudioBufferRef as B;
     match buf {
@@ -986,6 +1005,10 @@ impl Jukebox {
             .name("runnir-player".into())
             .spawn(move || run(rx, shared, wake, cfg, creds))
             .expect("spawn player thread");
+        // Tell the desktop there is a player here. Done at start rather than at first
+        // track: the media keys and the desktop's widget should find runnir the moment
+        // it can play, not only once it already is.
+        crate::mpris::publish(tx.clone(), state.clone());
         Jukebox { tx, state }
     }
 
@@ -1403,6 +1426,20 @@ mod tests {
         assert!(Rung::ExclusivePadded.is_bit_exact());
         assert!(!Rung::ExclusiveResampled.is_bit_exact());
         assert!(!Rung::Shared.is_bit_exact());
+    }
+
+    #[test]
+    fn the_source_depth_wins_over_the_decoders_buffer_width() {
+        // 16-bit FLAC decoded into an i32 buffer is still 16-bit audio. Reporting 32
+        // would claim a depth the recording never had, and would send a 16-bit stream
+        // to the DAC as if it were 32.
+        assert_eq!(source_bits(Some(16), 32), 16);
+        assert_eq!(source_bits(Some(24), 32), 24);
+        // Nothing declared: the buffer is all there is.
+        assert_eq!(source_bits(None, 32), 32);
+        // A nonsense declaration is not trusted over something real.
+        assert_eq!(source_bits(Some(0), 24), 24);
+        assert_eq!(source_bits(Some(64), 24), 24);
     }
 
     #[test]

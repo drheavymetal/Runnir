@@ -20,6 +20,7 @@ mod keys;
 mod layout;
 mod media;
 mod mouse;
+mod mpris;
 mod overlay;
 mod pane;
 mod platform;

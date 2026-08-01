@@ -3255,8 +3255,78 @@ rather than by reading the drawing code.
 540 tests. The `leader n` which-key was rendered headless (`runnir --demo … n`) and
 shows the five entries.
 
+## 2026-08-01 - It plays, and the desktop knows about it
+
+First sound out of runnir: Opeth, from the panel, driven by the remote control on an
+isolated instance. What the run proved, and what it broke.
+
+**Signing in: neither flow works, and for the same reason.** A TIDAL client id is
+registered for particular flows, and the one everybody has is registered for none of the
+interactive ones. The device flow answers `sub_status 1002` ("not a Limited Input Device
+client"). The authorization-code flow answers **error 11102** — with the app redirect AND
+with a loopback one, which is what settles it: the redirect was never the problem, the
+client was. A different first-party client id (the one `tidalapi` uses for PKCE) does
+accept the authorization-code flow, and with it the login page appears, credentials are
+taken, and TIDAL redirects to a page of its own that does not exist. That "page not
+found" IS the success case: the grant code is in the address bar.
+
+So the loopback callback is built, tested and unreachable for now. A local listener is
+the only way a terminal can CATCH an OAuth answer, and no first-party client id will
+redirect to one. The only route to a real callback is an app registered on
+`developer.tidal.com`, where the redirect is yours to declare — worth trying, but only
+once it is known whether such a token reaches `playbackinfopostpaywall` at full quality.
+Until then the sign-in is: click the link, log in, paste the address once. The code lives
+about sixty seconds, which is worth knowing before wondering why the first paste failed.
+
+**LOSSLESS arrives as DASH, not as BTS.** 16-bit/44.1 kHz came back as
+`application/dash+xml` — init segment plus media segments — not as the `vnd.tidal.bts`
+envelope that the tier was expected to use. The DASH path was built for hi-res and
+proven against an ffmpeg fixture the day before; without that, nothing would have played
+today. The BTS parser now has the opposite problem: it exists, it is unit-tested against
+a manifest written by the same person who wrote the parser, and it has never seen a real
+response. Whether TIDAL still sends BTS at all is an open question and it is on the list.
+
+**The badge was already lying, on its very first line.** It read `LOSSLESS 32/44.1 kHz`
+for a 16-bit track, because the depth was taken from the width of the buffer symphonia
+decodes into rather than from the stream. Every lossless track would have been reported
+as 32-bit — and the chain would have gone looking for a 32-bit device for a 16-bit
+stream. The codec parameters carry the real depth; the buffer width is now only the
+fallback, and a declared depth outside 8..=32 is ignored rather than believed.
+
+**MPRIS, brought forward from phase 4 to now**, because Pedro noticed the obvious: the
+desktop had no idea anything was playing, so the media keys went elsewhere and nothing
+could pause it from outside the window. runnir now announces itself on the session bus.
+Verified on the real bus: `playerctl -l` lists it, the metadata is right, and
+`playerctl -p runnir play-pause` pauses and resumes what the panel is playing.
+
+It lives on one thread of its own blocking on a small executor. D-Bus is asynchronous
+and runnir has no runtime; rather than grow one, the whole interface sits behind the same
+`Cmd` channel and `Snapshot` the panel uses. Two deliberate refusals in the interface:
+`Quit` is not supported (a widget's close button would take the whole terminal with it),
+and the volume is fixed at 1.0 and read-only — in bit-perfect mode there IS no volume to
+change, and a slider that silently does nothing is worse than one that is obviously
+fixed.
+
+**Still unproven, and the important half:** everything above played through PipeWire with
+`bit_perfect = false`. The exclusive `hw:` open, the BIT-PERFECT rung, hi-res over DASH,
+and the badge telling the truth about which rung it landed on are all untested. That
+needs the DAC and an ear.
+
+Two things to know before that test. The first exclusive open BYPASSES the system volume
+entirely — no PipeWire, no volume keys, nothing between the decoder and the DAC — so the
+system volume must be down before it, not after. And a real instance driven by the remote
+control must be identified by `/proc/<pid>/exe`: the socket picked by recency belongs to
+whichever window answered last, which today was Pedro's own.
+
 ## Gotchas (do not re-learn)
 
+- A decoder's buffer width is NOT the source's bit depth. symphonia decodes 16-bit FLAC
+  into an `i32` buffer; reading the depth from the buffer reports every lossless track
+  as 32-bit. The codec parameters carry the real one.
+- A TIDAL client id is registered for particular OAuth flows and most are registered for
+  none of the interactive ones: `sub_status 1002` refuses the device flow, `error 11102`
+  refuses the authorization-code flow. 11102 with a loopback AND with the app redirect
+  is the proof that the redirect is not what is being refused.
 - ALSA's `HintIter` does NOT list `hw:` devices — only aliases (`default`,
   `sysdefault:`, `front:`, `hdmi:`), none of which can be opened exclusively. Real cards
   come from `/proc/asound/cards` plus each card's `pcmNp` directories. `pcmNc` is
