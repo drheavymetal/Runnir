@@ -2732,6 +2732,31 @@ pub struct TidalPanel {
     pub snapshot: crate::player::Snapshot,
 }
 
+/// Where the panel is on screen and how it is divided.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TidalLayout {
+    pub col: usize,
+    pub row: usize,
+    pub w: usize,
+    pub h: usize,
+    /// Width of the sources column.
+    pub side: usize,
+    pub list_rows: usize,
+    /// Index of the first list row on screen.
+    pub first: usize,
+}
+
+/// What a click landed on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TidalHit {
+    Source(usize),
+    Row(usize),
+    Query,
+    /// Inside the panel but on none of the above — a border, the transport, the wave.
+    /// Worth naming, because it must NOT be read as "outside", which closes the panel.
+    Chrome,
+}
+
 /// The left column. Each is a different question, not a different filter.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Source {
@@ -2920,12 +2945,64 @@ impl TidalPanel {
         self.rows.iter().map(row_line).collect()
     }
 
-    fn render(&self, cols: usize, rows: usize, theme: &Theme) -> Vec<Panel> {
+    /// Where the panel sits and how it is divided.
+    ///
+    /// Shared by the drawing and the hit-testing rather than worked out twice: a panel
+    /// whose clicks land a row off the thing you pointed at is worse than one with no
+    /// mouse at all, and that is exactly what two copies of this arithmetic produce
+    /// the first time one of them changes.
+    pub fn layout(&self, cols: usize, rows: usize) -> TidalLayout {
         let w = (cols * 8 / 10).clamp(56, 110).min(cols.saturating_sub(2));
         let list_rows = rows.saturating_sub(12).clamp(5, 20);
         let h = list_rows + 7;
+        TidalLayout {
+            col: (cols.saturating_sub(w)) / 2,
+            row: (rows.saturating_sub(h)) / 3,
+            w,
+            h,
+            side: 14,
+            list_rows,
+            first: self.cursor.saturating_sub(list_rows.saturating_sub(2)),
+        }
+    }
+
+    /// What is under a screen cell, if anything of this panel is.
+    pub fn hit(&self, cols: usize, rows: usize, col: usize, row: usize) -> Option<TidalHit> {
+        let l = self.layout(cols, rows);
+        let (x, y) = (col.checked_sub(l.col)?, row.checked_sub(l.row)?);
+        if x >= l.w || y >= l.h {
+            return None;
+        }
+        // The sources column: five names starting two rows down. Above the first or
+        // below the last is still the panel — the same trap as the list, and it would
+        // have closed the panel when someone clicked the empty space under Playlists.
+        if x < l.side {
+            return match y.checked_sub(2) {
+                Some(i) if i < Source::ALL.len() => Some(TidalHit::Source(i)),
+                _ => Some(TidalHit::Chrome),
+            };
+        }
+        if y == 1 {
+            return Some(TidalHit::Query);
+        }
+        if let Some(line) = y.checked_sub(3) {
+            if line < l.list_rows {
+                let index = l.first + line;
+                // Past the end of a short list is still INSIDE the panel. Returning
+                // nothing here would read as "outside", which closes it — so clicking
+                // the empty space under a three-row list would have shut the panel.
+                if index < self.rows.len() {
+                    return Some(TidalHit::Row(index));
+                }
+            }
+        }
+        Some(TidalHit::Chrome)
+    }
+
+    fn render(&self, cols: usize, rows: usize, theme: &Theme) -> Vec<Panel> {
+        let l = self.layout(cols, rows);
+        let (w, h, side, list_rows) = (l.w, l.h, l.side, l.list_rows);
         let mut g = panel_grid(w, h, theme);
-        let side = 14usize; // the sources column
 
         let title = match &self.crumb {
             Some(c) => format!("TIDAL  \u{b7}  {c}"),
@@ -2987,6 +3064,20 @@ impl TidalPanel {
             None if self.snapshot.error.is_some() => {
                 self.snapshot.error.clone().unwrap_or_default()
             }
+            // A device that was passed over is worth more room than the one that took
+            // the audio: "it is coming out of the laptop" is obvious, and "because the
+            // DAC was busy" is the part nobody can work out from the outside.
+            None if !self.snapshot.signal.refused.is_empty() => {
+                let skipped = self
+                    .snapshot
+                    .signal
+                    .refused
+                    .iter()
+                    .map(|(device, why)| format!("{device} {why}"))
+                    .collect::<Vec<_>>()
+                    .join(" \u{b7} ");
+                format!("{} \u{2190} skipped {skipped}", self.snapshot.signal.badge())
+            }
             None => self.snapshot.signal.badge(),
         };
         let pen = if self.message.is_some() || self.snapshot.error.is_some() {
@@ -2998,9 +3089,7 @@ impl TidalPanel {
         };
         write(&mut g, bar + 2, 2, &short_tail(&foot, w.saturating_sub(4)), pen);
 
-        let col = (cols.saturating_sub(w)) / 2;
-        let row = (rows.saturating_sub(h)) / 3;
-        vec![Panel { grid: g, col, row }]
+        vec![Panel { grid: g, col: l.col, row: l.row }]
     }
 
     fn render_list(&self, g: &mut Grid, side: usize, list_rows: usize, w: usize, theme: &Theme) {
@@ -3018,6 +3107,7 @@ impl TidalPanel {
         }
 
         // Keep the cursor on screen without moving the list under it every keystroke.
+        // The same sum the hit-testing uses, through `layout`.
         let first = self.cursor.saturating_sub(list_rows.saturating_sub(2));
         for (i, row) in self.rows.iter().skip(first).take(list_rows).enumerate() {
             let index = first + i;
@@ -5357,6 +5447,51 @@ fn a_track(title: &str) -> crate::tidal::Track {
         // parking on a label.
         p.up();
         assert_eq!(p.cursor, 1);
+    }
+
+    #[test]
+    fn a_click_lands_on_the_thing_it_was_pointed_at() {
+        let mut p = TidalPanel::new(crate::player::Snapshot::default());
+        p.rows = vec![
+            TidalRow::Heading("TRACKS".into()),
+            TidalRow::Track(a_track("one")),
+            TidalRow::Track(a_track("two")),
+        ];
+        let (cols, rows) = (120, 40);
+        let l = p.layout(cols, rows);
+
+        // The sources column: five names, two rows down from the panel's top.
+        assert_eq!(p.hit(cols, rows, l.col + 2, l.row + 2), Some(TidalHit::Source(0)));
+        assert_eq!(p.hit(cols, rows, l.col + 2, l.row + 6), Some(TidalHit::Source(4)));
+        // One row further is past the last source and must not select the last one.
+        assert_eq!(p.hit(cols, rows, l.col + 2, l.row + 7), Some(TidalHit::Chrome));
+
+        // The list, three rows down and to the right of the divider.
+        assert_eq!(p.hit(cols, rows, l.col + l.side + 4, l.row + 3), Some(TidalHit::Row(0)));
+        assert_eq!(p.hit(cols, rows, l.col + l.side + 4, l.row + 5), Some(TidalHit::Row(2)));
+        // Past the end of a short list is the panel, not a row: clicking empty space
+        // must not select whatever happens to be last.
+        assert_eq!(p.hit(cols, rows, l.col + l.side + 4, l.row + 6), Some(TidalHit::Chrome));
+
+        // The query box.
+        assert_eq!(p.hit(cols, rows, l.col + l.side + 4, l.row + 1), Some(TidalHit::Query));
+
+        // Outside the panel is nothing at all, which is what closes it.
+        assert_eq!(p.hit(cols, rows, 0, 0), None);
+        assert_eq!(p.hit(cols, rows, l.col + l.w, l.row + 2), None);
+    }
+
+    #[test]
+    fn a_scrolled_list_hits_the_row_that_is_actually_drawn() {
+        // The bug this guards: hit-testing that forgets the list has scrolled points a
+        // click at the wrong song, which with a music panel means playing the wrong one.
+        let mut p = TidalPanel::new(crate::player::Snapshot::default());
+        p.rows = (0..60).map(|i| TidalRow::Track(a_track(&format!("t{i}")))).collect();
+        p.cursor = 50;
+        let (cols, rows) = (120, 40);
+        let l = p.layout(cols, rows);
+        assert!(l.first > 0, "a cursor at 50 must have scrolled the window");
+        assert_eq!(p.hit(cols, rows, l.col + l.side + 4, l.row + 3), Some(TidalHit::Row(l.first)));
     }
 
     #[test]

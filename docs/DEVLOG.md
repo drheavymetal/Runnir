@@ -3498,6 +3498,48 @@ meant to.
 
 566 tests, and this time the number was checked before it was written down.
 
+## 2026-08-01 - The DAC went missing for a second, and the panel took the mouse
+
+**The music came out of the laptop again**, with the DAC plugged in and the config
+asking for it. From the command line the same track was BIT-PERFECT on `hw:2,0`, so the
+device and the settings were both right. What was wrong was the timing:
+
+    tras 0.00s: audio open error: Dispositivo o recurso ocupado
+
+ALSA releases a card a moment AFTER the process holding it exits. Closing one window and
+opening another lands inside that gap: the daemon restarts, the DAC answers "device or
+resource busy", and the chain — doing exactly what it was told — falls to the next rung
+and plays through the speakers. A device busy for a fraction of a second is not a device
+that refuses, and treating it as one is the silent wrong-output failure this whole chain
+exists to prevent.
+
+Exclusive opens now wait out a busy card for a second and a half before moving on, and
+only for real hardware: `default` and `plughw` go through the mixer, which never answers
+busy for a reason that will pass.
+
+And the refusals stopped being invisible. The panel's footer says
+`… ← skipped hw:2,0 busy for over 1.5s` when something was passed over, because "it is
+coming out of the laptop" is obvious from the badge while "because the DAC was busy" is
+the part nobody can work out from outside.
+
+### The panel takes the mouse
+
+Sources and a list are both things people point at, and a music panel that can only be
+driven from the keyboard is one people stop opening. Same rule as the docker panel: one
+click selects, a second on the SAME thing acts. A stray click must not start playing
+music out loud any more than it should open an ssh connection.
+
+The geometry lives in one `layout()` used by both the drawing and the hit-testing. Two
+copies of that arithmetic disagree the first time one of them changes, and a panel whose
+clicks land a row off is worse than one with no mouse at all.
+
+Writing the test for it caught two real bugs before the mouse was ever used: clicking the
+empty space under a short list, and under the last source, both reported "nothing here" —
+which is what closes the panel. Clicking inside a panel had a one-in-three chance of
+dismissing it.
+
+568 tests.
+
 ## Gotchas (do not re-learn)
 
 - `runnir.json` WINS over `runnir.toml`. `Config::try_load` reads the JSON the settings
@@ -3525,6 +3567,11 @@ meant to.
   none of the interactive ones: `sub_status 1002` refuses the device flow, `error 11102`
   refuses the authorization-code flow. 11102 with a loopback AND with the app redirect
   is the proof that the redirect is not what is being refused.
+- ALSA frees a card a moment AFTER the process holding it dies. An exclusive open
+  attempted immediately after another process let go gets `EBUSY` and, in a fallback
+  chain, silently ends up somewhere else. Wait the card out before deciding it refused.
+- In a hit-test, "inside the panel but on nothing" and "outside the panel" must be
+  DIFFERENT answers. Collapsing them makes clicking empty space dismiss the panel.
 - ALSA's `HintIter` does NOT list `hw:` devices — only aliases (`default`,
   `sysdefault:`, `front:`, `hdmi:`), none of which can be opened exclusively. Real cards
   come from `/proc/asound/cards` plus each card's `pcmNp` directories. `pcmNc` is

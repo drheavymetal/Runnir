@@ -290,6 +290,15 @@ impl Gpu {
             }
             return;
         }
+        // The TIDAL panel takes the mouse for the same reason: sources and a list are
+        // both things people point at, and a music panel that can only be driven from
+        // the keyboard is one people give up on.
+        if matches!(self.overlay, Some(Overlay::Tidal(_))) {
+            if state == ElementState::Pressed && button == MouseButton::Left {
+                self.tidal_panel_click(self.cursor_px, config);
+            }
+            return;
+        }
         // The docker panel takes the mouse for the same reason the git panel does:
         // it is three lists, and lists are things people point at.
         if matches!(self.overlay, Some(Overlay::Docker(_))) {
@@ -7124,6 +7133,74 @@ impl Gpu {
         let snapshot = self.player(config).map(|j| j.snapshot()).unwrap_or_default();
         self.overlay = Some(Overlay::Tidal(overlay::TidalPanel::new(snapshot)));
         self.window.request_redraw();
+    }
+
+    /// A click in the TIDAL panel.
+    ///
+    /// One click selects, a second on the SAME thing acts. That is the docker panel's
+    /// rule and it is worth keeping: a stray click should never start playing music out
+    /// loud, any more than it should open an ssh connection.
+    fn tidal_panel_click(&mut self, pos: PhysicalPosition<f64>, config: &Config) {
+        let (cols, rows, col, row) = self.cell_at(pos);
+        let mut load: Option<crate::overlay::Source> = None;
+        let mut open: Option<crate::overlay::TidalRow> = None;
+        let mut play: Option<crate::player::Cmd> = None;
+        {
+            let Some(Overlay::Tidal(p)) = &mut self.overlay else { return };
+            let Some(hit) = p.hit(cols, rows, col, row) else {
+                // Outside the panel entirely reads as "put this away" — and putting the
+                // panel away never stops the music.
+                self.overlay = None;
+                self.window.request_redraw();
+                return;
+            };
+            match hit {
+                crate::overlay::TidalHit::Source(i) => {
+                    let source = crate::overlay::Source::ALL[i];
+                    p.focus = crate::overlay::PanelFocus::Sources;
+                    if p.source != source {
+                        p.source = source;
+                        p.crumb = None;
+                        load = Some(source);
+                    }
+                }
+                crate::overlay::TidalHit::Row(i) => {
+                    let same = p.cursor == i && p.focus == crate::overlay::PanelFocus::List;
+                    p.focus = crate::overlay::PanelFocus::List;
+                    p.show_lyrics = false;
+                    if p.rows.get(i).is_some_and(|r| !matches!(r, crate::overlay::TidalRow::Heading(_))) {
+                        p.cursor = i;
+                    }
+                    if same {
+                        match p.selected().cloned() {
+                            Some(crate::overlay::TidalRow::Track(_)) => {
+                                if let Some((tracks, at)) = p.play_selection() {
+                                    play = Some(crate::player::Cmd::Play { tracks, at });
+                                }
+                            }
+                            Some(other) => open = Some(other),
+                            None => {}
+                        }
+                    }
+                }
+                crate::overlay::TidalHit::Query => {
+                    p.source = crate::overlay::Source::Search;
+                    p.focus = crate::overlay::PanelFocus::List;
+                    p.editing = true;
+                }
+                crate::overlay::TidalHit::Chrome => {}
+            }
+        }
+        if let Some(source) = load {
+            self.tidal_load(source);
+        }
+        if let Some(row) = open {
+            self.tidal_open(row);
+        }
+        if let Some(cmd) = play {
+            self.tidal_send(cmd, config);
+        }
+        self.refresh_tidal_panel();
     }
 
     /// Moves the cursor, in whichever half has the keyboard.

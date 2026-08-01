@@ -780,10 +780,19 @@ mod linux {
         Ok(underruns)
     }
 
+    /// How long a busy device is waited for before the chain moves on.
+    ///
+    /// ALSA releases a card a moment AFTER the process holding it goes, so closing one
+    /// window and opening another lands inside that gap: the DAC answers "device or
+    /// resource busy" and the music comes out of the laptop instead. A device that is
+    /// busy for a fraction of a second is not a device that refuses, and treating it as
+    /// one is the silent wrong-output failure this whole chain exists to avoid.
+    const BUSY_PATIENCE: std::time::Duration = std::time::Duration::from_millis(1500);
+    const BUSY_RETRY: std::time::Duration = std::time::Duration::from_millis(100);
+
     /// Opens one candidate, or explains why it could not be used.
     fn try_open(attempt: &Attempt, want: &Want) -> Result<Sink, String> {
-        let pcm = PCM::new(&attempt.device, Direction::Playback, false)
-            .map_err(|e| e.to_string())?;
+        let pcm = open_waiting_for_busy(&attempt.device)?;
         let (format, rate, can_pause) = {
             let hwp = HwParams::any(&pcm).map_err(|e| e.to_string())?;
             hwp.set_access(Access::RWInterleaved).map_err(|e| e.to_string())?;
@@ -885,6 +894,35 @@ mod linux {
             Format::S16LE => 16,
             Format::S243LE | Format::S24LE => 24,
             _ => 32,
+        }
+    }
+
+    /// Opens a device, waiting out a card that is merely busy.
+    ///
+    /// Only real hardware is waited for: `default` and `plughw` go through the system
+    /// mixer, which does not hand out exclusive access and so never answers busy for a
+    /// reason that will pass.
+    fn open_waiting_for_busy(device: &str) -> Result<PCM, String> {
+        let exclusive = device.starts_with("hw:");
+        let deadline = std::time::Instant::now() + BUSY_PATIENCE;
+        loop {
+            match PCM::new(device, Direction::Playback, false) {
+                Ok(pcm) => return Ok(pcm),
+                Err(e) => {
+                    let busy = e.errno() == libc::EBUSY;
+                    if !busy || !exclusive || std::time::Instant::now() >= deadline {
+                        return Err(if busy {
+                            // Named for what it is. "Busy" is the commonest thing this
+                            // chain ever reports and the one people need to recognise:
+                            // something else is holding the card.
+                            format!("busy for over {}s ({e})", BUSY_PATIENCE.as_secs_f32())
+                        } else {
+                            e.to_string()
+                        });
+                    }
+                    std::thread::sleep(BUSY_RETRY);
+                }
+            }
         }
     }
 
