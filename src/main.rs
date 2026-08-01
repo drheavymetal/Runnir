@@ -626,7 +626,7 @@ fn tidal_decode(files: &[&str], play: bool) {
         .unwrap_or("flac");
     let ext = if matches!(ext, "m4s" | "m4a" | "mp4") { "mp4" } else { ext };
 
-    match player::play_parts(parts, ext, "", &cfg, play) {
+    match player::play_parts(parts, ext, "", &cfg, play, &mut |_| player::Flow::Continue) {
         Ok(played) => {
             let seconds = played.frames as f64 / played.signal.decoded_rate.max(1) as f64;
             println!("  {}", played.signal.badge());

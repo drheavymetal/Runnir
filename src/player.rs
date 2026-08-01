@@ -284,6 +284,9 @@ pub fn hint_for(info: &StreamInfo) -> &'static str {
 pub struct Played {
     pub frames: u64,
     pub signal: SignalPath,
+    /// True when playback ended because it was told to, not because the track did.
+    /// The difference decides whether the queue advances.
+    pub stopped: bool,
     /// ALSA underruns. Not fatal — recovered from — but they are audible, so a run that
     /// had them is not a run that worked.
     pub underruns: u32,
@@ -295,7 +298,34 @@ pub struct Played {
 /// version of this loop, which is why the decode and the output are already separated
 /// from the fetching.
 pub fn play(info: &StreamInfo, cfg: &TidalCfg) -> Result<Played, String> {
-    play_parts(parts_of(info)?, hint_for(info), &info.quality, cfg, true)
+    play_parts(parts_of(info)?, hint_for(info), &info.quality, cfg, true, &mut |_| Flow::Continue)
+}
+
+/// What the thing driving playback wants done next, asked once per decoded packet.
+///
+/// The audio loop never decides any of this: it knows about decoding and about ALSA,
+/// and nothing about queues, keys or panels. Everything that IS a decision lives on the
+/// other side of this callback — which is also why moving the queue into a separate
+/// process later changes nothing here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Flow {
+    Continue,
+    /// Hold the device but stop feeding it. The loop pauses the PCM rather than
+    /// blocking with a full buffer, which would underrun the moment it resumed.
+    Pause,
+    /// Abandon this track and return normally — the next one is wanted.
+    Skip,
+    /// Stop playing entirely.
+    Stop,
+}
+
+/// Told to the conductor once per packet: how far in, and (once known) how it is coming
+/// out. Passing the signal path back this way means the panel learns the rung at the
+/// moment the device opens, not when the track ends.
+pub struct Progress<'a> {
+    pub frames: u64,
+    pub rate: u32,
+    pub signal: Option<&'a SignalPath>,
 }
 
 /// The whole audio path, from a list of parts to the DAC.
@@ -309,6 +339,7 @@ pub fn play_parts(
     quality: &str,
     cfg: &TidalCfg,
     output: bool,
+    conductor: &mut dyn FnMut(Progress<'_>) -> Flow,
 ) -> Result<Played, String> {
     use symphonia::core::codecs::audio::AudioDecoderOptions;
     use symphonia::core::formats::probe::Hint;
@@ -396,6 +427,37 @@ pub fn play_parts(
             played.underruns += sink.write(&decoded)?;
         }
         played.frames += frames as u64;
+
+        // Asked AFTER the write, so the answer is about audio that has already been
+        // handed over: a pause here stops the next packet, not the one being heard.
+        let mut flow = conductor(Progress {
+            frames: played.frames,
+            rate: played.signal.decoded_rate,
+            signal: Some(&played.signal),
+        });
+        while flow == Flow::Pause {
+            if let Some(sink) = sink.as_mut() {
+                sink.set_paused(true);
+            }
+            std::thread::sleep(PAUSE_POLL);
+            flow = conductor(Progress {
+                frames: played.frames,
+                rate: played.signal.decoded_rate,
+                signal: Some(&played.signal),
+            });
+        }
+        if let Some(sink) = sink.as_mut() {
+            sink.set_paused(false);
+        }
+        match flow {
+            Flow::Continue | Flow::Pause => {}
+            // Skip drains nothing: the point of skipping is not to hear the rest.
+            Flow::Skip => return Ok(played),
+            Flow::Stop => {
+                played.stopped = true;
+                return Ok(played);
+            }
+        }
     }
 
     if let Some(sink) = sink.as_mut() {
@@ -406,6 +468,10 @@ pub fn play_parts(
     }
     Ok(played)
 }
+
+/// How often a paused track asks whether it may go on. Short enough that pressing play
+/// feels immediate, long enough that a paused player costs nothing.
+const PAUSE_POLL: std::time::Duration = std::time::Duration::from_millis(40);
 
 /// True for the "the stream just ended" flavours of error, which are normal.
 fn is_end_of_stream(e: &symphonia::core::errors::Error) -> bool {
@@ -470,6 +536,10 @@ mod linux {
         pcm: PCM,
         format: Format,
         channels: u32,
+        /// Whether this device implements `snd_pcm_pause`. Asked once, at open, because
+        /// the answer decides which of two quite different pauses is possible.
+        can_pause: bool,
+        paused: bool,
         pub signal: SignalPath,
     }
 
@@ -532,6 +602,26 @@ mod linux {
         pub fn drain(&mut self) {
             let _ = self.pcm.drain();
         }
+
+        /// Stops and restarts the stream under a pause.
+        ///
+        /// `snd_pcm_pause` is the clean way and keeps the buffer, but plenty of
+        /// hardware does not implement it. The fallback drops what is buffered and
+        /// prepares again, which costs the fraction of a second already in the buffer —
+        /// audible as a tiny clip, and better than a pause that does not pause.
+        pub fn set_paused(&mut self, paused: bool) {
+            if self.paused == paused {
+                return;
+            }
+            self.paused = paused;
+            if self.can_pause {
+                let _ = self.pcm.pause(paused);
+            } else if paused {
+                let _ = self.pcm.drop();
+            } else {
+                let _ = self.pcm.prepare();
+            }
+        }
     }
 
     /// Writes until the whole buffer is gone, recovering from underruns.
@@ -573,7 +663,7 @@ mod linux {
     fn try_open(attempt: &Attempt, want: &Want) -> Result<Sink, String> {
         let pcm = PCM::new(&attempt.device, Direction::Playback, false)
             .map_err(|e| e.to_string())?;
-        let (format, rate) = {
+        let (format, rate, can_pause) = {
             let hwp = HwParams::any(&pcm).map_err(|e| e.to_string())?;
             hwp.set_access(Access::RWInterleaved).map_err(|e| e.to_string())?;
             hwp.set_channels(want.channels).map_err(|e| e.to_string())?;
@@ -595,8 +685,9 @@ mod linux {
             // enough that pause and track change do not feel late.
             let _ = hwp.set_buffer_time_near(250_000, ValueOr::Nearest);
             let _ = hwp.set_period_time_near(50_000, ValueOr::Nearest);
+            let can_pause = hwp.can_pause();
             pcm.hw_params(&hwp).map_err(|e| e.to_string())?;
-            (format, rate)
+            (format, rate, can_pause)
         };
 
         let out_bits = format_bits(format);
@@ -618,6 +709,8 @@ mod linux {
         Ok(Sink {
             format,
             channels: want.channels,
+            can_pause,
+            paused: false,
             signal: SignalPath {
                 device: attempt.device.clone(),
                 rung: Some(rung),
@@ -814,7 +907,373 @@ mod other {
             Err("no audio output".into())
         }
         pub fn drain(&mut self) {}
+        pub fn set_paused(&mut self, _: bool) {}
     }
+}
+
+// ---- the jukebox ----------------------------------------------------------
+
+/// What the player can be told to do.
+///
+/// Deliberately small and deliberately serialisable in shape: when the player moves
+/// into its own process, this enum becomes the wire protocol and the panel does not
+/// change. Nothing here carries a callback, a handle or a lifetime for that reason.
+#[derive(Clone, Debug)]
+pub enum Cmd {
+    /// Replace the queue and start at `at`.
+    Play { tracks: Vec<tidal::Track>, at: usize },
+    Enqueue(tidal::Track),
+    /// Play if paused, pause if playing.
+    Toggle,
+    Next,
+    /// Back to the start of this track, or to the previous one when barely started —
+    /// the behaviour every music player has, and the reason is that a mis-pressed
+    /// "previous" should be cheap to undo.
+    Prev,
+    Stop,
+    /// The config changed: the output device or bit-perfect setting may be different.
+    /// Takes effect on the next track, since the current one is already on a device.
+    Reconfigure(Box<TidalCfg>),
+    Quit,
+}
+
+/// Everything a panel (or a status bar, or another window) needs to draw the player.
+/// One struct, cloned under a lock, so a reader can never see half an update.
+#[derive(Clone, Debug, Default)]
+pub struct Snapshot {
+    pub queue: Vec<tidal::Track>,
+    pub index: usize,
+    pub playing: bool,
+    pub paused: bool,
+    pub position_secs: f64,
+    pub signal: SignalPath,
+    /// The last thing that went wrong, kept until something goes right. A track that
+    /// will not play must say so somewhere the person can see it.
+    pub error: Option<String>,
+    /// Bumped on every change, so a drawing pass can tell "nothing happened" from
+    /// "happened to look the same".
+    pub generation: u64,
+}
+
+impl Snapshot {
+    pub fn now_playing(&self) -> Option<&tidal::Track> {
+        self.queue.get(self.index)
+    }
+}
+
+/// The handle the rest of the program holds. Cheap to clone, safe to keep on `App`.
+///
+/// It owns no audio state: everything real is behind the channel and the mutex, which
+/// is what lets the same handle later point at a socket instead of a thread.
+pub struct Jukebox {
+    tx: std::sync::mpsc::Sender<Cmd>,
+    state: std::sync::Arc<std::sync::Mutex<Snapshot>>,
+}
+
+impl Jukebox {
+    /// Starts the player thread. `wake` is called whenever the snapshot changes, so the
+    /// UI thread can be nudged to redraw — the same pattern `media.rs` uses, and the
+    /// only thing here that knows a UI exists at all.
+    pub fn start(
+        cfg: TidalCfg,
+        creds: tidal::Creds,
+        wake: Box<dyn Fn() + Send>,
+    ) -> Jukebox {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let state = std::sync::Arc::new(std::sync::Mutex::new(Snapshot::default()));
+        let shared = state.clone();
+        std::thread::Builder::new()
+            .name("runnir-player".into())
+            .spawn(move || run(rx, shared, wake, cfg, creds))
+            .expect("spawn player thread");
+        Jukebox { tx, state }
+    }
+
+    pub fn send(&self, cmd: Cmd) {
+        // A dead player thread is not worth crashing a terminal over: the panel will
+        // show the last snapshot and nothing will move, which is visible enough.
+        let _ = self.tx.send(cmd);
+    }
+
+    pub fn snapshot(&self) -> Snapshot {
+        self.state.lock().map(|s| s.clone()).unwrap_or_default()
+    }
+
+    /// Whether closing the window would interrupt music. Read by the close guard.
+    pub fn is_playing(&self) -> bool {
+        self.state.lock().map(|s| s.playing && !s.paused).unwrap_or(false)
+    }
+}
+
+/// The player thread.
+fn run(
+    rx: std::sync::mpsc::Receiver<Cmd>,
+    state: std::sync::Arc<std::sync::Mutex<Snapshot>>,
+    wake: Box<dyn Fn() + Send>,
+    mut cfg: TidalCfg,
+    creds: tidal::Creds,
+) {
+    let publish = |f: &dyn Fn(&mut Snapshot)| {
+        if let Ok(mut s) = state.lock() {
+            f(&mut s);
+            s.generation += 1;
+        }
+        wake();
+    };
+
+    while let Ok(cmd) = rx.recv() {
+        match cmd {
+            Cmd::Quit => return,
+            Cmd::Reconfigure(next) => cfg = *next,
+            Cmd::Play { tracks, at } => {
+                if tracks.is_empty() {
+                    continue;
+                }
+                publish(&|s| {
+                    s.queue = tracks.clone();
+                    s.index = at.min(tracks.len() - 1);
+                    s.error = None;
+                });
+                if play_queue(&rx, &state, &wake, &mut cfg, &creds) {
+                    return; // quit arrived mid-track
+                }
+            }
+            Cmd::Enqueue(track) => publish(&|s| s.queue.push(track.clone())),
+            // Anything else while stopped is meaningless — there is nothing to pause or
+            // skip — except that a Toggle with a queue means "start it again".
+            Cmd::Toggle => {
+                let has_queue = state.lock().map(|s| !s.queue.is_empty()).unwrap_or(false);
+                if has_queue && play_queue(&rx, &state, &wake, &mut cfg, &creds) {
+                    return;
+                }
+            }
+            Cmd::Next | Cmd::Prev | Cmd::Stop => {}
+        }
+    }
+}
+
+/// Plays from the current index to the end of the queue. Returns true if it was told to
+/// quit outright.
+fn play_queue(
+    rx: &std::sync::mpsc::Receiver<Cmd>,
+    state: &std::sync::Arc<std::sync::Mutex<Snapshot>>,
+    wake: &dyn Fn(),
+    cfg: &mut TidalCfg,
+    creds: &tidal::Creds,
+) -> bool {
+    loop {
+        let (track, index) = {
+            let Ok(s) = state.lock() else { return false };
+            match s.queue.get(s.index) {
+                Some(t) => (t.clone(), s.index),
+                None => return false, // ran off the end of the queue
+            }
+        };
+
+        let outcome = play_one(&track, rx, state, wake, cfg, creds);
+        match outcome {
+            Outcome::Quit => return true,
+            Outcome::Stopped => {
+                set(state, wake, |s| {
+                    s.playing = false;
+                    s.paused = false;
+                });
+                return false;
+            }
+            Outcome::Failed(why) => {
+                // One bad track must not end the evening: it is reported and the queue
+                // moves on. A queue where every track fails still stops, at the end.
+                set(state, wake, |s| s.error = Some(format!("{}: {why}", track.title)));
+                if !advance(state, wake, 1) {
+                    return false;
+                }
+            }
+            Outcome::Ended => {
+                if !advance(state, wake, 1) {
+                    set(state, wake, |s| {
+                        s.playing = false;
+                        s.paused = false;
+                    });
+                    return false;
+                }
+            }
+            // Restart and "the queue was replaced under us" both mean: play whatever
+            // the index now points at, without moving it.
+            Outcome::Restart => {
+                let _ = index;
+            }
+            Outcome::Previous => {
+                // At the first track, "previous" restarts it rather than stopping: the
+                // queue has nowhere further back to go.
+                advance(state, wake, -1);
+            }
+        }
+    }
+}
+
+enum Outcome {
+    Ended,
+    Stopped,
+    /// Play the same track again from the top.
+    Restart,
+    Previous,
+    Failed(String),
+    Quit,
+}
+
+/// Resolves and plays one track, obeying commands as they arrive.
+fn play_one(
+    track: &tidal::Track,
+    rx: &std::sync::mpsc::Receiver<Cmd>,
+    state: &std::sync::Arc<std::sync::Mutex<Snapshot>>,
+    wake: &dyn Fn(),
+    cfg: &mut TidalCfg,
+    creds: &tidal::Creds,
+) -> Outcome {
+    let Some(session) = tidal::Session::load() else {
+        return Outcome::Failed("not signed in".into());
+    };
+    let session = match tidal::ensure_fresh(creds, &session) {
+        Ok(s) => s,
+        Err(e) => return Outcome::Failed(e),
+    };
+    let info = match tidal::stream_info(&session, track.id, cfg.quality.as_api()) {
+        Ok(i) => i,
+        Err(e) => return Outcome::Failed(e),
+    };
+    let parts = match parts_of(&info) {
+        Ok(p) => p,
+        Err(e) => return Outcome::Failed(e),
+    };
+
+    set(state, wake, |s| {
+        s.playing = true;
+        s.paused = false;
+        s.position_secs = 0.0;
+        s.error = None;
+    });
+
+    // What the conductor decided, read after the loop returns. A closure cannot return
+    // this through `Flow`, which only says what the audio loop should do next.
+    let mut verdict = Outcome::Ended;
+    let mut paused = false;
+    let mut published_signal = false;
+    // The track plays under the config it started with. A `Reconfigure` arriving now is
+    // held and applied to the NEXT track — the device for this one is already open, and
+    // swapping it underneath would be a gap in the middle of a song.
+    let mut pending_cfg: Option<TidalCfg> = None;
+    let playing_cfg = cfg.clone();
+
+    let result = play_parts(
+        parts,
+        hint_for(&info),
+        &info.quality,
+        &playing_cfg,
+        true,
+        &mut |progress| {
+            // Every command waiting right now, not just one: a burst of key presses
+            // must not be answered one packet at a time.
+            while let Ok(cmd) = rx.try_recv() {
+                match cmd {
+                    Cmd::Toggle => {
+                        paused = !paused;
+                        set(state, wake, |s| s.paused = paused);
+                    }
+                    Cmd::Next => {
+                        verdict = Outcome::Ended;
+                        return Flow::Skip;
+                    }
+                    Cmd::Prev => {
+                        // Past the grace period "previous" means the start of THIS
+                        // track; within it, the one before. Every player behaves this
+                        // way because a mis-pressed previous should be cheap to undo.
+                        let secs = progress.frames as f64 / progress.rate.max(1) as f64;
+                        verdict = if secs > PREV_RESTARTS_AFTER {
+                            Outcome::Restart
+                        } else {
+                            Outcome::Previous
+                        };
+                        return Flow::Skip;
+                    }
+                    Cmd::Stop => {
+                        verdict = Outcome::Stopped;
+                        return Flow::Stop;
+                    }
+                    Cmd::Quit => {
+                        verdict = Outcome::Quit;
+                        return Flow::Stop;
+                    }
+                    Cmd::Play { tracks, at } => {
+                        set(state, wake, |s| {
+                            s.queue = tracks.clone();
+                            s.index = at.min(tracks.len().saturating_sub(1));
+                        });
+                        verdict = Outcome::Restart; // the new index is already right
+                        return Flow::Skip;
+                    }
+                    Cmd::Enqueue(t) => set(state, wake, |s| s.queue.push(t.clone())),
+                    Cmd::Reconfigure(next) => pending_cfg = Some(*next),
+                }
+            }
+
+            let secs = progress.frames as f64 / progress.rate.max(1) as f64;
+            if let Ok(mut s) = state.lock() {
+                s.position_secs = secs;
+                if !published_signal {
+                    if let Some(signal) = progress.signal {
+                        s.signal = signal.clone();
+                        published_signal = true;
+                    }
+                }
+                s.generation += 1;
+            }
+            wake();
+
+            if paused { Flow::Pause } else { Flow::Continue }
+        },
+    );
+
+    if let Some(next) = pending_cfg {
+        *cfg = next;
+    }
+    match result {
+        Err(e) => Outcome::Failed(e),
+        Ok(_) => verdict,
+    }
+}
+
+/// Seconds after which "previous" restarts the current track instead of going back.
+const PREV_RESTARTS_AFTER: f64 = 3.0;
+
+/// Moves the queue cursor. False when there is nowhere to move to.
+fn advance(
+    state: &std::sync::Arc<std::sync::Mutex<Snapshot>>,
+    wake: &dyn Fn(),
+    by: i64,
+) -> bool {
+    let mut moved = false;
+    if let Ok(mut s) = state.lock() {
+        let next = s.index as i64 + by;
+        if next >= 0 && (next as usize) < s.queue.len() {
+            s.index = next as usize;
+            s.generation += 1;
+            moved = true;
+        }
+    }
+    wake();
+    moved
+}
+
+fn set(
+    state: &std::sync::Arc<std::sync::Mutex<Snapshot>>,
+    wake: &dyn Fn(),
+    f: impl Fn(&mut Snapshot),
+) {
+    if let Ok(mut s) = state.lock() {
+        f(&mut s);
+        s.generation += 1;
+    }
+    wake();
 }
 
 #[cfg(test)]
