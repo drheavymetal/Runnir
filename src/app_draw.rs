@@ -584,9 +584,11 @@ impl Gpu {
         // a permanent empty slot would be noise.
         if let Some(player) = self.jukebox.as_ref() {
             let snapshot = player.snapshot();
-            // Everything left of the clock that the cwd and branch have not taken,
-            // less a space either side.
-            let room = right_edge.saturating_sub(x + 2);
+            // A fixed slice, not everything that is free: the bar belongs to the
+            // terminal, and a title that grows into the whole width pushes the eye away
+            // from the cwd and the branch. It scrolls inside this instead.
+            const MUSIC_WIDTH: usize = 34;
+            let room = right_edge.saturating_sub(x + 2).min(MUSIC_WIDTH);
             if let Some(line) = snapshot.status_line(room) {
                 let at = right_edge.saturating_sub(line.chars().count() + 1);
                 // Accent only when nothing touched the samples. The colour is the

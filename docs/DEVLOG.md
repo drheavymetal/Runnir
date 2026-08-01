@@ -3469,6 +3469,35 @@ Also: the daemon socket is 0600. The runtime directory is already 0700, so it is
 in depth rather than the boundary, but a socket that takes commands and hands back what
 somebody is listening to should not be readable by anything that gets inside it.
 
+## 2026-08-01 - The bar scrolls, and a correction about the last entry
+
+The status-bar segment now has a FIXED width — thirty-four columns — and slides when the
+title does not fit, so a long one can be read in full instead of being cut off for ever
+at the same word. The bar belongs to the terminal; music that grows into all the spare
+width pushes the eye away from the cwd and the branch.
+
+The playing position is the clock. Two things fall out of that and both are wanted: it
+needs no timer of its own, and a PAUSED track stops sliding — text moving beside a
+paused player reads as still playing. There is a second and a half of hold before it
+starts, because a title that begins scrolling the instant it appears is one nobody gets
+to read the beginning of.
+
+### A correction
+
+The previous entry said a regression test had been written for the `level_of` panic —
+the one that sized its destination by frames instead of frames × channels. **It had
+not.** The edit that was supposed to add it silently matched nothing, so the test never
+existed, and the same silent-no-op swallowed four more. The commit message claimed it
+too. It exists now, builds a real two-channel buffer, and would have caught the panic.
+
+That is twice in one day that a change was believed done because nothing complained: the
+first cost an hour of debugging a daemon whose stderr went to /dev/null, and the second
+put a false claim in this file. Both have the same shape — no output is not the same as
+success — and the scripted edits that do the work now assert that they changed what they
+meant to.
+
+566 tests, and this time the number was checked before it was written down.
+
 ## Gotchas (do not re-learn)
 
 - `runnir.json` WINS over `runnir.toml`. `Config::try_load` reads the JSON the settings
@@ -3484,6 +3513,9 @@ somebody is listening to should not be readable by anything that gets inside it.
   frames alone panics inside symphonia on the first packet, and a panic on the player
   thread is silent: the state goes on claiming to play for ever. Anything that decodes
   audio in a thread of its own needs its panics turned into messages.
+- An edit that finds nothing to change reports success. A scripted edit must assert
+  that it changed what it meant to, or code and tests quietly do not exist while
+  everything says they do.
 - A background process with its stderr on /dev/null cannot be debugged at all. Give it
   a file before the first bug, not after.
 - A decoder's buffer width is NOT the source's bit depth. symphonia decodes 16-bit FLAC

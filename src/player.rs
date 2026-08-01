@@ -1088,36 +1088,48 @@ impl Snapshot {
 
     /// One line for the status bar: what is playing and what it is coming out as.
     ///
-    /// `width` is the space actually available, and the parts drop in order of what
-    /// can be spared — the quality goes before the artist, and the artist before the
-    /// title. A bar that overflows is worse than one that says less.
+    /// Given a fixed, narrow `width` — the bar belongs to the terminal, not to the
+    /// music — and SCROLLS when the text does not fit, so a long title can still be
+    /// read in full rather than being cut off for ever at the same word.
     pub fn status_line(&self, width: usize) -> Option<String> {
         let track = self.now_playing()?;
-        if !self.playing {
+        if !self.playing || width == 0 {
             return None;
         }
         let mark = if self.paused { "\u{2016}" } else { "\u{25b8}" };
         let quality = self.signal.short();
-        let full = format!("{mark} {} \u{2014} {} \u{b7} {quality}", track.artist, track.title);
+        let full = if quality.is_empty() {
+            format!("{mark} {} \u{2014} {}", track.artist, track.title)
+        } else {
+            format!("{mark} {} \u{2014} {} \u{b7} {quality}", track.artist, track.title)
+        };
         if full.chars().count() <= width {
             return Some(full);
         }
-        let no_artist = format!("{mark} {} \u{b7} {quality}", track.title);
-        if no_artist.chars().count() <= width {
-            return Some(no_artist);
-        }
-        let bare = format!("{mark} {}", track.title);
-        Some(clip(&bare, width))
+        // The playing position is the clock. Two things fall out of that and both are
+        // wanted: it needs no timer of its own, and a PAUSED player stops scrolling —
+        // text sliding along beside a paused track looks like it is still playing.
+        Some(marquee(&full, width, self.position_secs))
     }
 }
 
-/// Cuts to fit, keeping the front and marking the cut.
-fn clip(s: &str, width: usize) -> String {
-    if s.chars().count() <= width {
-        return s.to_string();
+/// How fast the status line slides, in characters per second. Slow enough to read a
+/// title without chasing it, fast enough that a long one comes round again.
+const MARQUEE_SPEED: f64 = 2.5;
+
+/// Slides `text` through a window `width` wide, looping with a gap between the end and
+/// the start so it never reads as one run-on sentence.
+fn marquee(text: &str, width: usize, secs: f64) -> String {
+    const GAP: &str = "   \u{b7}   ";
+    let looped: Vec<char> = text.chars().chain(GAP.chars()).collect();
+    if looped.is_empty() {
+        return String::new();
     }
-    let keep = width.saturating_sub(1);
-    format!("{}\u{2026}", s.chars().take(keep).collect::<String>())
+    // Hold at the start for a moment before moving: a title that begins scrolling the
+    // instant it appears is one nobody gets to read the beginning of.
+    let held = (secs - 1.5).max(0.0);
+    let step = (held * MARQUEE_SPEED) as usize % looped.len();
+    looped.iter().cycle().skip(step).take(width).collect()
 }
 
 /// The handle the rest of the program holds. Cheap to clone, safe to keep on `App`.
@@ -1624,7 +1636,100 @@ mod tests {
         assert!(!Rung::Shared.is_bit_exact());
     }
 
-#[test]
+    #[test]
+    fn the_level_meter_sizes_its_buffer_for_every_channel() {
+        // The regression that mattered: symphonia writes frames * CHANNELS into the
+        // destination, and sizing it by frames alone panics on the first packet — which
+        // killed the player thread while the state went on claiming to be playing.
+        use symphonia::core::audio::{
+            AsGenericAudioBufferRef, Audio, AudioBuffer, AudioSpec, Channels,
+        };
+        // Two discrete channels — what stereo is, without needing speaker positions.
+        let spec = AudioSpec::new(48_000, Channels::Discrete(2));
+        let mut buf = AudioBuffer::<f32>::new(spec, 64);
+        // Full scale in every sample of both channels.
+        buf.render(Some(64), &[1.0, 1.0]);
+        // Full scale on both channels reads as the top of the meter, and does not panic.
+        let level = level_of(&buf.as_generic_audio_buffer_ref());
+        assert!((level - 1.0).abs() < 0.001, "full scale read as {level}");
+    }
+
+    #[test]
+    fn a_short_title_does_not_move_and_a_long_one_does() {
+        let mut snap = Snapshot {
+            queue: vec![crate::tidal::Track {
+                artist: "Opeth".into(),
+                title: "Bleak".into(),
+                ..Default::default()
+            }],
+            playing: true,
+            ..Default::default()
+        };
+        // Room to spare: drawn once and left alone.
+        let wide = snap.status_line(40).unwrap();
+        assert!(wide.contains("Opeth"), "{wide}");
+        snap.position_secs = 30.0;
+        assert_eq!(snap.status_line(40).unwrap(), wide, "it must not slide when it fits");
+
+        // Too narrow: it slides, and it is exactly as wide as it was given.
+        snap.position_secs = 0.0;
+        let at_zero = snap.status_line(12).unwrap();
+        assert_eq!(at_zero.chars().count(), 12);
+        // …but not immediately: the first moment is held so the start can be read.
+        assert_eq!(snap.status_line(12).unwrap(), at_zero);
+        snap.position_secs = 10.0;
+        assert_ne!(snap.status_line(12).unwrap(), at_zero, "it should have moved by now");
+    }
+
+    #[test]
+    fn pausing_shows_the_pause_mark_and_freezes_where_the_text_had_got_to() {
+        let mut snap = Snapshot {
+            queue: vec![crate::tidal::Track {
+                artist: "Fleetwood Mac".into(),
+                title: "Everywhere".into(),
+                ..Default::default()
+            }],
+            playing: true,
+            position_secs: 20.0,
+            ..Default::default()
+        };
+        // Wide enough not to scroll: there the mark is visible and is the only change.
+        let playing = snap.status_line(60).unwrap();
+        snap.paused = true;
+        let paused = snap.status_line(60).unwrap();
+        assert!(playing.starts_with('\u{25b8}'));
+        assert!(paused.starts_with('\u{2016}'));
+        assert_eq!(playing[3..], paused[3..], "only the mark should differ");
+
+        // Narrow enough to scroll: the offset comes from the position and nothing else,
+        // so a paused player — whose position stops — stops moving. Two calls at the
+        // same position must be identical, which is what the panel redraws against.
+        let first = snap.status_line(14).unwrap();
+        assert_eq!(snap.status_line(14).unwrap(), first);
+    }
+
+    #[test]
+    fn the_marquee_comes_round_again_with_a_gap() {
+        let text = "abcdef";
+        let start = marquee(text, 4, 1.5);
+        assert_eq!(start, "abcd");
+        // One full lap, gap included, returns to where it began.
+        let lap = (text.chars().count() + 7) as f64 / MARQUEE_SPEED + 1.5;
+        assert_eq!(marquee(text, 4, lap), start);
+    }
+
+    #[test]
+    fn nothing_playing_puts_nothing_in_the_bar() {
+        assert_eq!(Snapshot::default().status_line(40), None);
+        let stopped = Snapshot {
+            queue: vec![crate::tidal::Track::default()],
+            playing: false,
+            ..Default::default()
+        };
+        assert_eq!(stopped.status_line(40), None);
+    }
+
+    #[test]
     fn the_level_meter_spends_its_range_where_music_lives() {
         // Silence is the floor, and anything below -60 dB is silence for a picture.
         assert_eq!(db_level(0.0), 0.0);
