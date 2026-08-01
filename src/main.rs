@@ -193,6 +193,17 @@ fn main() {
         Some("--tidal-login") if args.get(2).map(String::as_str) == Some("--import") => {
             return tidal_import();
         }
+        // `--app` asks for the sign-in that lands on TIDAL's own page instead of on a
+        // local listener, for when a client id will not accept a loopback redirect.
+        // The code then has to be pasted back, which is worse and is why it is not the
+        // default — but a sign-in that works beats a nicer one that does not.
+        Some("--tidal-login") if args.get(2).map(String::as_str) == Some("--app") => {
+            let (_, creds) = match tidal_creds() {
+                Ok(v) => v,
+                Err(e) => return eprintln!("runnir: {e}"),
+            };
+            return tidal_login_paste(&creds);
+        }
         Some("--tidal-login") => return tidal_login(args.get(2).map(String::as_str)),
         // `runnir --tidal-play <track-id|search words>` — fetch, decode and play one
         // track, then report the signal path it came out on. This is how the audio
@@ -571,26 +582,83 @@ fn tidal_import() {
     }
 }
 
-/// Prints the browser half of a PKCE sign-in and remembers the verifier for the second
-/// command.
+/// The browser sign-in: open a link, wait for the redirect to come back here.
+///
+/// The loopback redirect is what makes it a real callback — the browser returns to a
+/// listener runnir is holding open, so nothing has to be copied out of an address bar.
+/// If TIDAL refuses that redirect for this client id, the flow falls back to its own
+/// app redirect and the code does have to be pasted; that path is kept working rather
+/// than removed, because which one a client id allows is TIDAL's decision, not ours.
 fn tidal_login_pkce(creds: &tidal::Creds) {
-    let pkce = match tidal::start_pkce(creds) {
+    let port = Config::load().tidal.callback_port;
+    let redirect = tidal::loopback_redirect(port);
+    let pkce = match tidal::start_pkce(creds, &redirect) {
+        Ok(p) => p,
+        Err(e) => return eprintln!("runnir: could not start sign-in: {e}"),
+    };
+    // Saved before the browser opens: if this process is interrupted, the paste-back
+    // form of the same sign-in still works.
+    if let Err(e) = pkce.save() {
+        return eprintln!("runnir: could not remember the sign-in: {e}");
+    }
+
+    println!("\n  Opening TIDAL in your browser. Log in there and this will finish itself.\n");
+    println!("  {}\n", pkce.authorize_url);
+    if let Err(e) = open_in_browser(&pkce.authorize_url) {
+        println!("  (could not open a browser here: {e} — the link above still works)\n");
+    }
+    println!("  Waiting for the callback on {redirect} …");
+
+    match tidal::wait_for_callback(port, std::time::Duration::from_secs(300)) {
+        Ok(code) => match tidal::finish_pkce(creds, &pkce, &code) {
+            Ok(session) => {
+                tidal::Pkce::clear();
+                match session.save() {
+                    Ok(()) => println!("  Signed in ({}).", session.country_code),
+                    Err(e) => eprintln!("runnir: signed in but could not save it: {e}"),
+                }
+            }
+            Err(e) => eprintln!("runnir: could not complete sign-in: {e}"),
+        },
+        Err(e) => eprintln!(
+            "runnir: {e}\n  \
+             If TIDAL showed an error instead of coming back, this client id may not\n  \
+             accept a loopback redirect. Paste the address it ended on:\n     \
+             runnir --tidal-login '<address>'"
+        ),
+    }
+}
+
+/// The sign-in that comes back through a page of TIDAL's own, so the grant code has to
+/// be copied out of the address bar and handed over in a second command.
+fn tidal_login_paste(creds: &tidal::Creds) {
+    let pkce = match tidal::start_pkce(creds, tidal::APP_REDIRECT) {
         Ok(p) => p,
         Err(e) => return eprintln!("runnir: could not start sign-in: {e}"),
     };
     if let Err(e) = pkce.save() {
         return eprintln!("runnir: could not remember the sign-in: {e}");
     }
+    println!("\n  1. Log in here:\n\n  {}\n", pkce.authorize_url);
+    let _ = open_in_browser(&pkce.authorize_url);
     println!(
-        "\n  These credentials are not registered for the device flow, so this is the\n  \
-         browser sign-in instead.\n\n  \
-         1. Open this and log in to TIDAL:\n\n{}\n\n  \
-         2. The browser will land on a tidal.com page that looks empty or broken.\n     \
-         That is expected — the grant code is in its ADDRESS BAR.\n\n  \
+        "  2. The browser lands on a tidal.com page that looks empty or broken. That is\n     \
+         expected — the grant code is in its ADDRESS BAR.\n\n  \
          3. Copy that whole address and run:\n\n     \
-         runnir --tidal-login '<the address you copied>'\n",
-        pkce.authorize_url
+         runnir --tidal-login '<the address you copied>'\n"
     );
+}
+
+/// Opens a URL in whatever the desktop considers a browser.
+fn open_in_browser(url: &str) -> Result<(), String> {
+    let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+    std::process::Command::new(opener)
+        .arg(url)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 
 /// Plays one track end to end and reports the path the audio actually took.

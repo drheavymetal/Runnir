@@ -196,6 +196,10 @@ pub struct Pkce {
     pub authorize_url: String,
     pub verifier: String,
     pub client_unique_key: String,
+    /// The exchange must present the SAME redirect the authorize call named, even
+    /// though nothing is redirected a second time. Storing it removes the chance of the
+    /// two drifting apart when one of them is a port number chosen at runtime.
+    pub redirect: String,
 }
 
 impl Pkce {
@@ -228,11 +232,22 @@ impl Pkce {
     }
 }
 
-/// Where TIDAL sends the browser after a successful login. Registered against the
-/// client id, so it is not ours to choose.
-const PKCE_REDIRECT: &str = "https://tidal.com/android/login/auth";
+/// Where TIDAL sends the browser after a successful login.
+///
+/// A redirect URI is registered against the client id, so this is not freely ours to
+/// choose — but a loopback address is the one form an OAuth client is normally allowed
+/// to name for itself, and it is the only one that lets a local program CATCH the
+/// answer instead of asking someone to copy it out of an address bar.
+pub fn loopback_redirect(port: u16) -> String {
+    format!("http://localhost:{port}/callback")
+}
 
-pub fn start_pkce(creds: &Creds) -> Result<Pkce, String> {
+/// The redirect TIDAL's own mobile client uses. Kept as the fallback for when the
+/// loopback one is refused: the login still works, but the code has to be pasted back
+/// because it lands on a page belonging to TIDAL.
+pub const APP_REDIRECT: &str = "https://tidal.com/android/login/auth";
+
+pub fn start_pkce(creds: &Creds, redirect: &str) -> Result<Pkce, String> {
     use base64::Engine;
     use sha2::{Digest, Sha256};
 
@@ -246,14 +261,19 @@ pub fn start_pkce(creds: &Creds) -> Result<Pkce, String> {
 
     let authorize_url = format!(
         "https://login.tidal.com/authorize?response_type=code\
-         &redirect_uri={redirect}&client_id={client}&lang=EN&appMode=android\
+         &redirect_uri={encoded}&client_id={client}&lang=EN&appMode=android\
          &client_unique_key={key}&code_challenge={challenge}\
          &code_challenge_method=S256&restrict_signup=true",
-        redirect = urlencode(PKCE_REDIRECT),
+        encoded = urlencode(redirect),
         client = creds.client_id,
         key = client_unique_key,
     );
-    Ok(Pkce { authorize_url, verifier, client_unique_key })
+    Ok(Pkce {
+        authorize_url,
+        verifier,
+        client_unique_key,
+        redirect: redirect.to_string(),
+    })
 }
 
 /// Trades the code from the redirect URL for a session.
@@ -264,7 +284,7 @@ pub fn finish_pkce(creds: &Creds, pkce: &Pkce, code: &str) -> Result<Session, St
             ("code", code),
             ("client_id", creds.client_id.as_str()),
             ("grant_type", "authorization_code"),
-            ("redirect_uri", PKCE_REDIRECT),
+            ("redirect_uri", pkce.redirect.as_str()),
             ("scope", SCOPE),
             ("code_verifier", pkce.verifier.as_str()),
             ("client_unique_key", pkce.client_unique_key.as_str()),
@@ -330,6 +350,76 @@ pub fn adopt(creds: &Creds, imported: &Imported) -> Result<Session, String> {
     Ok(session)
 }
 
+/// Waits for the browser to come back with the grant code.
+///
+/// A real callback rather than a copied address bar: TIDAL redirects to
+/// `http://localhost:<port>/callback?code=…`, this answers that one request with a page
+/// saying it worked, and hands the code back.
+///
+/// Written on a bare `TcpListener` — twenty lines of HTTP for one request that arrives
+/// once — rather than by taking on a web framework and an async runtime for it.
+pub fn wait_for_callback(port: u16, timeout: Duration) -> Result<String, String> {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", port))
+        .map_err(|e| format!("cannot listen on port {port}: {e}"))?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|e| format!("cannot set the listener non-blocking: {e}"))?;
+
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        match listener.accept() {
+            Ok((stream, _)) => match handle_callback(stream) {
+                // A browser asks for /favicon.ico too, and Chrome sometimes probes the
+                // port before following the redirect. Anything without a code is
+                // answered and ignored rather than taken as the answer.
+                Some(code) => return Ok(code),
+                None => continue,
+            },
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(e) => return Err(format!("callback listener failed: {e}")),
+        }
+    }
+    Err("the browser did not come back in time".into())
+}
+
+fn handle_callback(mut stream: std::net::TcpStream) -> Option<String> {
+    use std::io::Write;
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+    let mut buf = [0u8; 4096];
+    let read = stream.read(&mut buf).ok()?;
+    let request = String::from_utf8_lossy(&buf[..read]);
+    // "GET /callback?code=abc&state=x HTTP/1.1"
+    let line = request.lines().next()?;
+    let target = line.split_whitespace().nth(1)?;
+    let code = code_from_redirect(target).filter(|c| !c.is_empty());
+
+    let (status, body) = match &code {
+        Some(_) => ("200 OK", CALLBACK_OK),
+        None if target.starts_with("/callback") => ("400 Bad Request", CALLBACK_FAILED),
+        None => ("404 Not Found", "not here"),
+    };
+    let _ = write!(
+        stream,
+        "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let _ = stream.flush();
+    code
+}
+
+const CALLBACK_OK: &str = "<!doctype html><meta charset=utf-8><title>runnir</title>\
+<body style=\"font:16px system-ui;display:grid;place-items:center;height:90vh;margin:0\">\
+<div><h1 style=\"font-weight:600\">Signed in</h1>\
+<p>runnir has the session. You can close this tab.</p></div>";
+
+const CALLBACK_FAILED: &str = "<!doctype html><meta charset=utf-8><title>runnir</title>\
+<body style=\"font:16px system-ui;display:grid;place-items:center;height:90vh;margin:0\">\
+<div><h1 style=\"font-weight:600\">No grant code</h1>\
+<p>TIDAL came back without one. The terminal has the details.</p></div>";
+
 /// Pulls the `code` parameter out of whatever the browser ended up showing. Accepts the
 /// whole pasted URL or a bare code, because both are what people actually paste.
 pub fn code_from_redirect(pasted: &str) -> Option<String> {
@@ -337,7 +427,11 @@ pub fn code_from_redirect(pasted: &str) -> Option<String> {
     if pasted.is_empty() {
         return None;
     }
-    if !pasted.contains("://") && !pasted.contains('?') && !pasted.contains('&') {
+    if !pasted.contains("://")
+        && !pasted.contains('?')
+        && !pasted.contains('&')
+        && !pasted.starts_with('/')
+    {
         return Some(pasted.to_string());
     }
     let query = pasted.split_once('?').map(|(_, q)| q).unwrap_or(pasted);
@@ -1099,6 +1193,51 @@ mod tests {
         // race a request against the expiry.
         s.expires_at = now() + REFRESH_MARGIN - 1;
         assert!(s.expired());
+    }
+
+    #[test]
+    fn the_callback_answers_the_browser_and_keeps_the_code() {
+        use std::io::{Read as _, Write as _};
+        // Its own listener on an ephemeral port: the test must not depend on a
+        // particular port being free on whatever machine runs it.
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let client = std::thread::spawn(move || {
+            let mut sock = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+            sock.write_all(b"GET /callback?code=grant-42&state=x HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                .unwrap();
+            let mut reply = String::new();
+            let _ = sock.read_to_string(&mut reply);
+            reply
+        });
+        let (stream, _) = listener.accept().unwrap();
+        let code = handle_callback(stream);
+        let reply = client.join().unwrap();
+
+        assert_eq!(code.as_deref(), Some("grant-42"));
+        // The browser is left on a page that says it worked — a blank tab or a
+        // connection error reads as a failed sign-in even when it succeeded.
+        assert!(reply.starts_with("HTTP/1.1 200 OK"), "{reply}");
+        assert!(reply.contains("Signed in"), "{reply}");
+    }
+
+    #[test]
+    fn a_request_that_is_not_the_callback_is_answered_and_ignored() {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let client = std::thread::spawn(move || {
+            // Browsers ask for this unprompted; taking it as the answer would end the
+            // wait with no code at all.
+            let mut sock = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+            sock.write_all(b"GET /favicon.ico HTTP/1.1\r\n\r\n").unwrap();
+            let mut reply = String::new();
+            let _ = sock.read_to_string(&mut reply);
+            reply
+        });
+        let (stream, _) = listener.accept().unwrap();
+        assert!(handle_callback(stream).is_none());
+        assert!(client.join().unwrap().starts_with("HTTP/1.1 404"));
     }
 
     #[test]

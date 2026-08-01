@@ -503,6 +503,9 @@ pub struct Tidal {
     /// ReplayGain. Off by default because it scales every sample, which is exactly
     /// what bit-perfect promises not to do; with `bit_perfect` on it is ignored.
     pub volume_normalization: bool,
+    /// Port the sign-in callback listens on. Fixed rather than chosen at random,
+    /// because a redirect URI has to be predictable to be registered.
+    pub callback_port: u16,
 }
 
 impl Default for Tidal {
@@ -515,6 +518,7 @@ impl Default for Tidal {
             output: "auto".to_string(),
             bit_perfect: true,
             volume_normalization: false,
+            callback_port: 8747,
         }
     }
 }
