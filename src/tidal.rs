@@ -647,8 +647,31 @@ pub fn parse_track(v: &serde_json::Value) -> Track {
             .to_string(),
         album: v["album"]["title"].as_str().unwrap_or_default().to_string(),
         duration_secs: v["duration"].as_u64().unwrap_or(0) as u32,
-        quality: v["audioQuality"].as_str().unwrap_or_default().to_string(),
+        quality: tier_of(v),
     }
+}
+
+/// The tier a listing really offers.
+///
+/// NOT `audioQuality`, which is what this used to read and which is not the answer:
+/// TIDAL reports `LOSSLESS` there for tracks it serves at 24/192. The Muddy Waters
+/// album that plays bit-perfect at hi-res is listed as `LOSSLESS` on every one of its
+/// tracks. `mediaMetadata.tags` is the field that tells the truth, and it carries
+/// `HIRES_LOSSLESS` alongside `LOSSLESS` when both exist.
+fn tier_of(v: &serde_json::Value) -> String {
+    let tags = v["mediaMetadata"]["tags"].as_array();
+    let has = |tag: &str| {
+        tags.is_some_and(|t| t.iter().any(|x| x.as_str() == Some(tag)))
+    };
+    if has("HIRES_LOSSLESS") {
+        return "HI_RES_LOSSLESS".to_string();
+    }
+    if has("LOSSLESS") {
+        return "LOSSLESS".to_string();
+    }
+    // No tags at all: the old field is better than nothing, and some endpoints still
+    // only carry it.
+    v["audioQuality"].as_str().unwrap_or_default().to_string()
 }
 
 pub fn track(session: &Session, id: u64) -> Result<Track, String> {
@@ -742,7 +765,7 @@ pub fn parse_album(v: &serde_json::Value) -> Album {
             .as_str()
             .and_then(|d| d.get(..4))
             .and_then(|y| y.parse().ok()),
-        quality: v["audioQuality"].as_str().unwrap_or_default().to_string(),
+        quality: tier_of(v),
     }
 }
 
@@ -1631,6 +1654,32 @@ mod tests {
         let p = parse_playlist(&editorial, Some(42));
         assert!(!p.mine);
         assert_eq!(p.owner, "TIDAL");
+    }
+
+    #[test]
+    fn the_tier_comes_from_the_tags_and_not_from_the_field_that_lies() {
+        // Real shape, from a track of an album that plays bit-perfect at 24/192:
+        // audioQuality says LOSSLESS and the tags say otherwise. Colouring a list by
+        // the first one paints every hi-res track as ordinary lossless — which is
+        // exactly what it did, and why nothing on screen ever looked different.
+        let hires: serde_json::Value = serde_json::from_str(
+            r#"{"title":"My Home Is In The Delta","audioQuality":"LOSSLESS",
+                "mediaMetadata":{"tags":["LOSSLESS","HIRES_LOSSLESS"]}}"#,
+        )
+        .unwrap();
+        assert_eq!(parse_track(&hires).quality, "HI_RES_LOSSLESS");
+
+        let plain: serde_json::Value = serde_json::from_str(
+            r#"{"title":"Mannish Boy","audioQuality":"LOSSLESS",
+                "mediaMetadata":{"tags":["LOSSLESS"]}}"#,
+        )
+        .unwrap();
+        assert_eq!(parse_track(&plain).quality, "LOSSLESS");
+
+        // No tags at all: fall back rather than showing nothing.
+        let untagged: serde_json::Value =
+            serde_json::from_str(r#"{"title":"x","audioQuality":"HIGH"}"#).unwrap();
+        assert_eq!(parse_track(&untagged).quality, "HIGH");
     }
 
     #[test]

@@ -2843,17 +2843,22 @@ impl TidalRow {
 /// The colour is the point: Pedro asked for the resolution to be visible BEFORE
 /// pressing play, because asking for hi-res and getting 16/44.1 is common and only
 /// shows up afterwards otherwise.
-pub fn quality_tint(quality: &str, theme: &Theme) -> Color {
+pub fn quality_tint(quality: &str, _theme: &Theme) -> Color {
     match quality {
-        // The best tier TIDAL has: the accent, the one colour the eye is trained on.
-        "HI_RES_LOSSLESS" | "HI_RES" => {
-            let a = theme.accent;
-            Color::Rgb(a.0, a.1, a.2)
-        }
-        // Lossless but not hi-res: plainly readable, deliberately not the accent.
-        "LOSSLESS" => Color::Rgb(0xc8, 0xcb, 0xd2),
-        // Lossy. Dimmed, because on a hi-fi setup it is the thing you want to notice.
+        // Fixed hues, not the theme's accent, for the same reason a diff is green and
+        // red whatever the theme: these mean something on their own. And three hues
+        // that differ from each other, which the first version did not manage — it
+        // painted lossless in the ordinary text colour, and since nearly everything on
+        // TIDAL is lossless, a list of forty tracks came out looking uncoloured.
+        //
+        // Gold for the top tier: it is the exception worth spotting.
+        "HI_RES_LOSSLESS" | "HI_RES" => Color::Rgb(0xe0, 0xaf, 0x68),
+        // Green for lossless — the common case, and still worth saying out loud.
+        "LOSSLESS" => Color::Rgb(0x9e, 0xce, 0x6a),
+        // Lossy, dimmed: on a hi-fi setup it is the thing you want to notice.
         "HIGH" | "LOW" => Color::Rgb(0x7d, 0x81, 0x8a),
+        // Nothing said: ordinary text, because a guess would be a colour that means
+        // something it does not know.
         _ => Color::Rgb(0xc8, 0xcb, 0xd2),
     }
 }
@@ -5656,13 +5661,18 @@ fn a_track(title: &str) -> crate::tidal::Track {
     fn the_tier_reads_as_a_colour_and_as_three_characters() {
         let theme = Theme::default();
         let accent = Color::Rgb(theme.accent.0, theme.accent.1, theme.accent.2);
-        // Hi-res gets the accent: it is the thing worth spotting in a list.
-        assert_eq!(quality_tint("HI_RES_LOSSLESS", &theme), accent);
+        let _ = accent;
+        // Three tiers, three colours that differ from EACH OTHER and from plain text.
+        // The first version painted lossless in the ordinary text colour, so a list of
+        // forty lossless tracks — which is most of TIDAL — looked uncoloured.
+        let max = quality_tint("HI_RES_LOSSLESS", &theme);
+        let lossless = quality_tint("LOSSLESS", &theme);
+        let lossy = quality_tint("HIGH", &theme);
+        let plain = quality_tint("", &theme);
+        assert_ne!(max, lossless);
+        assert_ne!(lossless, lossy);
+        assert_ne!(lossless, plain, "lossless must not look like uncoloured text");
         assert_eq!(quality_tag("HI_RES_LOSSLESS"), "MAX");
-        // Lossless is plain, lossy is dimmed — on a hi-fi setup, lossy is what you
-        // want to notice.
-        assert_ne!(quality_tint("LOSSLESS", &theme), accent);
-        assert_ne!(quality_tint("HIGH", &theme), quality_tint("LOSSLESS", &theme));
         assert_eq!(quality_tag("HIGH"), "AAC");
         // An artist row has no tier, and inventing one would be a guess.
         assert_eq!(quality_tag(""), "   ");

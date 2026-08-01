@@ -288,6 +288,14 @@ fn main() {
                 Some(s) if s.starts_with("git") => {
                     git_scene(path, s.strip_prefix("git:").unwrap_or(""))
                 }
+                // `tidal` draws the music panel with a made-up library, so the colours
+                // and the layout can be LOOKED at rather than reasoned about. Made up
+                // on purpose: it needs no account, no network and no sound, and it can
+                // show all three quality tiers at once, which a real library rarely
+                // does — nearly everything on TIDAL is plain lossless.
+                Some(s) if s.starts_with("tidal") => {
+                    tidal_scene(path, s.strip_prefix("tidal:").unwrap_or(""))
+                }
                 Some(level) => leader_scene(path, level),
                 None => demo_scene(path),
             };
@@ -425,6 +433,120 @@ fn demo_scene(path: &str) {
 /// column, `zoom` one file full width, `leader` the panel's menu, `leader f` one of
 /// its groups. Used to look at the panel without driving a window, which is the
 /// only way to check a three-column layout in a test run.
+/// The music panel, drawn over a plain terminal, with a library invented for it.
+fn tidal_scene(path_out: &str, state: &str) {
+    use crate::render::Rect;
+    let track = |title: &str, artist: &str, secs: u32, quality: &str| tidal::Track {
+        id: title.len() as u64,
+        title: title.into(),
+        artist: artist.into(),
+        album: String::new(),
+        duration_secs: secs,
+        quality: quality.into(),
+    };
+    let queue = vec![
+        track("My Home Is In The Delta", "Muddy Waters", 240, "HI_RES_LOSSLESS"),
+        track("Dreams", "Fleetwood Mac", 257, "HI_RES_LOSSLESS"),
+        track("Ghost of Perdition", "Opeth", 629, "LOSSLESS"),
+    ];
+    let snapshot = player::Snapshot {
+        queue: queue.clone(),
+        index: 0,
+        playing: true,
+        position_secs: 87.0,
+        signal: player::SignalPath {
+            device: "hw:2,0".into(),
+            rung: Some(player::Rung::BitPerfect),
+            decoded_bits: 24,
+            decoded_rate: 192_000,
+            quality: "HI_RES_LOSSLESS".into(),
+            ..Default::default()
+        },
+        // A frame of the wave: one value per column, so the bars stand where they are.
+        wave: (0..player::WAVE_LEN)
+            .map(|i| {
+                let x = i as f32 / player::WAVE_LEN as f32 * std::f32::consts::TAU;
+                0.45 + 0.4 * (x * 2.0).sin() * (x * 0.7).cos()
+            })
+            .collect(),
+        ..Default::default()
+    };
+
+    let mut panel = overlay::TidalPanel::new(snapshot);
+    panel.source = overlay::Source::Search;
+    panel.query = "muddy".into();
+    panel.editing = false;
+    panel.crumb = None;
+    panel.rows = vec![
+        overlay::TidalRow::Heading("TRACKS".into()),
+        overlay::TidalRow::Track(track("My Home Is In The Delta", "Muddy Waters", 240, "HI_RES_LOSSLESS")),
+        overlay::TidalRow::Track(track("Mannish Boy", "Muddy Waters", 172, "LOSSLESS")),
+        overlay::TidalRow::Track(track("Rollin' Stone", "Muddy Waters", 189, "LOSSLESS")),
+        overlay::TidalRow::Track(track("Got My Mojo Working", "Muddy Waters", 168, "HIGH")),
+        overlay::TidalRow::Heading("ALBUMS".into()),
+        overlay::TidalRow::Album(tidal::Album {
+            id: 1,
+            title: "Folk Singer".into(),
+            artist: "Muddy Waters".into(),
+            tracks: 9,
+            year: Some(1964),
+            quality: "HI_RES_LOSSLESS".into(),
+        }),
+        overlay::TidalRow::Album(tidal::Album {
+            id: 2,
+            title: "The Best Of Muddy Waters".into(),
+            artist: "Muddy Waters".into(),
+            tracks: 12,
+            year: Some(1958),
+            quality: "LOSSLESS".into(),
+        }),
+        overlay::TidalRow::Heading("ARTISTS".into()),
+        overlay::TidalRow::Artist(tidal::Artist { id: 3, name: "Muddy Waters".into() }),
+        overlay::TidalRow::Heading("PLAYLISTS".into()),
+        overlay::TidalRow::Playlist(tidal::Playlist {
+            uuid: "x".into(),
+            title: "Blues Essentials".into(),
+            tracks: 40,
+            owner: "TIDAL".into(),
+            mine: false,
+        }),
+    ];
+    panel.cursor = 1;
+    if state == "queue" {
+        panel.source = overlay::Source::Queue;
+        panel.rows = queue.into_iter().map(overlay::TidalRow::Track).collect();
+        panel.cursor = 0;
+    }
+
+    const WIDTH: u32 = 1400;
+    const HEIGHT: u32 = 820;
+    let overlay = Overlay::Tidal(panel);
+    render::offscreen_scene(path_out, WIDTH, HEIGHT, 16.0, |r| {
+        let (cw, ch) = r.cell_size();
+        let cols = (WIDTH as f32 / cw) as usize;
+        let rows = (HEIGHT as f32 / ch) as usize;
+        let pen = Pen { fg: Color::Rgb(0xd4, 0xd6, 0xd9), ..Pen::default() };
+        let mut g = Grid::new(cols, rows);
+        g.write_str(0, 0, "~/projects/runnir ❯ ", pen);
+        let panes = vec![(g, Rect { x: 0.0, y: 0.0, w: WIDTH as f32, h: HEIGHT as f32 }, None, true)];
+
+        let panels = overlay.render(cols, rows, &config::Theme::default());
+        let specs: Vec<(Grid, Rect)> = panels
+            .into_iter()
+            .map(|p| {
+                let rect = Rect {
+                    x: p.col as f32 * cw,
+                    y: p.row as f32 * ch,
+                    w: p.grid.cols() as f32 * cw,
+                    h: p.grid.rows() as f32 * ch,
+                };
+                (p.grid, rect)
+            })
+            .collect();
+        (panes, Some(specs))
+    });
+}
+
 fn git_scene(path_out: &str, state: &str) {
     use crate::render::Rect;
     let cwd = std::env::current_dir().unwrap_or_default();

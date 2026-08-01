@@ -3836,6 +3836,42 @@ remember.
 
 586 tests.
 
+## 2026-08-01 - The colours were reading a field that lies
+
+Pedro: "what I do not see is the tracks coloured by quality". Two causes, and the second
+one matters much more than the first.
+
+**The field was wrong.** `audioQuality` on a listing is not the tier that gets served.
+The Muddy Waters album that plays bit-perfect at 24 bit / 192 kHz — proved on the DAC,
+twice — reports `audioQuality: LOSSLESS` on every one of its tracks. So did every track
+of every playlist. The colour was faithfully painting a field that says the same thing
+about everything.
+
+`mediaMetadata.tags` is the field that tells the truth, and it carries `HIRES_LOSSLESS`
+alongside `LOSSLESS` when both exist:
+
+    audioQuality: LOSSLESS
+    mediaMetadata: { tags: ["LOSSLESS", "HIRES_LOSSLESS"] }
+
+The tier now comes from the tags, falling back to the old field only when there are none.
+
+**And the palette was barely a palette.** Hi-res took the theme's accent and lossless
+took the ordinary text colour — which is to say, no colour at all. Since nearly
+everything on TIDAL is plain lossless, a list of forty tracks came out looking
+uncoloured, which is exactly what was reported. Three fixed hues now, gold, green and
+grey, chosen the way a diff is green and red: they mean something on their own, so they
+do not follow the theme.
+
+### Seen in pixels, not reasoned about
+
+`runnir --demo <out.png> tidal` draws the panel with an invented library. Invented on
+purpose: it needs no account, no network and no sound, and it can show all three tiers
+at once — which a real library rarely does, since almost everything is lossless. It is
+also how both of these were caught. Reading the code would not have shown it; the
+screenshot did, immediately.
+
+587 tests.
+
 ## Gotchas (do not re-learn)
 
 - `runnir.json` WINS over `runnir.toml`. `Config::try_load` reads the JSON the settings
@@ -3863,6 +3899,11 @@ remember.
   none of the interactive ones: `sub_status 1002` refuses the device flow, `error 11102`
   refuses the authorization-code flow. 11102 with a loopback AND with the app redirect
   is the proof that the redirect is not what is being refused.
+- TIDAL's `audioQuality` on a LISTING is not the tier it serves: it says `LOSSLESS`
+  for tracks it streams at 24/192. `mediaMetadata.tags` carries `HIRES_LOSSLESS` and is
+  the one to read.
+- A colour scheme where the common case is the default text colour is not a colour
+  scheme. Check it against the distribution of real data, not against one of each.
 - `Read::take(limit)` + `read_to_end` returns Ok on a body BIGGER than the limit,
   holding a truncated copy. Read one byte past the limit to tell the two apart.
 - Slicing a `String` by byte index panics on multibyte text. Anything parsing bytes off
