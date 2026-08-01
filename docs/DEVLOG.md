@@ -3207,6 +3207,54 @@ Unverified and unverifiable from here: **whether a DAC actually takes the stream
 untouched, and whether it sounds right.** That needs the hardware and an ear, and it is
 the reason the two verification commands exist rather than a test claiming to cover it.
 
+## 2026-08-01 - Phase 1: the player is the window's, and the panel is only a window onto it
+
+`leader n`. The letter `t` for tidal was the wish and it is taken by the Tabs group,
+which has ten bindings and years of muscle memory behind it; a new feature does not get
+to evict that. `n` was the only letter free at the top level, and the group reads
+`n n` panel, `n space` play/pause, `n f` forward, `n b` back, `n s` stop.
+
+**Where the player lives is the whole design.** It sits on `Gpu` — the window — beside
+the config and the theme. Not on a tab, not on a pane, not on the panel. So closing the
+pane the panel was opened from does not stop the music, closing the tab does not, and
+closing the panel does not; `leader n` reopens onto the same track at the same second.
+The transport is on the leader rather than only in the panel for the same reason: what
+is playing is not a property of what has focus.
+
+The panel holds no playback state at all. It is handed a `Snapshot` — one struct,
+cloned under a lock, so a reader can never catch half an update — and everything it can
+command travels as a small `Cmd` enum. Both halves are deliberately the shape of a wire
+protocol, because phase 3 moves the player into its own process and the panel should
+not notice.
+
+**Closing the window while music plays asks first, and asks even when
+`behaviour.confirm_close` is off.** That setting was written about shell commands, where
+the answer is usually "yes, I know". Silently killing playback is a different kind of
+surprise, and whoever turned that setting off did not turn this one off. The prompt
+names the song rather than counting it: "1 thing is playing" is a fact, but the title is
+what tells you whether you meant to stop it.
+
+Smaller decisions, each of which had a wrong version:
+
+- Enter on a search result plays the WHOLE result list from there. A list of songs on
+  screen implies an album's worth of intent; playing one and stopping is the surprising
+  reading.
+- Escape leaves the query box before it closes the panel. One key meaning two things is
+  fine as long as the smaller one goes first.
+- Opening with a queue opens on the QUEUE, not on search: with music playing, opening
+  the panel is nearly always "what is this?".
+- "Previous" restarts the track after three seconds and goes back before that, because
+  a mis-pressed previous should be cheap to undo.
+- A track that fails to play is reported and the queue moves on. One bad track does not
+  end the evening.
+
+The remote control reports the panel the way it reports git and docker — view, query,
+cursor, rows, position, badge — which is how this gets checked on a real instance
+rather than by reading the drawing code.
+
+540 tests. The `leader n` which-key was rendered headless (`runnir --demo … n`) and
+shows the five entries.
+
 ## Gotchas (do not re-learn)
 
 - ALSA's `HintIter` does NOT list `hw:` devices — only aliases (`default`,
