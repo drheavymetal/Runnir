@@ -100,6 +100,8 @@ pub enum UserEvent {
     /// coordinates of the drop. Comes from the `dnd` thread, which is the only
     /// place Wayland drag-and-drop exists — winit has none.
     FilesDropped(Vec<std::path::PathBuf>, f64, f64),
+    /// A TIDAL search result, tagged with the request sequence.
+    Tidal(u64, Result<Vec<tidal::Track>, String>),
     /// A now-playing update from a media worker: fetched metadata or a waveform frame.
     /// Delivered off the UI thread via the proxy, same wake pattern as `Ai`, so the
     /// playerctl / cava subprocess never blocks rendering.
@@ -962,6 +964,12 @@ struct Gpu {
     /// When the now-playing overlay last had its metadata refreshed, so a track change
     /// shows while it stays open without re-fetching on every wake. `None` when closed.
     media_last_refresh: Option<Instant>,
+    /// The TIDAL player, started on first use and owned by the WINDOW. Not by a tab, not
+    /// by a pane and not by the panel: closing any of those must not stop the music.
+    jukebox: Option<player::Jukebox>,
+    /// Search request counter, so an answer that arrives after a newer query is dropped
+    /// instead of drawn over it.
+    tidal_seq: u64,
     /// Repository state per repo ROOT, not per pane: two panes in the same repository
     /// share one entry and one `git status`.
     git_state: std::collections::HashMap<PathBuf, git::RepoState>,
@@ -1332,6 +1340,8 @@ impl App {
             image_watch: None,
             media_wave: None,
             media_last_refresh: None,
+            jukebox: None,
+            tidal_seq: 0,
             git_state: std::collections::HashMap::new(),
             git_pending: std::collections::HashSet::new(),
             git_seen: std::collections::HashMap::new(),
@@ -1548,7 +1558,12 @@ impl ApplicationHandler<UserEvent> for App {
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         let Some(gpu) = self.gpu.as_mut() else { return };
         match event {
-            UserEvent::Redraw => gpu.window.request_redraw(),
+            // A wake is also how the player says something changed, so a panel that is
+            // open follows the music without polling it on a timer.
+            UserEvent::Redraw => {
+                gpu.refresh_tidal_panel_if_open();
+                gpu.window.request_redraw();
+            }
             UserEvent::Ai(reply) => {
                 // The request finished: clear the "thinking" toast.
                 gpu.status = None;
@@ -1569,6 +1584,7 @@ impl ApplicationHandler<UserEvent> for App {
                 let _ = reply.send(resp);
             }
             UserEvent::Media(msg) => gpu.on_media_msg(msg, &self.config),
+            UserEvent::Tidal(seq, found) => gpu.on_tidal_results(seq, found),
             UserEvent::GitPanel(seq, msg) => gpu.on_git_panel_msg(seq, msg, &self.config),
             UserEvent::Docker(seq, msg) => gpu.on_docker_msg(seq, msg),
             UserEvent::Explorer(tab, seq, dir, entries) => {

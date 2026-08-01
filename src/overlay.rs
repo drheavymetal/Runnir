@@ -37,6 +37,8 @@ pub enum Overlay {
     Verbs(VerbsPanel),
     /// Zoomed out: the session as a map of headlines rather than of text.
     Map(MapPanel),
+    /// TIDAL: what is playing, the queue, and search.
+    Tidal(TidalPanel),
 }
 
 impl Overlay {
@@ -62,6 +64,7 @@ impl Overlay {
             Overlay::CatchUp(p) => p.render(cols, rows, theme),
             Overlay::Verbs(p) => p.render(cols, rows, theme),
             Overlay::Map(p) => p.render(cols, rows, theme),
+            Overlay::Tidal(p) => p.render(cols, rows, theme),
         }
     }
 }
@@ -2696,6 +2699,233 @@ fn clock_art(hhmm: &str) -> Option<(Vec<String>, usize)> {
     Some((out, w))
 }
 
+/// The TIDAL panel: what is playing, what is queued, and how to find more.
+///
+/// It holds NO playback state of its own. Everything about the music comes from a
+/// [`crate::player::Snapshot`] handed in at draw time, because the player belongs to the
+/// window and this panel is only a window onto it — closing it must not stop the music,
+/// and reopening it must show exactly what is going on.
+pub struct TidalPanel {
+    /// What the list is showing.
+    pub view: TidalView,
+    pub results: Vec<crate::tidal::Track>,
+    pub cursor: usize,
+    pub query: String,
+    /// True while the query is being typed, so ordinary letters go to the box rather
+    /// than to the transport.
+    pub editing: bool,
+    /// The search whose answer we are still waiting for, so a slow one that lands after
+    /// a newer one is dropped rather than drawn.
+    pub pending: Option<u64>,
+    pub message: Option<String>,
+    /// The player's state as of the last redraw. Refreshed from the jukebox, never
+    /// mutated here.
+    pub snapshot: crate::player::Snapshot,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TidalView {
+    Search,
+    Queue,
+}
+
+impl TidalPanel {
+    pub fn new(snapshot: crate::player::Snapshot) -> Self {
+        // Open on the queue when there IS one: the common reason to open the panel with
+        // music playing is to see what is playing, not to start a search.
+        let view = if snapshot.queue.is_empty() { TidalView::Search } else { TidalView::Queue };
+        Self {
+            view,
+            results: Vec::new(),
+            cursor: snapshot.index,
+            query: String::new(),
+            editing: view == TidalView::Search,
+            pending: None,
+            message: None,
+            snapshot,
+        }
+    }
+
+    /// How many rows the current view has.
+    fn len(&self) -> usize {
+        match self.view {
+            TidalView::Search => self.results.len(),
+            TidalView::Queue => self.snapshot.queue.len(),
+        }
+    }
+
+    pub fn up(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    pub fn down(&mut self) {
+        if self.cursor + 1 < self.len() {
+            self.cursor += 1;
+        }
+    }
+
+    pub fn toggle_view(&mut self) {
+        self.view = match self.view {
+            TidalView::Search => TidalView::Queue,
+            TidalView::Queue => TidalView::Search,
+        };
+        self.editing = false;
+        // Landing on the playing track is the useful default for the queue; for results
+        // it is the top, since nothing there is "current".
+        self.cursor = match self.view {
+            TidalView::Queue => self.snapshot.index,
+            TidalView::Search => 0,
+        };
+    }
+
+    /// The tracks a play command should carry, and where in them to start.
+    ///
+    /// Playing a search result plays the WHOLE result list from there, which is what a
+    /// list of songs on screen implies. Playing from the queue just moves the cursor.
+    pub fn play_selection(&self) -> Option<(Vec<crate::tidal::Track>, usize)> {
+        match self.view {
+            TidalView::Search if !self.results.is_empty() => {
+                Some((self.results.clone(), self.cursor.min(self.results.len() - 1)))
+            }
+            TidalView::Queue if !self.snapshot.queue.is_empty() => Some((
+                self.snapshot.queue.clone(),
+                self.cursor.min(self.snapshot.queue.len() - 1),
+            )),
+            _ => None,
+        }
+    }
+
+    pub fn selected_track(&self) -> Option<crate::tidal::Track> {
+        match self.view {
+            TidalView::Search => self.results.get(self.cursor).cloned(),
+            TidalView::Queue => self.snapshot.queue.get(self.cursor).cloned(),
+        }
+    }
+
+    /// For the remote control, so a script can assert what the panel is showing.
+    pub fn rows(&self) -> Vec<String> {
+        match self.view {
+            TidalView::Search => self.results.iter().map(track_line).collect(),
+            TidalView::Queue => self.snapshot.queue.iter().map(track_line).collect(),
+        }
+    }
+
+    fn render(&self, cols: usize, rows: usize, theme: &Theme) -> Vec<Panel> {
+        let w = (cols * 7 / 10).clamp(46, 96).min(cols.saturating_sub(2));
+        let list_rows = rows.saturating_sub(12).clamp(4, 16);
+        let h = list_rows + 7;
+        let mut g = panel_grid(w, h, theme);
+
+        let title = match self.view {
+            TidalView::Search => "TIDAL  \u{b7}  search",
+            TidalView::Queue => "TIDAL  \u{b7}  queue",
+        };
+        write(&mut g, 0, 2, title, accent());
+
+        // The query box is always drawn, even on the queue: it is how you get back to
+        // searching, and a box that appears and disappears moves everything under it.
+        let cue = if self.editing { "\u{2588}" } else { "" };
+        let query = format!("/ {}{cue}", self.query);
+        write(&mut g, 1, 2, &query, if self.editing { accent() } else { dim() });
+
+        let list = match self.view {
+            TidalView::Search => self.results.clone(),
+            TidalView::Queue => self.snapshot.queue.clone(),
+        };
+        if list.is_empty() {
+            let empty = match self.view {
+                TidalView::Search if self.pending.is_some() => "searching\u{2026}",
+                TidalView::Search => "type to search, Enter to run it",
+                TidalView::Queue => "nothing queued",
+            };
+            write(&mut g, 3, 2, empty, dim());
+        }
+
+        // Scroll the window so the cursor stays on screen without moving the list under
+        // it every keystroke.
+        let first = self.cursor.saturating_sub(list_rows.saturating_sub(1));
+        for (i, track) in list.iter().skip(first).take(list_rows).enumerate() {
+            let index = first + i;
+            let row = 3 + i;
+            let sel = index == self.cursor;
+            if sel {
+                write(&mut g, row, 0, &" ".repeat(w), selected());
+            }
+            let playing = self.view == TidalView::Queue && index == self.snapshot.index;
+            let pen = if sel {
+                selected()
+            } else if playing {
+                accent()
+            } else {
+                normal()
+            };
+            let mark = if playing { "\u{25b8} " } else { "  " };
+            let line = format!("{mark}{}", track_line(track));
+            write(&mut g, row, 2, &short_tail(&line, w.saturating_sub(12)), pen);
+            let dur = format!("{}:{:02}", track.duration_secs / 60, track.duration_secs % 60);
+            write(&mut g, row, w.saturating_sub(dur.chars().count() + 2), &dur, if sel { selected() } else { dim() });
+        }
+
+        // The transport and the signal path, at the bottom, where a status bar goes.
+        let bar = h.saturating_sub(3);
+        write(&mut g, bar, 0, &"\u{2500}".repeat(w), dim());
+        write(&mut g, bar + 1, 2, &short_tail(&self.transport_line(), w.saturating_sub(4)), normal());
+        let foot = match self.message.as_deref() {
+            Some(msg) => msg.to_string(),
+            None if self.snapshot.error.is_some() => {
+                self.snapshot.error.clone().unwrap_or_default()
+            }
+            None => self.snapshot.signal.badge(),
+        };
+        let pen = if self.message.is_some() || self.snapshot.error.is_some() { accent() } else { dim() };
+        write(&mut g, bar + 2, 2, &short_tail(&foot, w.saturating_sub(4)), pen);
+
+        let col = (cols.saturating_sub(w)) / 2;
+        let row = (rows.saturating_sub(h)) / 3;
+        vec![Panel { grid: g, col, row }]
+    }
+
+    /// `\u{25b8} Artist \u{2014} Title   1:23 / 4:56`, or an invitation when nothing is on.
+    fn transport_line(&self) -> String {
+        let Some(track) = self.snapshot.now_playing() else {
+            return "nothing playing".to_string();
+        };
+        let mark = if !self.snapshot.playing {
+            "\u{25a0}"
+        } else if self.snapshot.paused {
+            "\u{2016}"
+        } else {
+            "\u{25b8}"
+        };
+        let at = self.snapshot.position_secs as u32;
+        format!(
+            "{mark} {}  {}:{:02} / {}:{:02}",
+            track_line(track),
+            at / 60,
+            at % 60,
+            track.duration_secs / 60,
+            track.duration_secs % 60
+        )
+    }
+}
+
+/// Cuts a line to fit, keeping the FRONT.
+///
+/// The opposite of `short_path`, and for the opposite reason: a path is identified by
+/// its tail and a song by its artist and title, so here it is the end that gives.
+fn short_tail(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let Some(keep) = max.checked_sub(1) else { return String::new() };
+    let head: String = s.chars().take(keep).collect();
+    format!("{head}\u{2026}")
+}
+
+fn track_line(t: &crate::tidal::Track) -> String {
+    if t.artist.is_empty() { t.title.clone() } else { format!("{} \u{2014} {}", t.artist, t.title) }
+}
+
 /// The verbs panel: how this repository is actually built, tested and deployed,
 /// ranked by how often each verb succeeded here.
 pub struct VerbsPanel {
@@ -3823,7 +4053,7 @@ fn _cell_marker() -> Cell {
 #[cfg(test)]
 mod docker_tests {
     use super::*;
-    use crate::docker::{Container, Endpoint, Health, Host, Image, Kind, Network, Snapshot, Volume};
+    use crate::docker::{Container, Endpoint, Health, Host, Image, Kind, Network, Snapshot};
 
     fn container(name: &str, project: Option<&str>, running: bool) -> Container {
         Container {
@@ -4812,6 +5042,103 @@ mod tests {
         // A query that matches nothing leaves no selection rather than panicking.
         p.input('z');
         assert!(p.selected().is_none());
+    }
+
+fn a_track(title: &str) -> crate::tidal::Track {
+        crate::tidal::Track {
+            id: 1,
+            title: title.into(),
+            artist: "Opeth".into(),
+            album: "Blackwater Park".into(),
+            duration_secs: 601,
+            quality: "LOSSLESS".into(),
+        }
+    }
+
+    #[test]
+    fn the_panel_opens_on_what_is_playing_when_something_is() {
+        let snapshot = crate::player::Snapshot {
+            queue: vec![a_track("Bleak"), a_track("Harvest")],
+            index: 1,
+            playing: true,
+            ..Default::default()
+        };
+        let p = TidalPanel::new(snapshot);
+        // Opening the panel while music plays is nearly always "what is this?", not
+        // "let me search" — and the cursor starts on the track being heard.
+        assert_eq!(p.view, TidalView::Queue);
+        assert_eq!(p.cursor, 1);
+        assert!(!p.editing);
+
+        // With nothing queued there is nothing to look at, so it opens ready to type.
+        let empty = TidalPanel::new(crate::player::Snapshot::default());
+        assert_eq!(empty.view, TidalView::Search);
+        assert!(empty.editing);
+    }
+
+    #[test]
+    fn playing_a_search_result_takes_the_whole_list_with_it() {
+        let mut p = TidalPanel::new(crate::player::Snapshot::default());
+        p.results = vec![a_track("one"), a_track("two"), a_track("three")];
+        p.view = TidalView::Search;
+        p.cursor = 1;
+        let (tracks, at) = p.play_selection().expect("a selection");
+        // A list of songs on screen implies an album's worth of intent: pressing Enter
+        // on the second one plays from there to the end, not that one song alone.
+        assert_eq!(tracks.len(), 3);
+        assert_eq!(at, 1);
+    }
+
+    #[test]
+    fn an_empty_list_has_nothing_to_play() {
+        let p = TidalPanel::new(crate::player::Snapshot::default());
+        assert!(p.play_selection().is_none());
+        assert!(p.selected_track().is_none());
+    }
+
+    #[test]
+    fn switching_to_the_queue_lands_on_the_playing_track() {
+        let snapshot = crate::player::Snapshot {
+            queue: vec![a_track("a"), a_track("b"), a_track("c")],
+            index: 2,
+            ..Default::default()
+        };
+        let mut p = TidalPanel::new(snapshot);
+        p.toggle_view();
+        assert_eq!(p.view, TidalView::Search);
+        p.toggle_view();
+        assert_eq!(p.view, TidalView::Queue);
+        assert_eq!(p.cursor, 2);
+    }
+
+    #[test]
+    fn the_transport_line_says_which_of_three_states_it_is_in() {
+        let mut snapshot = crate::player::Snapshot {
+            queue: vec![a_track("Bleak")],
+            index: 0,
+            playing: true,
+            position_secs: 83.0,
+            ..Default::default()
+        };
+        let mut p = TidalPanel::new(snapshot.clone());
+        assert!(p.transport_line().contains("1:23 / 10:01"), "{}", p.transport_line());
+        assert!(p.transport_line().starts_with('\u{25b8}'));
+
+        snapshot.paused = true;
+        p.snapshot = snapshot.clone();
+        assert!(p.transport_line().starts_with('\u{2016}'), "{}", p.transport_line());
+
+        snapshot.playing = false;
+        p.snapshot = snapshot;
+        assert!(p.transport_line().starts_with('\u{25a0}'), "{}", p.transport_line());
+    }
+
+    #[test]
+    fn a_long_title_loses_its_end_and_a_path_loses_its_start() {
+        // Two truncations that must not be confused: a song is known by its beginning,
+        // a path by its end.
+        assert_eq!(short_tail("abcdefgh", 4), "abc\u{2026}");
+        assert_eq!(short_path("/home/pedro/x", 6), "\u{2026}dro/x");
     }
 
     #[test]
