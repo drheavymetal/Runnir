@@ -3669,6 +3669,31 @@ the HTTP timeout. It needs a prefetch thread; it is not fixed here.
 
 584 tests.
 
+## 2026-08-01 - The fetch moved off the audio loop
+
+The thing named as open in the audit entry is closed. Segments were fetched inline,
+inside `PartsReader::read`, which meant the audio loop stopped at every segment boundary
+for as long as the download took. Two consequences, both real: on a slow link that is an
+underrun you can hear each time, and — since the same loop is what reads the transport
+commands between packets — a pause or a stop could sit unanswered until the HTTP timeout
+gave up on it.
+
+Fetching now runs on its own thread, ahead of the decoder, over a `sync_channel` bounded
+at two parts. Bounded because the alternative is a fast network pulling a whole hi-res
+album into memory while the DAC is still on the first bar; two is enough to cover a
+fetch taking as long as a segment lasts, which is the case this exists for.
+
+Errors travel down the same channel rather than being logged on a thread nobody watches,
+so a failed download still surfaces where the decoder can report it. A send that fails
+means the track was skipped or stopped and nobody is reading any more, so the fetcher
+stops rather than downloading the rest of a song that is no longer playing.
+
+The reader sits behind a mutex for one reason worth writing down so nobody removes it:
+symphonia's `MediaSource` requires `Sync`, and a `Receiver` is `Send` but not `Sync`.
+Nothing contends for it — the decoder is the only reader and it holds `&mut self`.
+
+Verified afterwards on the real DAC: 24 bit / 192 kHz, `hw:2,0`, BIT-PERFECT.
+
 ## Gotchas (do not re-learn)
 
 - `runnir.json` WINS over `runnir.toml`. `Config::try_load` reads the JSON the settings

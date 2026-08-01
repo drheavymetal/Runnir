@@ -206,16 +206,35 @@ pub fn plan(pref: &str, bit_perfect: bool, hw_devices: &[String]) -> Vec<Attempt
     out
 }
 
+/// How many parts are fetched ahead of the one being played.
+///
+/// Two, not more: a hi-res segment is several megabytes, and this is memory held for
+/// every playing track. Two is enough to cover a fetch taking as long as a segment
+/// lasts, which is the case this exists for.
+const PREFETCH: usize = 2;
+
 /// Reads a track that arrives as an ordered list of URLs.
 ///
 /// A DASH stream is an initialisation segment plus N media segments that mean nothing
 /// apart; a BTS stream is one file. Both are "read these URLs in order", so both are
-/// this. Parts are fetched as they are needed rather than up front — a hi-res track is
-/// hundreds of megabytes and the first sample should not wait for the last byte.
+/// this.
+///
+/// Fetching happens on a thread of its own, AHEAD of the decoder. It used to happen
+/// inline, inside `read`, which meant the audio loop stopped at every segment boundary
+/// for as long as the download took: on a slow link that is an underrun you can hear
+/// each time, and — because the loop is also what reads the transport commands — a
+/// pause or a stop that sat unanswered until the HTTP timeout gave up.
 struct PartsReader {
-    parts: Vec<Part>,
-    next: usize,
+    /// Fetched parts, in order, at most `PREFETCH` ahead. Errors travel down it too, so
+    /// a failed download surfaces where the decoder can report it rather than being
+    /// swallowed on a thread nobody is watching.
+    /// Behind a mutex only because symphonia's `MediaSource` demands `Sync` and a
+    /// `Receiver` is `Send` but not `Sync`. Nothing contends for it: the decoder is the
+    /// only reader and it holds `&mut self`.
+    parts: std::sync::Mutex<std::sync::mpsc::Receiver<Result<Vec<u8>, String>>>,
     current: std::io::Cursor<Vec<u8>>,
+    /// Set once the fetcher has hung up, so a finished track stops asking.
+    finished: bool,
 }
 
 /// One piece of a track. A local file is not something TIDAL ever sends: it exists so
@@ -231,7 +250,34 @@ pub enum Part {
 
 impl PartsReader {
     fn new(parts: Vec<Part>) -> Self {
-        Self { parts, next: 0, current: std::io::Cursor::new(Vec::new()) }
+        // Bounded: the fetcher runs ahead but only by `PREFETCH`, so a fast network
+        // cannot pull a whole hi-res album into memory while the DAC plays the first
+        // bar of it. `sync_channel(n)` blocks the sender once n are waiting, which is
+        // exactly that.
+        let (tx, rx) = std::sync::mpsc::sync_channel(PREFETCH);
+        std::thread::Builder::new()
+            .name("runnir-fetch".into())
+            .spawn(move || {
+                for part in parts {
+                    let bytes = match part {
+                        Part::Url(url) => tidal::fetch(&url, MAX_PART_BYTES),
+                        Part::File(path) => std::fs::read(path).map_err(|e| e.to_string()),
+                    };
+                    let failed = bytes.is_err();
+                    // A send failing means the track was skipped or stopped and nobody
+                    // is reading any more: stop fetching rather than downloading the
+                    // rest of a song that is no longer playing.
+                    if tx.send(bytes).is_err() || failed {
+                        return;
+                    }
+                }
+            })
+            .ok();
+        Self {
+            parts: std::sync::Mutex::new(rx),
+            current: std::io::Cursor::new(Vec::new()),
+            finished: false,
+        }
     }
 }
 
@@ -242,17 +288,28 @@ impl Read for PartsReader {
             if n > 0 {
                 return Ok(n);
             }
-            if self.next >= self.parts.len() {
+            if self.finished {
                 return Ok(0); // end of track
             }
-            let part = self.parts[self.next].clone();
-            self.next += 1;
-            let bytes = match part {
-                Part::Url(url) => tidal::fetch(&url, MAX_PART_BYTES)
-                    .map_err(|e| std::io::Error::other(format!("fetch part: {e}")))?,
-                Part::File(path) => std::fs::read(path)?,
+            let got = match self.parts.lock() {
+                Ok(rx) => rx.recv(),
+                Err(_) => {
+                    self.finished = true;
+                    return Ok(0);
+                }
             };
-            self.current = std::io::Cursor::new(bytes);
+            match got {
+                Ok(Ok(bytes)) => self.current = std::io::Cursor::new(bytes),
+                Ok(Err(e)) => {
+                    self.finished = true;
+                    return Err(std::io::Error::other(format!("fetch part: {e}")));
+                }
+                // The fetcher hung up: every part has been handed over.
+                Err(_) => {
+                    self.finished = true;
+                    return Ok(0);
+                }
+            }
         }
     }
 }
