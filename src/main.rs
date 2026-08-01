@@ -220,6 +220,18 @@ fn main() {
         // `runnir --tidal-devices` — what the output chain would try, in order, for the
         // current config. Answers "why is it not bit-perfect" without playing anything.
         Some("--tidal-devices") => return tidal_devices(),
+        // `runnir --tidal-browse <words>` — exercises the whole catalogue layer in one
+        // go: the four search types, the user's playlists and favourites, an album's
+        // tracks, an artist's top tracks, and whether a track has timed lyrics. The
+        // unit tests cover the parsing; only this covers the SHAPE the service really
+        // answers with, which is the half that changes without warning.
+        Some("--tidal-browse") => {
+            let what = args[2..].join(" ");
+            if what.is_empty() {
+                return eprintln!("usage: runnir --tidal-browse <words>");
+            }
+            return tidal_browse(&what);
+        }
         // `runnir --tidal-info <track-id|search words>` — what TIDAL would serve for one
         // track at each quality tier: which manifest shape, which codec, what depth and
         // rate. Makes no sound, which is the point: the questions "is this really
@@ -692,6 +704,98 @@ fn tidal_find(what: &str) -> Result<(config::Tidal, tidal::Session, tidal::Track
             .ok_or_else(|| format!("nothing found for {what:?}"))?,
     };
     Ok((cfg, session, track))
+}
+
+/// Walks the catalogue once and prints what came back.
+fn tidal_browse(what: &str) {
+    let (_, creds) = match tidal_creds() {
+        Ok(v) => v,
+        Err(e) => return eprintln!("runnir: {e}"),
+    };
+    let Some(session) = tidal::Session::load() else {
+        return eprintln!("runnir: not signed in — run: runnir --tidal-login");
+    };
+    let session = match tidal::ensure_fresh(&creds, &session) {
+        Ok(s) => s,
+        Err(e) => return eprintln!("runnir: {e}"),
+    };
+
+    let found = match tidal::search(&session, what, 5) {
+        Ok(f) => f,
+        Err(e) => return eprintln!("runnir: search failed: {e}"),
+    };
+    println!(
+        "  search {what:?} -> {} tracks, {} albums, {} artists, {} playlists",
+        found.tracks.len(),
+        found.albums.len(),
+        found.artists.len(),
+        found.playlists.len()
+    );
+    for t in found.tracks.iter().take(3) {
+        println!("    track    {:<14} {} — {}", t.quality, t.artist, t.title);
+    }
+    for a in found.albums.iter().take(3) {
+        println!(
+            "    album    {:<14} {} — {} ({}, {} tracks)",
+            a.quality,
+            a.artist,
+            a.title,
+            a.year.map(|y| y.to_string()).unwrap_or_else(|| "?".into()),
+            a.tracks
+        );
+    }
+    for a in found.artists.iter().take(3) {
+        println!("    artist   {:<14} {}", "", a.name);
+    }
+    for p in found.playlists.iter().take(3) {
+        println!(
+            "    playlist {:<14} {} by {} ({} tracks)",
+            if p.mine { "mine" } else { "" },
+            p.title,
+            p.owner,
+            p.tracks
+        );
+    }
+
+    if let Some(album) = found.albums.first() {
+        match tidal::album_tracks(&session, album.id) {
+            Ok(tracks) => println!("\n  album {:?}: {} tracks", album.title, tracks.len()),
+            Err(e) => println!("\n  album tracks failed: {e}"),
+        }
+    }
+    if let Some(artist) = found.artists.first() {
+        match tidal::artist_top_tracks(&session, artist.id) {
+            Ok(tracks) => println!("  artist {:?}: {} top tracks", artist.name, tracks.len()),
+            Err(e) => println!("  artist top tracks failed: {e}"),
+        }
+    }
+    match tidal::my_playlists(&session) {
+        Ok(mine) => {
+            println!("  my playlists: {}", mine.len());
+            for p in mine.iter().take(3) {
+                println!("    {} ({} tracks)", p.title, p.tracks);
+            }
+        }
+        Err(e) => println!("  my playlists failed: {e}"),
+    }
+    match tidal::favourite_tracks(&session) {
+        Ok(tracks) => println!("  favourite tracks: {}", tracks.len()),
+        Err(e) => println!("  favourites failed: {e}"),
+    }
+    if let Some(track) = found.tracks.first() {
+        match tidal::lyrics(&session, track.id) {
+            Ok(l) if l.timed.is_empty() && l.plain.is_empty() => {
+                println!("  lyrics for {:?}: none", track.title)
+            }
+            Ok(l) => println!(
+                "  lyrics for {:?}: {} timed lines, {} chars plain",
+                track.title,
+                l.timed.len(),
+                l.plain.len()
+            ),
+            Err(e) => println!("  lyrics for {:?}: {e}", track.title),
+        }
+    }
 }
 
 /// What TIDAL would serve for one track, at each tier. Plays nothing.

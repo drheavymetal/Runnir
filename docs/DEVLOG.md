@@ -3350,6 +3350,35 @@ mean getting it:
 Four tracks, two tiers, one request. The badge reports what ARRIVED, and this is why
 that distinction is worth the code it costs.
 
+## 2026-08-01 - A licence, and the catalogue behind the panel
+
+**runnir is GPL-3.0-only from today.** It had no licence at all, which is the worst of
+both worlds: nobody may legally use it and nothing may legally be borrowed into it.
+Pedro chose copyleft knowing what it does — not that it prevents charging, which it does
+not, but that whoever receives runnir receives the source and the same freedoms, and
+that derivatives stay under the same terms. It also unblocks reusing code from mySone
+(GPL-3.0-only) rather than only reading it for protocol facts.
+
+**The catalogue layer**, verified against the real service in one command
+(`runnir --tidal-browse <words>`), because unit tests cover parsing and only a real call
+covers the SHAPE a service answers with:
+
+    search "Opeth" -> 5 tracks, 5 albums, 5 artists, 5 playlists
+    album "Damnation": 8 tracks · artist "Opeth": 50 top tracks
+    my playlists: 17 · favourite tracks: 99
+    lyrics for "Ghost of Perdition": 70 timed lines, 1555 chars plain
+
+One search request for four types rather than four requests: the panel shows them
+together, and someone typing does not want the artists to arrive a second after the
+tracks. Favourites come wrapped in an envelope carrying the date they were added, so the
+thing itself is a level down — handled once here rather than in four callers.
+
+Two details worth keeping. A playlist is "mine" only when its creator id matches the
+session's user id; TIDAL's own editorial playlists have no creator id at all, so they
+can never be mistaken for one of yours. And the LRC subtitles are sorted after parsing
+even though they arrive in order, because `line_at` binary-searches them — trusting the
+order would be a bug that only shows up on the one track where it is wrong.
+
 ## Gotchas (do not re-learn)
 
 - `runnir.json` WINS over `runnir.toml`. `Config::try_load` reads the JSON the settings

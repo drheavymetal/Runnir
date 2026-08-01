@@ -653,6 +653,279 @@ pub fn search_tracks(session: &Session, query: &str, limit: u32) -> Result<Vec<T
     Ok(v["items"].as_array().map(|a| a.iter().map(parse_track).collect()).unwrap_or_default())
 }
 
+// ---- the catalogue --------------------------------------------------------
+
+/// An album, as much of one as a list needs.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Album {
+    pub id: u64,
+    pub title: String,
+    pub artist: String,
+    pub tracks: u32,
+    pub year: Option<u32>,
+    /// TIDAL's word for the best tier it holds. Worth showing BEFORE playing: an album
+    /// listed as HI_RES_LOSSLESS is the reason to pick it over another master.
+    pub quality: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Artist {
+    pub id: u64,
+    pub name: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Playlist {
+    /// Playlists are keyed by uuid, not by a number like everything else.
+    pub uuid: String,
+    pub title: String,
+    pub tracks: u32,
+    /// Who made it: `mine` for the user's own, else the curator TIDAL names.
+    pub owner: String,
+    pub mine: bool,
+}
+
+/// Everything one search turned up.
+#[derive(Clone, Debug, Default)]
+pub struct Found {
+    pub tracks: Vec<Track>,
+    pub albums: Vec<Album>,
+    pub artists: Vec<Artist>,
+    pub playlists: Vec<Playlist>,
+}
+
+impl Found {
+#[allow(dead_code)] // wired to the panel next
+    pub fn is_empty(&self) -> bool {
+        self.tracks.is_empty()
+            && self.albums.is_empty()
+            && self.artists.is_empty()
+            && self.playlists.is_empty()
+    }
+}
+
+pub fn parse_album(v: &serde_json::Value) -> Album {
+    Album {
+        id: v["id"].as_u64().unwrap_or(0),
+        title: v["title"].as_str().unwrap_or_default().to_string(),
+        artist: v["artists"][0]["name"]
+            .as_str()
+            .or_else(|| v["artist"]["name"].as_str())
+            .unwrap_or_default()
+            .to_string(),
+        tracks: v["numberOfTracks"].as_u64().unwrap_or(0) as u32,
+        // "2001-05-21" — only the year is worth the width in a list.
+        year: v["releaseDate"]
+            .as_str()
+            .and_then(|d| d.get(..4))
+            .and_then(|y| y.parse().ok()),
+        quality: v["audioQuality"].as_str().unwrap_or_default().to_string(),
+    }
+}
+
+pub fn parse_artist(v: &serde_json::Value) -> Artist {
+    Artist {
+        id: v["id"].as_u64().unwrap_or(0),
+        name: v["name"].as_str().unwrap_or_default().to_string(),
+    }
+}
+
+pub fn parse_playlist(v: &serde_json::Value, user_id: Option<u64>) -> Playlist {
+    let owner_id = v["creator"]["id"].as_u64();
+    Playlist {
+        uuid: v["uuid"].as_str().unwrap_or_default().to_string(),
+        title: v["title"].as_str().unwrap_or_default().to_string(),
+        tracks: v["numberOfTracks"].as_u64().unwrap_or(0) as u32,
+        owner: v["creator"]["name"]
+            .as_str()
+            .or_else(|| v["promotedArtists"][0]["name"].as_str())
+            .unwrap_or("TIDAL")
+            .to_string(),
+        // A playlist with no creator id is one of TIDAL's own editorial ones.
+        mine: matches!((owner_id, user_id), (Some(a), Some(b)) if a == b),
+    }
+}
+
+/// One search across everything TIDAL indexes.
+///
+/// Four types in one request rather than four requests: the panel shows them together,
+/// and a person typing does not want the artists to arrive a second after the tracks.
+pub fn search(session: &Session, query: &str, limit: u32) -> Result<Found, String> {
+    let limit = limit.to_string();
+    let body = get_body(
+        &format!("{API_URL}/search"),
+        session,
+        &[
+            ("query", query),
+            ("countryCode", session.country_code.as_str()),
+            ("limit", limit.as_str()),
+            ("offset", "0"),
+            ("types", "ARTISTS,ALBUMS,TRACKS,PLAYLISTS"),
+            ("includeUserPlaylists", "true"),
+            ("supportsUserData", "true"),
+        ],
+    )?;
+    let v: serde_json::Value = serde_json::from_str(&body).map_err(|e| format!("{e}: {body}"))?;
+    let items = |key: &str| -> Vec<serde_json::Value> {
+        v[key]["items"].as_array().cloned().unwrap_or_default()
+    };
+    Ok(Found {
+        tracks: items("tracks").iter().map(parse_track).collect(),
+        albums: items("albums").iter().map(parse_album).collect(),
+        artists: items("artists").iter().map(parse_artist).collect(),
+        playlists: items("playlists")
+            .iter()
+            .map(|p| parse_playlist(p, session.user_id))
+            .collect(),
+    })
+}
+
+/// The tracks of an album, in album order.
+pub fn album_tracks(session: &Session, album_id: u64) -> Result<Vec<Track>, String> {
+    items_of(session, &format!("{API_URL}/albums/{album_id}/tracks"), &[])
+}
+
+/// What an artist is known for. TIDAL orders these by popularity, which is the right
+/// order for a list somebody is about to press play on.
+pub fn artist_top_tracks(session: &Session, artist_id: u64) -> Result<Vec<Track>, String> {
+    items_of(session, &format!("{API_URL}/artists/{artist_id}/toptracks"), &[("limit", "50")])
+}
+
+#[allow(dead_code)] // wired to the panel next
+pub fn playlist_tracks(session: &Session, uuid: &str) -> Result<Vec<Track>, String> {
+    items_of(session, &format!("{API_URL}/playlists/{uuid}/tracks"), &[("limit", "100")])
+}
+
+/// The user's own playlists.
+pub fn my_playlists(session: &Session) -> Result<Vec<Playlist>, String> {
+    let user = session.user_id.ok_or("no user id in the session")?;
+    let body = get_body(
+        &format!("{API_URL}/users/{user}/playlists"),
+        session,
+        &[("countryCode", session.country_code.as_str()), ("limit", "100")],
+    )?;
+    let v: serde_json::Value = serde_json::from_str(&body).map_err(|e| format!("{e}: {body}"))?;
+    Ok(v["items"]
+        .as_array()
+        .map(|a| a.iter().map(|p| parse_playlist(p, session.user_id)).collect())
+        .unwrap_or_default())
+}
+
+/// Favourites. TIDAL wraps each one in an envelope with the date it was added, so the
+/// thing itself is one level down — a detail worth handling here rather than in four
+/// callers.
+pub fn favourite_tracks(session: &Session) -> Result<Vec<Track>, String> {
+    let user = session.user_id.ok_or("no user id in the session")?;
+    let body = get_body(
+        &format!("{API_URL}/users/{user}/favorites/tracks"),
+        session,
+        &[
+            ("countryCode", session.country_code.as_str()),
+            ("limit", "100"),
+            ("order", "DATE"),
+            ("orderDirection", "DESC"),
+        ],
+    )?;
+    let v: serde_json::Value = serde_json::from_str(&body).map_err(|e| format!("{e}: {body}"))?;
+    Ok(v["items"]
+        .as_array()
+        .map(|a| a.iter().map(|i| parse_track(&i["item"])).collect())
+        .unwrap_or_default())
+}
+
+#[allow(dead_code)] // wired to the panel next
+pub fn favourite_albums(session: &Session) -> Result<Vec<Album>, String> {
+    let user = session.user_id.ok_or("no user id in the session")?;
+    let body = get_body(
+        &format!("{API_URL}/users/{user}/favorites/albums"),
+        session,
+        &[
+            ("countryCode", session.country_code.as_str()),
+            ("limit", "100"),
+            ("order", "DATE"),
+            ("orderDirection", "DESC"),
+        ],
+    )?;
+    let v: serde_json::Value = serde_json::from_str(&body).map_err(|e| format!("{e}: {body}"))?;
+    Ok(v["items"]
+        .as_array()
+        .map(|a| a.iter().map(|i| parse_album(&i["item"])).collect())
+        .unwrap_or_default())
+}
+
+fn items_of(session: &Session, url: &str, extra: &[(&str, &str)]) -> Result<Vec<Track>, String> {
+    let mut query = vec![("countryCode", session.country_code.as_str())];
+    query.extend_from_slice(extra);
+    let body = get_body(url, session, &query)?;
+    let v: serde_json::Value = serde_json::from_str(&body).map_err(|e| format!("{e}: {body}"))?;
+    // Some endpoints answer with a bare array, others with `{ items: [...] }`.
+    let list = v["items"].as_array().or_else(|| v.as_array());
+    Ok(list.map(|a| a.iter().map(parse_track).collect()).unwrap_or_default())
+}
+
+/// Words, and when to show them.
+#[derive(Clone, Debug, Default)]
+pub struct Lyrics {
+    /// The whole thing as plain text, which is what most tracks have.
+    pub plain: String,
+    /// One line per moment, in seconds. Empty when TIDAL has no timed version — and
+    /// that is the difference between lyrics you read and lyrics that follow the song.
+    pub timed: Vec<(f64, String)>,
+}
+
+impl Lyrics {
+#[allow(dead_code)] // wired to the panel next
+    pub fn is_empty(&self) -> bool {
+        self.plain.is_empty() && self.timed.is_empty()
+    }
+
+    /// Which line is current at `secs`, as an index into `timed`.
+#[allow(dead_code)] // wired to the panel next
+    pub fn line_at(&self, secs: f64) -> Option<usize> {
+        if self.timed.is_empty() {
+            return None;
+        }
+        // The last line whose moment has passed. `partition_point` rather than a scan:
+        // this runs on every frame while lyrics are open.
+        let after = self.timed.partition_point(|(at, _)| *at <= secs);
+        after.checked_sub(1)
+    }
+}
+
+pub fn lyrics(session: &Session, track_id: u64) -> Result<Lyrics, String> {
+    let body = get_body(
+        &format!("{API_URL}/tracks/{track_id}/lyrics"),
+        session,
+        &[("countryCode", session.country_code.as_str())],
+    )?;
+    let v: serde_json::Value = serde_json::from_str(&body).map_err(|e| format!("{e}: {body}"))?;
+    Ok(Lyrics {
+        plain: v["lyrics"].as_str().unwrap_or_default().to_string(),
+        timed: parse_lrc(v["subtitles"].as_str().unwrap_or_default()),
+    })
+}
+
+/// Parses the LRC subtitles TIDAL returns: `[mm:ss.cc] the words`.
+///
+/// Lines without a stamp are dropped rather than guessed at — a lyric shown at the
+/// wrong moment is worse than one not shown.
+fn parse_lrc(text: &str) -> Vec<(f64, String)> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let Some(rest) = line.strip_prefix('[') else { continue };
+        let Some((stamp, words)) = rest.split_once(']') else { continue };
+        let Some((mins, secs)) = stamp.split_once(':') else { continue };
+        let (Ok(m), Ok(s)) = (mins.trim().parse::<f64>(), secs.trim().parse::<f64>()) else {
+            continue;
+        };
+        out.push((m * 60.0 + s, words.trim().to_string()));
+    }
+    // TIDAL sends them in order, but a sorted list is what `line_at` assumes and it is
+    // cheap to guarantee here rather than to trust.
+    out.sort_by(|a, b| a.0.total_cmp(&b.0));
+    out
+}
+
 /// Where the audio actually is. Two shapes, because TIDAL serves the two tiers
 /// differently and the difference reaches all the way down to the decoder.
 #[derive(Clone, Debug, PartialEq)]
@@ -1238,6 +1511,70 @@ mod tests {
         let (stream, _) = listener.accept().unwrap();
         assert!(handle_callback(stream).is_none());
         assert!(client.join().unwrap().starts_with("HTTP/1.1 404"));
+    }
+
+#[test]
+    fn lrc_subtitles_become_moments_and_unstamped_lines_are_dropped() {
+        let lrc = "[00:12.30]First line\n[01:05.00]Second line\nno stamp here\n[00:40.5]Middle";
+        let timed = parse_lrc(lrc);
+        // Sorted, whatever order they arrived in, because line_at assumes it.
+        assert_eq!(
+            timed,
+            [
+                (12.3, "First line".to_string()),
+                (40.5, "Middle".to_string()),
+                (65.0, "Second line".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn the_current_lyric_is_the_last_one_whose_moment_has_passed() {
+        let l = Lyrics {
+            plain: String::new(),
+            timed: vec![
+                (10.0, "one".into()),
+                (20.0, "two".into()),
+                (30.0, "three".into()),
+            ],
+        };
+        // Before the first moment there is no line yet — an intro is not a lyric.
+        assert_eq!(l.line_at(0.0), None);
+        assert_eq!(l.line_at(9.9), None);
+        assert_eq!(l.line_at(10.0), Some(0));
+        assert_eq!(l.line_at(29.9), Some(1));
+        assert_eq!(l.line_at(300.0), Some(2));
+        // Nothing timed at all: the panel shows plain text and never highlights.
+        assert_eq!(Lyrics::default().line_at(5.0), None);
+    }
+
+    #[test]
+    fn a_playlist_is_mine_only_when_the_creator_is_me() {
+        let json: serde_json::Value = serde_json::from_str(
+            r#"{"uuid":"abc","title":"Mix","numberOfTracks":12,"creator":{"id":42,"name":"Pedro"}}"#,
+        )
+        .unwrap();
+        assert!(parse_playlist(&json, Some(42)).mine);
+        assert!(!parse_playlist(&json, Some(7)).mine);
+        // An editorial playlist has no creator id, so it can never be mistaken for mine.
+        let editorial: serde_json::Value =
+            serde_json::from_str(r#"{"uuid":"x","title":"Jazz","creator":{}}"#).unwrap();
+        let p = parse_playlist(&editorial, Some(42));
+        assert!(!p.mine);
+        assert_eq!(p.owner, "TIDAL");
+    }
+
+    #[test]
+    fn an_album_keeps_only_the_year_of_its_release_date() {
+        let json: serde_json::Value = serde_json::from_str(
+            r#"{"id":1,"title":"Rumours","releaseDate":"1977-02-04","numberOfTracks":11,
+                "audioQuality":"HI_RES_LOSSLESS","artists":[{"name":"Fleetwood Mac"}]}"#,
+        )
+        .unwrap();
+        let a = parse_album(&json);
+        assert_eq!(a.year, Some(1977));
+        assert_eq!(a.artist, "Fleetwood Mac");
+        assert_eq!(a.quality, "HI_RES_LOSSLESS");
     }
 
     #[test]
