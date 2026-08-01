@@ -3540,6 +3540,44 @@ dismissing it.
 
 568 tests.
 
+## 2026-08-01 - Sharing what is playing, owned by the daemon
+
+`leader n shift+s` publishes a link to what is playing; the same keys take it down. On
+shift, because putting something on the public internet should not be one letter away
+from "stop".
+
+**The daemon owns it, not a window.** That was the requirement — a link that dies
+because you closed the terminal that made it is not a link you would give anybody — and
+it is why the daemon was built before this rather than after.
+
+**What is served is not the samples.** Teeing the decoded audio on its way to the DAC is
+the obvious design and the wrong one: at 24/192 that is 1.1 MB per second of raw PCM,
+and sending it anywhere means adding an encoder, a format decision, and CPU spent on
+every packet whether anyone is listening or not. TIDAL's own stream is already
+compressed, so the listener gets that instead — the same parts, fetched again for them.
+It costs one extra download of a song somebody is already paying for, and nothing at all
+while nobody listens. It also keeps the share out of the playback path entirely: there
+is no shared buffer, so a slow listener cannot stall the music.
+
+The listener hears the track from its beginning rather than from the current second.
+Seeking into a stream nobody has buffered would mean guessing which segment matches
+which moment; hearing the same song from the top is honest, and pretending to be in
+sync when we are not would not be.
+
+**The link is not handed over until it answers.** cloudflared prints the URL several
+seconds before the edge will route to it — the first end-to-end test got `000` from a
+link that had just been announced as ready. `Share::start` now polls the public URL
+until it responds, because handing somebody a URL that does not work yet is handing them
+a broken link.
+
+Verified against the real tunnel: page 200, state 200, and 79 MB of audio pulled through
+the public URL before it was taken down again.
+
+Said plainly, because it deserves it: this re-transmits licensed audio to whoever holds
+the URL. The token is sixteen random bytes and the link dies with the session, which
+makes it a private link rather than a service. It is not described here as anything
+cleverer than that.
+
 ## Gotchas (do not re-learn)
 
 - `runnir.json` WINS over `runnir.toml`. `Config::try_load` reads the JSON the settings
@@ -3567,6 +3605,8 @@ dismissing it.
   none of the interactive ones: `sub_status 1002` refuses the device flow, `error 11102`
   refuses the authorization-code flow. 11102 with a loopback AND with the app redirect
   is the proof that the redirect is not what is being refused.
+- `cloudflared` prints a quick-tunnel URL SECONDS before the edge routes to it. A link
+  handed over the moment it appears fails for whoever opens it first.
 - ALSA frees a card a moment AFTER the process holding it dies. An exclusive open
   attempted immediately after another process let go gets `EBUSY` and, in a fallback
   chain, silently ends up somewhere else. Wait the card out before deciding it refused.

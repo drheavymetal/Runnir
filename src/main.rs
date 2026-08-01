@@ -30,6 +30,7 @@ mod project_session;
 mod pty;
 mod render;
 mod selection;
+mod share;
 mod session;
 mod settings;
 mod shell_integration;

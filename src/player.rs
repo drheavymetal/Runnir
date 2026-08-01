@@ -1094,6 +1094,10 @@ pub enum Cmd {
     /// The config changed: the output device or bit-perfect setting may be different.
     /// Takes effect on the next track, since the current one is already on a device.
     Reconfigure(Box<TidalCfg>),
+    /// Publish a link to what is playing, or take it down. Handled by the daemon rather
+    /// than by the player: a link must outlive the window that asked for it, which is
+    /// the whole reason the daemon exists.
+    Share(bool),
     Quit,
 }
 
@@ -1117,6 +1121,8 @@ pub struct Snapshot {
     /// The last [`WAVE_LEN`] loudness readings, oldest first — a scrolling picture of
     /// what has just been heard. Drawn by the panel; empty when nothing is playing.
     pub wave: Vec<f32>,
+    /// The public link, when there is one.
+    pub share: Option<crate::share::State>,
 }
 
 impl Snapshot {
@@ -1249,6 +1255,9 @@ fn run(
         match cmd {
             Cmd::Quit => return,
             Cmd::Reconfigure(next) => cfg = *next,
+            // Handled by the daemon, which owns the tunnel. Reaching the player means
+            // there is no daemon — a single-window build — and there is nothing to do.
+            Cmd::Share(_) => {}
             Cmd::Play { tracks, at } => {
                 if tracks.is_empty() {
                     continue;
@@ -1446,6 +1455,7 @@ fn play_one(
                     }
                     Cmd::Enqueue(t) => set(state, wake, |s| s.queue.push(t.clone())),
                     Cmd::Reconfigure(next) => pending_cfg = Some(*next),
+                    Cmd::Share(_) => {}
                 }
             }
 

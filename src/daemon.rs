@@ -77,6 +77,9 @@ pub fn main(cfg: TidalCfg, creds: tidal::Creds) {
     // Nothing wakes a UI here: the daemon has none. Clients are told about changes by
     // the writer loop on their own connection.
     let jukebox = Arc::new(Jukebox::start(cfg, creds, Box::new(|| {})));
+    // One share for the machine, held by the daemon. A second window asking to share
+    // finds it already on rather than opening a second tunnel.
+    let share: Arc<Mutex<Option<crate::share::Share>>> = Arc::new(Mutex::new(None));
     let clients = Arc::new(AtomicUsize::new(0));
     // Set once a window has actually connected, so a daemon started a moment too early
     // does not decide it has been abandoned before anyone arrives.
@@ -89,6 +92,7 @@ pub fn main(cfg: TidalCfg, creds: tidal::Creds) {
         let seen_anyone = seen_anyone.clone();
         let jukebox = jukebox.clone();
         let path = path.clone();
+        let share_for_exit = share.clone();
         std::thread::Builder::new()
             .name("runnir-daemon-life".into())
             .spawn(move || {
@@ -104,6 +108,13 @@ pub fn main(cfg: TidalCfg, creds: tidal::Creds) {
                     }
                     if arrived && alive == 0 {
                         break;
+                    }
+                }
+                // The link goes first: a public URL still answering after the terminal
+                // is gone is exactly what nobody expects.
+                if let Ok(mut held) = share_for_exit.lock() {
+                    if let Some(share) = held.take() {
+                        share.stop();
                     }
                 }
                 jukebox.send(Cmd::Quit);
@@ -123,18 +134,53 @@ pub fn main(cfg: TidalCfg, creds: tidal::Creds) {
         seen_anyone.fetch_add(1, Ordering::Relaxed);
         let jukebox = jukebox.clone();
         let clients = clients.clone();
+        let share = share.clone();
         std::thread::Builder::new()
             .name("runnir-daemon-client".into())
             .spawn(move || {
-                serve(stream, &jukebox);
+                serve(stream, &jukebox, &share);
                 clients.fetch_sub(1, Ordering::Relaxed);
             })
             .ok();
     }
 }
 
+/// Starts or stops the public link, and records the result where every window sees it.
+fn set_share(jukebox: &Jukebox, share: &Mutex<Option<crate::share::Share>>, on: bool) {
+    let Ok(mut held) = share.lock() else { return };
+    let publish = |state: Option<crate::share::State>| {
+        if let Ok(mut s) = jukebox.shared().lock() {
+            s.share = state;
+            s.generation += 1;
+        }
+    };
+    if !on {
+        if let Some(share) = held.take() {
+            share.stop();
+        }
+        publish(None);
+        return;
+    }
+    if held.is_some() {
+        return; // already sharing; asking twice is not an error
+    }
+    // Starting blocks for as long as cloudflared takes to publish a URL — up to
+    // twenty-five seconds. It runs on this client's own thread, so the player keeps
+    // playing and every other window keeps being served while it happens.
+    match crate::share::Share::start(jukebox.shared()) {
+        Ok(share) => {
+            publish(Some(share.state()));
+            *held = Some(share);
+        }
+        Err(e) => publish(Some(crate::share::State {
+            error: Some(e),
+            ..Default::default()
+        })),
+    }
+}
+
 /// One window, for as long as it is open.
-fn serve(stream: UnixStream, jukebox: &Jukebox) {
+fn serve(stream: UnixStream, jukebox: &Jukebox, share: &Mutex<Option<crate::share::Share>>) {
     let Ok(write_half) = stream.try_clone() else { return };
 
     // The writer: pushes a snapshot whenever it differs from the last one sent. Polled
@@ -169,6 +215,9 @@ fn serve(stream: UnixStream, jukebox: &Jukebox) {
             continue;
         }
         match serde_json::from_str::<Cmd>(&line) {
+            // The share is the daemon's, not the player's: it must outlive the window
+            // that asked for it, and the player has no business knowing about tunnels.
+            Ok(Cmd::Share(on)) => set_share(jukebox, share, on),
             Ok(cmd) => jukebox.send(cmd),
             // A command this daemon does not understand comes from a newer window than
             // itself. Ignored rather than fatal: the answer is to restart the daemon,

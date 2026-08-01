@@ -867,6 +867,7 @@ impl Gpu {
             Action::TidalNext => self.tidal_send(crate::player::Cmd::Next, config),
             Action::TidalPrev => self.tidal_send(crate::player::Cmd::Prev, config),
             Action::TidalStop => self.tidal_send(crate::player::Cmd::Stop, config),
+            Action::TidalShare => self.tidal_share(config),
             Action::Map => self.show_map(),
             Action::WarRoom => self.open_war_room(config),
             Action::WarRoomClose => self.close_war_room(config),
@@ -3343,6 +3344,9 @@ impl Gpu {
                 "position": p.snapshot.position_secs,
                 "track": p.snapshot.now_playing().map(|t| format!("{} — {}", t.artist, t.title)),
                 "badge": p.snapshot.signal.badge(),
+                "share": p.snapshot.share.as_ref().map(|s| serde_json::json!({
+                    "url": s.url, "listeners": s.listeners, "error": s.error,
+                })),
                 "error": p.snapshot.error,
             });
         }
@@ -4096,6 +4100,7 @@ impl Gpu {
             Action::TidalNext => self.tidal_send(crate::player::Cmd::Next, config),
             Action::TidalPrev => self.tidal_send(crate::player::Cmd::Prev, config),
             Action::TidalStop => self.tidal_send(crate::player::Cmd::Stop, config),
+            Action::TidalShare => self.tidal_share(config),
             Action::Map => self.show_map(),
             Action::WarRoom => self.open_war_room(config),
             Action::WarRoomClose => self.close_war_room(config),
@@ -7201,6 +7206,24 @@ impl Gpu {
             self.tidal_send(cmd, config);
         }
         self.refresh_tidal_panel();
+    }
+
+    /// Turns the public link on or off.
+    ///
+    /// Off when there is one, on when there is not — one key for both, because the
+    /// panel always shows which state it is in and a second key would be a second thing
+    /// to remember for no gain.
+    fn tidal_share(&mut self, config: &Config) {
+        let sharing = self
+            .jukebox
+            .as_ref()
+            .is_some_and(|j| j.snapshot().share.as_ref().is_some_and(|s| !s.url.is_empty()));
+        if !sharing {
+            // Starting waits on cloudflared, which takes seconds. Say so, or the pause
+            // looks like nothing happened.
+            self.toast("Opening a tunnel — this takes a few seconds", 6);
+        }
+        self.tidal_send(crate::player::Cmd::Share(!sharing), config);
     }
 
     /// Moves the cursor, in whichever half has the keyboard.

@@ -3059,7 +3059,25 @@ impl TidalPanel {
             None => write(&mut g, bar, 0, &"\u{2500}".repeat(w), dim()),
         }
         write(&mut g, bar + 1, 2, &short_tail(&self.transport_line(), w.saturating_sub(4)), normal());
-        let foot = match self.message.as_deref() {
+        // The link takes the footer while there is one: it is the only thing on this
+        // panel somebody needs to READ rather than glance at, and the terminal's hint
+        // layer can only make it clickable if it is on screen in full.
+        let foot = match self.snapshot.share.as_ref() {
+            Some(share) if !share.url.is_empty() => {
+                let who = match share.listeners {
+                    0 => "nobody listening yet".to_string(),
+                    1 => "1 listening".to_string(),
+                    n => format!("{n} listening"),
+                };
+                return_share_footer(&mut g, bar + 1, w, &share.url, &who);
+                String::new()
+            }
+            Some(share) if share.error.is_some() => {
+                format!("share failed: {}", share.error.clone().unwrap_or_default())
+            }
+            _ => String::new(),
+        };
+        let foot = if !foot.is_empty() { foot } else { match self.message.as_deref() {
             Some(msg) => msg.to_string(),
             None if self.snapshot.error.is_some() => {
                 self.snapshot.error.clone().unwrap_or_default()
@@ -3079,7 +3097,7 @@ impl TidalPanel {
                 format!("{} \u{2190} skipped {skipped}", self.snapshot.signal.badge())
             }
             None => self.snapshot.signal.badge(),
-        };
+        } };
         let pen = if self.message.is_some() || self.snapshot.error.is_some() {
             accent()
         } else if self.snapshot.signal.is_bit_exact() {
@@ -3222,6 +3240,17 @@ impl TidalPanel {
             track.duration_secs % 60
         )
     }
+}
+
+/// Draws the share link over the transport row, where it is impossible to miss.
+///
+/// Over the transport and not under it: what is playing is on the panel three times
+/// already, and a public URL is the one thing here that has to be read exactly.
+fn return_share_footer(g: &mut Grid, row: usize, w: usize, url: &str, who: &str) {
+    write(g, row, 0, &" ".repeat(w), accent());
+    write(g, row, 2, &short_tail(url, w.saturating_sub(4 + who.chars().count())), selected());
+    let at = w.saturating_sub(who.chars().count() + 2);
+    write(g, row, at, who, selected());
 }
 
 /// One row as a line of text. Also what the remote control reports, so a script sees

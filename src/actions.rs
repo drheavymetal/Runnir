@@ -75,6 +75,8 @@ pub enum Action {
     TidalNext,
     TidalPrev,
     TidalStop,
+    /// Publish a link to what is playing, or take it down.
+    TidalShare,
     /// Zoom out: the session as a map of headlines.
     Map,
     /// Arrange the window around a deploy: watches, and the deploy staged.
@@ -181,6 +183,7 @@ impl Action {
             TidalNext => "tidal_next",
             TidalPrev => "tidal_prev",
             TidalStop => "tidal_stop",
+            TidalShare => "tidal_share",
             Map => "map",
             WarRoom => "war_room",
             WarRoomClose => "war_room_close",
@@ -277,6 +280,7 @@ impl Action {
             TidalNext => "Next track",
             TidalPrev => "Previous track",
             TidalStop => "Stop playing",
+            TidalShare => "Share what is playing (link)",
             Map => "Map: the session zoomed out to one headline per pane",
             WarRoom => "War room: arrange the window around a deploy",
             WarRoomClose => "War room: close it, keeping panes you typed in",
@@ -376,6 +380,7 @@ impl Action {
             "tidal_next" => TidalNext,
             "tidal_prev" => TidalPrev,
             "tidal_stop" => TidalStop,
+            "tidal_share" => TidalShare,
             "map" => Map,
             "war_room" => WarRoom,
             "war_room_close" => WarRoomClose,
@@ -485,6 +490,7 @@ impl Action {
             TidalNext,
             TidalPrev,
             TidalStop,
+            TidalShare,
             Map,
             WarRoom,
             WarRoomClose,
@@ -1091,6 +1097,9 @@ fn default_leader_bindings() -> HashMap<Chord, LeaderNode> {
         leaf(g, "f", TidalNext);
         leaf(g, "b", TidalPrev);
         leaf(g, "s", TidalStop);
+        // Shift, because publishing a link to the internet should not be one letter
+        // away from "stop".
+        leaf(g, "shift+s", TidalShare);
     });
     group(&mut m, "s", "Session", |g| {
         leaf(g, "s", SaveProjectSession);
