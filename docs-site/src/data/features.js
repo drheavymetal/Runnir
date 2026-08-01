@@ -21,6 +21,69 @@
 const R = String.raw
 
 export const FEATURES = [
+  {
+    key: 'tidal-player', section: 'distinctive', status: 'dev',
+    title: { es: 'Reproductor de TIDAL', en: 'TIDAL player' },
+    natural: {
+      es: 'runnir reproduce TIDAL él mismo, no abre otra aplicación. El panel tiene cinco fuentes a la izquierda —búsqueda, cola, favoritos, álbumes y listas— y lo que contengan en el centro. Una sola búsqueda devuelve pistas, álbumes, artistas y listas a la vez, y cada fila viene coloreada por la calidad que TIDAL serviría de verdad: eso importa porque pedir hi-res no significa recibirlo, y con color se ve antes de darle al play. El ratón funciona: un clic selecciona, el segundo sobre lo mismo actúa.',
+      en: 'runnir plays TIDAL itself rather than opening another application. The panel has five sources down the left — search, queue, favourites, albums and playlists — and what they hold in the middle. One search returns tracks, albums, artists and playlists together, and every row is coloured by the quality TIDAL would actually serve: that matters because asking for hi-res does not mean getting it, and the colour says so before you press play. The mouse works: one click selects, a second on the same thing acts.',
+    },
+    keys: [
+      'Leader N N',
+      { es: 'Leader N Espacio · play/pausa', en: 'Leader N Space · play/pause' },
+      { es: 'Leader N F / B / S · siguiente, anterior, parar', en: 'Leader N F / B / S · next, previous, stop' },
+      { es: '/ buscar · Enter reproducir o abrir · A encolar · L letras', en: '/ search · Enter play or open · A queue · L lyrics' },
+    ],
+    config: [
+      { k: 'tidal.client_id', v: '""', d: { es: 'Credencial de TIDAL. Sin ella el panel no existe; nunca va compilada en el binario.', en: 'TIDAL credential. Without it the panel does not exist; never compiled into the binary.' } },
+      { k: 'tidal.quality', v: '"hi_res_lossless"', d: { es: 'Calidad que se pide. Lo que llega puede ser menor, y la insignia dice lo que llegó.', en: 'The tier asked for. What arrives may be lower, and the badge reports what arrived.' } },
+    ],
+    note: {
+      es: 'El transporte funciona sin abrir el panel, y las teclas multimedia también: runnir se anuncia en MPRIS como cualquier otro reproductor.',
+      en: 'The transport works with no panel open, and so do the media keys: runnir announces itself on MPRIS like any other player.',
+    },
+  },
+  {
+    key: 'tidal-bitperfect', section: 'distinctive', status: 'dev',
+    title: { es: 'Bit-perfect al DAC', en: 'Bit-perfect to the DAC' },
+    natural: {
+      es: 'Cuando el DAC acepta el stream tal cual fue decodificado, no se toca ni una muestra: ni remuestreo, ni conversión de formato, ni volumen por software. Pero bit-perfect es el mejor caso, nunca un requisito — la música suena en el hardware que haya, bajando por una cadena de escalones, y la insignia nombra en cuál cayó y qué se saltó por el camino. Un DAC ocupado un instante se espera en vez de descartarlo: ALSA libera la tarjeta un momento después de que muera el proceso que la tenía, y sin esa espera abrir una ventana nueva mandaba la música a los altavoces del portátil.',
+      en: 'When the DAC accepts the stream exactly as decoded, not one sample is touched: no resampling, no format conversion, no software volume. But bit-perfect is the best case and never a requirement — the music plays on whatever hardware is there, walking down a ladder of rungs, and the badge names which one it landed on and what was skipped. A DAC that is busy for a moment is waited for rather than passed over: ALSA frees a card an instant after the process holding it exits, and without that wait opening a new window sent the music to the laptop speakers.',
+    },
+    config: [
+      { k: 'tidal.output', v: '"auto"', d: { es: '"auto" elige el primer dispositivo que acepte el stream intacto (un DAC USB va primero; una pantalla, nunca). Un nombre como "hw:2,0" lo fija. "default" entrega el audio al mezclador del sistema.', en: '"auto" picks the first device that takes the stream untouched (a USB DAC goes first, a display never). A name like "hw:2,0" pins one. "default" hands the audio to the system mixer.' } },
+      { k: 'tidal.bit_perfect', v: 'true', d: { es: 'Intentar el camino exclusivo. Apagarlo no rompe la reproducción, solo deja de intentarlo.', en: 'Try for the exclusive path. Turning it off does not break playback, it just stops trying.' } },
+    ],
+    note: {
+      es: 'En bit-perfect el volumen queda BLOQUEADO: no hay nada entre el decodificador y el DAC, así que ni el volumen del sistema ni las teclas de volumen tienen nada que decir. Solo el control del propio DAC.',
+      en: 'In bit-perfect mode the volume is LOCKED: there is nothing between the decoder and the DAC, so the system volume and the volume keys have no say. Only the DAC\u2019s own control does.',
+    },
+  },
+  {
+    key: 'tidal-daemon', section: 'distinctive', status: 'dev',
+    title: { es: 'La música no pertenece a una ventana', en: 'The music does not belong to a window' },
+    natural: {
+      es: 'El reproductor vive en su propio proceso y cada ventana es una vista sobre él. Cerrar la ventana donde empezaste una canción no la para; dos ventanas enseñan lo mismo en el mismo segundo; y un solo proceso tiene la tarjeta de sonido, con lo que el camino exclusivo deja de ser una carrera entre ventanas. La última ventana que se cierra sí se lleva la música: no hay modo de seguir sonando en segundo plano, y es a propósito.',
+      en: 'The player runs in its own process and every window is a view onto it. Closing the window where you started a song does not stop it; two windows show the same thing at the same second; and one process holds the sound card, so the exclusive path stops being a race between windows. The last window to close does take the music with it: there is no keep-playing-in-the-background mode, deliberately.',
+    },
+    note: {
+      es: 'Cerrar una ventana con música sonando pregunta antes, y pregunta aunque tengas confirm_close apagado: ese ajuste se escribió pensando en comandos de shell.',
+      en: 'Closing a window while music plays asks first, and asks even with confirm_close off: that setting was written about shell commands.',
+    },
+  },
+  {
+    key: 'tidal-share', section: 'distinctive', status: 'dev',
+    title: { es: 'Compartir lo que suena', en: 'Share what is playing' },
+    natural: {
+      es: 'Un enlace público a lo que estás escuchando, por un túnel de Cloudflare, detrás de un token aleatorio. El enlace pertenece al reproductor y no a la ventana que lo pidió, así que cerrar esa ventana no lo tumba. No se comparten las muestras decodificadas —a 24/192 son 1,1 MB/s de PCM crudo— sino el propio stream de TIDAL, que ya viene comprimido: no cuesta nada mientras nadie escucha, y un oyente lento no puede atascar la música porque no hay búfer compartido.',
+      en: 'A public link to what you are listening to, over a Cloudflare tunnel, behind a random token. The link belongs to the player and not to the window that asked for it, so closing that window does not take it down. What is served is not the decoded samples — 1.1 MB a second of raw PCM at 24/192 — but TIDAL\u2019s own stream, already compressed: it costs nothing while nobody listens, and a slow listener cannot stall the music because there is no shared buffer.',
+    },
+    keys: ['Leader N Shift+S'],
+    note: {
+      es: 'Necesita cloudflared instalado. Y conviene decirlo claro: retransmite audio con licencia a quien tenga la URL. El enlace muere al pararlo o con la última ventana.',
+      en: 'Needs cloudflared installed. And worth saying plainly: it re-transmits licensed audio to whoever holds the URL. The link dies when it is stopped or with the last window.',
+    },
+  },
   // ------------------------------------------------------------------ NUCLEO
   {
     key: 'tabs', section: 'core', status: 'shipped',

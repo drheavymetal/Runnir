@@ -2923,8 +2923,930 @@ started), and a wheel click still moving its full `wheel_lines` step at once.
 506 tests. Not yet confirmed on the laptop by hand — that is Pedro's call, and the
 report rate of a real touchpad is exactly what a test cannot stand in for.
 
+## DESIGN, NOT YET BUILT — TIDAL in the terminal, bit-perfect when the hardware allows (2026-08-01)
+
+**Why.** Pedro's music is on TIDAL and his DAC is a HiBy R3. Every client that plays it
+is either a browser in a box — which resamples to 48 kHz before the audio ever leaves
+the application — or a whole separate app sitting beside the terminal he already lives
+in. runnir has the pieces a console player needs, and it has them together: a cell
+renderer that draws more than text (the map's rain is the precedent), a leader layer
+with a free letter, a hint layer that makes a URL clickable, and three panels — git,
+docker, explorer — that already read as consoles.
+
+**The reference, and the line drawn around it.** mySone (`~/myProjects/mySone`, Pedro's
+fork of `lullabyX/sone`) already does this well, and it was read as a PROTOCOL
+reference: which endpoints exist, what the manifests carry, how ALSA's format names
+line up. No code is copied. sone is GPL-3.0-only and runnir carries no licence at all;
+copying would decide runnir's licence as a side effect of shipping a feature, and that
+is not how that decision should get made.
+
+**What reading it saved** (each of these is a day found the hard way otherwise):
+
+- auth is the OAuth device flow at `auth.tidal.com/v1/oauth2/device_authorization`,
+  scope `r_usr w_usr w_sub`, approved by the user at `link.tidal.com`.
+- the stream comes from `/tracks/{id}/playbackinfopostpaywall`, whose response carries
+  `manifestMimeType` and a base64 `manifest`.
+- `application/vnd.tidal.bts` is a JSON envelope with direct URLs. The easy path, and
+  what LOSSLESS 16/44.1 arrives as.
+- `application/dash+xml` is an MPD, and hi-res arrives that way: fragmented MP4 with
+  FLAC inside, one Representation, a SegmentTemplate. sone hands the XML to GStreamer's
+  `dashdemux`; runnir has no GStreamer and must assemble init + segments itself.
+- ALSA and GStreamer name 24-bit formats in OPPOSITE directions — ALSA `S24LE` is
+  24-in-a-32-bit container, ALSA `S243LE` is packed 24. Getting this backwards produces
+  noise, not an error.
+- the same response carries `bitDepth`, `sampleRate` and both ReplayGain figures, so
+  the badge can be honest before a single sample is decoded.
+
+**Stack.** No GStreamer, no tokio. `ureq` (already a dependency) on worker threads for
+HTTP, `symphonia` for FLAC and the MP4 demux, the `alsa` crate for output. Rust the
+whole way down, which makes bit-perfect easier rather than harder: decoded `i32`
+samples go straight to the device at the source's own rate with nothing in between
+that could resample or scale them.
+
+**Output is a chain, not a switch.** Bit-perfect is the best case, never a
+requirement — the music plays on whatever hardware is actually there. Per track, in
+order:
+
+1. the device named in the config, if it accepts the native rate and format — bit-perfect
+2. auto: the first ALSA device that accepts them exclusively — where the R3 lands when
+   it is plugged in
+3. exclusive at the nearest format the DAC does accept (24→32 is zero-padding and stays
+   bit-exact; a resample does not)
+4. `plughw:X,Y` — ALSA converts
+5. `default` — PipeWire/Pulse: laptop speakers, headphone jack, HDMI, bluetooth. Never
+   bit-perfect, never fails.
+
+The status line names the rung it is standing on, because a player that claims
+bit-perfect while PipeWire resamples underneath it is worse than one that never claimed
+it:
+
+    FLAC 24/192 · hw:2,0 HiBy R3 · S32LE · BIT-PERFECT
+    FLAC 24/96  · hw:2,0 HiBy R3 · S32LE · exclusive (24→32, zero-pad)
+    FLAC 24/192 · default PipeWire · 48 kHz · SHARED · resampled 192→48
+
+An output picker (`leader n o`) lists the cards from `/proc/asound/cards` and marks
+which ones would be bit-perfect for the current track, so the cost of using the
+speakers is visible rather than assumed. Hotplug is watched on `/dev/snd`; when the
+preferred device appears the switch waits for the next track boundary, because
+switching mid-track cuts the sound. Known trap: if PipeWire is holding the card,
+exclusive returns `Device busy` — that is rung 4, not a failure, and the badge has to
+say so or bit-perfect will look broken when it is merely unavailable.
+
+**Credentials.** Never embedded. This repo is public, and sone's XOR-obfuscated
+`embedded_config.rs` is precisely the pattern not to carry into a public tree. They
+live in `~/.config/runnir/config.toml` under `[tidal]`, mode 0600, secret overridable
+from the environment — the shape the AI configurator already established. No
+credentials, no panel. Note for whoever builds it: `Config` is `deny_unknown_fields`,
+so the `[tidal]` struct must exist in code BEFORE that block may appear in a live
+config file, or every window stops parsing its config.
+
+**The panel.** `leader n`. `t` for tidal was the wish, but `t` is the Tabs group with
+ten bindings and that memory is older than this feature; `n` was free at the top level.
+Three columns, the same bar the git panel set: sources (library, playlists, albums,
+artists, mixes, search) | list | track detail. `hjkl` to move, space to play, `/` to
+search, `a` to enqueue, `o` for the output picker. Transport and the signal-path badge
+live in the status bar. The spectrum is drawn in braille from the player's own decode
+buffer — with a real player inside, `cava` is no longer needed, and `media.rs` can stop
+shelling out to `playerctl` to watch someone else's music.
+
+**Deliberately out of scope.** MQA (no free decoder). Offline downloads. macOS playback:
+ALSA is Linux, so the output backend sits behind a trait and macOS gets browse-only
+until someone writes a CoreAudio one — saying that up front is better than shipping a
+panel that silently does nothing there.
+
+**The unknown that decides how big this is.** Whether `symphonia` reads FLAC inside
+fragmented MP4. If it does, hi-res is the same code path as everything else. If it does
+not, the fMP4 has to be demuxed by hand to recover the FLAC frames, and that is a
+different size of project. This gets answered first, before anything else is built.
+
+**Phases.** 0: the device flow, `playbackinfopostpaywall`, and one LOSSLESS track
+reaching ALSA — behind a flag, no UI. It is the only phase carrying real risk. 1: the
+panel, library, search, queue, transport, `leader n`. 2: bit-perfect proper — hardware
+probing, the full fallback chain, hi-res over DASH, the signal-path badge. 3: the player
+daemon — one owner of the sound, every window a view onto it (see below; this moved
+ahead of MPRIS because MPRIS becomes nearly free once the daemon exists and announces
+itself once, instead of each window announcing a player it may not own). 4: MPRIS, so
+media keys and `playerctl` drive it like any other player. 5: a share link over a
+Cloudflare quick tunnel, the way sone does it — worth naming plainly that this
+re-transmits licensed audio to whoever holds the URL, so it dies with the session.
+
+**What "the same in every window" means**, since that is the requirement and it is
+easy to over-promise. SHARED: the track, the position, the queue, the quality and the
+signal path — and the transport in any window commands the one sound. LOCAL: the
+browsing cursor, the album being looked at, the search being typed. Wanting to dig
+through the library in one window without moving what the other one is showing is the
+normal case, not an edge case.
+
+### Where the pieces go, and why there
+
+Nothing here is a new pattern; every one of these already exists in the codebase and is
+being followed rather than invented.
+
+- `src/tidal.rs` — the service: device-code auth, token refresh, the catalog calls,
+  `playbackinfopostpaywall`, and both manifest parsers. Pure request/response, no UI
+  types, same as `docker.rs` and `git.rs` are to their panels.
+- `src/player.rs` — the audio side: the fetcher, the decoder, the output chain and the
+  signal-path snapshot. It owns its threads and never touches the grid.
+- `TidalPanel` in `overlay.rs` — the columns, the cursors, the focus, the scroll. Panel
+  STATE lives in the overlay module with the other panels; panel LOGIC does not.
+- `UserEvent::Tidal(u64, tidal::PanelMsg)` and `UserEvent::Player(player::Msg)` — the
+  proxy wake, the only safe way into the UI thread. The `u64` is the request sequence,
+  for the same reason the docker panel carries one: a slow search answering after the
+  cursor moved must be dropped, not drawn under the wrong title.
+
+**Threads.** Every HTTP call runs on a spawned worker and answers through the proxy —
+the UI thread never waits on the network. The player owns two of its own: a fetcher
+(HTTP → byte channel) and a decode/output thread (symphonia → ALSA), joined by a bounded
+`std::sync::mpsc` channel that doubles as the buffer. `std` channels, not crossbeam;
+there is no async runtime in this program and this feature is not the reason to add one.
+
+**Where the session is kept.** `dirs::data_dir()/runnir/tidal-session.json`, mode 0600 —
+refresh token, access token, expiry, country code. `data_dir` and not `config_dir`
+because that is where `session.rs` already writes, and the two disagreeing is a known
+piece of debt in this repo (see the explorer persistence entry); this must not add a
+third opinion.
+
+**The `[tidal]` config block.**
+
+    [tidal]
+    client_id = "..."         # required; without it the panel does not exist
+    client_secret = "..."     # or RUNNIR_TIDAL_SECRET in the environment
+    quality = "hi_res_lossless"   # hi_res_lossless | lossless | high
+    output = "auto"           # "auto" | "hw:2,0" | "default"
+    bit_perfect = true        # false forces the shared path even when exclusive is free
+    volume_normalization = false  # ReplayGain scales samples, so it is off with bit-perfect
+
+**Not in v1, on purpose:** gapless playback (needs the next track decoded before this
+one ends, which is a scheduler, not a feature), queue persistence across restarts
+(`session.rs` can carry it later), and lyrics.
+
+### The player belongs to the WINDOW, not to a pane (decided with Pedro, 2026-08-01)
+
+Every other panel in this program is scoped to something: the explorer to a tab, the
+git panel to a pane's repository, the viewer to whatever was opened. The player must
+not be. Music is not a view of the terminal, it is a thing the terminal is doing, and
+the panel is only a window onto it.
+
+Consequences, and they are the requirement, not a nicety:
+
+- the player lives on `App`, beside the config and the theme — never on `Tab` or `Pane`.
+- closing the pane the panel was opened from does not stop the music. Closing the TAB
+  does not stop it. Closing the panel does not stop it; `leader n` reopens onto the same
+  playing track, the same queue, the same position.
+- the transport keeps working from anywhere: the status-bar badge and the media keys
+  answer whatever pane has focus, because focus is not what owns the sound.
+- only quitting the window stops it, and that gets asked about first.
+
+**Closing the window while music plays asks first.** `request_close` already knows how
+to hold the window open and put a question on screen when commands are still running.
+Playback joins that question — "Close runnir? Music is still playing" — with one
+difference worth being deliberate about: the running-commands confirm obeys
+`behaviour.confirm_close`, and the music one does NOT. That setting was written about
+shell commands, where the answer is usually "yes, I know". Silently killing playback is
+a different kind of surprise, and the person who turned that setting off did not turn
+this one off.
+
+One window, one player — in v1. A second runnir window does not take the sound: whoever
+holds the ALSA device holds it, and the second window's panel says so rather than
+fighting for it (the exclusive device would refuse anyway — that is `Device busy`, rung
+4 of the output chain).
+
+### Surviving ACROSS instances — the daemon, and why the panel must not know yet
+
+Pedro asked whether the music could outlive any single window and be visible from all
+of them. It can, and this program is unusually close to it already: every instance opens
+a control socket at `$XDG_RUNTIME_DIR/runnir-<pid>.sock`, and since the second-window
+fix of 2026-07-22 it can tell a LIVE instance from a stale socket file, which is the
+hard half of the problem.
+
+Three levels, and only the first two are cheap:
+
+1. **Visible everywhere** — the playing instance announces on MPRIS, every other
+   instance reads the bus and paints the same now-playing with a working transport.
+   That is phase 3 as already planned, and it costs nothing extra. The sound still dies
+   with the window that owns it.
+2. **Handover on close** — the closing window passes queue and position to a live
+   sibling over the control socket. Cheap, but there is a gap of about a second and the
+   device is released and re-acquired.
+3. **A player daemon** — the player is its own process, every window is a view onto it.
+   Music survives any window closing; there is exactly one owner of the DAC, so the
+   contention above stops existing; and all panels agree because they read one state.
+   The costs are real: process lifecycle, a state protocol, what happens when the daemon
+   dies, and one policy decision, which Pedro settled: **when the last window closes the
+   daemon goes with it.** Nothing keeps playing in the background without a runnir on
+   screen. A music player that outlives its UI is a process you find later in `ps` and
+   wonder about, and the close already owes a warning anyway — that warning is now also
+   the daemon's shutdown.
+
+Level 3 is the right architecture and it is a later phase, not this one. What matters
+TODAY is not building it, but not making it expensive: the panel never talks to the
+player directly. It talks to a `PlayerHandle` — in-process in phase 1, socket-attached
+when the daemon lands. The player was already going to live behind a message channel on
+its own threads, so moving it to another process moves that channel onto a socket that
+already exists. Skip this and the panel grows in-process assumptions that have to be
+torn out later; keep it and the daemon is one more phase rather than a rewrite.
+
+## 2026-08-01 - Phase 0: the risky half answered, and three things the design had wrong
+
+The question the whole design hung on — **does symphonia read FLAC inside fragmented
+MP4, from a stream that cannot seek?** — is answered: yes, exactly.
+
+    codec AudioCodecId(8192)
+    decoded S32 96000 Hz, 2 channels
+    frames 576000  (6.00 s at 96 kHz)
+
+Six seconds in, six seconds out, not a frame lost. Hi-res is therefore the same code
+path as everything else and the project does not grow. The fixture is a DASH stream
+made with ffmpeg (`-c:a flac -f dash`), read as init segment + three media segments
+through a reader that refuses to seek — the same shape TIDAL sends, on a machine with
+no subscription in the way.
+
+That last part is now permanent: `runnir --tidal-decode [--play] <file…>` runs local
+files through the real decoder and the real output chain. Without `--play` it opens no
+device and makes no sound. The split earns its place immediately — "this stream does
+not decode" and "this device will not take it" are otherwise the same silence.
+
+### What the real world corrected
+
+**The device flow does not work with a web player client id.** TIDAL answers
+`Client is not a Limited Input Device client` (`sub_status 1002`), and that is not a
+misconfiguration to report — it is "sign in the other way". `--tidal-login` now tries
+the device flow and, on that specific refusal, switches to PKCE by itself: it prints an
+authorize URL, the browser lands on a tidal.com page that looks broken, and the grant
+code is in its address bar. Pasting the whole address back finishes it. No local
+callback server, no port held open — a terminal catching a redirect by hand.
+
+**ALSA's hint iterator does not list `hw:` devices.** It returns `default`,
+`sysdefault:CARD=…`, `front:…`, `hdmi:…` — conversion and routing aliases, not one of
+them openable exclusively. The real cards are in `/proc/asound`: `cards` for the list,
+then each card's `pcmNp` directories for its playback devices. `pcmNc` is capture and
+must be skipped, or the chain offers a microphone as an output.
+
+**HDMI would have won `auto`, and that is the worst bug this feature could ship.** This
+machine has eight HDMI outputs across two cards. Every one of them accepts 48 kHz
+without complaint, so for a 48 kHz track an idle monitor could take the BIT-PERFECT
+rung — with the music going to a screen that may have no speakers while headphones sit
+in the jack. Silence that reports success. `auto` now never chooses a display; they are
+reachable only by name. A machine whose ONLY output is HDMI still uses it, because
+there the monitor is the speakers.
+
+**`$Number%05d$`.** The MPD ffmpeg wrote uses the padded form of the segment
+identifier, and the hand parser only replaced the bare `$Number$`. Every segment URL
+would have 404'd, which downstream looks like a truncated song rather than a parsing
+bug. The expander now handles both forms and any width, and `<BaseURL>` is honoured for
+manifests whose segments are relative. The ffmpeg manifest is a test fixture now:
+written by a real encoder rather than by the person who wrote the parser.
+
+### Where phase 0 stands
+
+Signed in: **not yet** — the browser half is Pedro's to do. Everything up to it is
+built and tested: 17 tests over the TIDAL module (manifests, PKCE, session refresh) and
+12 over the player (the chain order, the device enumeration, the badge).
+
+Unverified and unverifiable from here: **whether a DAC actually takes the stream
+untouched, and whether it sounds right.** That needs the hardware and an ear, and it is
+the reason the two verification commands exist rather than a test claiming to cover it.
+
+## 2026-08-01 - Phase 1: the player is the window's, and the panel is only a window onto it
+
+`leader n`. The letter `t` for tidal was the wish and it is taken by the Tabs group,
+which has ten bindings and years of muscle memory behind it; a new feature does not get
+to evict that. `n` was the only letter free at the top level, and the group reads
+`n n` panel, `n space` play/pause, `n f` forward, `n b` back, `n s` stop.
+
+**Where the player lives is the whole design.** It sits on `Gpu` — the window — beside
+the config and the theme. Not on a tab, not on a pane, not on the panel. So closing the
+pane the panel was opened from does not stop the music, closing the tab does not, and
+closing the panel does not; `leader n` reopens onto the same track at the same second.
+The transport is on the leader rather than only in the panel for the same reason: what
+is playing is not a property of what has focus.
+
+The panel holds no playback state at all. It is handed a `Snapshot` — one struct,
+cloned under a lock, so a reader can never catch half an update — and everything it can
+command travels as a small `Cmd` enum. Both halves are deliberately the shape of a wire
+protocol, because phase 3 moves the player into its own process and the panel should
+not notice.
+
+**Closing the window while music plays asks first, and asks even when
+`behaviour.confirm_close` is off.** That setting was written about shell commands, where
+the answer is usually "yes, I know". Silently killing playback is a different kind of
+surprise, and whoever turned that setting off did not turn this one off. The prompt
+names the song rather than counting it: "1 thing is playing" is a fact, but the title is
+what tells you whether you meant to stop it.
+
+Smaller decisions, each of which had a wrong version:
+
+- Enter on a search result plays the WHOLE result list from there. A list of songs on
+  screen implies an album's worth of intent; playing one and stopping is the surprising
+  reading.
+- Escape leaves the query box before it closes the panel. One key meaning two things is
+  fine as long as the smaller one goes first.
+- Opening with a queue opens on the QUEUE, not on search: with music playing, opening
+  the panel is nearly always "what is this?".
+- "Previous" restarts the track after three seconds and goes back before that, because
+  a mis-pressed previous should be cheap to undo.
+- A track that fails to play is reported and the queue moves on. One bad track does not
+  end the evening.
+
+The remote control reports the panel the way it reports git and docker — view, query,
+cursor, rows, position, badge — which is how this gets checked on a real instance
+rather than by reading the drawing code.
+
+540 tests. The `leader n` which-key was rendered headless (`runnir --demo … n`) and
+shows the five entries.
+
+## 2026-08-01 - It plays, and the desktop knows about it
+
+First sound out of runnir: Opeth, from the panel, driven by the remote control on an
+isolated instance. What the run proved, and what it broke.
+
+**Signing in: neither flow works, and for the same reason.** A TIDAL client id is
+registered for particular flows, and the one everybody has is registered for none of the
+interactive ones. The device flow answers `sub_status 1002` ("not a Limited Input Device
+client"). The authorization-code flow answers **error 11102** — with the app redirect AND
+with a loopback one, which is what settles it: the redirect was never the problem, the
+client was. A different first-party client id (the one `tidalapi` uses for PKCE) does
+accept the authorization-code flow, and with it the login page appears, credentials are
+taken, and TIDAL redirects to a page of its own that does not exist. That "page not
+found" IS the success case: the grant code is in the address bar.
+
+So the loopback callback is built, tested and unreachable for now. A local listener is
+the only way a terminal can CATCH an OAuth answer, and no first-party client id will
+redirect to one. The only route to a real callback is an app registered on
+`developer.tidal.com`, where the redirect is yours to declare — worth trying, but only
+once it is known whether such a token reaches `playbackinfopostpaywall` at full quality.
+Until then the sign-in is: click the link, log in, paste the address once. The code lives
+about sixty seconds, which is worth knowing before wondering why the first paste failed.
+
+**LOSSLESS arrives as DASH, not as BTS.** 16-bit/44.1 kHz came back as
+`application/dash+xml` — init segment plus media segments — not as the `vnd.tidal.bts`
+envelope that the tier was expected to use. The DASH path was built for hi-res and
+proven against an ffmpeg fixture the day before; without that, nothing would have played
+today. The BTS parser now has the opposite problem: it exists, it is unit-tested against
+a manifest written by the same person who wrote the parser, and it has never seen a real
+response. Whether TIDAL still sends BTS at all is an open question and it is on the list.
+
+**The badge was already lying, on its very first line.** It read `LOSSLESS 32/44.1 kHz`
+for a 16-bit track, because the depth was taken from the width of the buffer symphonia
+decodes into rather than from the stream. Every lossless track would have been reported
+as 32-bit — and the chain would have gone looking for a 32-bit device for a 16-bit
+stream. The codec parameters carry the real depth; the buffer width is now only the
+fallback, and a declared depth outside 8..=32 is ignored rather than believed.
+
+**MPRIS, brought forward from phase 4 to now**, because Pedro noticed the obvious: the
+desktop had no idea anything was playing, so the media keys went elsewhere and nothing
+could pause it from outside the window. runnir now announces itself on the session bus.
+Verified on the real bus: `playerctl -l` lists it, the metadata is right, and
+`playerctl -p runnir play-pause` pauses and resumes what the panel is playing.
+
+It lives on one thread of its own blocking on a small executor. D-Bus is asynchronous
+and runnir has no runtime; rather than grow one, the whole interface sits behind the same
+`Cmd` channel and `Snapshot` the panel uses. Two deliberate refusals in the interface:
+`Quit` is not supported (a widget's close button would take the whole terminal with it),
+and the volume is fixed at 1.0 and read-only — in bit-perfect mode there IS no volume to
+change, and a slider that silently does nothing is worse than one that is obviously
+fixed.
+
+**Still unproven, and the important half:** everything above played through PipeWire with
+`bit_perfect = false`. The exclusive `hw:` open, the BIT-PERFECT rung, hi-res over DASH,
+and the badge telling the truth about which rung it landed on are all untested. That
+needs the DAC and an ear.
+
+Two things to know before that test. The first exclusive open BYPASSES the system volume
+entirely — no PipeWire, no volume keys, nothing between the decoder and the DAC — so the
+system volume must be down before it, not after. And a real instance driven by the remote
+control must be identified by `/proc/<pid>/exe`: the socket picked by recency belongs to
+whichever window answered last, which today was Pedro's own.
+
+## 2026-08-01 - The BTS manifest never turns up, and asking is now a command
+
+`runnir --tidal-info <track>` asks TIDAL what it would serve for one track at each tier
+and prints the answer: manifest shape, codec, depth, rate. It makes no sound, which is
+the point — "is this really hi-res" and "which manifest does this tier use" should not
+require playing a song out loud.
+
+The answer to the open question, on this account:
+
+    HI_RES_LOSSLESS   served LOSSLESS         DASH, 183 segments + init   16 bit / 44100   flac
+    LOSSLESS          served LOSSLESS         DASH, 183 segments + init   16 bit / 44100   flac
+    HIGH              served HIGH             DASH, 183 segments + init   ?                mp4a.40.2
+
+**DASH at every tier, including the lossy one. `vnd.tidal.bts` never appears.** The BTS
+parser stays — it is fifteen lines, TIDAL's own API still documents that mime type, and
+older or region-specific content may yet use it — but it is now labelled for what it is:
+a path that has never seen a real response, covered only by a manifest written by the
+person who wrote the parser. If it ever fires, that is the first time it has been
+exercised, and the failure will be loud rather than silent because an unknown manifest
+type is an error here, not a fallback.
+
+The same command settles what the badge is for. Asking for `HI_RES_LOSSLESS` does not
+mean getting it:
+
+    Fleetwood Mac — Dreams     served HI_RES_LOSSLESS   24 bit / 96000
+    Metallica — Battery        served HI_RES_LOSSLESS   24 bit / 44100
+    Daft Punk — Get Lucky      served LOSSLESS          16 bit / 44100
+    Heilung — Alfadhirhaiti    served LOSSLESS          16 bit / 44100
+
+Four tracks, two tiers, one request. The badge reports what ARRIVED, and this is why
+that distinction is worth the code it costs.
+
+## 2026-08-01 - A licence, and the catalogue behind the panel
+
+**runnir is GPL-3.0-only from today.** It had no licence at all, which is the worst of
+both worlds: nobody may legally use it and nothing may legally be borrowed into it.
+Pedro chose copyleft knowing what it does — not that it prevents charging, which it does
+not, but that whoever receives runnir receives the source and the same freedoms, and
+that derivatives stay under the same terms. It also unblocks reusing code from mySone
+(GPL-3.0-only) rather than only reading it for protocol facts.
+
+**The catalogue layer**, verified against the real service in one command
+(`runnir --tidal-browse <words>`), because unit tests cover parsing and only a real call
+covers the SHAPE a service answers with:
+
+    search "Opeth" -> 5 tracks, 5 albums, 5 artists, 5 playlists
+    album "Damnation": 8 tracks · artist "Opeth": 50 top tracks
+    my playlists: 17 · favourite tracks: 99
+    lyrics for "Ghost of Perdition": 70 timed lines, 1555 chars plain
+
+One search request for four types rather than four requests: the panel shows them
+together, and someone typing does not want the artists to arrive a second after the
+tracks. Favourites come wrapped in an envelope carrying the date they were added, so the
+thing itself is a level down — handled once here rather than in four callers.
+
+Two details worth keeping. A playlist is "mine" only when its creator id matches the
+session's user id; TIDAL's own editorial playlists have no creator id at all, so they
+can never be mistaken for one of yours. And the LRC subtitles are sorted after parsing
+even though they arrive in order, because `line_at` binary-searches them — trusting the
+order would be a bug that only shows up on the one track where it is wrong.
+
+## 2026-08-01 - The panel grows sources, a colour for the tier, and words
+
+`leader n` stopped being a search box with a queue behind it. Five sources down the
+left — search, queue, favourites, albums, playlists — and the middle column shows
+whatever the one you are on holds.
+
+**The tier is a colour, not a word.** Pedro asked for the resolution to be visible
+BEFORE pressing play, and he was right to: on this account, Dire Straits, Miles Davis
+and Yello are all requested as HI_RES_LOSSLESS and all arrive as 16/44.1. Hi-res takes
+the accent, lossless is plain, lossy is dimmed, and a three-character tag (MAX/LSL/AAC)
+carries the same information for anyone who reads text before colour. An artist row has
+no tier and gets no tag — colouring one would be a guess.
+
+**One search, four kinds.** Tracks, albums, artists and playlists come back from a
+single request and are drawn as one list with headings, because someone typing does not
+want the artists to arrive a second after the tracks. Headings are never selectable —
+j/k skips them, since stopping on a label makes the keys feel broken — and
+`play_selection` counts only tracks, so playing the third song of a mixed result does
+not start at the wrong one.
+
+**Moving over a source loads it.** A column that needs Enter to show anything is a
+column people stop using. The queue is the exception and needs no request at all: it is
+already in the snapshot, and it is rebuilt from it rather than kept in step by hand, so
+the list and the player cannot disagree.
+
+**Words.** `L` shows the lyrics for what is PLAYING, not for what is under the cursor —
+lyrics follow the music, not the browsing. TIDAL serves both a plain text and an LRC
+with timings; when the timings are there the current line is picked out and the view
+scrolls so that line sits a third of the way down, where the eye expects the "now" of a
+scrolling list. When they are not, the plain text is shown with no highlight and no
+pretending there is one.
+
+Verified by driving a real instance over the remote control: a mixed search on
+"fleetwood", the seventeen playlists, opening one into its seven tracks, playing from
+it, and toggling the words. 554 tests.
+
+## 2026-08-01 - The player moves out, and the music stops belonging to a window
+
+The player runs in its own process now. Every window is a VIEW: it sends commands up a
+socket and reads snapshots coming down it, and the sound is made somewhere else.
+
+Three things fall out of that at once. Closing the window that started a song does not
+stop it. Two windows show the same thing rather than each keeping its own idea of it.
+And exactly one process holds the ALSA device, so the exclusive path stops being a race
+between windows.
+
+**The last window takes the daemon with it** — Pedro's rule, and the right one. There is
+no "keep playing in the background" mode: a music player that outlives its UI is a
+process you find later in `ps` and wonder about. The connection IS the subscription,
+which makes the rule almost free — when the last one closes there is nobody left to play
+for. A daemon nobody ever connects to gives up after five seconds, so a window that
+starts one and then dies does not leave it sitting there for ever.
+
+The panel, the status bar and the close guard did not change at all. That was the point
+of building the player behind a channel and a snapshot in the first place: `Remote`
+offers the same three methods `Jukebox` does, and nothing above it can tell which it is
+holding.
+
+Proved by driving two real windows: window two showed the same track at the same second,
+closing window one left the music playing, and closing the second took the daemon with
+it.
+
+### The bug this uncovered, which was mine and a day old
+
+The first daemon run played nothing. State said `playing`, position never moved, no
+wave. The daemon's stderr went to `/dev/null`, so there was nothing to read; an hour
+went into guessing before that got fixed, and the log now lives at
+`$XDG_RUNTIME_DIR/runnir-player.log`.
+
+What it said, once it could say anything:
+
+    thread 'runnir-player' panicked at symphonia-core/audio/util.rs:134:
+    destination slice does not match number of samples
+
+`level_of` — the wave, committed the same day — sized its destination by FRAMES when
+`copy_to_slice_interleaved` writes frames × channels. It panicked on the first packet of
+every track. The wave's own tests passed because they tested the DRAWING with synthetic
+numbers; nothing had ever run the measuring against a real decoded buffer. A test that
+does now exists, and it builds a real two-channel buffer to do it.
+
+The second half of that fix matters more than the first: a panic in the player thread
+killed playback while the snapshot went on saying `playing`, silently, for ever.
+Playback is wrapped in `catch_unwind` now, so a crash becomes an error message on the
+panel and the queue moves on — the same thing that happens to a track that will not play
+for any other reason.
+
+Also: the daemon socket is 0600. The runtime directory is already 0700, so it is defence
+in depth rather than the boundary, but a socket that takes commands and hands back what
+somebody is listening to should not be readable by anything that gets inside it.
+
+## 2026-08-01 - The bar scrolls, and a correction about the last entry
+
+The status-bar segment now has a FIXED width — thirty-four columns — and slides when the
+title does not fit, so a long one can be read in full instead of being cut off for ever
+at the same word. The bar belongs to the terminal; music that grows into all the spare
+width pushes the eye away from the cwd and the branch.
+
+The playing position is the clock. Two things fall out of that and both are wanted: it
+needs no timer of its own, and a PAUSED track stops sliding — text moving beside a
+paused player reads as still playing. There is a second and a half of hold before it
+starts, because a title that begins scrolling the instant it appears is one nobody gets
+to read the beginning of.
+
+### A correction
+
+The previous entry said a regression test had been written for the `level_of` panic —
+the one that sized its destination by frames instead of frames × channels. **It had
+not.** The edit that was supposed to add it silently matched nothing, so the test never
+existed, and the same silent-no-op swallowed four more. The commit message claimed it
+too. It exists now, builds a real two-channel buffer, and would have caught the panic.
+
+That is twice in one day that a change was believed done because nothing complained: the
+first cost an hour of debugging a daemon whose stderr went to /dev/null, and the second
+put a false claim in this file. Both have the same shape — no output is not the same as
+success — and the scripted edits that do the work now assert that they changed what they
+meant to.
+
+566 tests, and this time the number was checked before it was written down.
+
+## 2026-08-01 - The DAC went missing for a second, and the panel took the mouse
+
+**The music came out of the laptop again**, with the DAC plugged in and the config
+asking for it. From the command line the same track was BIT-PERFECT on `hw:2,0`, so the
+device and the settings were both right. What was wrong was the timing:
+
+    tras 0.00s: audio open error: Dispositivo o recurso ocupado
+
+ALSA releases a card a moment AFTER the process holding it exits. Closing one window and
+opening another lands inside that gap: the daemon restarts, the DAC answers "device or
+resource busy", and the chain — doing exactly what it was told — falls to the next rung
+and plays through the speakers. A device busy for a fraction of a second is not a device
+that refuses, and treating it as one is the silent wrong-output failure this whole chain
+exists to prevent.
+
+Exclusive opens now wait out a busy card for a second and a half before moving on, and
+only for real hardware: `default` and `plughw` go through the mixer, which never answers
+busy for a reason that will pass.
+
+And the refusals stopped being invisible. The panel's footer says
+`… ← skipped hw:2,0 busy for over 1.5s` when something was passed over, because "it is
+coming out of the laptop" is obvious from the badge while "because the DAC was busy" is
+the part nobody can work out from outside.
+
+### The panel takes the mouse
+
+Sources and a list are both things people point at, and a music panel that can only be
+driven from the keyboard is one people stop opening. Same rule as the docker panel: one
+click selects, a second on the SAME thing acts. A stray click must not start playing
+music out loud any more than it should open an ssh connection.
+
+The geometry lives in one `layout()` used by both the drawing and the hit-testing. Two
+copies of that arithmetic disagree the first time one of them changes, and a panel whose
+clicks land a row off is worse than one with no mouse at all.
+
+Writing the test for it caught two real bugs before the mouse was ever used: clicking the
+empty space under a short list, and under the last source, both reported "nothing here" —
+which is what closes the panel. Clicking inside a panel had a one-in-three chance of
+dismissing it.
+
+568 tests.
+
+## 2026-08-01 - Sharing what is playing, owned by the daemon
+
+`leader n shift+s` publishes a link to what is playing; the same keys take it down. On
+shift, because putting something on the public internet should not be one letter away
+from "stop".
+
+**The daemon owns it, not a window.** That was the requirement — a link that dies
+because you closed the terminal that made it is not a link you would give anybody — and
+it is why the daemon was built before this rather than after.
+
+**What is served is not the samples.** Teeing the decoded audio on its way to the DAC is
+the obvious design and the wrong one: at 24/192 that is 1.1 MB per second of raw PCM,
+and sending it anywhere means adding an encoder, a format decision, and CPU spent on
+every packet whether anyone is listening or not. TIDAL's own stream is already
+compressed, so the listener gets that instead — the same parts, fetched again for them.
+It costs one extra download of a song somebody is already paying for, and nothing at all
+while nobody listens. It also keeps the share out of the playback path entirely: there
+is no shared buffer, so a slow listener cannot stall the music.
+
+The listener hears the track from its beginning rather than from the current second.
+Seeking into a stream nobody has buffered would mean guessing which segment matches
+which moment; hearing the same song from the top is honest, and pretending to be in
+sync when we are not would not be.
+
+**The link is not handed over until it answers.** cloudflared prints the URL several
+seconds before the edge will route to it — the first end-to-end test got `000` from a
+link that had just been announced as ready. `Share::start` now polls the public URL
+until it responds, because handing somebody a URL that does not work yet is handing them
+a broken link.
+
+Verified against the real tunnel: page 200, state 200, and 79 MB of audio pulled through
+the public URL before it was taken down again.
+
+Said plainly, because it deserves it: this re-transmits licensed audio to whoever holds
+the URL. The token is sixteen random bytes and the link dies with the session, which
+makes it a private link rather than a service. It is not described here as anything
+cleverer than that.
+
+## 2026-08-01 - Audit rounds: what three reviewers found in the TIDAL feature
+
+Three read-only reviewers over `tidal.rs`, `player.rs`, and `daemon.rs` + `share.rs`.
+Twenty-six findings, all fixed. The ones worth remembering:
+
+### Wrong data reported as success
+
+- **`fetch` returned `Ok` holding a cut-off file** whenever a body exceeded the limit.
+  `take(limit)` reads up to the limit and stops; there is no error for "there was more".
+  A truncated song reported as a success — and it was live, because the share path capped
+  at 64 MB, which a hi-res track passes in about seven minutes. It reads one byte past
+  the limit now, to tell "exactly this big" from "bigger than this".
+- **Playlists, albums and favourites read one page and stopped.** A 250-track playlist
+  played as a 100-track playlist with nothing anywhere saying tracks were missing. There
+  is no "and 150 more" in a music panel, so the only honest option was to fetch them.
+- **`r="-1"` in a SegmentTimeline counted as one segment** instead of "repeat to the end
+  of the period", and a **`$Time$` template** passed through unexpanded into URLs with a
+  literal `$Time$` in them. Both truncate a song; both are now errors, which is what the
+  parser's own comment already claimed.
+- **The country code defaulted to `"US"`** and then lived on disk, silently stamping a
+  different licensed catalogue onto a Spanish account.
+
+### The badge lying, twice more
+
+- **`S24LE` was offered as a format with no way to write it.** ALSA refuses `io_i32` for
+  a PCM configured that way, so the device opened, the chain committed to it, and every
+  track then failed — on exactly the format list SOF laptop cards publish
+  (`S16_LE S24_LE S32_LE`). And had the write gone through, the samples needed shifting
+  into the low three bytes: symphonia hands back full-scale MSB-justified values, so
+  without that it plays full-scale noise *while the badge says BIT-PERFECT*. Same class
+  as the packed-24 bug from the morning, one format along.
+- **Anything not called `default` or `plug*` was assumed exclusive**, so
+  `output = "sysdefault:CARD=X"` or `dmix:` earned a BIT-PERFECT badge through a software
+  mixer. Only a raw `hw:` device is exclusive.
+
+### Security
+
+- **`urldecode` sliced a `String` by byte index**, so a `%` followed by an accented
+  character panicked. It runs on whatever anything on the machine sends to the callback
+  port.
+- **The share's request line was unbounded and read before the token check.** The read
+  timeout is per-recv, so a sender trickling bytes with no newline never trips it and
+  grows a String until something dies. No link needed to reach it.
+- **A track title went into the landing page unescaped.** The page carries the token in
+  its own URL and the token is the only authentication there is, so script on that page
+  would be a permanent grant of the stream to whoever collected it.
+- **The trust boundary was an environment variable with a `/tmp` fallback.** With
+  `XDG_RUNTIME_DIR` unset — ssh, `su`, some units — the socket went to a world-writable
+  directory, where another user can pre-create it: our bind fails, but the WINDOW
+  connects to theirs, sending them every command and drawing what they send back,
+  including a share URL the person is invited to hand out. There is no player without a
+  private directory now.
+- **A token could reach an error string**, and an error string reaches a toast and
+  whatever screenshot follows. The one body guaranteed to hold credentials is never
+  quoted back; its length is all that is safe to say.
+- Upstream API errors were echoed verbatim to the remote listener — account detail for
+  free. They go to the terminal instead.
+
+### Lifecycle
+
+- **Two windows opened at the same instant both started a daemon.** Both found nothing,
+  both unlinked, both bound — two players fighting for the exclusive device, and the
+  loser deleting the winner's socket on the way past. "Connect to see if anyone is
+  there" cannot settle that on its own, because both look before either binds. An
+  `flock`ed lock file does, and the kernel releases it however the process dies.
+- **A window could connect to a daemon that had already decided to die** — the watcher
+  breaks, sleeps 200 ms, then exits, and the accept loop kept serving throughout. The
+  window got a working handle to a vanishing process and a transport that silently did
+  nothing for ever. Connections are refused once it is closing, so that window starts a
+  fresh daemon instead.
+- **A failed tunnel left the port bound for the life of the daemon**, so the second
+  attempt failed with "address already in use" — an error that hides the real one and
+  never goes away.
+- **The writer thread only noticed a closed socket when it had something to write**, so
+  with the music paused it looped for ever holding a thread and a file descriptor. It
+  sends a newline every ten seconds now.
+- **Starting a share made the asking window deaf for up to 45 seconds**, because it ran
+  on the thread reading that window's commands.
+- A zero-frame ALSA write dropped the rest of the buffer and still counted it as played.
+  A failed last track left the player claiming to play for ever. A spawn failure left
+  the client count above zero so the daemon could never exit. A daemon spawned per
+  keypress was never reaped.
+
+### Still open, and honestly named
+
+Segment fetches happen inside the audio loop. On a slow link that means audible
+underruns at each segment boundary, and a transport key can sit unread for as long as
+the HTTP timeout. It needs a prefetch thread; it is not fixed here.
+
+584 tests.
+
+## 2026-08-01 - The fetch moved off the audio loop
+
+The thing named as open in the audit entry is closed. Segments were fetched inline,
+inside `PartsReader::read`, which meant the audio loop stopped at every segment boundary
+for as long as the download took. Two consequences, both real: on a slow link that is an
+underrun you can hear each time, and — since the same loop is what reads the transport
+commands between packets — a pause or a stop could sit unanswered until the HTTP timeout
+gave up on it.
+
+Fetching now runs on its own thread, ahead of the decoder, over a `sync_channel` bounded
+at two parts. Bounded because the alternative is a fast network pulling a whole hi-res
+album into memory while the DAC is still on the first bar; two is enough to cover a
+fetch taking as long as a segment lasts, which is the case this exists for.
+
+Errors travel down the same channel rather than being logged on a thread nobody watches,
+so a failed download still surfaces where the decoder can report it. A send that fails
+means the track was skipped or stopped and nobody is reading any more, so the fetcher
+stops rather than downloading the rest of a song that is no longer playing.
+
+The reader sits behind a mutex for one reason worth writing down so nobody removes it:
+symphonia's `MediaSource` requires `Sync`, and a `Receiver` is `Send` but not `Sync`.
+Nothing contends for it — the decoder is the only reader and it holds `&mut self`.
+
+Verified afterwards on the real DAC: 24 bit / 192 kHz, `hw:2,0`, BIT-PERFECT.
+
+## 2026-08-01 - Audit round two: the panel
+
+A fourth reviewer over the panel and its input — the part nobody had looked at. Seven
+findings, all real, all fixed.
+
+**A click on the lyrics started playing music.** The hit test did not know the list was
+hidden, so a click on a line of words fell through to the row underneath. And on a
+scrolled list the cursor's own line is always the second from the bottom of the window,
+which is exactly where a lyric gets drawn — so clicking that line sent `Cmd::Play` with
+whatever list happened to be browsed. With the words up there is now nothing under the
+pointer but the panel.
+
+**Walking the sources column stole the keyboard.** Passing over Search armed the query
+box, so the next `j` was typed instead of moving and `q` no longer closed the panel,
+with nothing on screen explaining why. Typing is armed by asking for it — `/`, Enter, or
+a click — not by scrolling past.
+
+**Switching to Search left the previous request live**, so a favourites list could
+arrive and be drawn under the word "Search", with an empty query box above it.
+
+**The lyrics cache compared the crumb to the track title.** The crumb holds the album or
+playlist that was opened, so the cache never hit — and on the day a playlist name
+matched a track title, it would have shown the previous song's words. Keyed on the track
+id now, which is what words belong to.
+
+**Words outlived their song.** Nothing cleared them when the player advanced, so the
+panel kept drawing one track's lyrics while highlighting a line by the NEXT track's
+position: confidently wrong words, presented as synced.
+
+**The trail was written when a list was ASKED for, not when it arrived.** An album that
+failed to load left its name over the previous, unrelated list. And lyrics shared the
+one pending slot with the lists, so asking for words mid-load cancelled the album: its
+answer was dropped by the guard, the list never came, and the crumb named it for ever.
+Two slots now, and the crumb is applied on arrival.
+
+**The queue view checked the queue's LENGTH.** Two different lists of the same size —
+two artists' top tracks, or another window driving the same daemon — left the rows
+stale, and Enter on a stale row replayed a queue that no longer existed. It compares the
+generation, which exists for exactly this.
+
+Worth noting what the reviewer looked for and did not find, since it says where the
+earlier care paid off: no byte-vs-char slicing anywhere in the panel (the truncation is
+char-based, the grid writer is char-based and width-aware), no usize underflow in the
+layout arithmetic, no cursor that can index out of bounds, and the scroll offset really
+is shared between drawing and hit-testing rather than computed twice.
+
+585 tests.
+
+## 2026-08-01 - The verifier: two of the fixes were not fixes
+
+A fifth reviewer, given only one job: assume every fix from the first round is
+incomplete or wrong until the code proves otherwise. Seven of the nine held. Two did
+not, and both were mine claiming more than they had done.
+
+**The share's 64 MB cap was named in the commit message and never changed.** The player
+was raised to 512 MB and the share was left where it was, so a single-file lossless
+track over about twelve minutes played locally and failed for the listener. Worse, the
+new error path made it uglier: the `200 OK` went out BEFORE the fetch, so the failure
+arrived as a page saying "playing" attached to a stream that never produced a byte.
+There is one ceiling now, used by both, and the first part is fetched before a single
+header goes out — an error code is a worse experience than music and a better one than a
+lie.
+
+**The dying-daemon race was narrowed, not closed.** Refusing new connections once the
+daemon is closing does nothing during the two hundred milliseconds before that flag is
+set, and a `connect` succeeds through the kernel backlog anyway. On the client side
+nothing recovered: the reader thread exited silently on EOF, `send` swallowed the write
+error, and the window cached that handle for ever. The comment claiming "the next
+command will report the real failure" was simply false.
+
+So the window can notice now. The reader marks the handle dead at EOF, `send` reports
+whether it got through, and a failed send drops the handle and builds another — which
+starts a fresh daemon if there is none. One retry, not a loop.
+
+Proved by doing the thing that used to break it: kill the last window, open another
+immediately, ask it to play. It plays.
+
+Also from the same pass: a timed-out `cloudflared` was killed but never reaped, leaving
+a zombie per attempt; and a test that unset `XDG_RUNTIME_DIR` was mutating a
+process-global variable while its neighbours read it — the rule is tested directly now
+instead.
+
+### What this round is really about
+
+Two rounds of reviewers found twenty-six defects. The verifier found that two of the
+twenty-six fixes were themselves wrong — and one of them made the failure worse than the
+bug had been. A fix is a change that has to be checked like any other, and the commit
+message saying it was done is not the check.
+
+585 tests.
+
 ## Gotchas (do not re-learn)
 
+- `runnir.json` WINS over `runnir.toml`. `Config::try_load` reads the JSON the settings
+  panel writes and only falls back to the TOML when that file is absent. Editing the
+  TOML on a machine that has a JSON changes nothing, and the symptom is not an error:
+  the program simply runs on values you did not write. Check `Config::active_path`
+  before believing any config edit took.
+- `install.sh` always builds origin's DEFAULT branch — it does a
+  `git reset --hard origin/<default>` in `~/.local/share/runnir/src`. Installing a
+  branch means pointing that checkout at it by hand, and `runnir-update` afterwards will
+  silently take the machine back to `main`.
+- `copy_to_slice_interleaved` writes frames × CHANNELS. Sizing the destination by
+  frames alone panics inside symphonia on the first packet, and a panic on the player
+  thread is silent: the state goes on claiming to play for ever. Anything that decodes
+  audio in a thread of its own needs its panics turned into messages.
+- An edit that finds nothing to change reports success. A scripted edit must assert
+  that it changed what it meant to, or code and tests quietly do not exist while
+  everything says they do.
+- A background process with its stderr on /dev/null cannot be debugged at all. Give it
+  a file before the first bug, not after.
+- A decoder's buffer width is NOT the source's bit depth. symphonia decodes 16-bit FLAC
+  into an `i32` buffer; reading the depth from the buffer reports every lossless track
+  as 32-bit. The codec parameters carry the real one.
+- A TIDAL client id is registered for particular OAuth flows and most are registered for
+  none of the interactive ones: `sub_status 1002` refuses the device flow, `error 11102`
+  refuses the authorization-code flow. 11102 with a loopback AND with the app redirect
+  is the proof that the redirect is not what is being refused.
+- `Read::take(limit)` + `read_to_end` returns Ok on a body BIGGER than the limit,
+  holding a truncated copy. Read one byte past the limit to tell the two apart.
+- Slicing a `String` by byte index panics on multibyte text. Anything parsing bytes off
+  a socket must index the bytes, not the string.
+- A fallback-chain step that OPENS successfully and then fails on use is worse than one
+  that refuses: the chain has already committed and will not try the next rung.
+- Two processes that both check "is anyone there?" before either binds will both bind.
+  Only a lock settles it.
+- `cloudflared` prints a quick-tunnel URL SECONDS before the edge routes to it. A link
+  handed over the moment it appears fails for whoever opens it first.
+- ALSA frees a card a moment AFTER the process holding it dies. An exclusive open
+  attempted immediately after another process let go gets `EBUSY` and, in a fallback
+  chain, silently ends up somewhere else. Wait the card out before deciding it refused.
+- A hit test must know which VIEW is drawn, not just where the panel is. An overlay
+  drawn over a list makes every row underneath unreachable, and a hit test that does not
+  know it will action the row a click never saw.
+- Send the error BEFORE the body, or not at all. A 200 followed by a failure is a
+  stream that never produces a byte, which reads as a hang rather than as an error.
+- The same limit written in two places is two behaviours for the same input. Export the
+  constant.
+- Two kinds of request sharing one "pending" slot cancel each other. The second kind
+  needs its own, or asking for one thing silently abandons the other.
+- In a hit-test, "inside the panel but on nothing" and "outside the panel" must be
+  DIFFERENT answers. Collapsing them makes clicking empty space dismiss the panel.
+- ALSA's `HintIter` does NOT list `hw:` devices — only aliases (`default`,
+  `sysdefault:`, `front:`, `hdmi:`), none of which can be opened exclusively. Real cards
+  come from `/proc/asound/cards` plus each card's `pcmNp` directories. `pcmNc` is
+  capture.
+- Any output that accepts 48 kHz can win a "best quality" search, including an HDMI port
+  with nothing plugged into it. Ranking outputs by what they ACCEPT is not enough; a
+  display has to be excluded from any automatic choice, or the music goes to a monitor
+  and the failure looks like success.
+- A DASH `SegmentTemplate` may write `$Number%05d$`, not just `$Number$`. Replacing only
+  the bare form yields URLs that 404, and a 404 segment reads as a short song rather
+  than as a bug in the parser.
 - A touchpad's `PixelDelta` is a FRACTION of a line arriving dozens of times a second.
   Rounding one event on its own — `.round()`, or a `.max(1.0)` floor — makes scroll
   speed a function of the device's report rate instead of the distance travelled. Every

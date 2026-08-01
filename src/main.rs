@@ -5,6 +5,7 @@ mod catchup;
 mod clipboard;
 mod config;
 mod control;
+mod daemon;
 mod dnd;
 mod docs;
 mod docker;
@@ -20,18 +21,22 @@ mod keys;
 mod layout;
 mod media;
 mod mouse;
+mod mpris;
 mod overlay;
 mod pane;
 mod platform;
+mod player;
 mod project_session;
 mod pty;
 mod render;
 mod selection;
+mod share;
 mod session;
 mod settings;
 mod shell_integration;
 mod tab;
 mod themes;
+mod tidal;
 mod verbs;
 mod warroom;
 mod watch;
@@ -98,6 +103,8 @@ pub enum UserEvent {
     /// coordinates of the drop. Comes from the `dnd` thread, which is the only
     /// place Wayland drag-and-drop exists — winit has none.
     FilesDropped(Vec<std::path::PathBuf>, f64, f64),
+    /// An answer from a TIDAL worker, tagged with the request sequence.
+    Tidal(u64, Result<TidalAnswer, String>),
     /// A now-playing update from a media worker: fetched metadata or a waveform frame.
     /// Delivered off the UI thread via the proxy, same wake pattern as `Ai`, so the
     /// playerctl / cava subprocess never blocks rendering.
@@ -178,6 +185,94 @@ fn main() {
             };
             let secs: u64 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(5);
             return zsa_paint(revision, secs);
+        }
+        // `runnir --tidal-login` — sign in to TIDAL by the device flow. Prints the code
+        // to approve and waits. Separate from the terminal for the same reason
+        // `--zsa-paint` is: it is the half that needs a human and a service to both be
+        // there, and it must be checkable without a window in the way.
+        // `runnir --tidal-login --import` reads a session out of pasted text on stdin.
+        // The flows above are gated by what the client id is registered FOR; a refresh
+        // token is not, so this is the way in when both of them are refused.
+        Some("--tidal-login") if args.get(2).map(String::as_str) == Some("--import") => {
+            return tidal_import();
+        }
+        // `--app` asks for the sign-in that lands on TIDAL's own page instead of on a
+        // local listener, for when a client id will not accept a loopback redirect.
+        // The code then has to be pasted back, which is worse and is why it is not the
+        // default — but a sign-in that works beats a nicer one that does not.
+        Some("--tidal-login") if args.get(2).map(String::as_str) == Some("--app") => {
+            let (_, creds) = match tidal_creds() {
+                Ok(v) => v,
+                Err(e) => return eprintln!("runnir: {e}"),
+            };
+            return tidal_login_paste(&creds);
+        }
+        Some("--tidal-login") => return tidal_login(args.get(2).map(String::as_str)),
+        // `runnir --tidal-play <track-id|search words>` — fetch, decode and play one
+        // track, then report the signal path it came out on. This is how the audio
+        // chain gets verified: whether the DAC really took the stream untouched is not
+        // something a test can answer.
+        Some("--tidal-play") => {
+            let what = args[2..].join(" ");
+            if what.is_empty() {
+                return eprintln!("usage: runnir --tidal-play <track-id|search words>");
+            }
+            return tidal_play(&what);
+        }
+        // `runnir --tidal-devices` — what the output chain would try, in order, for the
+        // current config. Answers "why is it not bit-perfect" without playing anything.
+        Some("--tidal-devices") => return tidal_devices(),
+        // The player process itself. Started by a window that finds no daemon running,
+        // never by a person — which is why it is not in --help.
+        Some("--player-daemon") => {
+            let (cfg, creds) = match tidal_creds() {
+                Ok(v) => v,
+                Err(e) => return eprintln!("runnir: {e}"),
+            };
+            return daemon::main(cfg, creds);
+        }
+        // `runnir --tidal-browse <words>` — exercises the whole catalogue layer in one
+        // go: the four search types, the user's playlists and favourites, an album's
+        // tracks, an artist's top tracks, and whether a track has timed lyrics. The
+        // unit tests cover the parsing; only this covers the SHAPE the service really
+        // answers with, which is the half that changes without warning.
+        Some("--tidal-browse") => {
+            let what = args[2..].join(" ");
+            if what.is_empty() {
+                return eprintln!("usage: runnir --tidal-browse <words>");
+            }
+            return tidal_browse(&what);
+        }
+        // `runnir --tidal-info <track-id|search words>` — what TIDAL would serve for one
+        // track at each quality tier: which manifest shape, which codec, what depth and
+        // rate. Makes no sound, which is the point: the questions "is this really
+        // hi-res" and "which manifest does this tier use" should not require playing a
+        // song out loud to answer.
+        Some("--tidal-info") => {
+            let what = args[2..].join(" ");
+            if what.is_empty() {
+                return eprintln!("usage: runnir --tidal-info <track-id|search words>");
+            }
+            return tidal_info(&what);
+        }
+        // `runnir --tidal-decode [--play] <file…>` — run local files through the same
+        // decoder and output chain a TIDAL stream takes. Several files are read as one
+        // stream, which is what a DASH init segment plus its media segments are.
+        //
+        // Without `--play` nothing is opened and nothing is heard: it measures the
+        // decode alone. That separation is the point — it tells "this stream does not
+        // decode" apart from "this device will not take it", which are otherwise the
+        // same silence.
+        Some("--tidal-decode") => {
+            let mut files: Vec<&str> = args[2..].iter().map(String::as_str).collect();
+            let play = files.first() == Some(&"--play");
+            if play {
+                files.remove(0);
+            }
+            if files.is_empty() {
+                return eprintln!("usage: runnir --tidal-decode [--play] <file…>");
+            }
+            return tidal_decode(&files, play);
         }
         Some("--version" | "-v") => return println!("runnir {}", env!("CARGO_PKG_VERSION")),
         Some("--help" | "-h") => return print_help(),
@@ -388,6 +483,506 @@ fn git_scene(path_out: &str, state: &str) {
             .collect();
         (panes, Some(specs))
     });
+}
+
+/// The credentials from the config, or a message explaining what is missing. Every
+/// TIDAL entry point starts here, because "the panel does not exist without
+/// credentials" has to be one decision made in one place.
+fn tidal_creds() -> Result<(config::Tidal, tidal::Creds), String> {
+    let cfg = Config::load().tidal;
+    if !cfg.configured() {
+        return Err(format!(
+            "no TIDAL credentials.\n  \
+             Put them in {} under [tidal]:\n    \
+             client_id = \"...\"\n    \
+             client_secret = \"...\"   # or set {} in the environment",
+            Config::path().display(),
+            cfg.client_secret_env
+        ));
+    }
+    let creds = tidal::Creds {
+        client_id: cfg.client_id.clone(),
+        client_secret: cfg.client_secret(),
+    };
+    Ok((cfg, creds))
+}
+
+/// Signs in.
+///
+/// Two flows, chosen by what the credentials are registered for rather than by a flag.
+/// The device flow is nicer — a code, no browser — but TIDAL only allows it for clients
+/// registered as limited-input devices, and a web player client id is refused with
+/// `sub_status 1002`. Rather than make the user know which kind they pasted, the device
+/// flow is tried first and the refusal switches to PKCE automatically.
+///
+/// PKCE needs the code the browser was redirected with, so it runs in two commands:
+/// this one prints the URL, and the same command with the pasted URL finishes it.
+fn tidal_login(pasted: Option<&str>) {
+    let (_, creds) = match tidal_creds() {
+        Ok(v) => v,
+        Err(e) => return eprintln!("runnir: {e}"),
+    };
+
+    // Second half of a PKCE sign-in: the browser has been and this is what it showed.
+    if let Some(pasted) = pasted {
+        let Some(pkce) = tidal::Pkce::load() else {
+            return eprintln!("runnir: no sign-in is in progress — run: runnir --tidal-login");
+        };
+        let Some(code) = tidal::code_from_redirect(pasted) else {
+            return eprintln!(
+                "runnir: no grant code in that URL.\n  \
+                 Paste the whole address the browser ended on, the one with ?code=… in it."
+            );
+        };
+        match tidal::finish_pkce(&creds, &pkce, &code) {
+            Ok(session) => {
+                tidal::Pkce::clear();
+                if let Err(e) = session.save() {
+                    return eprintln!("runnir: signed in but could not save the session: {e}");
+                }
+                println!("  Signed in ({}).", session.country_code);
+            }
+            Err(e) => eprintln!("runnir: could not complete sign-in: {e}"),
+        }
+        return;
+    }
+
+    let auth = match tidal::start_device_auth(&creds) {
+        Ok(a) => a,
+        Err(e) if tidal::is_not_a_device_client(&e) => return tidal_login_pkce(&creds),
+        Err(e) => return eprintln!("runnir: could not start sign-in: {e}"),
+    };
+    println!("\n  Open {}\n  and enter this code:\n", auth.verification_uri);
+    println!("      {}\n", auth.user_code);
+    println!("  Waiting (up to {}s)…", auth.expires_in);
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(auth.expires_in);
+    while std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_secs(auth.interval));
+        match tidal::poll_device_token(&creds, &auth.device_code) {
+            Ok(tidal::Poll::Pending) => continue,
+            Ok(tidal::Poll::Granted(session)) => {
+                if let Err(e) = session.save() {
+                    return eprintln!("runnir: signed in but could not save the session: {e}");
+                }
+                let where_ = tidal::Session::path()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default();
+                println!("  Signed in ({}). Session saved to {where_}", session.country_code);
+                return;
+            }
+            Err(e) => return eprintln!("runnir: sign-in failed: {e}"),
+        }
+    }
+    eprintln!("runnir: the code expired before it was approved");
+}
+
+/// Adopts a session pasted on stdin.
+fn tidal_import() {
+    let (cfg, mut creds) = match tidal_creds() {
+        Ok(v) => v,
+        Err(e) => return eprintln!("runnir: {e}"),
+    };
+    let mut text = String::new();
+    if let Err(e) = std::io::Read::read_to_string(&mut std::io::stdin(), &mut text) {
+        return eprintln!("runnir: could not read stdin: {e}");
+    }
+    let Some(imported) = tidal::parse_import(&text) else {
+        return eprintln!(
+            "runnir: no refresh_token in that text.\n  \
+             Paste the session from a signed-in TIDAL web player — it must contain a\n  \
+             refresh_token, and ideally the client_id it was issued to."
+        );
+    };
+    // A refresh token belongs to the client id it was issued to. Using the configured
+    // one instead would be refused, so the pasted id wins when there is one.
+    if let Some(id) = imported.client_id.clone() {
+        if id != creds.client_id {
+            println!("  using the client id from the pasted session ({id})");
+            creds.client_id = id;
+        }
+    }
+    let _ = cfg;
+    match tidal::adopt(&creds, &imported) {
+        Ok(session) => {
+            if let Err(e) = session.save() {
+                return eprintln!("runnir: signed in but could not save the session: {e}");
+            }
+            println!("  Signed in ({}).", session.country_code);
+            if imported.client_id.as_deref() != Some(creds.client_id.as_str()) {
+                return;
+            }
+            println!("  Put that client_id in [tidal] so refreshes keep working.");
+        }
+        Err(e) => eprintln!("runnir: that session was refused: {e}"),
+    }
+}
+
+/// The browser sign-in: open a link, wait for the redirect to come back here.
+///
+/// The loopback redirect is what makes it a real callback — the browser returns to a
+/// listener runnir is holding open, so nothing has to be copied out of an address bar.
+/// If TIDAL refuses that redirect for this client id, the flow falls back to its own
+/// app redirect and the code does have to be pasted; that path is kept working rather
+/// than removed, because which one a client id allows is TIDAL's decision, not ours.
+fn tidal_login_pkce(creds: &tidal::Creds) {
+    let port = Config::load().tidal.callback_port;
+    let redirect = tidal::loopback_redirect(port);
+    let pkce = match tidal::start_pkce(creds, &redirect) {
+        Ok(p) => p,
+        Err(e) => return eprintln!("runnir: could not start sign-in: {e}"),
+    };
+    // Saved before the browser opens: if this process is interrupted, the paste-back
+    // form of the same sign-in still works.
+    if let Err(e) = pkce.save() {
+        return eprintln!("runnir: could not remember the sign-in: {e}");
+    }
+
+    println!("\n  Opening TIDAL in your browser. Log in there and this will finish itself.\n");
+    println!("  {}\n", pkce.authorize_url);
+    if let Err(e) = open_in_browser(&pkce.authorize_url) {
+        println!("  (could not open a browser here: {e} — the link above still works)\n");
+    }
+    println!("  Waiting for the callback on {redirect} …");
+
+    match tidal::wait_for_callback(port, std::time::Duration::from_secs(300)) {
+        Ok(code) => match tidal::finish_pkce(creds, &pkce, &code) {
+            Ok(session) => {
+                tidal::Pkce::clear();
+                match session.save() {
+                    Ok(()) => println!("  Signed in ({}).", session.country_code),
+                    Err(e) => eprintln!("runnir: signed in but could not save it: {e}"),
+                }
+            }
+            Err(e) => eprintln!("runnir: could not complete sign-in: {e}"),
+        },
+        Err(e) => eprintln!(
+            "runnir: {e}\n  \
+             If TIDAL showed an error instead of coming back, this client id may not\n  \
+             accept a loopback redirect. Paste the address it ended on:\n     \
+             runnir --tidal-login '<address>'"
+        ),
+    }
+}
+
+/// The sign-in that comes back through a page of TIDAL's own, so the grant code has to
+/// be copied out of the address bar and handed over in a second command.
+fn tidal_login_paste(creds: &tidal::Creds) {
+    let pkce = match tidal::start_pkce(creds, tidal::APP_REDIRECT) {
+        Ok(p) => p,
+        Err(e) => return eprintln!("runnir: could not start sign-in: {e}"),
+    };
+    if let Err(e) = pkce.save() {
+        return eprintln!("runnir: could not remember the sign-in: {e}");
+    }
+    println!("\n  1. Log in here:\n\n  {}\n", pkce.authorize_url);
+    let _ = open_in_browser(&pkce.authorize_url);
+    println!(
+        "  2. The browser lands on a tidal.com page that looks empty or broken. That is\n     \
+         expected — the grant code is in its ADDRESS BAR.\n\n  \
+         3. Copy that whole address and run:\n\n     \
+         runnir --tidal-login '<the address you copied>'\n"
+    );
+}
+
+/// Opens a URL in whatever the desktop considers a browser.
+fn open_in_browser(url: &str) -> Result<(), String> {
+    let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+    std::process::Command::new(opener)
+        .arg(url)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+/// A signed-in session and the track `what` names, for the commands that need both.
+///
+/// A bare number is a track id; anything else is something to search for, because
+/// typing a track id is not how anyone finds music.
+fn tidal_find(what: &str) -> Result<(config::Tidal, tidal::Session, tidal::Track), String> {
+    let (cfg, creds) = tidal_creds()?;
+    let session = tidal::Session::load()
+        .ok_or_else(|| "not signed in — run: runnir --tidal-login".to_string())?;
+    let session = tidal::ensure_fresh(&creds, &session)
+        .map_err(|e| format!("could not refresh the session: {e}"))?;
+    let track = match what.parse::<u64>() {
+        Ok(id) => tidal::track(&session, id)?,
+        Err(_) => tidal::search_tracks(&session, what, 1)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| format!("nothing found for {what:?}"))?,
+    };
+    Ok((cfg, session, track))
+}
+
+/// Walks the catalogue once and prints what came back.
+fn tidal_browse(what: &str) {
+    let (_, creds) = match tidal_creds() {
+        Ok(v) => v,
+        Err(e) => return eprintln!("runnir: {e}"),
+    };
+    let Some(session) = tidal::Session::load() else {
+        return eprintln!("runnir: not signed in — run: runnir --tidal-login");
+    };
+    let session = match tidal::ensure_fresh(&creds, &session) {
+        Ok(s) => s,
+        Err(e) => return eprintln!("runnir: {e}"),
+    };
+
+    let found = match tidal::search(&session, what, 5) {
+        Ok(f) => f,
+        Err(e) => return eprintln!("runnir: search failed: {e}"),
+    };
+    println!(
+        "  search {what:?} -> {} tracks, {} albums, {} artists, {} playlists",
+        found.tracks.len(),
+        found.albums.len(),
+        found.artists.len(),
+        found.playlists.len()
+    );
+    for t in found.tracks.iter().take(3) {
+        println!("    track    {:<14} {} — {}", t.quality, t.artist, t.title);
+    }
+    for a in found.albums.iter().take(3) {
+        println!(
+            "    album    {:<14} {} — {} ({}, {} tracks)",
+            a.quality,
+            a.artist,
+            a.title,
+            a.year.map(|y| y.to_string()).unwrap_or_else(|| "?".into()),
+            a.tracks
+        );
+    }
+    for a in found.artists.iter().take(3) {
+        println!("    artist   {:<14} {}", "", a.name);
+    }
+    for p in found.playlists.iter().take(3) {
+        println!(
+            "    playlist {:<14} {} by {} ({} tracks)",
+            if p.mine { "mine" } else { "" },
+            p.title,
+            p.owner,
+            p.tracks
+        );
+    }
+
+    if let Some(album) = found.albums.first() {
+        match tidal::album_tracks(&session, album.id) {
+            Ok(tracks) => println!("\n  album {:?}: {} tracks", album.title, tracks.len()),
+            Err(e) => println!("\n  album tracks failed: {e}"),
+        }
+    }
+    if let Some(artist) = found.artists.first() {
+        match tidal::artist_top_tracks(&session, artist.id) {
+            Ok(tracks) => println!("  artist {:?}: {} top tracks", artist.name, tracks.len()),
+            Err(e) => println!("  artist top tracks failed: {e}"),
+        }
+    }
+    match tidal::my_playlists(&session) {
+        Ok(mine) => {
+            println!("  my playlists: {}", mine.len());
+            for p in mine.iter().take(3) {
+                println!("    {} ({} tracks)", p.title, p.tracks);
+            }
+        }
+        Err(e) => println!("  my playlists failed: {e}"),
+    }
+    match tidal::favourite_tracks(&session) {
+        Ok(tracks) => println!("  favourite tracks: {}", tracks.len()),
+        Err(e) => println!("  favourites failed: {e}"),
+    }
+    if let Some(track) = found.tracks.first() {
+        match tidal::lyrics(&session, track.id) {
+            Ok(l) if l.timed.is_empty() && l.plain.is_empty() => {
+                println!("  lyrics for {:?}: none", track.title)
+            }
+            Ok(l) => println!(
+                "  lyrics for {:?}: {} timed lines, {} chars plain",
+                track.title,
+                l.timed.len(),
+                l.plain.len()
+            ),
+            Err(e) => println!("  lyrics for {:?}: {e}", track.title),
+        }
+    }
+}
+
+/// What TIDAL would serve for one track, at each tier. Plays nothing.
+fn tidal_info(what: &str) {
+    let (_, session, track) = match tidal_find(what) {
+        Ok(v) => v,
+        Err(e) => return eprintln!("runnir: {e}"),
+    };
+    println!("  {} — {} [{}]  id {}", track.artist, track.title, track.album, track.id);
+    println!("  the tier TIDAL lists for it: {}\n", track.quality);
+
+    for quality in [
+        config::Quality::HiResLossless,
+        config::Quality::Lossless,
+        config::Quality::High,
+    ] {
+        print!("  {:<18} ", quality.as_api());
+        match tidal::stream_info(&session, track.id, quality.as_api()) {
+            Ok(info) => {
+                let shape = match info.media.as_ref() {
+                    Some(tidal::Media::Direct(urls)) => format!("BTS, {} url(s)", urls.len()),
+                    Some(tidal::Media::Dash { init, segments }) => format!(
+                        "DASH, {} segment(s){}",
+                        segments.len(),
+                        if init.is_some() { " + init" } else { "" }
+                    ),
+                    None => "no media".to_string(),
+                };
+                println!(
+                    "served {:<16} {:<22} {} bit / {} Hz  codec {}",
+                    info.quality,
+                    shape,
+                    info.bit_depth.map(|b| b.to_string()).unwrap_or_else(|| "?".into()),
+                    info.sample_rate.map(|r| r.to_string()).unwrap_or_else(|| "?".into()),
+                    if info.codec.is_empty() { "?" } else { info.codec.as_str() },
+                );
+            }
+            Err(e) => println!("refused: {e}"),
+        }
+    }
+}
+
+/// Plays one track end to end and reports the path the audio actually took.
+fn tidal_play(what: &str) {
+    let (cfg, _session, track) = match tidal_find(what) {
+        Ok(v) => v,
+        Err(e) => return eprintln!("runnir: {e}"),
+    };
+    let session = match tidal::Session::load() {
+        Some(s) => s,
+        None => return eprintln!("runnir: not signed in"),
+    };
+    println!(
+        "  {} — {} [{}]  ({}, {}:{:02})",
+        track.artist,
+        track.title,
+        track.album,
+        track.quality,
+        track.duration_secs / 60,
+        track.duration_secs % 60
+    );
+
+    let info = match tidal::stream_info(&session, track.id, cfg.quality.as_api()) {
+        Ok(i) => i,
+        Err(e) => return eprintln!("runnir: no stream for this track: {e}"),
+    };
+    println!(
+        "  manifest {} · codec {} · {} bit / {} Hz",
+        info.mime,
+        if info.codec.is_empty() { "?" } else { info.codec.as_str() },
+        info.bit_depth.map(|b| b.to_string()).unwrap_or_else(|| "?".into()),
+        info.sample_rate.map(|r| r.to_string()).unwrap_or_else(|| "?".into()),
+    );
+
+    // Reported the moment the device opens rather than when the track ends: "which
+    // rung did it land on" is the question being asked, and waiting four minutes for
+    // the answer makes the command useless for the thing it exists to check.
+    let mut announced = false;
+    let played = player::play_parts(
+        match player::parts_of(&info) {
+            Ok(p) => p,
+            Err(e) => return eprintln!("runnir: {e}"),
+        },
+        player::hint_for(&info),
+        &info.quality,
+        &cfg,
+        true,
+        &mut |progress| {
+            if !announced {
+                if let Some(signal) = progress.signal {
+                    if signal.rung.is_some() {
+                        announced = true;
+                        for (device, why) in &signal.refused {
+                            println!("  skipped {device}: {why}");
+                        }
+                        println!("  {}", signal.badge());
+                    }
+                }
+            }
+            player::Flow::Continue
+        },
+    );
+
+    match played {
+        Ok(played) => {
+            println!(
+                "  {} frames ({}:{:02}){}",
+                played.frames,
+                played.frames / played.signal.decoded_rate.max(1) as u64 / 60,
+                played.frames / played.signal.decoded_rate.max(1) as u64 % 60,
+                if played.underruns > 0 {
+                    format!(", {} underruns", played.underruns)
+                } else {
+                    String::new()
+                }
+            );
+        }
+        Err(e) => eprintln!("runnir: playback failed: {e}"),
+    }
+}
+
+/// Runs local files through the decoder, and optionally through the output chain.
+fn tidal_decode(files: &[&str], play: bool) {
+    let cfg = Config::load().tidal;
+    let parts: Vec<player::Part> =
+        files.iter().map(|f| player::Part::File(std::path::PathBuf::from(f))).collect();
+    // The first file names the container for the whole stream: an init segment and its
+    // media segments are one MP4, not several files that each stand alone.
+    let ext = std::path::Path::new(files[0])
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("flac");
+    let ext = if matches!(ext, "m4s" | "m4a" | "mp4") { "mp4" } else { ext };
+
+    match player::play_parts(parts, ext, "", &cfg, play, &mut |_| player::Flow::Continue) {
+        Ok(played) => {
+            let seconds = played.frames as f64 / played.signal.decoded_rate.max(1) as f64;
+            println!("  {}", played.signal.badge());
+            println!("  {} frames ({seconds:.2} s)", played.frames);
+            if played.underruns > 0 {
+                println!("  {} underruns", played.underruns);
+            }
+        }
+        Err(e) => eprintln!("runnir: {e}"),
+    }
+}
+
+/// Prints the output chain for the current config, without playing anything.
+fn tidal_devices() {
+    let cfg = Config::load().tidal;
+    let devices = player::hw_devices_public();
+    if devices.is_empty() {
+        println!("  no playback devices found under /proc/asound");
+    }
+    for d in &devices {
+        println!(
+            "  found {:<10} {}{}",
+            d.name,
+            d.label,
+            if d.is_display { "   (display — only reachable by name)" } else { "" }
+        );
+    }
+    let names = player::auto_candidates(&devices);
+    println!("\n  chain for output = {:?}, bit_perfect = {}:", cfg.output, cfg.bit_perfect);
+    for (i, attempt) in player::plan(&cfg.output, cfg.bit_perfect, &names).iter().enumerate() {
+        println!(
+            "   {}. {:<14} {}",
+            i + 1,
+            attempt.device,
+            match (attempt.exact, attempt.same_rate) {
+                (true, _) => "exact rate and depth (bit-perfect)",
+                (false, true) => "same rate, wider container allowed",
+                (false, false) => "whatever it takes",
+            }
+        );
+    }
 }
 
 /// Prints which LED each key of the leader's top level sits under, for `revision`
@@ -682,6 +1277,13 @@ struct Gpu {
     /// When the now-playing overlay last had its metadata refreshed, so a track change
     /// shows while it stays open without re-fetching on every wake. `None` when closed.
     media_last_refresh: Option<Instant>,
+    /// This window's end of the player. The player itself lives in a daemon shared by
+    /// every runnir on the session, so closing a window — any window but the last —
+    /// does not stop the music. Connected on first use.
+    jukebox: Option<daemon::Remote>,
+    /// Search request counter, so an answer that arrives after a newer query is dropped
+    /// instead of drawn over it.
+    tidal_seq: u64,
     /// Repository state per repo ROOT, not per pane: two panes in the same repository
     /// share one entry and one `git status`.
     git_state: std::collections::HashMap<PathBuf, git::RepoState>,
@@ -847,6 +1449,57 @@ fn notify(body: &str) {
 /// A PTY wake closure. Sends a user event through the proxy — the reliable way to
 /// interrupt `ControlFlow::Wait` from another thread on Wayland — rather than
 /// calling `Window::request_redraw` directly, which can be missed there.
+/// What a TIDAL worker can come back with. Two shapes rather than one: a list and a
+/// set of lyrics are drawn by different halves of the panel, and collapsing them into
+/// one type would mean each side checking whether the answer was meant for it.
+pub enum TidalAnswer {
+    Found(tidal::Found),
+    /// The track the words are for, and the words. The id travels with them because
+    /// the answer can arrive after the song has changed, and words for the wrong song
+    /// are worse than none.
+    Lyrics(u64, tidal::Lyrics),
+}
+
+/// Turns a search result into the rows a list draws, headings and all.
+///
+/// The order is deliberate: tracks first because they are what a search is usually
+/// for, then albums, artists and playlists. Headings only appear when there is more
+/// than one kind, since a single-kind list needs no label.
+fn rows_of(found: &tidal::Found) -> Vec<overlay::TidalRow> {
+    let kinds = [
+        !found.tracks.is_empty(),
+        !found.albums.is_empty(),
+        !found.artists.is_empty(),
+        !found.playlists.is_empty(),
+    ]
+    .iter()
+    .filter(|x| **x)
+    .count();
+    let mut rows = Vec::new();
+    let heading = |rows: &mut Vec<overlay::TidalRow>, text: &str| {
+        if kinds > 1 {
+            rows.push(overlay::TidalRow::Heading(text.to_string()));
+        }
+    };
+    if !found.tracks.is_empty() {
+        heading(&mut rows, "TRACKS");
+        rows.extend(found.tracks.iter().cloned().map(overlay::TidalRow::Track));
+    }
+    if !found.albums.is_empty() {
+        heading(&mut rows, "ALBUMS");
+        rows.extend(found.albums.iter().cloned().map(overlay::TidalRow::Album));
+    }
+    if !found.artists.is_empty() {
+        heading(&mut rows, "ARTISTS");
+        rows.extend(found.artists.iter().cloned().map(overlay::TidalRow::Artist));
+    }
+    if !found.playlists.is_empty() {
+        heading(&mut rows, "PLAYLISTS");
+        rows.extend(found.playlists.iter().cloned().map(overlay::TidalRow::Playlist));
+    }
+    rows
+}
+
 fn wake_fn(proxy: EventLoopProxy<UserEvent>) -> impl Fn() + Send + Clone + 'static {
     move || {
         let _ = proxy.send_event(UserEvent::Redraw);
@@ -1052,6 +1705,8 @@ impl App {
             image_watch: None,
             media_wave: None,
             media_last_refresh: None,
+            jukebox: None,
+            tidal_seq: 0,
             git_state: std::collections::HashMap::new(),
             git_pending: std::collections::HashSet::new(),
             git_seen: std::collections::HashMap::new(),
@@ -1268,7 +1923,12 @@ impl ApplicationHandler<UserEvent> for App {
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         let Some(gpu) = self.gpu.as_mut() else { return };
         match event {
-            UserEvent::Redraw => gpu.window.request_redraw(),
+            // A wake is also how the player says something changed, so a panel that is
+            // open follows the music without polling it on a timer.
+            UserEvent::Redraw => {
+                gpu.refresh_tidal_panel_if_open();
+                gpu.window.request_redraw();
+            }
             UserEvent::Ai(reply) => {
                 // The request finished: clear the "thinking" toast.
                 gpu.status = None;
@@ -1289,6 +1949,7 @@ impl ApplicationHandler<UserEvent> for App {
                 let _ = reply.send(resp);
             }
             UserEvent::Media(msg) => gpu.on_media_msg(msg, &self.config),
+            UserEvent::Tidal(seq, found) => gpu.on_tidal_results(seq, found),
             UserEvent::GitPanel(seq, msg) => gpu.on_git_panel_msg(seq, msg, &self.config),
             UserEvent::Docker(seq, msg) => gpu.on_docker_msg(seq, msg),
             UserEvent::Explorer(tab, seq, dir, entries) => {

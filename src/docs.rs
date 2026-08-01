@@ -648,6 +648,105 @@ Config: explorer.side (left/right), explorer.width in COLUMNS (not a fraction: a
 fraction on an ultrawide gives a 90-column tree), explorer.show_hidden. All three
 are in the settings panel too.
 
+# TIDAL — the console player (leader n)
+
+runnir plays TIDAL itself, straight to the DAC. Not a browser in a box: the stream is
+decoded here and written to the sound card with nothing in between when the hardware
+allows it.
+
+leader n n opens the panel. Sources down the left — Search, Queue, Favourites, Albums,
+Playlists — and what they hold in the middle. h l or Tab move between the two columns,
+j k move in either, and moving over a source loads it.
+
+  /            search: tracks, albums, artists and playlists at once
+  Enter        on a track, play the whole list from there; on an album,
+               artist or playlist, open it
+  a            add to the queue
+  L            the words for what is PLAYING, following the song when
+               TIDAL has timed lyrics for it
+  space f b s  play/pause, forward, back, stop
+  Escape       leaves the search box, then the words, then the panel
+  q            close
+
+The mouse works: one click selects, a second on the same thing acts. A click outside
+puts the panel away — which never stops the music.
+
+Every row is coloured by what TIDAL would actually SERVE it as, with a three-letter tag:
+MAX for hi-res lossless, LSL for lossless, AAC for lossy. This is worth reading before
+pressing play, because asking for hi-res does not mean getting it — plenty of albums are
+listed as MAX and arrive at 16 bit / 44.1 kHz.
+
+The transport also works with no panel open: leader n space, leader n f, leader n b.
+Media keys work too, and the desktop's now-playing widget shows runnir, because it
+announces itself on MPRIS like any other player.
+
+# TIDAL — bit-perfect, and the output chain
+
+Bit-perfect is the best case, never a requirement: the music plays on whatever hardware
+is there. For each track, in order:
+
+  1. the device named in [tidal] output, if it takes the rate and depth untouched
+  2. auto: the first device that does — a USB DAC goes first, a display never
+  3. exclusive at the nearest format the DAC accepts (24 into 32 is zero-padding,
+     which is still bit-exact; a rate change is not)
+  4. plughw — ALSA converts
+  5. default — PipeWire or PulseAudio: never bit-perfect, never fails
+
+The badge names the rung it landed on, and says what was skipped and why when something
+was passed over. A DAC that is merely busy for a moment is waited for rather than
+skipped: ALSA frees a card an instant after the process holding it exits, so opening a
+new window right after closing one used to land the music on the laptop speakers.
+
+In bit-perfect mode the volume is LOCKED. There is nothing between the decoder and the
+DAC, which means the system volume and the volume keys have no say — only the DAC's own
+control. Turn the system volume down before the first exclusive open, not after.
+
+# TIDAL — signing in
+
+  runnir --tidal-login          browser sign-in; paste back the address it lands on
+  runnir --tidal-login --app    the same, through TIDAL's own redirect
+  runnir --tidal-login --import read a session from pasted text, on stdin
+
+Credentials go in [tidal] as client_id and client_secret (or the environment variable
+named by client_secret_env). They are never compiled in — this repository is public.
+Without them the panel does not exist.
+
+The browser lands on a tidal.com page that looks broken. That is expected: the grant
+code is in its address bar, and pasting the whole address finishes the sign-in. The code
+lasts about a minute.
+
+# TIDAL — one player for every window
+
+The player runs in its own process, so the music belongs to the session and not to a
+window. Closing the window that started a song does not stop it; every window shows the
+same track at the same second; and exactly one process holds the sound card.
+
+The LAST window closing stops the music and takes the player with it. There is no
+keep-playing-in-the-background mode. Closing a window while something plays asks first,
+and asks even with behaviour.confirm_close off — that setting is about shell commands.
+
+# TIDAL — sharing what is playing
+
+leader n shift+s publishes a link to what is playing, and the same keys take it down.
+It needs cloudflared installed. The link is a random token on a *.trycloudflare.com
+address, it shows what is playing and plays it, and the panel shows how many people are
+listening.
+
+The link belongs to the player, not to the window that made it, so closing that window
+leaves it up. It dies when the sharing is stopped or when the last window closes.
+
+Worth being plain about: this re-transmits audio you are licensed to listen to, to
+whoever holds the URL.
+
+# TIDAL — checking things without playing them
+
+  runnir --tidal-devices        what the output chain would try, in order
+  runnir --tidal-info TRACK     what TIDAL would serve at each tier
+  runnir --tidal-browse WORDS   search, playlists, favourites and lyrics in one go
+  runnir --tidal-play TRACK     play one track and report the rung it came out on
+  runnir --tidal-decode FILES   run local files through the same decoder;
+                                without --play it opens no device and makes no sound
+
 # ZSA keyboard: lights and signals
 
 On a ZSA board (Moonlander, Voyager) runnir can drive the RGB, with no custom

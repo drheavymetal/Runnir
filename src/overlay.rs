@@ -37,6 +37,8 @@ pub enum Overlay {
     Verbs(VerbsPanel),
     /// Zoomed out: the session as a map of headlines rather than of text.
     Map(MapPanel),
+    /// TIDAL: what is playing, the queue, and search.
+    Tidal(TidalPanel),
 }
 
 impl Overlay {
@@ -62,6 +64,7 @@ impl Overlay {
             Overlay::CatchUp(p) => p.render(cols, rows, theme),
             Overlay::Verbs(p) => p.render(cols, rows, theme),
             Overlay::Map(p) => p.render(cols, rows, theme),
+            Overlay::Tidal(p) => p.render(cols, rows, theme),
         }
     }
 }
@@ -2696,6 +2699,619 @@ fn clock_art(hhmm: &str) -> Option<(Vec<String>, usize)> {
     Some((out, w))
 }
 
+/// The TIDAL panel: sources on the left, what they hold in the middle, and the player
+/// along the bottom.
+///
+/// It holds NO playback state of its own. Everything about the music comes from a
+/// [`crate::player::Snapshot`] handed in at draw time, because the player belongs to the
+/// window and this panel is only a window onto it — closing it must not stop the music,
+/// and reopening it must show exactly what is going on.
+pub struct TidalPanel {
+    pub source: Source,
+    /// Which half the keyboard is driving.
+    pub focus: PanelFocus,
+    pub rows: Vec<TidalRow>,
+    pub cursor: usize,
+    /// Where the current list came from, when it is not simply a source: the album,
+    /// artist or playlist that was opened. Shown as a trail so it is never a mystery
+    /// which list you are looking at.
+    pub crumb: Option<String>,
+    pub query: String,
+    /// True while the query is being typed, so ordinary letters go to the box rather
+    /// than to the transport.
+    pub editing: bool,
+    /// The list request whose answer we are still waiting for, so a slow one that lands
+    /// after a newer one is dropped rather than drawn.
+    pub pending: Option<u64>,
+    /// The same, for words. A separate slot because asking for lyrics used to cancel a
+    /// half-loaded album — the album's answer was dropped by the shared guard, the list
+    /// never arrived, and its name stayed in the trail.
+    pub pending_lyrics: Option<u64>,
+    pub message: Option<String>,
+    /// Words for the track being played, when they have been asked for.
+    pub lyrics: Option<crate::tidal::Lyrics>,
+    /// Which track the words belong to. Without this they outlive their song: the
+    /// panel went on drawing one track's lyrics while highlighting a line by the NEXT
+    /// track's position — confidently wrong words, presented as synced.
+    pub lyrics_for: Option<u64>,
+    pub show_lyrics: bool,
+    /// The trail for a list that has been ASKED for but has not arrived.
+    ///
+    /// Written on arrival rather than on request: an album that fails to load used to
+    /// leave its name over the previous, unrelated list, and a request that was
+    /// superseded left the crumb naming a list that never appeared.
+    pub crumb_pending: Option<String>,
+    /// The player's state as of the last redraw. Refreshed from the jukebox, never
+    /// mutated here.
+    pub snapshot: crate::player::Snapshot,
+}
+
+/// Where the panel is on screen and how it is divided.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TidalLayout {
+    pub col: usize,
+    pub row: usize,
+    pub w: usize,
+    pub h: usize,
+    /// Width of the sources column.
+    pub side: usize,
+    pub list_rows: usize,
+    /// Index of the first list row on screen.
+    pub first: usize,
+}
+
+/// What a click landed on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TidalHit {
+    Source(usize),
+    Row(usize),
+    Query,
+    /// Inside the panel but on none of the above — a border, the transport, the wave.
+    /// Worth naming, because it must NOT be read as "outside", which closes the panel.
+    Chrome,
+}
+
+/// The left column. Each is a different question, not a different filter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Source {
+    Search,
+    Queue,
+    Favourites,
+    Albums,
+    Playlists,
+}
+
+impl Source {
+    pub const ALL: [Source; 5] =
+        [Source::Search, Source::Queue, Source::Favourites, Source::Albums, Source::Playlists];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Source::Search => "Search",
+            Source::Queue => "Queue",
+            Source::Favourites => "Favourites",
+            Source::Albums => "Albums",
+            Source::Playlists => "Playlists",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PanelFocus {
+    Sources,
+    List,
+}
+
+/// One line of the middle column. Four kinds, because a search answers with four kinds
+/// and pretending otherwise would mean four searches or three lost answers.
+#[derive(Clone, Debug)]
+pub enum TidalRow {
+    Track(crate::tidal::Track),
+    Album(crate::tidal::Album),
+    Artist(crate::tidal::Artist),
+    Playlist(crate::tidal::Playlist),
+    /// A heading inside a mixed list. Never selectable.
+    Heading(String),
+}
+
+impl TidalRow {
+    fn selectable(&self) -> bool {
+        !matches!(self, TidalRow::Heading(_))
+    }
+
+    /// TIDAL's word for the tier, when this row has one. Empty for the kinds that do
+    /// not carry it — an artist has no quality, and colouring one would be a guess.
+    fn quality(&self) -> &str {
+        match self {
+            TidalRow::Track(t) => &t.quality,
+            TidalRow::Album(a) => &a.quality,
+            _ => "",
+        }
+    }
+}
+
+/// How a tier reads at a glance.
+///
+/// The colour is the point: Pedro asked for the resolution to be visible BEFORE
+/// pressing play, because asking for hi-res and getting 16/44.1 is common and only
+/// shows up afterwards otherwise.
+pub fn quality_tint(quality: &str, theme: &Theme) -> Color {
+    match quality {
+        // The best tier TIDAL has: the accent, the one colour the eye is trained on.
+        "HI_RES_LOSSLESS" | "HI_RES" => {
+            let a = theme.accent;
+            Color::Rgb(a.0, a.1, a.2)
+        }
+        // Lossless but not hi-res: plainly readable, deliberately not the accent.
+        "LOSSLESS" => Color::Rgb(0xc8, 0xcb, 0xd2),
+        // Lossy. Dimmed, because on a hi-fi setup it is the thing you want to notice.
+        "HIGH" | "LOW" => Color::Rgb(0x7d, 0x81, 0x8a),
+        _ => Color::Rgb(0xc8, 0xcb, 0xd2),
+    }
+}
+
+/// The short tag drawn beside a row: three characters that say the tier without
+/// spelling it. Colour carries the same information for anyone who reads colour first.
+fn quality_tag(quality: &str) -> &'static str {
+    match quality {
+        "HI_RES_LOSSLESS" | "HI_RES" => "MAX",
+        "LOSSLESS" => "LSL",
+        "HIGH" => "AAC",
+        "LOW" => "low",
+        _ => "   ",
+    }
+}
+
+impl TidalPanel {
+    pub fn new(snapshot: crate::player::Snapshot) -> Self {
+        // Open on the queue when there IS one: the common reason to open the panel with
+        // music playing is to see what is playing, not to start a search.
+        let source = if snapshot.queue.is_empty() { Source::Search } else { Source::Queue };
+        let cursor = if source == Source::Queue { snapshot.index } else { 0 };
+        let mut panel = Self {
+            source,
+            focus: PanelFocus::List,
+            rows: Vec::new(),
+            cursor,
+            crumb: None,
+            query: String::new(),
+            editing: source == Source::Search,
+            pending: None,
+            pending_lyrics: None,
+            message: None,
+            lyrics: None,
+            lyrics_for: None,
+            show_lyrics: false,
+            crumb_pending: None,
+            snapshot,
+        };
+        panel.reload_queue();
+        panel
+    }
+
+    /// The queue is not fetched: it is already in the snapshot. Rebuilt on every change
+    /// so the list and the player cannot disagree.
+    pub fn reload_queue(&mut self) {
+        if self.source == Source::Queue {
+            self.rows = self.snapshot.queue.iter().cloned().map(TidalRow::Track).collect();
+        }
+    }
+
+    pub fn up(&mut self) {
+        // Skip headings rather than landing on them: a heading is a label, and stopping
+        // on it makes j/k feel broken.
+        let mut i = self.cursor;
+        while i > 0 {
+            i -= 1;
+            if self.rows.get(i).is_some_and(TidalRow::selectable) {
+                self.cursor = i;
+                return;
+            }
+        }
+    }
+
+    pub fn down(&mut self) {
+        let mut i = self.cursor;
+        while i + 1 < self.rows.len() {
+            i += 1;
+            if self.rows[i].selectable() {
+                self.cursor = i;
+                return;
+            }
+        }
+    }
+
+    /// The first selectable row, for when a list has just arrived.
+    pub fn settle_cursor(&mut self) {
+        self.cursor = self.rows.iter().position(TidalRow::selectable).unwrap_or(0);
+    }
+
+    pub fn selected(&self) -> Option<&TidalRow> {
+        self.rows.get(self.cursor).filter(|r| r.selectable())
+    }
+
+    /// Every track in the current list, and where the cursor sits among them.
+    ///
+    /// Playing a track from a list plays the WHOLE list from there, which is what a
+    /// list of songs on screen implies. Headings and non-tracks are skipped, so playing
+    /// the third track of a mixed search result does not start at the wrong song.
+    pub fn play_selection(&self) -> Option<(Vec<crate::tidal::Track>, usize)> {
+        let mut tracks = Vec::new();
+        let mut at = None;
+        for (i, row) in self.rows.iter().enumerate() {
+            if let TidalRow::Track(t) = row {
+                if i == self.cursor {
+                    at = Some(tracks.len());
+                }
+                tracks.push(t.clone());
+            }
+        }
+        let at = at?;
+        (!tracks.is_empty()).then_some((tracks, at))
+    }
+
+    pub fn selected_track(&self) -> Option<crate::tidal::Track> {
+        match self.selected()? {
+            TidalRow::Track(t) => Some(t.clone()),
+            _ => None,
+        }
+    }
+
+    /// For the remote control, so a script can assert what the panel is showing.
+    pub fn rows(&self) -> Vec<String> {
+        self.rows.iter().map(row_line).collect()
+    }
+
+    /// Where the panel sits and how it is divided.
+    ///
+    /// Shared by the drawing and the hit-testing rather than worked out twice: a panel
+    /// whose clicks land a row off the thing you pointed at is worse than one with no
+    /// mouse at all, and that is exactly what two copies of this arithmetic produce
+    /// the first time one of them changes.
+    pub fn layout(&self, cols: usize, rows: usize) -> TidalLayout {
+        let w = (cols * 8 / 10).clamp(56, 110).min(cols.saturating_sub(2));
+        let list_rows = rows.saturating_sub(12).clamp(5, 20);
+        let h = list_rows + 7;
+        TidalLayout {
+            col: (cols.saturating_sub(w)) / 2,
+            row: (rows.saturating_sub(h)) / 3,
+            w,
+            h,
+            side: 14,
+            list_rows,
+            first: self.cursor.saturating_sub(list_rows.saturating_sub(2)),
+        }
+    }
+
+    /// What is under a screen cell, if anything of this panel is.
+    pub fn hit(&self, cols: usize, rows: usize, col: usize, row: usize) -> Option<TidalHit> {
+        let l = self.layout(cols, rows);
+        let (x, y) = (col.checked_sub(l.col)?, row.checked_sub(l.row)?);
+        if x >= l.w || y >= l.h {
+            return None;
+        }
+        // The sources column: five names starting two rows down. Above the first or
+        // below the last is still the panel — the same trap as the list, and it would
+        // have closed the panel when someone clicked the empty space under Playlists.
+        if x < l.side {
+            return match y.checked_sub(2) {
+                Some(i) if i < Source::ALL.len() => Some(TidalHit::Source(i)),
+                _ => Some(TidalHit::Chrome),
+            };
+        }
+        if y == 1 {
+            return Some(TidalHit::Query);
+        }
+        // With the words up there is no list under the pointer, whatever the rows say.
+        // Without this, a click on a lyric line hit the row the cursor happened to be
+        // on — and on a scrolled list that is exactly the cursor's own line, so
+        // clicking a line of text started playing music.
+        if self.show_lyrics {
+            return Some(TidalHit::Chrome);
+        }
+        if let Some(line) = y.checked_sub(3) {
+            if line < l.list_rows {
+                let index = l.first + line;
+                // Past the end of a short list is still INSIDE the panel. Returning
+                // nothing here would read as "outside", which closes it — so clicking
+                // the empty space under a three-row list would have shut the panel.
+                if index < self.rows.len() {
+                    return Some(TidalHit::Row(index));
+                }
+            }
+        }
+        Some(TidalHit::Chrome)
+    }
+
+    fn render(&self, cols: usize, rows: usize, theme: &Theme) -> Vec<Panel> {
+        let l = self.layout(cols, rows);
+        let (w, h, side, list_rows) = (l.w, l.h, l.side, l.list_rows);
+        let mut g = panel_grid(w, h, theme);
+
+        let title = match &self.crumb {
+            Some(c) => format!("TIDAL  \u{b7}  {c}"),
+            None => "TIDAL".to_string(),
+        };
+        write(&mut g, 0, 2, &title, accent());
+
+        // Sources, always visible: the panel should never be a place you can get lost
+        // in with no way back to a named list.
+        for (i, source) in Source::ALL.iter().enumerate() {
+            let row = 2 + i;
+            let here = *source == self.source;
+            let focused = here && self.focus == PanelFocus::Sources;
+            if focused {
+                write(&mut g, row, 0, &" ".repeat(side), selected());
+            }
+            let pen = if focused {
+                selected()
+            } else if here {
+                accent()
+            } else {
+                dim()
+            };
+            write(&mut g, row, 2, source.label(), pen);
+        }
+        for row in 1..h - 4 {
+            write(&mut g, row, side, "\u{2502}", dim());
+        }
+
+        // The query box, on the search source only — a box that appears and disappears
+        // would move everything under it, so it keeps its row and greys out instead.
+        let cue = if self.editing { "\u{2588}" } else { "" };
+        let query_pen = if self.editing {
+            accent()
+        } else if self.source == Source::Search {
+            normal()
+        } else {
+            dim()
+        };
+        write(&mut g, 1, side + 2, &format!("/ {}{cue}", self.query), query_pen);
+
+        if self.show_lyrics {
+            self.render_lyrics(&mut g, side, list_rows, w);
+        } else {
+            self.render_list(&mut g, side, list_rows, w, theme);
+        }
+
+        // The transport and the signal path, at the bottom, where a status bar goes.
+        let bar = h.saturating_sub(3);
+        // The wave takes the place of the rule when there is one to draw: a separator
+        // and a picture of the sound want the same row, and the picture is worth more.
+        match self.wave_line(w) {
+            Some(wave) => write(&mut g, bar, 0, &wave, accent()),
+            None => write(&mut g, bar, 0, &"\u{2500}".repeat(w), dim()),
+        }
+        write(&mut g, bar + 1, 2, &short_tail(&self.transport_line(), w.saturating_sub(4)), normal());
+        // The link takes the footer while there is one: it is the only thing on this
+        // panel somebody needs to READ rather than glance at, and the terminal's hint
+        // layer can only make it clickable if it is on screen in full.
+        let foot = match self.snapshot.share.as_ref() {
+            Some(share) if !share.url.is_empty() => {
+                let who = match share.listeners {
+                    0 => "nobody listening yet".to_string(),
+                    1 => "1 listening".to_string(),
+                    n => format!("{n} listening"),
+                };
+                return_share_footer(&mut g, bar + 1, w, &share.url, &who);
+                String::new()
+            }
+            Some(share) if share.error.is_some() => {
+                format!("share failed: {}", share.error.clone().unwrap_or_default())
+            }
+            _ => String::new(),
+        };
+        let foot = if !foot.is_empty() { foot } else { match self.message.as_deref() {
+            Some(msg) => msg.to_string(),
+            None if self.snapshot.error.is_some() => {
+                self.snapshot.error.clone().unwrap_or_default()
+            }
+            // A device that was passed over is worth more room than the one that took
+            // the audio: "it is coming out of the laptop" is obvious, and "because the
+            // DAC was busy" is the part nobody can work out from the outside.
+            None if !self.snapshot.signal.refused.is_empty() => {
+                let skipped = self
+                    .snapshot
+                    .signal
+                    .refused
+                    .iter()
+                    .map(|(device, why)| format!("{device} {why}"))
+                    .collect::<Vec<_>>()
+                    .join(" \u{b7} ");
+                format!("{} \u{2190} skipped {skipped}", self.snapshot.signal.badge())
+            }
+            None => self.snapshot.signal.badge(),
+        } };
+        let pen = if self.message.is_some() || self.snapshot.error.is_some() {
+            accent()
+        } else if self.snapshot.signal.is_bit_exact() {
+            accent()
+        } else {
+            dim()
+        };
+        write(&mut g, bar + 2, 2, &short_tail(&foot, w.saturating_sub(4)), pen);
+
+        vec![Panel { grid: g, col: l.col, row: l.row }]
+    }
+
+    fn render_list(&self, g: &mut Grid, side: usize, list_rows: usize, w: usize, theme: &Theme) {
+        if self.rows.is_empty() {
+            let empty = match (self.source, self.pending.is_some()) {
+                (_, true) => "loading\u{2026}",
+                (Source::Search, _) => "type to search \u{b7} tracks, albums, artists, playlists",
+                (Source::Queue, _) => "nothing queued",
+                (Source::Favourites, _) => "no favourites",
+                (Source::Albums, _) => "no saved albums",
+                (Source::Playlists, _) => "no playlists",
+            };
+            write(g, 3, side + 2, empty, dim());
+            return;
+        }
+
+        // Keep the cursor on screen without moving the list under it every keystroke.
+        // The same sum the hit-testing uses, through `layout`.
+        let first = self.cursor.saturating_sub(list_rows.saturating_sub(2));
+        for (i, row) in self.rows.iter().skip(first).take(list_rows).enumerate() {
+            let index = first + i;
+            let at = 3 + i;
+            let sel = index == self.cursor && self.focus == PanelFocus::List;
+            if sel {
+                write(g, at, side, &" ".repeat(w.saturating_sub(side)), selected());
+            }
+            if let TidalRow::Heading(text) = row {
+                write(g, at, side + 2, text, dim());
+                continue;
+            }
+            // The tier, three characters, before the text — a column the eye can run
+            // down without reading any of the titles.
+            let tag = quality_tag(row.quality());
+            let tint = quality_tint(row.quality(), theme);
+            if !tag.trim().is_empty() {
+                let pen = if sel { selected() } else { Pen { fg: tint, ..normal() } };
+                write(g, at, side + 2, tag, pen);
+            }
+            let playing = matches!(row, TidalRow::Track(t)
+                if self.snapshot.now_playing().is_some_and(|p| p.id == t.id));
+            let mark = if playing { "\u{25b8} " } else { "  " };
+            let text = format!("{mark}{}", row_line(row));
+            let pen = if sel {
+                selected()
+            } else if playing {
+                accent()
+            } else {
+                Pen { fg: tint, ..normal() }
+            };
+            let room = w.saturating_sub(side + 8 + 8);
+            write(g, at, side + 6, &short_tail(&text, room), pen);
+
+            if let TidalRow::Track(t) = row {
+                let dur = format!("{}:{:02}", t.duration_secs / 60, t.duration_secs % 60);
+                let x = w.saturating_sub(dur.chars().count() + 2);
+                write(g, at, x, &dur, if sel { selected() } else { dim() });
+            }
+        }
+    }
+
+    /// The words, with the line being sung right now picked out.
+    fn render_lyrics(&self, g: &mut Grid, side: usize, list_rows: usize, w: usize) {
+        let Some(lyrics) = self.lyrics.as_ref() else {
+            write(g, 3, side + 2, "no lyrics for this track", dim());
+            return;
+        };
+        if !lyrics.timed.is_empty() {
+            let current = lyrics.line_at(self.snapshot.position_secs);
+            // Scroll so the current line sits a third of the way down, which is where
+            // the eye expects the "now" of a scrolling list to be.
+            let anchor = list_rows / 3;
+            let first = current.unwrap_or(0).saturating_sub(anchor);
+            for (i, (_, text)) in lyrics.timed.iter().skip(first).take(list_rows).enumerate() {
+                let index = first + i;
+                let pen = if Some(index) == current { accent() } else { dim() };
+                write(g, 3 + i, side + 2, &short_tail(text, w.saturating_sub(side + 4)), pen);
+            }
+            return;
+        }
+        // Plain words: no highlight, and no pretending there is one.
+        for (i, line) in lyrics.plain.lines().take(list_rows).enumerate() {
+            write(g, 3 + i, side + 2, &short_tail(line, w.saturating_sub(side + 4)), normal());
+        }
+    }
+
+    /// The sound as a row of bars, most recent on the right.
+    ///
+    /// Eight block glyphs rather than braille: braille packs four rows of dots into a
+    /// cell and is the right tool for a plot, but a level meter is one value per column
+    /// and the blocks give it eight heights with no arithmetic and no font surprises.
+    /// Nothing is drawn when nothing is playing — an idle meter is a flat line that
+    /// looks like a bug.
+    fn wave_line(&self, w: usize) -> Option<String> {
+        if !self.snapshot.playing || self.snapshot.wave.is_empty() {
+            return None;
+        }
+        const BARS: [char; 9] = [' ', '\u{2581}', '\u{2582}', '\u{2583}', '\u{2584}', '\u{2585}', '\u{2586}', '\u{2587}', '\u{2588}'];
+        let room = w.min(self.snapshot.wave.len());
+        let from = self.snapshot.wave.len() - room;
+        Some(
+            self.snapshot.wave[from..]
+                .iter()
+                .map(|level| {
+                    let step = (level * 8.0).round().clamp(0.0, 8.0) as usize;
+                    BARS[step]
+                })
+                .collect(),
+        )
+    }
+
+    /// `\u{25b8} Artist \u{2014} Title   1:23 / 4:56`, or an invitation when nothing is on.
+    fn transport_line(&self) -> String {
+        let Some(track) = self.snapshot.now_playing() else {
+            return "nothing playing".to_string();
+        };
+        let mark = if !self.snapshot.playing {
+            "\u{25a0}"
+        } else if self.snapshot.paused {
+            "\u{2016}"
+        } else {
+            "\u{25b8}"
+        };
+        let at = self.snapshot.position_secs as u32;
+        format!(
+            "{mark} {}  {}:{:02} / {}:{:02}",
+            track_line(track),
+            at / 60,
+            at % 60,
+            track.duration_secs / 60,
+            track.duration_secs % 60
+        )
+    }
+}
+
+/// Draws the share link over the transport row, where it is impossible to miss.
+///
+/// Over the transport and not under it: what is playing is on the panel three times
+/// already, and a public URL is the one thing here that has to be read exactly.
+fn return_share_footer(g: &mut Grid, row: usize, w: usize, url: &str, who: &str) {
+    write(g, row, 0, &" ".repeat(w), accent());
+    write(g, row, 2, &short_tail(url, w.saturating_sub(4 + who.chars().count())), selected());
+    let at = w.saturating_sub(who.chars().count() + 2);
+    write(g, row, at, who, selected());
+}
+
+/// One row as a line of text. Also what the remote control reports, so a script sees
+/// exactly what a person would.
+fn row_line(row: &TidalRow) -> String {
+    match row {
+        TidalRow::Track(t) => track_line(t),
+        TidalRow::Album(a) => {
+            let year = a.year.map(|y| format!(" ({y})")).unwrap_or_default();
+            format!("{} \u{2014} {}{year}", a.artist, a.title)
+        }
+        TidalRow::Artist(a) => a.name.clone(),
+        TidalRow::Playlist(p) => {
+            let who = if p.mine { "mine".to_string() } else { p.owner.clone() };
+            format!("{} \u{b7} {who} ({} tracks)", p.title, p.tracks)
+        }
+        TidalRow::Heading(text) => text.clone(),
+    }
+}
+
+/// Cuts a line to fit, keeping the FRONT.
+///
+/// The opposite of `short_path`, and for the opposite reason: a path is identified by
+/// its tail and a song by its artist and title, so here it is the end that gives.
+fn short_tail(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let Some(keep) = max.checked_sub(1) else { return String::new() };
+    let head: String = s.chars().take(keep).collect();
+    format!("{head}\u{2026}")
+}
+
+fn track_line(t: &crate::tidal::Track) -> String {
+    if t.artist.is_empty() { t.title.clone() } else { format!("{} \u{2014} {}", t.artist, t.title) }
+}
+
 /// The verbs panel: how this repository is actually built, tested and deployed,
 /// ranked by how often each verb succeeded here.
 pub struct VerbsPanel {
@@ -3823,7 +4439,7 @@ fn _cell_marker() -> Cell {
 #[cfg(test)]
 mod docker_tests {
     use super::*;
-    use crate::docker::{Container, Endpoint, Health, Host, Image, Kind, Network, Snapshot, Volume};
+    use crate::docker::{Container, Endpoint, Health, Host, Image, Kind, Network, Snapshot};
 
     fn container(name: &str, project: Option<&str>, running: bool) -> Container {
         Container {
@@ -4812,6 +5428,250 @@ mod tests {
         // A query that matches nothing leaves no selection rather than panicking.
         p.input('z');
         assert!(p.selected().is_none());
+    }
+
+fn a_track(title: &str) -> crate::tidal::Track {
+        crate::tidal::Track {
+            id: 1,
+            title: title.into(),
+            artist: "Opeth".into(),
+            album: "Blackwater Park".into(),
+            duration_secs: 601,
+            quality: "LOSSLESS".into(),
+        }
+    }
+
+    #[test]
+    fn the_panel_opens_on_what_is_playing_when_something_is() {
+        let snapshot = crate::player::Snapshot {
+            queue: vec![a_track("Bleak"), a_track("Harvest")],
+            index: 1,
+            playing: true,
+            ..Default::default()
+        };
+        let p = TidalPanel::new(snapshot);
+        // Opening the panel while music plays is nearly always "what is this?", not
+        // "let me search" — and the cursor starts on the track being heard.
+        assert_eq!(p.source, Source::Queue);
+        assert_eq!(p.cursor, 1);
+        assert_eq!(p.rows.len(), 2);
+        assert!(!p.editing);
+
+        // With nothing queued there is nothing to look at, so it opens ready to type.
+        let empty = TidalPanel::new(crate::player::Snapshot::default());
+        assert_eq!(empty.source, Source::Search);
+        assert!(empty.editing);
+    }
+
+    #[test]
+    fn playing_a_track_takes_the_whole_list_with_it_and_skips_what_is_not_a_track() {
+        let mut p = TidalPanel::new(crate::player::Snapshot::default());
+        p.rows = vec![
+            TidalRow::Heading("TRACKS".into()),
+            TidalRow::Track(a_track("one")),
+            TidalRow::Track(a_track("two")),
+            TidalRow::Heading("ALBUMS".into()),
+            TidalRow::Album(crate::tidal::Album::default()),
+        ];
+        p.cursor = 2; // the second track
+        let (tracks, at) = p.play_selection().expect("a selection");
+        // The album and both headings are not tracks: counting them would start
+        // playback at the wrong song.
+        assert_eq!(tracks.len(), 2);
+        assert_eq!(at, 1);
+    }
+
+    #[test]
+    fn moving_never_lands_on_a_heading() {
+        let mut p = TidalPanel::new(crate::player::Snapshot::default());
+        p.rows = vec![
+            TidalRow::Heading("TRACKS".into()),
+            TidalRow::Track(a_track("one")),
+            TidalRow::Heading("ALBUMS".into()),
+            TidalRow::Album(crate::tidal::Album::default()),
+        ];
+        p.settle_cursor();
+        assert_eq!(p.cursor, 1, "the first selectable row, not the heading above it");
+        p.down();
+        assert_eq!(p.cursor, 3, "jumped over the ALBUMS heading");
+        p.up();
+        assert_eq!(p.cursor, 1);
+        // At the top there is nowhere selectable to go, so it stays put rather than
+        // parking on a label.
+        p.up();
+        assert_eq!(p.cursor, 1);
+    }
+
+    #[test]
+    fn a_click_lands_on_the_thing_it_was_pointed_at() {
+        let mut p = TidalPanel::new(crate::player::Snapshot::default());
+        p.rows = vec![
+            TidalRow::Heading("TRACKS".into()),
+            TidalRow::Track(a_track("one")),
+            TidalRow::Track(a_track("two")),
+        ];
+        let (cols, rows) = (120, 40);
+        let l = p.layout(cols, rows);
+
+        // The sources column: five names, two rows down from the panel's top.
+        assert_eq!(p.hit(cols, rows, l.col + 2, l.row + 2), Some(TidalHit::Source(0)));
+        assert_eq!(p.hit(cols, rows, l.col + 2, l.row + 6), Some(TidalHit::Source(4)));
+        // One row further is past the last source and must not select the last one.
+        assert_eq!(p.hit(cols, rows, l.col + 2, l.row + 7), Some(TidalHit::Chrome));
+
+        // The list, three rows down and to the right of the divider.
+        assert_eq!(p.hit(cols, rows, l.col + l.side + 4, l.row + 3), Some(TidalHit::Row(0)));
+        assert_eq!(p.hit(cols, rows, l.col + l.side + 4, l.row + 5), Some(TidalHit::Row(2)));
+        // Past the end of a short list is the panel, not a row: clicking empty space
+        // must not select whatever happens to be last.
+        assert_eq!(p.hit(cols, rows, l.col + l.side + 4, l.row + 6), Some(TidalHit::Chrome));
+
+        // The query box.
+        assert_eq!(p.hit(cols, rows, l.col + l.side + 4, l.row + 1), Some(TidalHit::Query));
+
+        // Outside the panel is nothing at all, which is what closes it.
+        assert_eq!(p.hit(cols, rows, 0, 0), None);
+        assert_eq!(p.hit(cols, rows, l.col + l.w, l.row + 2), None);
+    }
+
+    #[test]
+    fn a_click_on_the_words_never_reaches_the_list_behind_them() {
+        // The worst of the panel findings: the hit test did not know the list was
+        // hidden, and on a scrolled list the cursor's own line is exactly where the
+        // words are drawn — so clicking a line of TEXT started playing music.
+        let mut p = TidalPanel::new(crate::player::Snapshot::default());
+        p.rows = (0..60).map(|i| TidalRow::Track(a_track(&format!("t{i}")))).collect();
+        p.cursor = 50;
+        let (cols, rows) = (120, 40);
+        let l = p.layout(cols, rows);
+        let cursor_line = l.row + 3 + (p.cursor - l.first);
+
+        assert_eq!(p.hit(cols, rows, l.col + l.side + 4, cursor_line), Some(TidalHit::Row(50)));
+        p.show_lyrics = true;
+        assert_eq!(
+            p.hit(cols, rows, l.col + l.side + 4, cursor_line),
+            Some(TidalHit::Chrome),
+            "with the words up there is no list under the pointer"
+        );
+        // The sources column still works: it is drawn either way.
+        assert_eq!(p.hit(cols, rows, l.col + 2, l.row + 2), Some(TidalHit::Source(0)));
+    }
+
+    #[test]
+    fn a_scrolled_list_hits_the_row_that_is_actually_drawn() {
+        // The bug this guards: hit-testing that forgets the list has scrolled points a
+        // click at the wrong song, which with a music panel means playing the wrong one.
+        let mut p = TidalPanel::new(crate::player::Snapshot::default());
+        p.rows = (0..60).map(|i| TidalRow::Track(a_track(&format!("t{i}")))).collect();
+        p.cursor = 50;
+        let (cols, rows) = (120, 40);
+        let l = p.layout(cols, rows);
+        assert!(l.first > 0, "a cursor at 50 must have scrolled the window");
+        assert_eq!(p.hit(cols, rows, l.col + l.side + 4, l.row + 3), Some(TidalHit::Row(l.first)));
+    }
+
+    #[test]
+    fn an_empty_list_has_nothing_to_play() {
+        let p = TidalPanel::new(crate::player::Snapshot::default());
+        assert!(p.play_selection().is_none());
+        assert!(p.selected_track().is_none());
+    }
+
+    #[test]
+    fn the_tier_reads_as_a_colour_and_as_three_characters() {
+        let theme = Theme::default();
+        let accent = Color::Rgb(theme.accent.0, theme.accent.1, theme.accent.2);
+        // Hi-res gets the accent: it is the thing worth spotting in a list.
+        assert_eq!(quality_tint("HI_RES_LOSSLESS", &theme), accent);
+        assert_eq!(quality_tag("HI_RES_LOSSLESS"), "MAX");
+        // Lossless is plain, lossy is dimmed — on a hi-fi setup, lossy is what you
+        // want to notice.
+        assert_ne!(quality_tint("LOSSLESS", &theme), accent);
+        assert_ne!(quality_tint("HIGH", &theme), quality_tint("LOSSLESS", &theme));
+        assert_eq!(quality_tag("HIGH"), "AAC");
+        // An artist row has no tier, and inventing one would be a guess.
+        assert_eq!(quality_tag(""), "   ");
+    }
+
+    #[test]
+    fn a_row_says_what_kind_of_thing_it_is() {
+        let album = TidalRow::Album(crate::tidal::Album {
+            title: "Rumours".into(),
+            artist: "Fleetwood Mac".into(),
+            year: Some(1977),
+            ..Default::default()
+        });
+        assert_eq!(row_line(&album), "Fleetwood Mac \u{2014} Rumours (1977)");
+
+        let mine = TidalRow::Playlist(crate::tidal::Playlist {
+            title: "Dormir".into(),
+            tracks: 11,
+            owner: "Pedro".into(),
+            mine: true,
+            ..Default::default()
+        });
+        assert_eq!(row_line(&mine), "Dormir \u{b7} mine (11 tracks)");
+    }
+
+    #[test]
+    fn the_wave_is_only_drawn_when_there_is_sound_to_draw() {
+        let mut p = TidalPanel::new(crate::player::Snapshot::default());
+        // Nothing playing: no bars. An idle meter is a flat line that reads as a bug.
+        assert_eq!(p.wave_line(20), None);
+
+        p.snapshot.playing = true;
+        assert_eq!(p.wave_line(20), None, "playing but nothing measured yet");
+
+        p.snapshot.wave = vec![0.0, 0.5, 1.0];
+        let line = p.wave_line(20).expect("bars");
+        assert_eq!(line.chars().count(), 3, "one column per reading, never padded");
+        assert_eq!(line.chars().next(), Some(' '), "silence is an empty column");
+        assert_eq!(line.chars().last(), Some('\u{2588}'), "full scale is a full block");
+    }
+
+    #[test]
+    fn a_long_wave_keeps_its_most_recent_end() {
+        let mut p = TidalPanel::new(crate::player::Snapshot::default());
+        p.snapshot.playing = true;
+        // Old and quiet at the front, recent and loud at the back.
+        p.snapshot.wave = (0..40).map(|i| i as f32 / 40.0).collect();
+        let line = p.wave_line(8).expect("bars");
+        assert_eq!(line.chars().count(), 8);
+        // The newest reading is the loudest, and it is the one kept — 39/40 rounds up
+        // to the full block, which is what "almost full scale" should look like.
+        assert_eq!(line.chars().last(), Some('\u{2588}'));
+        // …and the oldest of the eight kept is not the oldest of the forty measured.
+        assert_ne!(line.chars().next(), Some(' '));
+    }
+
+    #[test]
+    fn the_transport_line_says_which_of_three_states_it_is_in() {
+        let mut snapshot = crate::player::Snapshot {
+            queue: vec![a_track("Bleak")],
+            index: 0,
+            playing: true,
+            position_secs: 83.0,
+            ..Default::default()
+        };
+        let mut p = TidalPanel::new(snapshot.clone());
+        assert!(p.transport_line().contains("1:23 / 10:01"), "{}", p.transport_line());
+        assert!(p.transport_line().starts_with('\u{25b8}'));
+
+        snapshot.paused = true;
+        p.snapshot = snapshot.clone();
+        assert!(p.transport_line().starts_with('\u{2016}'), "{}", p.transport_line());
+
+        snapshot.playing = false;
+        p.snapshot = snapshot;
+        assert!(p.transport_line().starts_with('\u{25a0}'), "{}", p.transport_line());
+    }
+
+    #[test]
+    fn a_long_title_loses_its_end_and_a_path_loses_its_start() {
+        // Two truncations that must not be confused: a song is known by its beginning,
+        // a path by its end.
+        assert_eq!(short_tail("abcdefgh", 4), "abc\u{2026}");
+        assert_eq!(short_path("/home/pedro/x", 6), "\u{2026}dro/x");
     }
 
     #[test]

@@ -570,12 +570,32 @@ impl Gpu {
             bar.write_str(0, x, &s, accent);
             x += s.chars().count() + 2;
         }
-        let _ = x;
-        // Right: clock.
+        // Right: clock, and the music just before it.
+        let mut right_edge = cols;
         if !self.clock.is_empty() {
             let s = format!("\u{f017} {} ", self.clock); //  clock glyph
-            let right = cols.saturating_sub(s.chars().count());
-            bar.write_str(0, right, &s, dim);
+            let at = cols.saturating_sub(s.chars().count());
+            bar.write_str(0, at, &s, dim);
+            right_edge = at;
+        }
+        // What is playing sits between the repo and the clock, because that is where
+        // it belongs in the sentence the bar reads as: where you are, what you are
+        // listening to, what time it is. Only when something is actually playing —
+        // a permanent empty slot would be noise.
+        if let Some(player) = self.jukebox.as_ref() {
+            let snapshot = player.snapshot();
+            // A fixed slice, not everything that is free: the bar belongs to the
+            // terminal, and a title that grows into the whole width pushes the eye away
+            // from the cwd and the branch. It scrolls inside this instead.
+            const MUSIC_WIDTH: usize = 34;
+            let room = right_edge.saturating_sub(x + 2).min(MUSIC_WIDTH);
+            if let Some(line) = snapshot.status_line(room) {
+                let at = right_edge.saturating_sub(line.chars().count() + 1);
+                // Accent only when nothing touched the samples. The colour is the
+                // claim; the words are the detail.
+                let pen = if snapshot.signal.is_bit_exact() { accent } else { dim };
+                bar.write_str(0, at, &line, pen);
+            }
         }
         Some((bar, 0.0, y))
     }

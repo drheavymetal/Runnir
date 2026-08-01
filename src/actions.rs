@@ -67,6 +67,16 @@ pub enum Action {
     CatchUp,
     /// The verbs this repository is actually worked with.
     RepoVerbs,
+    /// The TIDAL panel: what is playing, the queue, and search.
+    TidalPanel,
+    /// Transport. Bound on the leader layer so they work with no panel open — the
+    /// music does not belong to the panel, and neither does controlling it.
+    TidalToggle,
+    TidalNext,
+    TidalPrev,
+    TidalStop,
+    /// Publish a link to what is playing, or take it down.
+    TidalShare,
     /// Zoom out: the session as a map of headlines.
     Map,
     /// Arrange the window around a deploy: watches, and the deploy staged.
@@ -168,6 +178,12 @@ impl Action {
             ToggleExplorer => "toggle_explorer",
             CatchUp => "catch_up",
             RepoVerbs => "repo_verbs",
+            TidalPanel => "tidal_panel",
+            TidalToggle => "tidal_toggle",
+            TidalNext => "tidal_next",
+            TidalPrev => "tidal_prev",
+            TidalStop => "tidal_stop",
+            TidalShare => "tidal_share",
             Map => "map",
             WarRoom => "war_room",
             WarRoomClose => "war_room_close",
@@ -259,6 +275,12 @@ impl Action {
             ToggleExplorer => "File explorer sidebar (tree of the project)",
             CatchUp => "Catch up: one headline per pane after time away",
             RepoVerbs => "How this repo is worked (learned verbs)",
+            TidalPanel => "TIDAL: what is playing, the queue, search",
+            TidalToggle => "Play / pause",
+            TidalNext => "Next track",
+            TidalPrev => "Previous track",
+            TidalStop => "Stop playing",
+            TidalShare => "Share what is playing (link)",
             Map => "Map: the session zoomed out to one headline per pane",
             WarRoom => "War room: arrange the window around a deploy",
             WarRoomClose => "War room: close it, keeping panes you typed in",
@@ -353,6 +375,12 @@ impl Action {
             "toggle_explorer" => ToggleExplorer,
             "catch_up" => CatchUp,
             "repo_verbs" => RepoVerbs,
+            "tidal_panel" => TidalPanel,
+            "tidal_toggle" => TidalToggle,
+            "tidal_next" => TidalNext,
+            "tidal_prev" => TidalPrev,
+            "tidal_stop" => TidalStop,
+            "tidal_share" => TidalShare,
             "map" => Map,
             "war_room" => WarRoom,
             "war_room_close" => WarRoomClose,
@@ -457,6 +485,12 @@ impl Action {
             ToggleExplorer,
             CatchUp,
             RepoVerbs,
+            TidalPanel,
+            TidalToggle,
+            TidalNext,
+            TidalPrev,
+            TidalStop,
+            TidalShare,
             Map,
             WarRoom,
             WarRoomClose,
@@ -1053,6 +1087,20 @@ fn default_leader_bindings() -> HashMap<Chord, LeaderNode> {
         leaf(g, "i", ToggleImageWatch);
         leaf(g, "w", SetImageWatchDir);
     });
+    // `n` for the music. `t` for tidal was the wish, but `t` is the Tabs group with ten
+    // bindings, and a feature does not get to evict memory that old.
+    group(&mut m, "n", "Music", |g| {
+        leaf(g, "n", TidalPanel);
+        leaf(g, "space", TidalToggle);
+        // Forward and back rather than next/previous: `n` is taken by this group's own
+        // key and `p` reads as "pause" to about half the people who try it.
+        leaf(g, "f", TidalNext);
+        leaf(g, "b", TidalPrev);
+        leaf(g, "s", TidalStop);
+        // Shift, because publishing a link to the internet should not be one letter
+        // away from "stop".
+        leaf(g, "shift+s", TidalShare);
+    });
     group(&mut m, "s", "Session", |g| {
         leaf(g, "s", SaveProjectSession);
         leaf(g, "r", RestoreProjectSession);
@@ -1493,6 +1541,16 @@ mod tests {
         assert_eq!(seq(&map, "c v"), Some(&Action::Paste));
         // A group on its own runs nothing — it waits.
         assert!(matches!(map.resolve_leader(&[Chord::parse("r").unwrap()]), Some(LeaderNode::Group { .. })));
+        // `n` is the music group, and `t` still belongs to Tabs: a new feature does not
+        // get to evict a binding people already have in their fingers.
+        assert!(matches!(
+            map.resolve_leader(&[Chord::parse("n").unwrap()]),
+            Some(LeaderNode::Group { title: "Music", .. })
+        ));
+        assert!(matches!(
+            map.resolve_leader(&[Chord::parse("t").unwrap()]),
+            Some(LeaderNode::Group { title: "Tabs", .. })
+        ));
         assert_eq!(seq(&map, "r"), None);
         // And a miss inside a group is a miss, not a fall back to the root.
         assert_eq!(seq(&map, "r 1"), None);

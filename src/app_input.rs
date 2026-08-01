@@ -32,7 +32,12 @@ impl Gpu {
     /// running (or the setting off) closes straight away: a confirm that fires on an
     /// idle shell is a confirm people learn to dismiss without reading.
     pub fn request_close(&mut self, config: &Config) -> bool {
-        if !config.behaviour.confirm_close {
+        // Music is asked about even with `confirm_close` off. That setting was written
+        // about shell commands, where the answer is usually "yes, I know"; killing
+        // playback is a different kind of surprise, and whoever turned that setting off
+        // did not turn this one off.
+        let music = self.jukebox.as_ref().is_some_and(|j| j.is_playing());
+        if !config.behaviour.confirm_close && !music {
             return true;
         }
         // Already asking: a second click on the window's close button must not
@@ -40,11 +45,26 @@ impl Gpu {
         if matches!(&self.overlay, Some(Overlay::Prompt(p)) if p.kind == PromptKind::ConfirmQuit) {
             return false;
         }
-        let running = self.running_commands();
+        let mut running =
+            if config.behaviour.confirm_close { self.running_commands() } else { Vec::new() };
+        if let Some(track) = self
+            .jukebox
+            .as_ref()
+            .filter(|_| music)
+            .and_then(|j| j.snapshot().now_playing().cloned())
+        {
+            // Named, not counted: "music is playing" is a fact, but the song is what
+            // tells you whether you meant to stop it.
+            running.insert(0, format!("playing: {} — {}", track.artist, track.title));
+        }
         if running.is_empty() {
             return true;
         }
-        let label = if running.len() == 1 {
+        let label = if music && running.len() == 1 {
+            "Close runnir? Music is still playing".to_string()
+        } else if music {
+            format!("Close runnir? Music is playing and {} still running", running.len() - 1)
+        } else if running.len() == 1 {
             "Close runnir? 1 command is still running".to_string()
         } else {
             format!("Close runnir? {} commands are still running", running.len())
@@ -267,6 +287,15 @@ impl Gpu {
         if matches!(self.overlay, Some(Overlay::Git(_))) {
             if state == ElementState::Pressed && button == MouseButton::Left {
                 self.git_panel_click(self.cursor_px, config);
+            }
+            return;
+        }
+        // The TIDAL panel takes the mouse for the same reason: sources and a list are
+        // both things people point at, and a music panel that can only be driven from
+        // the keyboard is one people give up on.
+        if matches!(self.overlay, Some(Overlay::Tidal(_))) {
+            if state == ElementState::Pressed && button == MouseButton::Left {
+                self.tidal_panel_click(self.cursor_px, config);
             }
             return;
         }
@@ -833,6 +862,12 @@ impl Gpu {
             Action::ToggleExplorer => self.toggle_explorer(config),
             Action::CatchUp => self.show_catch_up(),
             Action::RepoVerbs => self.show_repo_verbs(config),
+            Action::TidalPanel => self.show_tidal_panel(config),
+            Action::TidalToggle => self.tidal_send(crate::player::Cmd::Toggle, config),
+            Action::TidalNext => self.tidal_send(crate::player::Cmd::Next, config),
+            Action::TidalPrev => self.tidal_send(crate::player::Cmd::Prev, config),
+            Action::TidalStop => self.tidal_send(crate::player::Cmd::Stop, config),
+            Action::TidalShare => self.tidal_share(config),
             Action::Map => self.show_map(),
             Action::WarRoom => self.open_war_room(config),
             Action::WarRoomClose => self.close_war_room(config),
@@ -3122,6 +3157,7 @@ impl Gpu {
             Some(Overlay::Props(_)) => "props",
             Some(Overlay::CatchUp(_)) => "catch_up",
             Some(Overlay::Verbs(_)) => "verbs",
+            Some(Overlay::Tidal(_)) => "tidal",
             Some(Overlay::Map(_)) => "map",
             Some(_) => "other",
         };
@@ -3288,6 +3324,30 @@ impl Gpu {
                         None => json!({"kind": "tag"}),
                     },
                 }).collect::<Vec<_>>(),
+            });
+        }
+        if let Some(Overlay::Tidal(p)) = &self.overlay {
+            out["tidal"] = json!({
+                "source": p.source.label(),
+                "crumb": p.crumb,
+                "focus": match p.focus {
+                    crate::overlay::PanelFocus::Sources => "sources",
+                    crate::overlay::PanelFocus::List => "list",
+                },
+                "lyrics": p.show_lyrics,
+                "query": p.query,
+                "editing": p.editing,
+                "cursor": p.cursor,
+                "rows": p.rows(),
+                "playing": p.snapshot.playing,
+                "paused": p.snapshot.paused,
+                "position": p.snapshot.position_secs,
+                "track": p.snapshot.now_playing().map(|t| format!("{} — {}", t.artist, t.title)),
+                "badge": p.snapshot.signal.badge(),
+                "share": p.snapshot.share.as_ref().map(|s| serde_json::json!({
+                    "url": s.url, "listeners": s.listeners, "error": s.error,
+                })),
+                "error": p.snapshot.error,
             });
         }
         if let Some(Overlay::Git(p)) = &self.overlay {
@@ -3598,6 +3658,121 @@ impl Gpu {
                 },
                 _ => {}
             },
+            // The TIDAL panel. Typing goes to the query box while it is armed, so the
+            // transport letters only mean transport when they cannot mean a search.
+            Overlay::Tidal(p) => {
+                let mut search_for: Option<String> = None;
+                let mut command: Option<crate::player::Cmd> = None;
+                let mut open: Option<crate::overlay::TidalRow> = None;
+                let mut load: Option<crate::overlay::Source> = None;
+                let mut want_lyrics = false;
+                match key {
+                    Key::Named(NamedKey::Escape) => {
+                        // Escape leaves the smaller thing first: the query box, then the
+                        // lyrics, then the panel. Closing the panel never stops music.
+                        if p.editing {
+                            p.editing = false;
+                        } else if p.show_lyrics {
+                            p.show_lyrics = false;
+                        } else {
+                            self.overlay = None;
+                        }
+                    }
+                    Key::Named(NamedKey::Enter) => {
+                        if p.editing {
+                            p.editing = false;
+                            if !p.query.trim().is_empty() {
+                                search_for = Some(p.query.trim().to_string());
+                            }
+                        } else if p.focus == crate::overlay::PanelFocus::Sources {
+                            p.focus = crate::overlay::PanelFocus::List;
+                            // Entering Search is asking to type in it.
+                            p.editing = p.source == crate::overlay::Source::Search;
+                            load = Some(p.source);
+                        } else if let Some(row) = p.selected().cloned() {
+                            match row {
+                                // A track plays its whole list from where it sits.
+                                crate::overlay::TidalRow::Track(_) => {
+                                    if let Some((tracks, at)) = p.play_selection() {
+                                        command =
+                                            Some(crate::player::Cmd::Play { tracks, at });
+                                    }
+                                }
+                                // Anything else is a container: it opens.
+                                other => open = Some(other),
+                            }
+                        }
+                    }
+                    Key::Named(NamedKey::Backspace) if p.editing => {
+                        p.query.pop();
+                    }
+                    Key::Named(NamedKey::Space) if p.editing => p.query.push(' '),
+                    Key::Named(NamedKey::Space) => command = Some(crate::player::Cmd::Toggle),
+                    Key::Named(NamedKey::ArrowUp) => self.tidal_move(-1),
+                    Key::Named(NamedKey::ArrowDown) => self.tidal_move(1),
+                    Key::Named(NamedKey::ArrowLeft) => {
+                        p.focus = crate::overlay::PanelFocus::Sources
+                    }
+                    Key::Named(NamedKey::ArrowRight) => {
+                        p.focus = crate::overlay::PanelFocus::List
+                    }
+                    Key::Named(NamedKey::Tab) => {
+                        p.focus = match p.focus {
+                            crate::overlay::PanelFocus::Sources => {
+                                crate::overlay::PanelFocus::List
+                            }
+                            crate::overlay::PanelFocus::List => {
+                                crate::overlay::PanelFocus::Sources
+                            }
+                        };
+                    }
+                    Key::Character(c) if p.editing => p.query.push_str(c.as_str()),
+                    Key::Character(c) => match c.as_str() {
+                        "k" => self.tidal_move(-1),
+                        "j" => self.tidal_move(1),
+                        "h" => p.focus = crate::overlay::PanelFocus::Sources,
+                        "l" => p.focus = crate::overlay::PanelFocus::List,
+                        "/" => {
+                            p.source = crate::overlay::Source::Search;
+                            p.focus = crate::overlay::PanelFocus::List;
+                            p.crumb = None;
+                            p.editing = true;
+                            p.query.clear();
+                        }
+                        "a" => {
+                            if let Some(track) = p.selected_track() {
+                                p.message = Some(format!("queued {}", track.title));
+                                command = Some(crate::player::Cmd::Enqueue(track));
+                            }
+                        }
+                        // The words, for the track PLAYING — not the one under the
+                        // cursor. Lyrics follow the music, not the browsing.
+                        "L" | "y" => want_lyrics = true,
+                        "f" => command = Some(crate::player::Cmd::Next),
+                        "b" => command = Some(crate::player::Cmd::Prev),
+                        "s" => command = Some(crate::player::Cmd::Stop),
+                        "q" => self.overlay = None,
+                        _ => {}
+                    },
+                    _ => {}
+                }
+                if let Some(query) = search_for {
+                    self.tidal_search(query);
+                }
+                if let Some(row) = open {
+                    self.tidal_open(row);
+                }
+                if let Some(source) = load {
+                    self.tidal_load(source);
+                }
+                if want_lyrics {
+                    self.tidal_lyrics();
+                }
+                if let Some(cmd) = command {
+                    self.tidal_send(cmd, config);
+                }
+                self.refresh_tidal_panel();
+            }
             // The verbs panel: Enter STAGES the verb at the prompt and never runs
             // it. A list learned from what you typed, typing itself back, is exactly
             // the place where a stray Enter must not execute anything.
@@ -3922,6 +4097,12 @@ impl Gpu {
             Action::ToggleExplorer => self.toggle_explorer(config),
             Action::CatchUp => self.show_catch_up(),
             Action::RepoVerbs => self.show_repo_verbs(config),
+            Action::TidalPanel => self.show_tidal_panel(config),
+            Action::TidalToggle => self.tidal_send(crate::player::Cmd::Toggle, config),
+            Action::TidalNext => self.tidal_send(crate::player::Cmd::Next, config),
+            Action::TidalPrev => self.tidal_send(crate::player::Cmd::Prev, config),
+            Action::TidalStop => self.tidal_send(crate::player::Cmd::Stop, config),
+            Action::TidalShare => self.tidal_share(config),
             Action::Map => self.show_map(),
             Action::WarRoom => self.open_war_room(config),
             Action::WarRoomClose => self.close_war_room(config),
@@ -4308,6 +4489,10 @@ impl Gpu {
             // (which this path cannot reach) — the same save-then-exit the palette's
             // Quit does, so a confirmed close never loses the session.
             PromptKind::ConfirmQuit => {
+                // The player is NOT told to quit here. It belongs to the session, and
+                // another window may still be listening; the daemon decides for itself
+                // when the last one has gone. Dropping this window's connection is the
+                // whole message, and closing the process sends it.
                 self.save_session(config);
                 std::process::exit(0);
             }
@@ -6012,6 +6197,12 @@ impl Gpu {
     /// Key bindings are rebuilt by the caller (they live on `App`, not `Gpu`).
     fn apply_config(&mut self, config: &Config) {
         self.leader_timeout = crate::leader_timeout(config);
+        // The output device or the bit-perfect setting may have changed. The player
+        // applies it to the NEXT track: the current one is already on a device, and
+        // swapping underneath it would be a gap in the middle of a song.
+        if let Some(jukebox) = self.jukebox.as_ref() {
+            jukebox.send(crate::player::Cmd::Reconfigure(Box::new(config.tidal.clone())));
+        }
         // A status-bar toggle changes the content height, so reflow after.
         if self.status_bar != config.window.status_bar {
             self.status_bar = config.window.status_bar;
@@ -6891,6 +7082,452 @@ impl Gpu {
 
     /// Spawns a worker that fetches now-playing metadata and delivers it back through
     /// the event-loop proxy. Non-blocking; safe to call on a timer.
+/// The player, started on first use.
+    ///
+    /// Lazy because most windows never play anything, and starting a thread that opens
+    /// nothing costs nothing but is still a thread. `None` means the credentials are
+    /// missing, which is also the answer to "does this terminal have a music panel".
+    fn player(&mut self, config: &Config) -> Option<&crate::daemon::Remote> {
+        // A handle whose daemon has gone is worse than no handle: it accepts everything
+        // and does nothing.
+        if self.jukebox.as_ref().is_some_and(|j| !j.is_alive()) {
+            self.jukebox = None;
+        }
+        if self.jukebox.is_none() {
+            if !config.tidal.configured() {
+                return None;
+            }
+            let proxy = self.proxy.clone();
+            match crate::daemon::Remote::connect(
+                &config.tidal,
+                Box::new(move || {
+                    let _ = proxy.send_event(UserEvent::Redraw);
+                }),
+            ) {
+                Ok(remote) => self.jukebox = Some(remote),
+                // No daemon and none could be started: say so once rather than trying
+                // again on every keystroke.
+                Err(e) => {
+                    self.toast(&format!("player unavailable: {e}"), 6);
+                    return None;
+                }
+            }
+        }
+        self.jukebox.as_ref()
+    }
+
+    /// Sends one command to the player, starting it if this is the first.
+    ///
+    /// Works with no panel open, which is the whole point of the transport living on
+    /// the leader layer: the music is the window's, not the panel's.
+    fn tidal_send(&mut self, cmd: crate::player::Cmd, config: &Config) {
+        // One retry, and only one. A daemon that went away between the connect and the
+        // keypress — which is what closing the last window and opening a new one inside
+        // a quarter of a second does — leaves a handle that writes into nothing. The
+        // window drops it and builds another, which starts a fresh daemon if needed.
+        for attempt in 0..2 {
+            match self.player(config) {
+                Some(jukebox) => {
+                    if jukebox.send(cmd.clone()) {
+                        return;
+                    }
+                    self.jukebox = None;
+                    if attempt == 1 {
+                        self.toast("The player went away and would not come back", 6);
+                    }
+                }
+                None => {
+                    if attempt == 0 && config.tidal.configured() {
+                        continue; // connecting failed; try once more
+                    }
+                    return self.toast_no_tidal();
+                }
+            }
+        }
+    }
+
+    fn toast_no_tidal(&mut self) {
+        self.toast(
+            "No TIDAL credentials — add [tidal] client_id and client_secret to the config",
+            6,
+        );
+    }
+
+    /// Opens the panel onto whatever the player is already doing.
+    fn show_tidal_panel(&mut self, config: &Config) {
+        if !config.tidal.configured() {
+            return self.toast_no_tidal();
+        }
+        if crate::tidal::Session::load().is_none() {
+            return self.toast("Not signed in to TIDAL — run: runnir --tidal-login", 6);
+        }
+        let snapshot = self.player(config).map(|j| j.snapshot()).unwrap_or_default();
+        self.overlay = Some(Overlay::Tidal(overlay::TidalPanel::new(snapshot)));
+        self.window.request_redraw();
+    }
+
+    /// A click in the TIDAL panel.
+    ///
+    /// One click selects, a second on the SAME thing acts. That is the docker panel's
+    /// rule and it is worth keeping: a stray click should never start playing music out
+    /// loud, any more than it should open an ssh connection.
+    fn tidal_panel_click(&mut self, pos: PhysicalPosition<f64>, config: &Config) {
+        let (cols, rows, col, row) = self.cell_at(pos);
+        let mut load: Option<crate::overlay::Source> = None;
+        let mut open: Option<crate::overlay::TidalRow> = None;
+        let mut play: Option<crate::player::Cmd> = None;
+        {
+            let Some(Overlay::Tidal(p)) = &mut self.overlay else { return };
+            let Some(hit) = p.hit(cols, rows, col, row) else {
+                // Outside the panel entirely reads as "put this away" — and putting the
+                // panel away never stops the music.
+                self.overlay = None;
+                self.window.request_redraw();
+                return;
+            };
+            match hit {
+                crate::overlay::TidalHit::Source(i) => {
+                    let source = crate::overlay::Source::ALL[i];
+                    p.focus = crate::overlay::PanelFocus::Sources;
+                    if p.source != source {
+                        p.source = source;
+                        p.crumb = None;
+                        load = Some(source);
+                    }
+                }
+                crate::overlay::TidalHit::Row(i) => {
+                    let same = p.cursor == i && p.focus == crate::overlay::PanelFocus::List;
+                    p.focus = crate::overlay::PanelFocus::List;
+                    p.show_lyrics = false;
+                    if p.rows.get(i).is_some_and(|r| !matches!(r, crate::overlay::TidalRow::Heading(_))) {
+                        p.cursor = i;
+                    }
+                    if same {
+                        match p.selected().cloned() {
+                            Some(crate::overlay::TidalRow::Track(_)) => {
+                                if let Some((tracks, at)) = p.play_selection() {
+                                    play = Some(crate::player::Cmd::Play { tracks, at });
+                                }
+                            }
+                            Some(other) => open = Some(other),
+                            None => {}
+                        }
+                    }
+                }
+                crate::overlay::TidalHit::Query => {
+                    p.source = crate::overlay::Source::Search;
+                    p.focus = crate::overlay::PanelFocus::List;
+                    p.editing = true;
+                }
+                crate::overlay::TidalHit::Chrome => {}
+            }
+        }
+        if let Some(source) = load {
+            self.tidal_load(source);
+        }
+        if let Some(row) = open {
+            self.tidal_open(row);
+        }
+        if let Some(cmd) = play {
+            self.tidal_send(cmd, config);
+        }
+        self.refresh_tidal_panel();
+    }
+
+    /// Turns the public link on or off.
+    ///
+    /// Off when there is one, on when there is not — one key for both, because the
+    /// panel always shows which state it is in and a second key would be a second thing
+    /// to remember for no gain.
+    fn tidal_share(&mut self, config: &Config) {
+        let sharing = self
+            .jukebox
+            .as_ref()
+            .is_some_and(|j| j.snapshot().share.as_ref().is_some_and(|s| !s.url.is_empty()));
+        if !sharing {
+            // Starting waits on cloudflared, which takes seconds. Say so, or the pause
+            // looks like nothing happened.
+            self.toast("Opening a tunnel — this takes a few seconds", 6);
+        }
+        self.tidal_send(crate::player::Cmd::Share(!sharing), config);
+    }
+
+    /// Moves the cursor, in whichever half has the keyboard.
+    ///
+    /// The sources column and the list share j/k because they are never both driven at
+    /// once, and having one pair of keys mean "move" everywhere is worth more than
+    /// having a separate pair nobody remembers.
+    fn tidal_move(&mut self, by: i32) {
+        let mut load: Option<crate::overlay::Source> = None;
+        if let Some(Overlay::Tidal(p)) = &mut self.overlay {
+            match p.focus {
+                crate::overlay::PanelFocus::Sources => {
+                    let all = crate::overlay::Source::ALL;
+                    let at = all.iter().position(|s| *s == p.source).unwrap_or(0) as i32;
+                    let next = (at + by).clamp(0, all.len() as i32 - 1) as usize;
+                    if all[next] != p.source {
+                        p.source = all[next];
+                        p.crumb = None;
+                        // Moving over the sources loads them as you go: a column that
+                        // needs Enter to show anything is a column you stop using.
+                        load = Some(p.source);
+                    }
+                }
+                crate::overlay::PanelFocus::List => {
+                    if by < 0 {
+                        p.up()
+                    } else {
+                        p.down()
+                    }
+                }
+            }
+        }
+        if let Some(source) = load {
+            self.tidal_load(source);
+        }
+    }
+
+    /// Fills the list for a source. The queue needs no request — it is already here.
+    fn tidal_load(&mut self, source: crate::overlay::Source) {
+        use crate::overlay::Source;
+        if source == Source::Queue {
+            if let Some(Overlay::Tidal(p)) = &mut self.overlay {
+                p.rows = p.snapshot.queue.iter().cloned().map(crate::overlay::TidalRow::Track).collect();
+                p.cursor = p.snapshot.index.min(p.rows.len().saturating_sub(1));
+                p.pending = None;
+                p.message = None;
+            }
+            self.window.request_redraw();
+            return;
+        }
+        if source == Source::Search {
+            if let Some(Overlay::Tidal(p)) = &mut self.overlay {
+                p.rows.clear();
+                // NOT armed here. Passing over Search while walking the sources column
+                // used to steal the keyboard: the next `j` was typed into the query box
+                // instead of moving, with nothing on screen saying why. Typing is armed
+                // by asking for it — `/`, Enter, or a click.
+                //
+                // And the pending request is dropped, or an answer for the source we
+                // just left arrives and is drawn under the word "Search".
+                p.pending = None;
+                p.crumb_pending = None;
+            }
+            self.window.request_redraw();
+            return;
+        }
+        let seq = self.tidal_request(None);
+        let proxy = self.proxy.clone();
+        std::thread::spawn(move || {
+            let answer = crate::tidal::Session::load()
+                .ok_or_else(|| "not signed in".to_string())
+                .and_then(|session| match source {
+                    Source::Favourites => crate::tidal::favourite_tracks(&session)
+                        .map(|t| crate::tidal::Found { tracks: t, ..Default::default() }),
+                    Source::Albums => crate::tidal::favourite_albums(&session)
+                        .map(|a| crate::tidal::Found { albums: a, ..Default::default() }),
+                    Source::Playlists => crate::tidal::my_playlists(&session)
+                        .map(|p| crate::tidal::Found { playlists: p, ..Default::default() }),
+                    _ => Ok(crate::tidal::Found::default()),
+                });
+            let _ = proxy.send_event(UserEvent::Tidal(seq, answer.map(TidalAnswer::Found)));
+        });
+    }
+
+    /// Opens a container row: an album, an artist or a playlist becomes a list of its
+    /// tracks, with a crumb naming where you are.
+    fn tidal_open(&mut self, row: crate::overlay::TidalRow) {
+        use crate::overlay::TidalRow;
+        let (crumb, work): (String, Box<dyn Fn(&crate::tidal::Session) -> Result<Vec<crate::tidal::Track>, String> + Send>) =
+            match row {
+                TidalRow::Album(a) => {
+                    let id = a.id;
+                    (format!("{} — {}", a.artist, a.title), Box::new(move |s| crate::tidal::album_tracks(s, id)))
+                }
+                TidalRow::Artist(a) => {
+                    let id = a.id;
+                    (a.name.clone(), Box::new(move |s| crate::tidal::artist_top_tracks(s, id)))
+                }
+                TidalRow::Playlist(p) => {
+                    let uuid = p.uuid.clone();
+                    (p.title.clone(), Box::new(move |s| crate::tidal::playlist_tracks(s, &uuid)))
+                }
+                TidalRow::Track(_) | TidalRow::Heading(_) => return,
+            };
+        let seq = self.tidal_request(Some(crumb));
+        let proxy = self.proxy.clone();
+        std::thread::spawn(move || {
+            let answer = crate::tidal::Session::load()
+                .ok_or_else(|| "not signed in".to_string())
+                .and_then(|session| work(&session))
+                .map(|tracks| TidalAnswer::Found(crate::tidal::Found { tracks, ..Default::default() }));
+            let _ = proxy.send_event(UserEvent::Tidal(seq, answer));
+        });
+    }
+
+    /// Fetches the words for whatever is PLAYING.
+    fn tidal_lyrics(&mut self) {
+        let Some(track) = self
+            .jukebox
+            .as_ref()
+            .and_then(|j| j.snapshot().now_playing().cloned())
+        else {
+            if let Some(Overlay::Tidal(p)) = &mut self.overlay {
+                p.message = Some("nothing playing to show words for".into());
+            }
+            return;
+        };
+        if let Some(Overlay::Tidal(p)) = &mut self.overlay {
+            p.show_lyrics = true;
+            // Keyed on the TRACK, which is what they belong to. It used to compare the
+            // crumb — the opened album or playlist — against the track title, so the
+            // cache never hit, and on the one day those two strings matched it would
+            // have shown the previous track's words.
+            if p.lyrics.is_some() && p.lyrics_for == Some(track.id) {
+                return;
+            }
+            // Not the ones we are about to fetch: showing the last track's words while
+            // the next track's arrive is the failure this whole key is for.
+            p.lyrics = None;
+            p.lyrics_for = None;
+        }
+        // Lyrics carry their own sequence. Sharing one slot with the lists meant asking
+        // for words cancelled a half-loaded album: the album's answer was dropped by the
+        // guard, the list never arrived, and its name stayed in the trail for ever.
+        self.tidal_seq += 1;
+        let seq = self.tidal_seq;
+        if let Some(Overlay::Tidal(p)) = &mut self.overlay {
+            p.pending_lyrics = Some(seq);
+        }
+        let proxy = self.proxy.clone();
+        let id = track.id;
+        std::thread::spawn(move || {
+            let answer = crate::tidal::Session::load()
+                .ok_or_else(|| "not signed in".to_string())
+                .and_then(|session| crate::tidal::lyrics(&session, id))
+                .map(|l| TidalAnswer::Lyrics(id, l));
+            let _ = proxy.send_event(UserEvent::Tidal(seq, answer));
+        });
+    }
+
+    /// Stamps a new request and marks the panel as waiting for it.
+    fn tidal_request(&mut self, crumb: Option<String>) -> u64 {
+        self.tidal_seq += 1;
+        if let Some(Overlay::Tidal(p)) = &mut self.overlay {
+            p.pending = Some(self.tidal_seq);
+            p.message = None;
+            // Held, not applied. The trail names the list you are LOOKING at; writing it
+            // when the request goes out left an album's name over the previous list
+            // whenever the load failed or was superseded.
+            p.crumb_pending = crumb;
+        }
+        self.tidal_seq
+    }
+
+    /// Runs a search off the UI thread. The sequence number is what makes a slow answer
+    /// arriving after a newer query harmless — the same guard the git and docker panels
+    /// carry, and for the same reason.
+    fn tidal_search(&mut self, query: String) {
+        let seq = self.tidal_request(None);
+        if let Some(Overlay::Tidal(p)) = &mut self.overlay {
+            p.crumb = None;
+        }
+        let proxy = self.proxy.clone();
+        std::thread::spawn(move || {
+            let found = crate::tidal::Session::load()
+                .ok_or_else(|| "not signed in".to_string())
+                .and_then(|session| crate::tidal::search(&session, &query, 30))
+                .map(TidalAnswer::Found);
+            let _ = proxy.send_event(UserEvent::Tidal(seq, found));
+        });
+    }
+
+    /// An answer came back.
+    fn on_tidal_results(&mut self, seq: u64, answer: Result<TidalAnswer, String>) {
+        let Some(Overlay::Tidal(p)) = &mut self.overlay else { return };
+        // Two slots, because words and lists are asked for independently and either can
+        // be superseded without touching the other.
+        let for_lyrics = p.pending_lyrics == Some(seq);
+        let for_list = p.pending == Some(seq);
+        if !for_lyrics && !for_list {
+            return; // an older request that took longer
+        }
+        match answer {
+            Ok(TidalAnswer::Lyrics(track, lyrics)) if for_lyrics => {
+                p.pending_lyrics = None;
+                if lyrics.is_empty() {
+                    p.message = Some("no words for this one".into());
+                    p.show_lyrics = false;
+                }
+                p.lyrics_for = Some(track);
+                p.lyrics = Some(lyrics);
+            }
+            Ok(TidalAnswer::Found(found)) if for_list => {
+                p.pending = None;
+                p.rows = rows_of(&found);
+                p.settle_cursor();
+                p.show_lyrics = false;
+                // The trail is written now that there is something under it.
+                p.crumb = p.crumb_pending.take();
+                p.message = found.is_empty().then(|| "nothing found".to_string());
+            }
+            Err(e) => {
+                if for_lyrics {
+                    p.pending_lyrics = None;
+                    p.show_lyrics = false;
+                } else {
+                    p.pending = None;
+                    // The list did not change, so neither does the name over it.
+                    p.crumb_pending = None;
+                }
+                p.message = Some(e);
+            }
+            // An answer of the wrong kind for the slot it matched. Cannot happen today;
+            // dropping it is better than drawing lyrics as a list.
+            _ => {}
+        }
+        self.window.request_redraw();
+    }
+
+    /// Refreshes the panel only when one is open, which is the common case on a wake.
+    pub fn refresh_tidal_panel_if_open(&mut self) {
+        if matches!(self.overlay, Some(Overlay::Tidal(_))) {
+            self.refresh_tidal_panel();
+        }
+    }
+
+    /// Pulls the player's current state into an open panel. Called after anything that
+    /// might have changed it, and on every player wake.
+    fn refresh_tidal_panel(&mut self) {
+        let Some(jukebox) = self.jukebox.as_ref() else { return };
+        let snapshot = jukebox.snapshot();
+        if let Some(Overlay::Tidal(p)) = &mut self.overlay {
+            // On the GENERATION, not on the length. Two different lists of the same
+            // size — two artists' top tracks, or another window driving the same
+            // daemon — left the rows stale, and Enter on a stale row then replayed a
+            // queue that no longer existed.
+            let moved = p.snapshot.generation != snapshot.generation;
+            let playing = snapshot.now_playing().map(|t| t.id);
+            let was_playing = p.snapshot.now_playing().map(|t| t.id);
+            p.snapshot = snapshot;
+            if p.source == overlay::Source::Queue && moved {
+                p.reload_queue();
+            }
+            // Words belong to a song. When the song changes they are not "old lyrics",
+            // they are the wrong ones — and the view would go on highlighting a line by
+            // the new track's position.
+            if playing != was_playing {
+                p.lyrics = None;
+                p.lyrics_for = None;
+                if p.show_lyrics {
+                    p.message = Some("track changed — press L for the new words".into());
+                    p.show_lyrics = false;
+                }
+            }
+        }
+        self.window.request_redraw();
+    }
+
     fn spawn_media_fetch(&self) {
         let proxy = self.proxy.clone();
         std::thread::spawn(move || {
