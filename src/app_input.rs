@@ -87,11 +87,15 @@ impl Gpu {
     }
 
     fn on_wheel(&mut self, delta: MouseScrollDelta, config: &Config, mods: ModifiersState) {
-        let cell_h = self.renderer.cell_size().1;
-        // While an overlay owns input, the wheel scrolls it, not the terminal. Use
-        // the real cell height so a touchpad's pixel deltas map to sane line counts.
+        // Whole lines only, with the remainder carried across events: a touchpad
+        // sends dozens of sub-line pixel deltas a second, and every path that
+        // rounded one up on its own turned a slow swipe into a sprint.
+        let lines = self.wheel_steps(delta, config);
+        // While an overlay owns input, the wheel scrolls it, not the terminal.
         if self.overlay.is_some() {
-            let lines = wheel_lines(delta, config.behaviour.wheel_lines, cell_h);
+            if lines == 0.0 {
+                return;
+            }
             // Over the panel's list the wheel moves the selection; over its diff it
             // scrolls the diff. Which one you get follows the pointer, the only
             // reading that matches what is under it.
@@ -133,7 +137,7 @@ impl Gpu {
         // catches it: over the tree the wheel scrolls the tree. Checked before the
         // pane paths, or the wheel scrolls a pane the pointer is not even over.
         if self.explorer_row_at(self.cursor_px).is_some() {
-            let step = -wheel_lines(delta, config.behaviour.wheel_lines, cell_h).round() as i32;
+            let step = -lines as i32;
             if step != 0 {
                 let body = self.explorer_body_rows();
                 if let Some(e) = self.tabs[self.active].explorer.as_mut() {
@@ -143,28 +147,33 @@ impl Gpu {
             }
             return;
         }
-        // A mouse-mode app (unless Shift is held) gets the wheel as button events.
-        let lines = wheel_lines(delta, config.behaviour.wheel_lines, cell_h);
-        // A zero delta (horizontal-only scroll event) must not synthesise a vertical
-        // wheel report or a scroll — bail before either path.
+        // A zero step (horizontal-only event, or a swipe that has not yet covered a
+        // whole line) must not synthesise a wheel report or a scroll.
         if lines == 0.0 {
             return;
         }
         // The user took over scrolling: cancel any in-flight glide animation.
         self.scroll_glide = None;
+        // A mouse-mode app (unless Shift is held) gets the wheel as button events.
         if !mods.shift_key() && self.forward_wheel(lines) {
-            self.scroll_accum = 0.0;
             return;
         }
-        // Accumulate fractional lines so a slow touchpad swipe (sub-line pixel
-        // deltas) scrolls smoothly instead of being truncated to nothing. The whole
-        // part moves now; the remainder carries to the next event.
-        self.scroll_accum += lines;
-        let whole = self.scroll_accum.trunc();
-        self.scroll_accum -= whole;
-        if whole != 0.0 && self.tab().focused().scroll(whole as isize) {
+        if self.tab().focused().scroll(lines as isize) {
             self.window.request_redraw();
         }
+    }
+
+    /// Wheel delta → whole lines, carrying the remainder to the next event.
+    ///
+    /// A mouse wheel sends `LineDelta`, already whole. A touchpad sends
+    /// `PixelDelta` dozens of times a second, each a fraction of a line; rounding
+    /// one of those to a line makes every event a line and the surface flies.
+    /// Every wheel path shares this one accumulator, so they all move the distance
+    /// the finger moved.
+    fn wheel_steps(&mut self, delta: MouseScrollDelta, config: &Config) -> f32 {
+        let cell_h = self.renderer.cell_size().1;
+        let lines = wheel_lines(delta, config.behaviour.wheel_lines, cell_h);
+        take_whole_lines(&mut self.scroll_accum, lines)
     }
 
     fn on_cursor(&mut self, position: PhysicalPosition<f64>, mods: ModifiersState) {
@@ -7288,6 +7297,17 @@ fn wheel_lines(delta: MouseScrollDelta, wheel_lines: f32, cell_h: f32) -> f32 {
     }
 }
 
+/// Adds `lines` to `accum` and hands back the whole lines in it, leaving the
+/// fraction behind for the next event. A wheel click is already whole and comes
+/// straight back out; a touchpad's fractions only move a line once they add up
+/// to one.
+fn take_whole_lines(accum: &mut f32, lines: f32) -> f32 {
+    *accum += lines;
+    let whole = accum.trunc();
+    *accum -= whole;
+    whole
+}
+
 /// Writes `data` to `path` with 0600 permissions, replacing an existing file we
 /// own. The file is recreated, never opened in place: `mode(0o600)` only applies
 /// at creation, so writing into a pre-existing file would keep its old mode and
@@ -7410,6 +7430,53 @@ mod split_outcome_tests {
         assert!(split_refusal(Ok(false)).is_some(), "a refused split is not a split");
         let failed = split_refusal(Err(anyhow::anyhow!("no ptys left")));
         assert!(failed.is_some_and(|why| why.contains("no ptys left")), "say what went wrong");
+    }
+}
+
+#[cfg(test)]
+mod wheel_tests {
+    use super::{take_whole_lines, wheel_lines};
+    use winit::dpi::PhysicalPosition;
+    use winit::event::MouseScrollDelta;
+
+    /// The bug this pins: a touchpad sends a stream of sub-line pixel deltas, and
+    /// every path that rounded one on its own turned each of them into a whole
+    /// line — a swipe of one cell's height scrolled as far as the finger had
+    /// events, not as far as it travelled.
+    #[test]
+    fn a_touchpad_moves_the_distance_the_finger_moved_not_one_line_per_event() {
+        let cell_h = 22.0;
+        let mut accum = 0.0;
+        let mut moved = 0.0;
+        // Eleven events of 2px each: one cell's worth of finger travel.
+        for _ in 0..11 {
+            let delta = MouseScrollDelta::PixelDelta(PhysicalPosition::new(0.0, 2.0));
+            moved += take_whole_lines(&mut accum, wheel_lines(delta, 3.0, cell_h));
+        }
+        assert_eq!(moved, 1.0, "22px of finger travel is one 22px line, not eleven");
+    }
+
+    /// The fraction is carried, not dropped: the same swipe in either direction
+    /// ends where it started rather than losing a line to truncation each way.
+    #[test]
+    fn the_leftover_fraction_survives_a_change_of_direction() {
+        let mut accum = 0.0;
+        assert_eq!(take_whole_lines(&mut accum, 0.6), 0.0);
+        assert_eq!(take_whole_lines(&mut accum, 0.6), 1.0);
+        assert_eq!(take_whole_lines(&mut accum, -0.6), 0.0);
+        assert_eq!(take_whole_lines(&mut accum, -0.6), -1.0);
+        assert!(accum.abs() < 1e-6, "back where it started, no line owed either way");
+    }
+
+    /// A real wheel is unaffected: its click is already whole lines and comes
+    /// straight back out, `wheel_lines` clicks and all.
+    #[test]
+    fn a_wheel_click_still_moves_its_full_step_at_once() {
+        let mut accum = 0.0;
+        let delta = MouseScrollDelta::LineDelta(0.0, -1.0);
+        let lines = wheel_lines(delta, 3.0, 22.0);
+        assert_eq!(take_whole_lines(&mut accum, lines), -3.0);
+        assert_eq!(accum, 0.0);
     }
 }
 

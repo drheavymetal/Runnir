@@ -2896,8 +2896,39 @@ it is recorded here rather than papered over.
 501 tests (was 504): four kontroll-specific ones deleted with the code they guarded,
 one added for the deadline.
 
+## 2026-07-31 - The touchpad scrolled by event count, not by distance
+
+Reported from the laptop: the wheel goes far too fast. It is a touchpad, and the
+difference matters — a mouse sends `LineDelta` (whole clicks, a handful a second), a
+touchpad sends `PixelDelta` dozens of times a second, each one a FRACTION of a line.
+`wheel_lines` converted both correctly; what followed did not.
+
+Only the pane path accumulated the fraction. Every other consumer rounded its own
+copy: the overlays did `-lines.round()`, the sidebar the same, and `forward_wheel`
+(the mouse-mode path, so nvim/less/htop and anything else reading wheel reports) did
+`lines.abs().round().max(1.0)` — a floor of ONE report per event. With a 22px cell and
+~2px per event, a swipe worth one line arrived as eleven. Scroll speed was a function
+of the touchpad's report rate, which is why a mouse felt fine and the laptop did not.
+
+Now `on_wheel` converts once, through `wheel_steps`, and hands whole lines to whoever
+consumes them; `take_whole_lines` carries the remainder to the next event. One
+accumulator for every surface, so they all move the distance the finger moved. The
+`.max(1.0)` floor is harmless where it stands (its input is already whole) and was
+left alone rather than moved.
+
+Three tests, on the pure helper rather than the app: the eleven-events-one-line case,
+the fraction surviving a change of direction (the same swipe back ends where it
+started), and a wheel click still moving its full `wheel_lines` step at once.
+
+506 tests. Not yet confirmed on the laptop by hand — that is Pedro's call, and the
+report rate of a real touchpad is exactly what a test cannot stand in for.
+
 ## Gotchas (do not re-learn)
 
+- A touchpad's `PixelDelta` is a FRACTION of a line arriving dozens of times a second.
+  Rounding one event on its own — `.round()`, or a `.max(1.0)` floor — makes scroll
+  speed a function of the device's report rate instead of the distance travelled. Every
+  wheel consumer takes whole lines from the one shared accumulator.
 - A wire protocol read out of published firmware source still has to be CONFIRMED
   against the board. An enum with implicit values is only right if the flashed build
   matches that source, and the version query is what proves it. Everything else here
