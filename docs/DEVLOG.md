@@ -2923,6 +2923,229 @@ started), and a wheel click still moving its full `wheel_lines` step at once.
 506 tests. Not yet confirmed on the laptop by hand — that is Pedro's call, and the
 report rate of a real touchpad is exactly what a test cannot stand in for.
 
+## DESIGN, NOT YET BUILT — TIDAL in the terminal, bit-perfect when the hardware allows (2026-08-01)
+
+**Why.** Pedro's music is on TIDAL and his DAC is a HiBy R3. Every client that plays it
+is either a browser in a box — which resamples to 48 kHz before the audio ever leaves
+the application — or a whole separate app sitting beside the terminal he already lives
+in. runnir has the pieces a console player needs, and it has them together: a cell
+renderer that draws more than text (the map's rain is the precedent), a leader layer
+with a free letter, a hint layer that makes a URL clickable, and three panels — git,
+docker, explorer — that already read as consoles.
+
+**The reference, and the line drawn around it.** mySone (`~/myProjects/mySone`, Pedro's
+fork of `lullabyX/sone`) already does this well, and it was read as a PROTOCOL
+reference: which endpoints exist, what the manifests carry, how ALSA's format names
+line up. No code is copied. sone is GPL-3.0-only and runnir carries no licence at all;
+copying would decide runnir's licence as a side effect of shipping a feature, and that
+is not how that decision should get made.
+
+**What reading it saved** (each of these is a day found the hard way otherwise):
+
+- auth is the OAuth device flow at `auth.tidal.com/v1/oauth2/device_authorization`,
+  scope `r_usr w_usr w_sub`, approved by the user at `link.tidal.com`.
+- the stream comes from `/tracks/{id}/playbackinfopostpaywall`, whose response carries
+  `manifestMimeType` and a base64 `manifest`.
+- `application/vnd.tidal.bts` is a JSON envelope with direct URLs. The easy path, and
+  what LOSSLESS 16/44.1 arrives as.
+- `application/dash+xml` is an MPD, and hi-res arrives that way: fragmented MP4 with
+  FLAC inside, one Representation, a SegmentTemplate. sone hands the XML to GStreamer's
+  `dashdemux`; runnir has no GStreamer and must assemble init + segments itself.
+- ALSA and GStreamer name 24-bit formats in OPPOSITE directions — ALSA `S24LE` is
+  24-in-a-32-bit container, ALSA `S243LE` is packed 24. Getting this backwards produces
+  noise, not an error.
+- the same response carries `bitDepth`, `sampleRate` and both ReplayGain figures, so
+  the badge can be honest before a single sample is decoded.
+
+**Stack.** No GStreamer, no tokio. `ureq` (already a dependency) on worker threads for
+HTTP, `symphonia` for FLAC and the MP4 demux, the `alsa` crate for output. Rust the
+whole way down, which makes bit-perfect easier rather than harder: decoded `i32`
+samples go straight to the device at the source's own rate with nothing in between
+that could resample or scale them.
+
+**Output is a chain, not a switch.** Bit-perfect is the best case, never a
+requirement — the music plays on whatever hardware is actually there. Per track, in
+order:
+
+1. the device named in the config, if it accepts the native rate and format — bit-perfect
+2. auto: the first ALSA device that accepts them exclusively — where the R3 lands when
+   it is plugged in
+3. exclusive at the nearest format the DAC does accept (24→32 is zero-padding and stays
+   bit-exact; a resample does not)
+4. `plughw:X,Y` — ALSA converts
+5. `default` — PipeWire/Pulse: laptop speakers, headphone jack, HDMI, bluetooth. Never
+   bit-perfect, never fails.
+
+The status line names the rung it is standing on, because a player that claims
+bit-perfect while PipeWire resamples underneath it is worse than one that never claimed
+it:
+
+    FLAC 24/192 · hw:2,0 HiBy R3 · S32LE · BIT-PERFECT
+    FLAC 24/96  · hw:2,0 HiBy R3 · S32LE · exclusive (24→32, zero-pad)
+    FLAC 24/192 · default PipeWire · 48 kHz · SHARED · resampled 192→48
+
+An output picker (`leader n o`) lists the cards from `/proc/asound/cards` and marks
+which ones would be bit-perfect for the current track, so the cost of using the
+speakers is visible rather than assumed. Hotplug is watched on `/dev/snd`; when the
+preferred device appears the switch waits for the next track boundary, because
+switching mid-track cuts the sound. Known trap: if PipeWire is holding the card,
+exclusive returns `Device busy` — that is rung 4, not a failure, and the badge has to
+say so or bit-perfect will look broken when it is merely unavailable.
+
+**Credentials.** Never embedded. This repo is public, and sone's XOR-obfuscated
+`embedded_config.rs` is precisely the pattern not to carry into a public tree. They
+live in `~/.config/runnir/config.toml` under `[tidal]`, mode 0600, secret overridable
+from the environment — the shape the AI configurator already established. No
+credentials, no panel. Note for whoever builds it: `Config` is `deny_unknown_fields`,
+so the `[tidal]` struct must exist in code BEFORE that block may appear in a live
+config file, or every window stops parsing its config.
+
+**The panel.** `leader n`. `t` for tidal was the wish, but `t` is the Tabs group with
+ten bindings and that memory is older than this feature; `n` was free at the top level.
+Three columns, the same bar the git panel set: sources (library, playlists, albums,
+artists, mixes, search) | list | track detail. `hjkl` to move, space to play, `/` to
+search, `a` to enqueue, `o` for the output picker. Transport and the signal-path badge
+live in the status bar. The spectrum is drawn in braille from the player's own decode
+buffer — with a real player inside, `cava` is no longer needed, and `media.rs` can stop
+shelling out to `playerctl` to watch someone else's music.
+
+**Deliberately out of scope.** MQA (no free decoder). Offline downloads. macOS playback:
+ALSA is Linux, so the output backend sits behind a trait and macOS gets browse-only
+until someone writes a CoreAudio one — saying that up front is better than shipping a
+panel that silently does nothing there.
+
+**The unknown that decides how big this is.** Whether `symphonia` reads FLAC inside
+fragmented MP4. If it does, hi-res is the same code path as everything else. If it does
+not, the fMP4 has to be demuxed by hand to recover the FLAC frames, and that is a
+different size of project. This gets answered first, before anything else is built.
+
+**Phases.** 0: the device flow, `playbackinfopostpaywall`, and one LOSSLESS track
+reaching ALSA — behind a flag, no UI. It is the only phase carrying real risk. 1: the
+panel, library, search, queue, transport, `leader n`. 2: bit-perfect proper — hardware
+probing, the full fallback chain, hi-res over DASH, the signal-path badge. 3: the player
+daemon — one owner of the sound, every window a view onto it (see below; this moved
+ahead of MPRIS because MPRIS becomes nearly free once the daemon exists and announces
+itself once, instead of each window announcing a player it may not own). 4: MPRIS, so
+media keys and `playerctl` drive it like any other player. 5: a share link over a
+Cloudflare quick tunnel, the way sone does it — worth naming plainly that this
+re-transmits licensed audio to whoever holds the URL, so it dies with the session.
+
+**What "the same in every window" means**, since that is the requirement and it is
+easy to over-promise. SHARED: the track, the position, the queue, the quality and the
+signal path — and the transport in any window commands the one sound. LOCAL: the
+browsing cursor, the album being looked at, the search being typed. Wanting to dig
+through the library in one window without moving what the other one is showing is the
+normal case, not an edge case.
+
+### Where the pieces go, and why there
+
+Nothing here is a new pattern; every one of these already exists in the codebase and is
+being followed rather than invented.
+
+- `src/tidal.rs` — the service: device-code auth, token refresh, the catalog calls,
+  `playbackinfopostpaywall`, and both manifest parsers. Pure request/response, no UI
+  types, same as `docker.rs` and `git.rs` are to their panels.
+- `src/player.rs` — the audio side: the fetcher, the decoder, the output chain and the
+  signal-path snapshot. It owns its threads and never touches the grid.
+- `TidalPanel` in `overlay.rs` — the columns, the cursors, the focus, the scroll. Panel
+  STATE lives in the overlay module with the other panels; panel LOGIC does not.
+- `UserEvent::Tidal(u64, tidal::PanelMsg)` and `UserEvent::Player(player::Msg)` — the
+  proxy wake, the only safe way into the UI thread. The `u64` is the request sequence,
+  for the same reason the docker panel carries one: a slow search answering after the
+  cursor moved must be dropped, not drawn under the wrong title.
+
+**Threads.** Every HTTP call runs on a spawned worker and answers through the proxy —
+the UI thread never waits on the network. The player owns two of its own: a fetcher
+(HTTP → byte channel) and a decode/output thread (symphonia → ALSA), joined by a bounded
+`std::sync::mpsc` channel that doubles as the buffer. `std` channels, not crossbeam;
+there is no async runtime in this program and this feature is not the reason to add one.
+
+**Where the session is kept.** `dirs::data_dir()/runnir/tidal-session.json`, mode 0600 —
+refresh token, access token, expiry, country code. `data_dir` and not `config_dir`
+because that is where `session.rs` already writes, and the two disagreeing is a known
+piece of debt in this repo (see the explorer persistence entry); this must not add a
+third opinion.
+
+**The `[tidal]` config block.**
+
+    [tidal]
+    client_id = "..."         # required; without it the panel does not exist
+    client_secret = "..."     # or RUNNIR_TIDAL_SECRET in the environment
+    quality = "hi_res_lossless"   # hi_res_lossless | lossless | high
+    output = "auto"           # "auto" | "hw:2,0" | "default"
+    bit_perfect = true        # false forces the shared path even when exclusive is free
+    volume_normalization = false  # ReplayGain scales samples, so it is off with bit-perfect
+
+**Not in v1, on purpose:** gapless playback (needs the next track decoded before this
+one ends, which is a scheduler, not a feature), queue persistence across restarts
+(`session.rs` can carry it later), and lyrics.
+
+### The player belongs to the WINDOW, not to a pane (decided with Pedro, 2026-08-01)
+
+Every other panel in this program is scoped to something: the explorer to a tab, the
+git panel to a pane's repository, the viewer to whatever was opened. The player must
+not be. Music is not a view of the terminal, it is a thing the terminal is doing, and
+the panel is only a window onto it.
+
+Consequences, and they are the requirement, not a nicety:
+
+- the player lives on `App`, beside the config and the theme — never on `Tab` or `Pane`.
+- closing the pane the panel was opened from does not stop the music. Closing the TAB
+  does not stop it. Closing the panel does not stop it; `leader n` reopens onto the same
+  playing track, the same queue, the same position.
+- the transport keeps working from anywhere: the status-bar badge and the media keys
+  answer whatever pane has focus, because focus is not what owns the sound.
+- only quitting the window stops it, and that gets asked about first.
+
+**Closing the window while music plays asks first.** `request_close` already knows how
+to hold the window open and put a question on screen when commands are still running.
+Playback joins that question — "Close runnir? Music is still playing" — with one
+difference worth being deliberate about: the running-commands confirm obeys
+`behaviour.confirm_close`, and the music one does NOT. That setting was written about
+shell commands, where the answer is usually "yes, I know". Silently killing playback is
+a different kind of surprise, and the person who turned that setting off did not turn
+this one off.
+
+One window, one player — in v1. A second runnir window does not take the sound: whoever
+holds the ALSA device holds it, and the second window's panel says so rather than
+fighting for it (the exclusive device would refuse anyway — that is `Device busy`, rung
+4 of the output chain).
+
+### Surviving ACROSS instances — the daemon, and why the panel must not know yet
+
+Pedro asked whether the music could outlive any single window and be visible from all
+of them. It can, and this program is unusually close to it already: every instance opens
+a control socket at `$XDG_RUNTIME_DIR/runnir-<pid>.sock`, and since the second-window
+fix of 2026-07-22 it can tell a LIVE instance from a stale socket file, which is the
+hard half of the problem.
+
+Three levels, and only the first two are cheap:
+
+1. **Visible everywhere** — the playing instance announces on MPRIS, every other
+   instance reads the bus and paints the same now-playing with a working transport.
+   That is phase 3 as already planned, and it costs nothing extra. The sound still dies
+   with the window that owns it.
+2. **Handover on close** — the closing window passes queue and position to a live
+   sibling over the control socket. Cheap, but there is a gap of about a second and the
+   device is released and re-acquired.
+3. **A player daemon** — the player is its own process, every window is a view onto it.
+   Music survives any window closing; there is exactly one owner of the DAC, so the
+   contention above stops existing; and all panels agree because they read one state.
+   The costs are real: process lifecycle, a state protocol, what happens when the daemon
+   dies, and one policy decision, which Pedro settled: **when the last window closes the
+   daemon goes with it.** Nothing keeps playing in the background without a runnir on
+   screen. A music player that outlives its UI is a process you find later in `ps` and
+   wonder about, and the close already owes a warning anyway — that warning is now also
+   the daemon's shutdown.
+
+Level 3 is the right architecture and it is a later phase, not this one. What matters
+TODAY is not building it, but not making it expensive: the panel never talks to the
+player directly. It talks to a `PlayerHandle` — in-process in phase 1, socket-attached
+when the daemon lands. The player was already going to live behind a message channel on
+its own threads, so moving it to another process moves that channel onto a socket that
+already exists. Skip this and the panel grows in-process assumptions that have to be
+torn out later; keep it and the daemon is one more phase rather than a rewrite.
+
 ## Gotchas (do not re-learn)
 
 - A touchpad's `PixelDelta` is a FRACTION of a line arriving dozens of times a second.

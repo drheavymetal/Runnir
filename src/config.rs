@@ -35,6 +35,11 @@ pub struct Config {
     /// The file explorer sidebar.
     #[serde(default)]
     pub explorer: Explorer,
+    /// TIDAL: the console player. Absent credentials mean the panel does not exist,
+    /// which is the right default for a terminal most people run without a
+    /// subscription behind it.
+    #[serde(default)]
+    pub tidal: Tidal,
     /// Extra keybindings, merged over the built-in ones. `"ctrl+shift+t" = "new_tab"`.
     /// A `"leader+v"` key binds on the leader layer instead of as a plain chord.
     pub keys: HashMap<String, String>,
@@ -95,6 +100,7 @@ impl Default for Config {
             theme: Theme::default(),
             behaviour: Behaviour::default(),
             clipboard: ClipboardCfg::default(),
+            tidal: Tidal::default(),
             ai: Ai::default(),
             watch: Watch::default(),
             media: Media::default(),
@@ -463,6 +469,94 @@ impl Default for Explorer {
             width: 30,
             show_hidden: false,
             open_on_start: false,
+        }
+    }
+}
+
+// ---- TIDAL ----------------------------------------------------------------
+
+/// The TIDAL player (leader n).
+///
+/// `client_id` is an identifier, not a secret, and lives in the file. The secret does
+/// not have to: `client_secret_env` names an environment variable and wins over the
+/// file when it is set, for the same reason the AI providers keep their keys out of a
+/// config that tends to end up in a dotfile repository. The in-file field stays
+/// available because runnir is launched from a desktop entry as often as from a shell,
+/// and an environment variable that only exists in one of those is a support question.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Tidal {
+    pub client_id: String,
+    pub client_secret: String,
+    pub client_secret_env: String,
+    /// The tier to ASK for. TIDAL answers with the best it can serve for the
+    /// subscription and the track, which may be lower — the badge reports what
+    /// actually arrived, never what was requested.
+    pub quality: Quality,
+    /// `"auto"` picks the first device that can take the stream untouched. A name like
+    /// `"hw:2,0"` pins one. `"default"` deliberately hands the audio to
+    /// PipeWire/PulseAudio, which is never bit-perfect and always works.
+    pub output: String,
+    /// Try for an exclusive, unaltered path to the DAC. Turning it off does not break
+    /// playback, it just stops trying — useful when something else needs the card.
+    pub bit_perfect: bool,
+    /// ReplayGain. Off by default because it scales every sample, which is exactly
+    /// what bit-perfect promises not to do; with `bit_perfect` on it is ignored.
+    pub volume_normalization: bool,
+}
+
+impl Default for Tidal {
+    fn default() -> Self {
+        Self {
+            client_id: String::new(),
+            client_secret: String::new(),
+            client_secret_env: "RUNNIR_TIDAL_SECRET".to_string(),
+            quality: Quality::HiResLossless,
+            output: "auto".to_string(),
+            bit_perfect: true,
+            volume_normalization: false,
+        }
+    }
+}
+
+impl Tidal {
+    /// The secret, from the environment first and the file second. Empty means the
+    /// panel is not available, which is checked before anything reaches the network.
+    pub fn client_secret(&self) -> String {
+        if !self.client_secret_env.is_empty() {
+            if let Ok(v) = std::env::var(&self.client_secret_env) {
+                if !v.is_empty() {
+                    return v;
+                }
+            }
+        }
+        self.client_secret.clone()
+    }
+
+    /// Whether the panel exists at all.
+    pub fn configured(&self) -> bool {
+        !self.client_id.is_empty() && !self.client_secret().is_empty()
+    }
+}
+
+/// The quality tiers TIDAL serves, in the words its API expects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Quality {
+    /// Up to 24-bit / 192 kHz, delivered as fragmented MP4 over DASH.
+    HiResLossless,
+    /// 16-bit / 44.1 kHz FLAC, delivered as a whole file.
+    Lossless,
+    /// Lossy AAC. Here for a metered connection, not for listening.
+    High,
+}
+
+impl Quality {
+    pub fn as_api(self) -> &'static str {
+        match self {
+            Quality::HiResLossless => "HI_RES_LOSSLESS",
+            Quality::Lossless => "LOSSLESS",
+            Quality::High => "HIGH",
         }
     }
 }

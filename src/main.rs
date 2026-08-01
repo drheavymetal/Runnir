@@ -23,6 +23,7 @@ mod mouse;
 mod overlay;
 mod pane;
 mod platform;
+mod player;
 mod project_session;
 mod pty;
 mod render;
@@ -32,6 +33,7 @@ mod settings;
 mod shell_integration;
 mod tab;
 mod themes;
+mod tidal;
 mod verbs;
 mod warroom;
 mod watch;
@@ -179,6 +181,25 @@ fn main() {
             let secs: u64 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(5);
             return zsa_paint(revision, secs);
         }
+        // `runnir --tidal-login` — sign in to TIDAL by the device flow. Prints the code
+        // to approve and waits. Separate from the terminal for the same reason
+        // `--zsa-paint` is: it is the half that needs a human and a service to both be
+        // there, and it must be checkable without a window in the way.
+        Some("--tidal-login") => return tidal_login(args.get(2).map(String::as_str)),
+        // `runnir --tidal-play <track-id|search words>` — fetch, decode and play one
+        // track, then report the signal path it came out on. This is how the audio
+        // chain gets verified: whether the DAC really took the stream untouched is not
+        // something a test can answer.
+        Some("--tidal-play") => {
+            let what = args[2..].join(" ");
+            if what.is_empty() {
+                return eprintln!("usage: runnir --tidal-play <track-id|search words>");
+            }
+            return tidal_play(&what);
+        }
+        // `runnir --tidal-devices` — what the output chain would try, in order, for the
+        // current config. Answers "why is it not bit-perfect" without playing anything.
+        Some("--tidal-devices") => return tidal_devices(),
         Some("--version" | "-v") => return println!("runnir {}", env!("CARGO_PKG_VERSION")),
         Some("--help" | "-h") => return print_help(),
         Some("--demo") => {
@@ -388,6 +409,220 @@ fn git_scene(path_out: &str, state: &str) {
             .collect();
         (panes, Some(specs))
     });
+}
+
+/// The credentials from the config, or a message explaining what is missing. Every
+/// TIDAL entry point starts here, because "the panel does not exist without
+/// credentials" has to be one decision made in one place.
+fn tidal_creds() -> Result<(config::Tidal, tidal::Creds), String> {
+    let cfg = Config::load().tidal;
+    if !cfg.configured() {
+        return Err(format!(
+            "no TIDAL credentials.\n  \
+             Put them in {} under [tidal]:\n    \
+             client_id = \"...\"\n    \
+             client_secret = \"...\"   # or set {} in the environment",
+            Config::path().display(),
+            cfg.client_secret_env
+        ));
+    }
+    let creds = tidal::Creds {
+        client_id: cfg.client_id.clone(),
+        client_secret: cfg.client_secret(),
+    };
+    Ok((cfg, creds))
+}
+
+/// Signs in.
+///
+/// Two flows, chosen by what the credentials are registered for rather than by a flag.
+/// The device flow is nicer — a code, no browser — but TIDAL only allows it for clients
+/// registered as limited-input devices, and a web player client id is refused with
+/// `sub_status 1002`. Rather than make the user know which kind they pasted, the device
+/// flow is tried first and the refusal switches to PKCE automatically.
+///
+/// PKCE needs the code the browser was redirected with, so it runs in two commands:
+/// this one prints the URL, and the same command with the pasted URL finishes it.
+fn tidal_login(pasted: Option<&str>) {
+    let (_, creds) = match tidal_creds() {
+        Ok(v) => v,
+        Err(e) => return eprintln!("runnir: {e}"),
+    };
+
+    // Second half of a PKCE sign-in: the browser has been and this is what it showed.
+    if let Some(pasted) = pasted {
+        let Some(pkce) = tidal::Pkce::load() else {
+            return eprintln!("runnir: no sign-in is in progress — run: runnir --tidal-login");
+        };
+        let Some(code) = tidal::code_from_redirect(pasted) else {
+            return eprintln!(
+                "runnir: no grant code in that URL.\n  \
+                 Paste the whole address the browser ended on, the one with ?code=… in it."
+            );
+        };
+        match tidal::finish_pkce(&creds, &pkce, &code) {
+            Ok(session) => {
+                tidal::Pkce::clear();
+                if let Err(e) = session.save() {
+                    return eprintln!("runnir: signed in but could not save the session: {e}");
+                }
+                println!("  Signed in ({}).", session.country_code);
+            }
+            Err(e) => eprintln!("runnir: could not complete sign-in: {e}"),
+        }
+        return;
+    }
+
+    let auth = match tidal::start_device_auth(&creds) {
+        Ok(a) => a,
+        Err(e) if tidal::is_not_a_device_client(&e) => return tidal_login_pkce(&creds),
+        Err(e) => return eprintln!("runnir: could not start sign-in: {e}"),
+    };
+    println!("\n  Open {}\n  and enter this code:\n", auth.verification_uri);
+    println!("      {}\n", auth.user_code);
+    println!("  Waiting (up to {}s)…", auth.expires_in);
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(auth.expires_in);
+    while std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_secs(auth.interval));
+        match tidal::poll_device_token(&creds, &auth.device_code) {
+            Ok(tidal::Poll::Pending) => continue,
+            Ok(tidal::Poll::Granted(session)) => {
+                if let Err(e) = session.save() {
+                    return eprintln!("runnir: signed in but could not save the session: {e}");
+                }
+                let where_ = tidal::Session::path()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default();
+                println!("  Signed in ({}). Session saved to {where_}", session.country_code);
+                return;
+            }
+            Err(e) => return eprintln!("runnir: sign-in failed: {e}"),
+        }
+    }
+    eprintln!("runnir: the code expired before it was approved");
+}
+
+/// Prints the browser half of a PKCE sign-in and remembers the verifier for the second
+/// command.
+fn tidal_login_pkce(creds: &tidal::Creds) {
+    let pkce = match tidal::start_pkce(creds) {
+        Ok(p) => p,
+        Err(e) => return eprintln!("runnir: could not start sign-in: {e}"),
+    };
+    if let Err(e) = pkce.save() {
+        return eprintln!("runnir: could not remember the sign-in: {e}");
+    }
+    println!(
+        "\n  These credentials are not registered for the device flow, so this is the\n  \
+         browser sign-in instead.\n\n  \
+         1. Open this and log in to TIDAL:\n\n{}\n\n  \
+         2. The browser will land on a tidal.com page that looks empty or broken.\n     \
+         That is expected — the grant code is in its ADDRESS BAR.\n\n  \
+         3. Copy that whole address and run:\n\n     \
+         runnir --tidal-login '<the address you copied>'\n",
+        pkce.authorize_url
+    );
+}
+
+/// Plays one track end to end and reports the path the audio actually took.
+fn tidal_play(what: &str) {
+    let (cfg, creds) = match tidal_creds() {
+        Ok(v) => v,
+        Err(e) => return eprintln!("runnir: {e}"),
+    };
+    let Some(session) = tidal::Session::load() else {
+        return eprintln!("runnir: not signed in — run: runnir --tidal-login");
+    };
+    let session = match tidal::ensure_fresh(&creds, &session) {
+        Ok(s) => s,
+        Err(e) => return eprintln!("runnir: could not refresh the session: {e}"),
+    };
+
+    // A bare number is a track id; anything else is something to search for, because
+    // typing a track id is not how anyone finds music.
+    let track = match what.parse::<u64>() {
+        Ok(id) => tidal::track(&session, id),
+        Err(_) => match tidal::search_tracks(&session, what, 1) {
+            Ok(mut tracks) if !tracks.is_empty() => Ok(tracks.remove(0)),
+            Ok(_) => Err(format!("nothing found for {what:?}")),
+            Err(e) => Err(e),
+        },
+    };
+    let track = match track {
+        Ok(t) => t,
+        Err(e) => return eprintln!("runnir: {e}"),
+    };
+    println!(
+        "  {} — {} [{}]  ({}, {}:{:02})",
+        track.artist,
+        track.title,
+        track.album,
+        track.quality,
+        track.duration_secs / 60,
+        track.duration_secs % 60
+    );
+
+    let info = match tidal::stream_info(&session, track.id, cfg.quality.as_api()) {
+        Ok(i) => i,
+        Err(e) => return eprintln!("runnir: no stream for this track: {e}"),
+    };
+    println!(
+        "  manifest {} · codec {} · {} bit / {} Hz",
+        info.mime,
+        if info.codec.is_empty() { "?" } else { info.codec.as_str() },
+        info.bit_depth.map(|b| b.to_string()).unwrap_or_else(|| "?".into()),
+        info.sample_rate.map(|r| r.to_string()).unwrap_or_else(|| "?".into()),
+    );
+
+    match player::play(&info, &cfg) {
+        Ok(played) => {
+            println!("  {}", played.signal.badge());
+            println!(
+                "  {} frames ({}:{:02}){}",
+                played.frames,
+                played.frames / played.signal.decoded_rate.max(1) as u64 / 60,
+                played.frames / played.signal.decoded_rate.max(1) as u64 % 60,
+                if played.underruns > 0 {
+                    format!(", {} underruns", played.underruns)
+                } else {
+                    String::new()
+                }
+            );
+        }
+        Err(e) => eprintln!("runnir: playback failed: {e}"),
+    }
+}
+
+/// Prints the output chain for the current config, without playing anything.
+fn tidal_devices() {
+    let cfg = Config::load().tidal;
+    let devices = player::hw_devices_public();
+    if devices.is_empty() {
+        println!("  no playback devices found under /proc/asound");
+    }
+    for d in &devices {
+        println!(
+            "  found {:<10} {}{}",
+            d.name,
+            d.label,
+            if d.is_display { "   (display — only reachable by name)" } else { "" }
+        );
+    }
+    let names = player::auto_candidates(&devices);
+    println!("\n  chain for output = {:?}, bit_perfect = {}:", cfg.output, cfg.bit_perfect);
+    for (i, attempt) in player::plan(&cfg.output, cfg.bit_perfect, &names).iter().enumerate() {
+        println!(
+            "   {}. {:<14} {}",
+            i + 1,
+            attempt.device,
+            match (attempt.exact, attempt.same_rate) {
+                (true, _) => "exact rate and depth (bit-perfect)",
+                (false, true) => "same rate, wider container allowed",
+                (false, false) => "whatever it takes",
+            }
+        );
+    }
 }
 
 /// Prints which LED each key of the leader's top level sits under, for `revision`
