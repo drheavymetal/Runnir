@@ -4473,12 +4473,10 @@ impl Gpu {
             // (which this path cannot reach) — the same save-then-exit the palette's
             // Quit does, so a confirmed close never loses the session.
             PromptKind::ConfirmQuit => {
-                // Tell the player before the process goes: it holds an ALSA device, and
-                // one that is closed rather than yanked leaves the card in a state the
-                // next application does not have to recover from.
-                if let Some(jukebox) = self.jukebox.as_ref() {
-                    jukebox.send(crate::player::Cmd::Quit);
-                }
+                // The player is NOT told to quit here. It belongs to the session, and
+                // another window may still be listening; the daemon decides for itself
+                // when the last one has gone. Dropping this window's connection is the
+                // whole message, and closing the process sends it.
                 self.save_session(config);
                 std::process::exit(0);
             }
@@ -7073,23 +7071,26 @@ impl Gpu {
     /// Lazy because most windows never play anything, and starting a thread that opens
     /// nothing costs nothing but is still a thread. `None` means the credentials are
     /// missing, which is also the answer to "does this terminal have a music panel".
-    fn player(&mut self, config: &Config) -> Option<&crate::player::Jukebox> {
+    fn player(&mut self, config: &Config) -> Option<&crate::daemon::Remote> {
         if self.jukebox.is_none() {
             if !config.tidal.configured() {
                 return None;
             }
-            let creds = crate::tidal::Creds {
-                client_id: config.tidal.client_id.clone(),
-                client_secret: config.tidal.client_secret(),
-            };
             let proxy = self.proxy.clone();
-            self.jukebox = Some(crate::player::Jukebox::start(
-                config.tidal.clone(),
-                creds,
+            match crate::daemon::Remote::connect(
+                &config.tidal,
                 Box::new(move || {
                     let _ = proxy.send_event(UserEvent::Redraw);
                 }),
-            ));
+            ) {
+                Ok(remote) => self.jukebox = Some(remote),
+                // No daemon and none could be started: say so once rather than trying
+                // again on every keystroke.
+                Err(e) => {
+                    self.toast(&format!("player unavailable: {e}"), 6);
+                    return None;
+                }
+            }
         }
         self.jukebox.as_ref()
     }

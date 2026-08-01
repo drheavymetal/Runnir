@@ -600,7 +600,8 @@ fn fill_session_details(session: &mut Session) -> Result<(), String> {
 }
 
 /// One track, as much of it as the panel and the badge need.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Track {
     pub id: u64,
     pub title: String,

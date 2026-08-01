@@ -5,6 +5,7 @@ mod catchup;
 mod clipboard;
 mod config;
 mod control;
+mod daemon;
 mod dnd;
 mod docs;
 mod docker;
@@ -220,6 +221,15 @@ fn main() {
         // `runnir --tidal-devices` — what the output chain would try, in order, for the
         // current config. Answers "why is it not bit-perfect" without playing anything.
         Some("--tidal-devices") => return tidal_devices(),
+        // The player process itself. Started by a window that finds no daemon running,
+        // never by a person — which is why it is not in --help.
+        Some("--player-daemon") => {
+            let (cfg, creds) = match tidal_creds() {
+                Ok(v) => v,
+                Err(e) => return eprintln!("runnir: {e}"),
+            };
+            return daemon::main(cfg, creds);
+        }
         // `runnir --tidal-browse <words>` — exercises the whole catalogue layer in one
         // go: the four search types, the user's playlists and favourites, an album's
         // tracks, an artist's top tracks, and whether a track has timed lyrics. The
@@ -1266,9 +1276,10 @@ struct Gpu {
     /// When the now-playing overlay last had its metadata refreshed, so a track change
     /// shows while it stays open without re-fetching on every wake. `None` when closed.
     media_last_refresh: Option<Instant>,
-    /// The TIDAL player, started on first use and owned by the WINDOW. Not by a tab, not
-    /// by a pane and not by the panel: closing any of those must not stop the music.
-    jukebox: Option<player::Jukebox>,
+    /// This window's end of the player. The player itself lives in a daemon shared by
+    /// every runnir on the session, so closing a window — any window but the last —
+    /// does not stop the music. Connected on first use.
+    jukebox: Option<daemon::Remote>,
     /// Search request counter, so an answer that arrives after a newer query is dropped
     /// instead of drawn over it.
     tidal_seq: u64,

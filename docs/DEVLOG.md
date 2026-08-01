@@ -3415,6 +3415,60 @@ Verified by driving a real instance over the remote control: a mixed search on
 "fleetwood", the seventeen playlists, opening one into its seven tracks, playing from
 it, and toggling the words. 554 tests.
 
+## 2026-08-01 - The player moves out, and the music stops belonging to a window
+
+The player runs in its own process now. Every window is a VIEW: it sends commands up a
+socket and reads snapshots coming down it, and the sound is made somewhere else.
+
+Three things fall out of that at once. Closing the window that started a song does not
+stop it. Two windows show the same thing rather than each keeping its own idea of it.
+And exactly one process holds the ALSA device, so the exclusive path stops being a race
+between windows.
+
+**The last window takes the daemon with it** — Pedro's rule, and the right one. There is
+no "keep playing in the background" mode: a music player that outlives its UI is a
+process you find later in `ps` and wonder about. The connection IS the subscription,
+which makes the rule almost free — when the last one closes there is nobody left to play
+for. A daemon nobody ever connects to gives up after five seconds, so a window that
+starts one and then dies does not leave it sitting there for ever.
+
+The panel, the status bar and the close guard did not change at all. That was the point
+of building the player behind a channel and a snapshot in the first place: `Remote`
+offers the same three methods `Jukebox` does, and nothing above it can tell which it is
+holding.
+
+Proved by driving two real windows: window two showed the same track at the same second,
+closing window one left the music playing, and closing the second took the daemon with
+it.
+
+### The bug this uncovered, which was mine and a day old
+
+The first daemon run played nothing. State said `playing`, position never moved, no
+wave. The daemon's stderr went to `/dev/null`, so there was nothing to read; an hour
+went into guessing before that got fixed, and the log now lives at
+`$XDG_RUNTIME_DIR/runnir-player.log`.
+
+What it said, once it could say anything:
+
+    thread 'runnir-player' panicked at symphonia-core/audio/util.rs:134:
+    destination slice does not match number of samples
+
+`level_of` — the wave, committed the same day — sized its destination by FRAMES when
+`copy_to_slice_interleaved` writes frames × channels. It panicked on the first packet of
+every track. The wave's own tests passed because they tested the DRAWING with synthetic
+numbers; nothing had ever run the measuring against a real decoded buffer. A test that
+does now exists, and it builds a real two-channel buffer to do it.
+
+The second half of that fix matters more than the first: a panic in the player thread
+killed playback while the snapshot went on saying `playing`, silently, for ever.
+Playback is wrapped in `catch_unwind` now, so a crash becomes an error message on the
+panel and the queue moves on — the same thing that happens to a track that will not play
+for any other reason.
+
+Also: the daemon socket is 0600. The runtime directory is already 0700, so it is defence
+in depth rather than the boundary, but a socket that takes commands and hands back what
+somebody is listening to should not be readable by anything that gets inside it.
+
 ## Gotchas (do not re-learn)
 
 - `runnir.json` WINS over `runnir.toml`. `Config::try_load` reads the JSON the settings
@@ -3426,6 +3480,12 @@ it, and toggling the words. 554 tests.
   `git reset --hard origin/<default>` in `~/.local/share/runnir/src`. Installing a
   branch means pointing that checkout at it by hand, and `runnir-update` afterwards will
   silently take the machine back to `main`.
+- `copy_to_slice_interleaved` writes frames × CHANNELS. Sizing the destination by
+  frames alone panics inside symphonia on the first packet, and a panic on the player
+  thread is silent: the state goes on claiming to play for ever. Anything that decodes
+  audio in a thread of its own needs its panics turned into messages.
+- A background process with its stderr on /dev/null cannot be debugged at all. Give it
+  a file before the first bug, not after.
 - A decoder's buffer width is NOT the source's bit depth. symphonia decodes 16-bit FLAC
   into an `i32` buffer; reading the depth from the buffer reports every lossless track
   as 32-bit. The codec parameters carry the real one.

@@ -22,7 +22,7 @@ const MAX_PART_BYTES: usize = 512 * 1024 * 1024;
 /// The rung of the output chain the audio actually came out on. This is what the status
 /// badge reports, and the whole point of naming them is that "bit-perfect" must mean
 /// bit-perfect and nothing else.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Rung {
     /// Exclusive access, the source's own rate, the source's own depth. No conversion
     /// of any kind between the decoder and the DAC.
@@ -63,7 +63,8 @@ impl Rung {
 /// What the decoder produced, what the device accepted, and every difference between
 /// them. The panel shows this; it is also the only honest way to answer "am I actually
 /// getting hi-res?".
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct SignalPath {
     pub device: String,
     pub rung: Option<Rung>,
@@ -365,17 +366,19 @@ pub const WAVE_LEN: usize = 96;
 /// what music does and leaves quiet passages flat against the floor.
 pub fn level_of(buf: &symphonia::core::audio::GenericAudioBufferRef<'_>) -> f32 {
     let frames = buf.frames();
+    let channels = buf.spec().channels().count().max(1);
     if frames == 0 {
         return 0.0;
     }
-    // One channel is enough for a level meter, and halves the work per packet.
-    let mut samples = vec![0f32; frames];
+    // The destination must hold frames * channels. Sizing it by frames alone panics
+    // inside symphonia — "destination slice does not match number of samples" — and it
+    // panics on the FIRST packet, which killed the player thread while the state went
+    // on claiming to be playing. Measured once, remembered here.
+    let mut samples = vec![0f32; frames * channels];
     buf.copy_to_slice_interleaved(&mut samples[..]);
-    let sum: f32 = samples.iter().map(|s| s * s).sum();
-    let rms = (sum / samples.len() as f32).sqrt();
-    if rms <= 0.0 {
-        return 0.0;
-    }
+    // One channel is enough for a level meter, so only every Nth sample is squared.
+    let sum: f32 = samples.iter().step_by(channels).map(|s| s * s).sum();
+    let rms = (sum / frames as f32).sqrt();
     db_level(rms)
 }
 
@@ -1037,7 +1040,7 @@ mod other {
 /// Deliberately small and deliberately serialisable in shape: when the player moves
 /// into its own process, this enum becomes the wire protocol and the panel does not
 /// change. Nothing here carries a callback, a handle or a lifetime for that reason.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub enum Cmd {
     /// Replace the queue and start at `at`.
     Play { tracks: Vec<tidal::Track>, at: usize },
@@ -1058,7 +1061,8 @@ pub enum Cmd {
 
 /// Everything a panel (or a status bar, or another window) needs to draw the player.
 /// One struct, cloned under a lock, so a reader can never see half an update.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Snapshot {
     pub queue: Vec<tidal::Track>,
     pub index: usize,
@@ -1158,7 +1162,18 @@ impl Jukebox {
         self.state.lock().map(|s| s.clone()).unwrap_or_default()
     }
 
-    /// Whether closing the window would interrupt music. Read by the close guard.
+    /// The state itself, for the daemon's writer thread — it watches for changes rather
+    /// than polling a copy, which would mean cloning a queue eighty times a second.
+    pub fn shared(&self) -> std::sync::Arc<std::sync::Mutex<Snapshot>> {
+        self.state.clone()
+    }
+
+    /// Whether closing the window would interrupt music.
+    ///
+    /// The window asks its [`crate::daemon::Remote`] rather than this, since the player
+    /// is in another process; kept here because the daemon runs a Jukebox directly and
+    /// the two answers must not be allowed to drift apart.
+    #[allow(dead_code)]
     pub fn is_playing(&self) -> bool {
         self.state.lock().map(|s| s.playing && !s.paused).unwrap_or(false)
     }
@@ -1328,7 +1343,11 @@ fn play_one(
     let mut pending_cfg: Option<TidalCfg> = None;
     let playing_cfg = cfg.clone();
 
-    let result = play_parts(
+    // Caught, because a panic here kills the player thread and leaves the state saying
+    // "playing" forever: silent, with nothing on screen to explain it. A crash has to
+    // become a message like any other failure — the queue then moves on, which is what
+    // it does for a track that will not play for any other reason.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| play_parts(
         parts,
         hint_for(&info),
         &info.quality,
@@ -1417,14 +1436,23 @@ fn play_one(
 
             if paused { Flow::Pause } else { Flow::Continue }
         },
-    );
+    )
+    ));
 
     if let Some(next) = pending_cfg {
         *cfg = next;
     }
     match result {
-        Err(e) => Outcome::Failed(e),
-        Ok(_) => verdict,
+        Err(panic) => {
+            let what = panic
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| panic.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "player panicked".into());
+            Outcome::Failed(format!("internal error: {what}"))
+        }
+        Ok(Err(e)) => Outcome::Failed(e),
+        Ok(Ok(_)) => verdict,
     }
 }
 
