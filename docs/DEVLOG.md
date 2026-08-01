@@ -3318,6 +3318,38 @@ system volume must be down before it, not after. And a real instance driven by t
 control must be identified by `/proc/<pid>/exe`: the socket picked by recency belongs to
 whichever window answered last, which today was Pedro's own.
 
+## 2026-08-01 - The BTS manifest never turns up, and asking is now a command
+
+`runnir --tidal-info <track>` asks TIDAL what it would serve for one track at each tier
+and prints the answer: manifest shape, codec, depth, rate. It makes no sound, which is
+the point — "is this really hi-res" and "which manifest does this tier use" should not
+require playing a song out loud.
+
+The answer to the open question, on this account:
+
+    HI_RES_LOSSLESS   served LOSSLESS         DASH, 183 segments + init   16 bit / 44100   flac
+    LOSSLESS          served LOSSLESS         DASH, 183 segments + init   16 bit / 44100   flac
+    HIGH              served HIGH             DASH, 183 segments + init   ?                mp4a.40.2
+
+**DASH at every tier, including the lossy one. `vnd.tidal.bts` never appears.** The BTS
+parser stays — it is fifteen lines, TIDAL's own API still documents that mime type, and
+older or region-specific content may yet use it — but it is now labelled for what it is:
+a path that has never seen a real response, covered only by a manifest written by the
+person who wrote the parser. If it ever fires, that is the first time it has been
+exercised, and the failure will be loud rather than silent because an unknown manifest
+type is an error here, not a fallback.
+
+The same command settles what the badge is for. Asking for `HI_RES_LOSSLESS` does not
+mean getting it:
+
+    Fleetwood Mac — Dreams     served HI_RES_LOSSLESS   24 bit / 96000
+    Metallica — Battery        served HI_RES_LOSSLESS   24 bit / 44100
+    Daft Punk — Get Lucky      served LOSSLESS          16 bit / 44100
+    Heilung — Alfadhirhaiti    served LOSSLESS          16 bit / 44100
+
+Four tracks, two tiers, one request. The badge reports what ARRIVED, and this is why
+that distinction is worth the code it costs.
+
 ## Gotchas (do not re-learn)
 
 - A decoder's buffer width is NOT the source's bit depth. symphonia decodes 16-bit FLAC

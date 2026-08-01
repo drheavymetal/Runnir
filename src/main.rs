@@ -220,6 +220,18 @@ fn main() {
         // `runnir --tidal-devices` — what the output chain would try, in order, for the
         // current config. Answers "why is it not bit-perfect" without playing anything.
         Some("--tidal-devices") => return tidal_devices(),
+        // `runnir --tidal-info <track-id|search words>` — what TIDAL would serve for one
+        // track at each quality tier: which manifest shape, which codec, what depth and
+        // rate. Makes no sound, which is the point: the questions "is this really
+        // hi-res" and "which manifest does this tier use" should not require playing a
+        // song out loud to answer.
+        Some("--tidal-info") => {
+            let what = args[2..].join(" ");
+            if what.is_empty() {
+                return eprintln!("usage: runnir --tidal-info <track-id|search words>");
+            }
+            return tidal_info(&what);
+        }
         // `runnir --tidal-decode [--play] <file…>` — run local files through the same
         // decoder and output chain a TIDAL stream takes. Several files are read as one
         // stream, which is what a DASH init segment plus its media segments are.
@@ -662,33 +674,75 @@ fn open_in_browser(url: &str) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
-/// Plays one track end to end and reports the path the audio actually took.
-fn tidal_play(what: &str) {
-    let (cfg, creds) = match tidal_creds() {
+/// A signed-in session and the track `what` names, for the commands that need both.
+///
+/// A bare number is a track id; anything else is something to search for, because
+/// typing a track id is not how anyone finds music.
+fn tidal_find(what: &str) -> Result<(config::Tidal, tidal::Session, tidal::Track), String> {
+    let (cfg, creds) = tidal_creds()?;
+    let session = tidal::Session::load()
+        .ok_or_else(|| "not signed in — run: runnir --tidal-login".to_string())?;
+    let session = tidal::ensure_fresh(&creds, &session)
+        .map_err(|e| format!("could not refresh the session: {e}"))?;
+    let track = match what.parse::<u64>() {
+        Ok(id) => tidal::track(&session, id)?,
+        Err(_) => tidal::search_tracks(&session, what, 1)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| format!("nothing found for {what:?}"))?,
+    };
+    Ok((cfg, session, track))
+}
+
+/// What TIDAL would serve for one track, at each tier. Plays nothing.
+fn tidal_info(what: &str) {
+    let (_, session, track) = match tidal_find(what) {
         Ok(v) => v,
         Err(e) => return eprintln!("runnir: {e}"),
     };
-    let Some(session) = tidal::Session::load() else {
-        return eprintln!("runnir: not signed in — run: runnir --tidal-login");
-    };
-    let session = match tidal::ensure_fresh(&creds, &session) {
-        Ok(s) => s,
-        Err(e) => return eprintln!("runnir: could not refresh the session: {e}"),
-    };
+    println!("  {} — {} [{}]  id {}", track.artist, track.title, track.album, track.id);
+    println!("  the tier TIDAL lists for it: {}\n", track.quality);
 
-    // A bare number is a track id; anything else is something to search for, because
-    // typing a track id is not how anyone finds music.
-    let track = match what.parse::<u64>() {
-        Ok(id) => tidal::track(&session, id),
-        Err(_) => match tidal::search_tracks(&session, what, 1) {
-            Ok(mut tracks) if !tracks.is_empty() => Ok(tracks.remove(0)),
-            Ok(_) => Err(format!("nothing found for {what:?}")),
-            Err(e) => Err(e),
-        },
-    };
-    let track = match track {
-        Ok(t) => t,
+    for quality in [
+        config::Quality::HiResLossless,
+        config::Quality::Lossless,
+        config::Quality::High,
+    ] {
+        print!("  {:<18} ", quality.as_api());
+        match tidal::stream_info(&session, track.id, quality.as_api()) {
+            Ok(info) => {
+                let shape = match info.media.as_ref() {
+                    Some(tidal::Media::Direct(urls)) => format!("BTS, {} url(s)", urls.len()),
+                    Some(tidal::Media::Dash { init, segments }) => format!(
+                        "DASH, {} segment(s){}",
+                        segments.len(),
+                        if init.is_some() { " + init" } else { "" }
+                    ),
+                    None => "no media".to_string(),
+                };
+                println!(
+                    "served {:<16} {:<22} {} bit / {} Hz  codec {}",
+                    info.quality,
+                    shape,
+                    info.bit_depth.map(|b| b.to_string()).unwrap_or_else(|| "?".into()),
+                    info.sample_rate.map(|r| r.to_string()).unwrap_or_else(|| "?".into()),
+                    if info.codec.is_empty() { "?" } else { info.codec.as_str() },
+                );
+            }
+            Err(e) => println!("refused: {e}"),
+        }
+    }
+}
+
+/// Plays one track end to end and reports the path the audio actually took.
+fn tidal_play(what: &str) {
+    let (cfg, _session, track) = match tidal_find(what) {
+        Ok(v) => v,
         Err(e) => return eprintln!("runnir: {e}"),
+    };
+    let session = match tidal::Session::load() {
+        Some(s) => s,
+        None => return eprintln!("runnir: not signed in"),
     };
     println!(
         "  {} — {} [{}]  ({}, {}:{:02})",
