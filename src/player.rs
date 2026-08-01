@@ -1317,6 +1317,9 @@ pub struct Snapshot {
     pub wave: Vec<f32>,
     /// The public link, when there is one.
     pub share: Option<crate::share::State>,
+    /// Which build of runnir this daemon is. Empty in a window's own copy; filled by
+    /// the daemon so a window can tell whether it is talking to its own version.
+    pub build: String,
     /// True between "play this" and the first sound: resolving the stream, opening the
     /// device, fetching the first segment. Without it the panel showed a track and a
     /// position of zero and looked stuck — the gap is a second or two on a good link

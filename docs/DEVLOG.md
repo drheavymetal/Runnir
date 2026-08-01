@@ -3926,6 +3926,36 @@ the first open still found the card busy and only a later attempt succeeded.
 
 588 tests.
 
+## 2026-08-01 - "The daemon does not work": it was working, three hours out of date
+
+The report was that the player daemon was broken. It was not broken. It was old:
+
+    /proc/855308/exe -> /home/drheavymetal/.local/bin/runnir (deleted)
+    started 18:18:54 · installed binary 18:31
+
+**A daemon outlives an install.** It keeps running the image it started with while the
+file on disk is replaced underneath it, and Linux marks the link `(deleted)` to say so.
+So a window from the new build connected to a player from three hours earlier and got
+three hours of missing fixes: no PipeWire reservation, so the music came out of the
+laptop; no device reuse, so track changes were slow; none of it.
+
+The failure mode is the nasty kind. It does not error. Everything answers. The person
+watches a fix land, installs it, opens a window, and the bug is still there — which
+reads as "your fix does not work" rather than "you are talking to yesterday's program".
+
+Every snapshot now carries the build that made it — the size and modification time of
+the running image, which `/proc/self/exe` still reports for a replaced file. Not a
+version string: two builds of the same version are precisely the case that matters.
+A window that sees a build other than its own treats that daemon as gone, tells it to
+quit, and starts a current one. Any other window attached to it reconnects and gets the
+new one too, which is the point rather than a side effect.
+
+An unstamped daemon — one older than this field — is left alone rather than restarted on
+every keypress, since it cannot be told apart from a current one and guessing would make
+this worse than the problem.
+
+590 tests.
+
 ## Gotchas (do not re-learn)
 
 - `runnir.json` WINS over `runnir.toml`. `Config::try_load` reads the JSON the settings
@@ -3971,6 +4001,9 @@ the first open still found the card busy and only a later attempt succeeded.
 - Closing and reopening an ALSA device between tracks makes it wait out its OWN
   release: the busy-patience that fixes wrong-output then costs a gap at every track
   change. Hold the device while the format stays the same.
+- A long-lived daemon keeps running the binary it STARTED with. After an install,
+  windows from the new build talk to the old program and every fix looks like it did
+  not work. `/proc/<pid>/exe` reading `(deleted)` is the tell. Version the connection.
 - PipeWire holds every card it manages, IDLE or not, so an exclusive open normally
   fails. `pactl suspend-sink` does not release it. The Device Reservation protocol
   does: take `org.freedesktop.ReserveDevice1.Audio<N>` with ReplaceExisting.

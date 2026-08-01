@@ -7089,8 +7089,14 @@ impl Gpu {
     /// missing, which is also the answer to "does this terminal have a music panel".
     fn player(&mut self, config: &Config) -> Option<&crate::daemon::Remote> {
         // A handle whose daemon has gone is worse than no handle: it accepts everything
-        // and does nothing.
-        if self.jukebox.as_ref().is_some_and(|j| !j.is_alive()) {
+        // and does nothing. A handle to an OUT-OF-DATE daemon is worse still, because
+        // it works — with the code from whenever that daemon started, which after an
+        // install is not the code the person just watched land.
+        if let Some(old) = self.jukebox.as_ref().filter(|j| !j.is_alive()) {
+            if old.is_stale() {
+                old.retire();
+                self.toast("Player was from an older build — restarting it", 4);
+            }
             self.jukebox = None;
         }
         if self.jukebox.is_none() {

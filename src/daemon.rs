@@ -22,7 +22,7 @@
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::config::Tidal as TidalCfg;
@@ -70,6 +70,34 @@ fn take_the_lock(path: &std::path::Path) -> Option<std::fs::File> {
     // SAFETY: a plain flock on a file descriptor we own.
     let taken = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
     taken.then_some(file)
+}
+
+/// Which build this process is.
+///
+/// A daemon outlives an install: it keeps running the binary it started with, and the
+/// file on disk is replaced underneath it — `/proc/<pid>/exe` then reads
+/// `…/runnir (deleted)`. Windows from the new build were connecting to a player from
+/// hours earlier and getting the old behaviour, which is indistinguishable from the
+/// feature being broken.
+///
+/// Size and modification time of the running image, which `/proc/self/exe` still
+/// reports for a replaced file. Not a version string: two builds of the same version
+/// are exactly the case that matters here.
+pub fn build_id() -> String {
+    match std::fs::metadata("/proc/self/exe") {
+        Ok(meta) => {
+            let stamp = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            format!("{}-{stamp}", meta.len())
+        }
+        // No /proc: everything looks like the same build, which is the old behaviour
+        // and no worse than it was.
+        Err(_) => String::new(),
+    }
 }
 
 /// How long a window waits for a daemon it has just started.
@@ -121,6 +149,11 @@ pub fn main(cfg: TidalCfg, creds: tidal::Creds) {
     // Nothing wakes a UI here: the daemon has none. Clients are told about changes by
     // the writer loop on their own connection.
     let jukebox = Arc::new(Jukebox::start(cfg, creds, Box::new(|| {})));
+    // Stamped once, at the top, so every snapshot a window ever sees carries it.
+    if let Ok(mut state) = jukebox.shared().lock() {
+        state.build = build_id();
+        state.generation += 1;
+    }
     // Set the moment the daemon decides to go. The accept loop refuses connections
     // after that, so a window opened during the last two hundred milliseconds sees a
     // closed socket and starts a fresh daemon — rather than connecting successfully to
@@ -331,6 +364,10 @@ fn serve(
 pub struct Remote {
     stream: Mutex<UnixStream>,
     state: Arc<Mutex<Snapshot>>,
+    /// Set when the daemon on the other end turns out to be a different build. Not a
+    /// failure — it works — but it is the WRONG one, and every fix installed since it
+    /// started is missing from it.
+    stale: Arc<AtomicBool>,
     /// Cleared when the connection dies — either because the reader saw the end of it
     /// or because a write failed.
     ///
@@ -363,14 +400,23 @@ impl Remote {
         let state = Arc::new(Mutex::new(Snapshot::default()));
         let reader = stream.try_clone().map_err(|e| e.to_string())?;
         let shared = state.clone();
-        let alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let alive = Arc::new(AtomicBool::new(true));
         let reader_alive = alive.clone();
+        let stale = Arc::new(AtomicBool::new(false));
+        let reader_stale = stale.clone();
+        let mine = build_id();
         std::thread::Builder::new()
             .name("runnir-player-client".into())
             .spawn(move || {
                 for line in BufReader::new(reader).lines() {
                     let Ok(line) = line else { break };
                     let Ok(snapshot) = serde_json::from_str::<Snapshot>(&line) else { continue };
+                    // A daemon from before the last install answers perfectly well and
+                    // is simply the wrong program. Noticed here rather than by the
+                    // person wondering why a fix they watched land does nothing.
+                    if !snapshot.build.is_empty() && !mine.is_empty() && snapshot.build != mine {
+                        reader_stale.store(true, Ordering::Relaxed);
+                    }
                     if let Ok(mut s) = shared.lock() {
                         *s = snapshot;
                     }
@@ -384,7 +430,7 @@ impl Remote {
                 wake();
             })
             .ok();
-        Ok(Remote { stream: Mutex::new(stream), state, alive })
+        Ok(Remote { stream: Mutex::new(stream), state, alive, stale })
     }
 
     /// Sends one command. False when the connection is gone, so the caller can build a
@@ -393,6 +439,7 @@ impl Remote {
         if !self.is_alive() {
             return false;
         }
+        let _ = &self.stale;
         let Ok(line) = serde_json::to_string(&cmd) else { return true };
         let sent = match self.stream.lock() {
             Ok(mut stream) => writeln!(stream, "{line}").and_then(|()| stream.flush()).is_ok(),
@@ -404,9 +451,31 @@ impl Remote {
         sent
     }
 
-    /// Whether this handle still reaches a daemon.
+    /// Whether this handle still reaches a daemon worth talking to.
+    ///
+    /// A stale one counts as gone: it answers, but it is a different program from the
+    /// one the window is part of.
     pub fn is_alive(&self) -> bool {
-        self.alive.load(std::sync::atomic::Ordering::Relaxed)
+        self.alive.load(Ordering::Relaxed) && !self.stale.load(Ordering::Relaxed)
+    }
+
+    /// Whether the daemon is an older build than this window.
+    pub fn is_stale(&self) -> bool {
+        self.stale.load(Ordering::Relaxed)
+    }
+
+    /// Tells an out-of-date daemon to go, so the next connection starts a current one.
+    ///
+    /// Sent past the alive check, because `is_alive` already reports a stale daemon as
+    /// gone and this is the one message that still has to reach it. Any other window
+    /// attached to it reconnects and gets the new one too, which is the point.
+    pub fn retire(&self) {
+        let Ok(line) = serde_json::to_string(&Cmd::Quit) else { return };
+        if let Ok(mut stream) = self.stream.lock() {
+            let _ = writeln!(stream, "{line}");
+            let _ = stream.flush();
+        }
+        self.alive.store(false, Ordering::Relaxed);
     }
 
     pub fn snapshot(&self) -> Snapshot {
@@ -523,6 +592,31 @@ mod tests {
         let Some(log) = log_path() else { return };
         assert_eq!(log.file_name().unwrap(), "runnir-player.log");
         assert_eq!(log.parent(), socket_path().as_deref().and_then(|p| p.parent()));
+    }
+
+    #[test]
+    fn a_build_id_exists_and_is_the_same_for_this_process_twice() {
+        // The whole point is that it changes when the binary does and not otherwise.
+        let a = build_id();
+        assert_eq!(a, build_id());
+        assert!(!a.is_empty(), "on Linux /proc/self/exe always answers");
+        // Size and stamp, not a version string: two builds of the same version are
+        // exactly the case this exists for.
+        assert!(a.contains('-'), "{a}");
+    }
+
+    #[test]
+    fn a_daemon_from_another_build_reads_as_gone_rather_than_as_working() {
+        // A stale daemon answers perfectly well, which is why it took three hours to
+        // notice: a window from the new build was talking to a player from before the
+        // fixes, and the feature looked broken rather than out of date.
+        let snapshot = Snapshot { build: "999-1".into(), ..Default::default() };
+        let mine = build_id();
+        assert_ne!(snapshot.build, mine, "the fixture must not match this build");
+        // And an unstamped daemon — one older than this field — is left alone rather
+        // than being restarted on every keypress.
+        let unstamped = Snapshot::default();
+        assert!(unstamped.build.is_empty());
     }
 
     #[test]
