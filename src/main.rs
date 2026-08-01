@@ -101,8 +101,8 @@ pub enum UserEvent {
     /// coordinates of the drop. Comes from the `dnd` thread, which is the only
     /// place Wayland drag-and-drop exists — winit has none.
     FilesDropped(Vec<std::path::PathBuf>, f64, f64),
-    /// A TIDAL search result, tagged with the request sequence.
-    Tidal(u64, Result<Vec<tidal::Track>, String>),
+    /// An answer from a TIDAL worker, tagged with the request sequence.
+    Tidal(u64, Result<TidalAnswer, String>),
     /// A now-playing update from a media worker: fetched metadata or a waveform frame.
     /// Delivered off the UI thread via the proxy, same wake pattern as `Ai`, so the
     /// playerctl / cava subprocess never blocks rendering.
@@ -1437,6 +1437,54 @@ fn notify(body: &str) {
 /// A PTY wake closure. Sends a user event through the proxy — the reliable way to
 /// interrupt `ControlFlow::Wait` from another thread on Wayland — rather than
 /// calling `Window::request_redraw` directly, which can be missed there.
+/// What a TIDAL worker can come back with. Two shapes rather than one: a list and a
+/// set of lyrics are drawn by different halves of the panel, and collapsing them into
+/// one type would mean each side checking whether the answer was meant for it.
+pub enum TidalAnswer {
+    Found(tidal::Found),
+    Lyrics(tidal::Lyrics),
+}
+
+/// Turns a search result into the rows a list draws, headings and all.
+///
+/// The order is deliberate: tracks first because they are what a search is usually
+/// for, then albums, artists and playlists. Headings only appear when there is more
+/// than one kind, since a single-kind list needs no label.
+fn rows_of(found: &tidal::Found) -> Vec<overlay::TidalRow> {
+    let kinds = [
+        !found.tracks.is_empty(),
+        !found.albums.is_empty(),
+        !found.artists.is_empty(),
+        !found.playlists.is_empty(),
+    ]
+    .iter()
+    .filter(|x| **x)
+    .count();
+    let mut rows = Vec::new();
+    let heading = |rows: &mut Vec<overlay::TidalRow>, text: &str| {
+        if kinds > 1 {
+            rows.push(overlay::TidalRow::Heading(text.to_string()));
+        }
+    };
+    if !found.tracks.is_empty() {
+        heading(&mut rows, "TRACKS");
+        rows.extend(found.tracks.iter().cloned().map(overlay::TidalRow::Track));
+    }
+    if !found.albums.is_empty() {
+        heading(&mut rows, "ALBUMS");
+        rows.extend(found.albums.iter().cloned().map(overlay::TidalRow::Album));
+    }
+    if !found.artists.is_empty() {
+        heading(&mut rows, "ARTISTS");
+        rows.extend(found.artists.iter().cloned().map(overlay::TidalRow::Artist));
+    }
+    if !found.playlists.is_empty() {
+        heading(&mut rows, "PLAYLISTS");
+        rows.extend(found.playlists.iter().cloned().map(overlay::TidalRow::Playlist));
+    }
+    rows
+}
+
 fn wake_fn(proxy: EventLoopProxy<UserEvent>) -> impl Fn() + Send + Clone + 'static {
     move || {
         let _ = proxy.send_event(UserEvent::Redraw);

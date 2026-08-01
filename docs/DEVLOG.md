@@ -3379,6 +3379,42 @@ can never be mistaken for one of yours. And the LRC subtitles are sorted after p
 even though they arrive in order, because `line_at` binary-searches them — trusting the
 order would be a bug that only shows up on the one track where it is wrong.
 
+## 2026-08-01 - The panel grows sources, a colour for the tier, and words
+
+`leader n` stopped being a search box with a queue behind it. Five sources down the
+left — search, queue, favourites, albums, playlists — and the middle column shows
+whatever the one you are on holds.
+
+**The tier is a colour, not a word.** Pedro asked for the resolution to be visible
+BEFORE pressing play, and he was right to: on this account, Dire Straits, Miles Davis
+and Yello are all requested as HI_RES_LOSSLESS and all arrive as 16/44.1. Hi-res takes
+the accent, lossless is plain, lossy is dimmed, and a three-character tag (MAX/LSL/AAC)
+carries the same information for anyone who reads text before colour. An artist row has
+no tier and gets no tag — colouring one would be a guess.
+
+**One search, four kinds.** Tracks, albums, artists and playlists come back from a
+single request and are drawn as one list with headings, because someone typing does not
+want the artists to arrive a second after the tracks. Headings are never selectable —
+j/k skips them, since stopping on a label makes the keys feel broken — and
+`play_selection` counts only tracks, so playing the third song of a mixed result does
+not start at the wrong one.
+
+**Moving over a source loads it.** A column that needs Enter to show anything is a
+column people stop using. The queue is the exception and needs no request at all: it is
+already in the snapshot, and it is rebuilt from it rather than kept in step by hand, so
+the list and the player cannot disagree.
+
+**Words.** `L` shows the lyrics for what is PLAYING, not for what is under the cursor —
+lyrics follow the music, not the browsing. TIDAL serves both a plain text and an LRC
+with timings; when the timings are there the current line is picked out and the view
+scrolls so that line sits a third of the way down, where the eye expects the "now" of a
+scrolling list. When they are not, the plain text is shown with no highlight and no
+pretending there is one.
+
+Verified by driving a real instance over the remote control: a mixed search on
+"fleetwood", the seventeen playlists, opening one into its seven tracks, playing from
+it, and toggling the words. 554 tests.
+
 ## Gotchas (do not re-learn)
 
 - `runnir.json` WINS over `runnir.toml`. `Config::try_load` reads the JSON the settings

@@ -3318,10 +3318,13 @@ impl Gpu {
         }
         if let Some(Overlay::Tidal(p)) = &self.overlay {
             out["tidal"] = json!({
-                "view": match p.view {
-                    crate::overlay::TidalView::Search => "search",
-                    crate::overlay::TidalView::Queue => "queue",
+                "source": p.source.label(),
+                "crumb": p.crumb,
+                "focus": match p.focus {
+                    crate::overlay::PanelFocus::Sources => "sources",
+                    crate::overlay::PanelFocus::List => "list",
                 },
+                "lyrics": p.show_lyrics,
                 "query": p.query,
                 "editing": p.editing,
                 "cursor": p.cursor,
@@ -3647,13 +3650,17 @@ impl Gpu {
             Overlay::Tidal(p) => {
                 let mut search_for: Option<String> = None;
                 let mut command: Option<crate::player::Cmd> = None;
+                let mut open: Option<crate::overlay::TidalRow> = None;
+                let mut load: Option<crate::overlay::Source> = None;
+                let mut want_lyrics = false;
                 match key {
                     Key::Named(NamedKey::Escape) => {
-                        // Escape leaves the query box first and the panel second: one
-                        // key that means two things is fine as long as the smaller one
-                        // goes first. And closing the panel never stops the music.
+                        // Escape leaves the smaller thing first: the query box, then the
+                        // lyrics, then the panel. Closing the panel never stops music.
                         if p.editing {
                             p.editing = false;
+                        } else if p.show_lyrics {
+                            p.show_lyrics = false;
                         } else {
                             self.overlay = None;
                         }
@@ -3664,8 +3671,21 @@ impl Gpu {
                             if !p.query.trim().is_empty() {
                                 search_for = Some(p.query.trim().to_string());
                             }
-                        } else if let Some((tracks, at)) = p.play_selection() {
-                            command = Some(crate::player::Cmd::Play { tracks, at });
+                        } else if p.focus == crate::overlay::PanelFocus::Sources {
+                            p.focus = crate::overlay::PanelFocus::List;
+                            load = Some(p.source);
+                        } else if let Some(row) = p.selected().cloned() {
+                            match row {
+                                // A track plays its whole list from where it sits.
+                                crate::overlay::TidalRow::Track(_) => {
+                                    if let Some((tracks, at)) = p.play_selection() {
+                                        command =
+                                            Some(crate::player::Cmd::Play { tracks, at });
+                                    }
+                                }
+                                // Anything else is a container: it opens.
+                                other => open = Some(other),
+                            }
                         }
                     }
                     Key::Named(NamedKey::Backspace) if p.editing => {
@@ -3673,15 +3693,34 @@ impl Gpu {
                     }
                     Key::Named(NamedKey::Space) if p.editing => p.query.push(' '),
                     Key::Named(NamedKey::Space) => command = Some(crate::player::Cmd::Toggle),
-                    Key::Named(NamedKey::ArrowUp) => p.up(),
-                    Key::Named(NamedKey::ArrowDown) => p.down(),
-                    Key::Named(NamedKey::Tab) => p.toggle_view(),
+                    Key::Named(NamedKey::ArrowUp) => self.tidal_move(-1),
+                    Key::Named(NamedKey::ArrowDown) => self.tidal_move(1),
+                    Key::Named(NamedKey::ArrowLeft) => {
+                        p.focus = crate::overlay::PanelFocus::Sources
+                    }
+                    Key::Named(NamedKey::ArrowRight) => {
+                        p.focus = crate::overlay::PanelFocus::List
+                    }
+                    Key::Named(NamedKey::Tab) => {
+                        p.focus = match p.focus {
+                            crate::overlay::PanelFocus::Sources => {
+                                crate::overlay::PanelFocus::List
+                            }
+                            crate::overlay::PanelFocus::List => {
+                                crate::overlay::PanelFocus::Sources
+                            }
+                        };
+                    }
                     Key::Character(c) if p.editing => p.query.push_str(c.as_str()),
                     Key::Character(c) => match c.as_str() {
-                        "k" => p.up(),
-                        "j" => p.down(),
+                        "k" => self.tidal_move(-1),
+                        "j" => self.tidal_move(1),
+                        "h" => p.focus = crate::overlay::PanelFocus::Sources,
+                        "l" => p.focus = crate::overlay::PanelFocus::List,
                         "/" => {
-                            p.view = crate::overlay::TidalView::Search;
+                            p.source = crate::overlay::Source::Search;
+                            p.focus = crate::overlay::PanelFocus::List;
+                            p.crumb = None;
                             p.editing = true;
                             p.query.clear();
                         }
@@ -3691,6 +3730,9 @@ impl Gpu {
                                 command = Some(crate::player::Cmd::Enqueue(track));
                             }
                         }
+                        // The words, for the track PLAYING — not the one under the
+                        // cursor. Lyrics follow the music, not the browsing.
+                        "L" | "y" => want_lyrics = true,
                         "f" => command = Some(crate::player::Cmd::Next),
                         "b" => command = Some(crate::player::Cmd::Prev),
                         "s" => command = Some(crate::player::Cmd::Stop),
@@ -3701,6 +3743,15 @@ impl Gpu {
                 }
                 if let Some(query) = search_for {
                     self.tidal_search(query);
+                }
+                if let Some(row) = open {
+                    self.tidal_open(row);
+                }
+                if let Some(source) = load {
+                    self.tidal_load(source);
+                }
+                if want_lyrics {
+                    self.tidal_lyrics();
                 }
                 if let Some(cmd) = command {
                     self.tidal_send(cmd, config);
@@ -7074,39 +7125,195 @@ impl Gpu {
         self.window.request_redraw();
     }
 
+    /// Moves the cursor, in whichever half has the keyboard.
+    ///
+    /// The sources column and the list share j/k because they are never both driven at
+    /// once, and having one pair of keys mean "move" everywhere is worth more than
+    /// having a separate pair nobody remembers.
+    fn tidal_move(&mut self, by: i32) {
+        let mut load: Option<crate::overlay::Source> = None;
+        if let Some(Overlay::Tidal(p)) = &mut self.overlay {
+            match p.focus {
+                crate::overlay::PanelFocus::Sources => {
+                    let all = crate::overlay::Source::ALL;
+                    let at = all.iter().position(|s| *s == p.source).unwrap_or(0) as i32;
+                    let next = (at + by).clamp(0, all.len() as i32 - 1) as usize;
+                    if all[next] != p.source {
+                        p.source = all[next];
+                        p.crumb = None;
+                        // Moving over the sources loads them as you go: a column that
+                        // needs Enter to show anything is a column you stop using.
+                        load = Some(p.source);
+                    }
+                }
+                crate::overlay::PanelFocus::List => {
+                    if by < 0 {
+                        p.up()
+                    } else {
+                        p.down()
+                    }
+                }
+            }
+        }
+        if let Some(source) = load {
+            self.tidal_load(source);
+        }
+    }
+
+    /// Fills the list for a source. The queue needs no request — it is already here.
+    fn tidal_load(&mut self, source: crate::overlay::Source) {
+        use crate::overlay::Source;
+        if source == Source::Queue {
+            if let Some(Overlay::Tidal(p)) = &mut self.overlay {
+                p.rows = p.snapshot.queue.iter().cloned().map(crate::overlay::TidalRow::Track).collect();
+                p.cursor = p.snapshot.index.min(p.rows.len().saturating_sub(1));
+                p.pending = None;
+                p.message = None;
+            }
+            self.window.request_redraw();
+            return;
+        }
+        if source == Source::Search {
+            if let Some(Overlay::Tidal(p)) = &mut self.overlay {
+                p.rows.clear();
+                p.editing = true;
+            }
+            self.window.request_redraw();
+            return;
+        }
+        let seq = self.tidal_request(None);
+        let proxy = self.proxy.clone();
+        std::thread::spawn(move || {
+            let answer = crate::tidal::Session::load()
+                .ok_or_else(|| "not signed in".to_string())
+                .and_then(|session| match source {
+                    Source::Favourites => crate::tidal::favourite_tracks(&session)
+                        .map(|t| crate::tidal::Found { tracks: t, ..Default::default() }),
+                    Source::Albums => crate::tidal::favourite_albums(&session)
+                        .map(|a| crate::tidal::Found { albums: a, ..Default::default() }),
+                    Source::Playlists => crate::tidal::my_playlists(&session)
+                        .map(|p| crate::tidal::Found { playlists: p, ..Default::default() }),
+                    _ => Ok(crate::tidal::Found::default()),
+                });
+            let _ = proxy.send_event(UserEvent::Tidal(seq, answer.map(TidalAnswer::Found)));
+        });
+    }
+
+    /// Opens a container row: an album, an artist or a playlist becomes a list of its
+    /// tracks, with a crumb naming where you are.
+    fn tidal_open(&mut self, row: crate::overlay::TidalRow) {
+        use crate::overlay::TidalRow;
+        let (crumb, work): (String, Box<dyn Fn(&crate::tidal::Session) -> Result<Vec<crate::tidal::Track>, String> + Send>) =
+            match row {
+                TidalRow::Album(a) => {
+                    let id = a.id;
+                    (format!("{} — {}", a.artist, a.title), Box::new(move |s| crate::tidal::album_tracks(s, id)))
+                }
+                TidalRow::Artist(a) => {
+                    let id = a.id;
+                    (a.name.clone(), Box::new(move |s| crate::tidal::artist_top_tracks(s, id)))
+                }
+                TidalRow::Playlist(p) => {
+                    let uuid = p.uuid.clone();
+                    (p.title.clone(), Box::new(move |s| crate::tidal::playlist_tracks(s, &uuid)))
+                }
+                TidalRow::Track(_) | TidalRow::Heading(_) => return,
+            };
+        let seq = self.tidal_request(Some(crumb));
+        let proxy = self.proxy.clone();
+        std::thread::spawn(move || {
+            let answer = crate::tidal::Session::load()
+                .ok_or_else(|| "not signed in".to_string())
+                .and_then(|session| work(&session))
+                .map(|tracks| TidalAnswer::Found(crate::tidal::Found { tracks, ..Default::default() }));
+            let _ = proxy.send_event(UserEvent::Tidal(seq, answer));
+        });
+    }
+
+    /// Fetches the words for whatever is PLAYING.
+    fn tidal_lyrics(&mut self) {
+        let Some(track) = self
+            .jukebox
+            .as_ref()
+            .and_then(|j| j.snapshot().now_playing().cloned())
+        else {
+            if let Some(Overlay::Tidal(p)) = &mut self.overlay {
+                p.message = Some("nothing playing to show words for".into());
+            }
+            return;
+        };
+        if let Some(Overlay::Tidal(p)) = &mut self.overlay {
+            p.show_lyrics = true;
+            // Already have them for this track: showing them again should not cost a
+            // request, and flicking the view should be instant.
+            if p.lyrics.is_some() && p.crumb.as_deref() == Some(track.title.as_str()) {
+                return;
+            }
+        }
+        let seq = self.tidal_request(None);
+        let proxy = self.proxy.clone();
+        let id = track.id;
+        std::thread::spawn(move || {
+            let answer = crate::tidal::Session::load()
+                .ok_or_else(|| "not signed in".to_string())
+                .and_then(|session| crate::tidal::lyrics(&session, id))
+                .map(TidalAnswer::Lyrics);
+            let _ = proxy.send_event(UserEvent::Tidal(seq, answer));
+        });
+    }
+
+    /// Stamps a new request and marks the panel as waiting for it.
+    fn tidal_request(&mut self, crumb: Option<String>) -> u64 {
+        self.tidal_seq += 1;
+        if let Some(Overlay::Tidal(p)) = &mut self.overlay {
+            p.pending = Some(self.tidal_seq);
+            p.message = None;
+            if crumb.is_some() {
+                p.crumb = crumb;
+            }
+        }
+        self.tidal_seq
+    }
+
     /// Runs a search off the UI thread. The sequence number is what makes a slow answer
     /// arriving after a newer query harmless — the same guard the git and docker panels
     /// carry, and for the same reason.
     fn tidal_search(&mut self, query: String) {
-        self.tidal_seq += 1;
-        let seq = self.tidal_seq;
+        let seq = self.tidal_request(None);
         if let Some(Overlay::Tidal(p)) = &mut self.overlay {
-            p.pending = Some(seq);
-            p.message = None;
+            p.crumb = None;
         }
         let proxy = self.proxy.clone();
         std::thread::spawn(move || {
             let found = crate::tidal::Session::load()
                 .ok_or_else(|| "not signed in".to_string())
-                .and_then(|session| crate::tidal::search_tracks(&session, &query, 50));
+                .and_then(|session| crate::tidal::search(&session, &query, 30))
+                .map(TidalAnswer::Found);
             let _ = proxy.send_event(UserEvent::Tidal(seq, found));
         });
     }
 
-    /// A search came back.
-    fn on_tidal_results(&mut self, seq: u64, found: Result<Vec<crate::tidal::Track>, String>) {
+    /// An answer came back.
+    fn on_tidal_results(&mut self, seq: u64, answer: Result<TidalAnswer, String>) {
         let Some(Overlay::Tidal(p)) = &mut self.overlay else { return };
-        // Not the search we are waiting for: an older one that took longer.
+        // Not the request we are waiting for: an older one that took longer.
         if p.pending != Some(seq) {
             return;
         }
         p.pending = None;
-        match found {
-            Ok(tracks) => {
-                p.message = (tracks.is_empty()).then(|| "nothing found".to_string());
-                p.results = tracks;
-                p.cursor = 0;
-                p.view = overlay::TidalView::Search;
+        match answer {
+            Ok(TidalAnswer::Lyrics(lyrics)) => {
+                if lyrics.is_empty() {
+                    p.message = Some("no words for this one".into());
+                    p.show_lyrics = false;
+                }
+                p.lyrics = Some(lyrics);
+            }
+            Ok(TidalAnswer::Found(found)) => {
+                p.rows = rows_of(&found);
+                p.settle_cursor();
+                p.show_lyrics = false;
+                p.message = found.is_empty().then(|| "nothing found".to_string());
             }
             Err(e) => p.message = Some(e),
         }
@@ -7126,12 +7333,13 @@ impl Gpu {
         let Some(jukebox) = self.jukebox.as_ref() else { return };
         let snapshot = jukebox.snapshot();
         if let Some(Overlay::Tidal(p)) = &mut self.overlay {
-            // The queue cursor follows the player while the panel is not being driven,
-            // so a track change moves the highlight rather than leaving it behind.
-            if p.view == overlay::TidalView::Queue && p.cursor >= snapshot.queue.len() {
-                p.cursor = snapshot.index;
-            }
+            let queue_changed = p.snapshot.queue.len() != snapshot.queue.len();
             p.snapshot = snapshot;
+            // The queue view is a view OF the queue, so it is rebuilt rather than left
+            // to drift: enqueueing something while looking at it should show it.
+            if p.source == overlay::Source::Queue && queue_changed {
+                p.reload_queue();
+            }
         }
         self.window.request_redraw();
     }
