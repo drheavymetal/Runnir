@@ -671,14 +671,23 @@ j k move in either, and moving over a source loads it.
 The mouse works: one click selects, a second on the same thing acts. A click outside
 puts the panel away — which never stops the music.
 
-Every row is coloured by what TIDAL would actually SERVE it as, with a three-letter tag:
-MAX for hi-res lossless, LSL for lossless, AAC for lossy. This is worth reading before
-pressing play, because asking for hi-res does not mean getting it — plenty of albums are
-listed as MAX and arrive at 16 bit / 44.1 kHz.
+Every row is coloured by the tier TIDAL really offers, with a three-letter tag: MAX in
+gold for hi-res lossless, LSL in green for lossless, AAC in grey for lossy. Worth
+reading before pressing play — plenty of albums you would expect in hi-res are only
+lossless, and the colour says so without opening anything.
+
+Along the bottom: how far through the track, with a mark at the exact position, and
+underneath it what is playing and the signal path. In the top corner, the sound itself
+as a row of bars that rise and fall in place — flat when nothing is playing, and flat
+when paused. And while a track is still being fetched, or a list is still loading, a
+spinner turns where the play mark goes: that gap is a second or two and used to look
+like nothing was happening.
 
 The transport also works with no panel open: leader n space, leader n f, leader n b.
 Media keys work too, and the desktop's now-playing widget shows runnir, because it
-announces itself on MPRIS like any other player.
+announces itself on MPRIS like any other player. The status bar carries what is playing
+between the directory and the clock, scrolling the title when it does not fit, and in
+the accent colour only when nothing touched the samples.
 
 # TIDAL — bit-perfect, and the output chain
 
@@ -746,6 +755,8 @@ whoever holds the URL.
   runnir --tidal-play TRACK     play one track and report the rung it came out on
   runnir --tidal-decode FILES   run local files through the same decoder;
                                 without --play it opens no device and makes no sound
+  runnir --demo OUT.png tidal   draw the panel to a PNG, with an invented library:
+                                no account, no network, no sound
 
 # ZSA keyboard: lights and signals
 

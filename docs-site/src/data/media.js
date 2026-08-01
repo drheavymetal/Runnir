@@ -3,6 +3,10 @@
 // Real screenshots rendered headless with runnir --render / --demo.
 // Key = the feature's stable key (see features.js). Value = { src, cap:{es,en} }.
 export const MEDIA = {
+  'tidal-player': [
+    { src: './img/tidal-panel.png', cap: { es: 'Captura real (runnir --demo tidal): una búsqueda devuelve pistas, álbumes, artistas y listas a la vez. Cada fila lleva el nivel real —MAX en dorado, LSL en verde, AAC en gris— leído de las etiquetas del catálogo, no del campo audioQuality, que dice LOSSLESS incluso para lo que se sirve a 24/192.', en: 'Real screenshot (runnir --demo tidal): one search returns tracks, albums, artists and playlists together. Every row carries the real tier — MAX in gold, LSL in green, AAC in grey — read from the catalogue tags rather than from audioQuality, which says LOSSLESS even for what is served at 24/192.' } },
+    { src: './img/tidal-queue.png', cap: { es: 'Captura real: la cola, con la barra de progreso abajo y la onda arriba a la derecha. La insignia dice el escalón de salida: aquí bit-perfect a 24/192 por hw:2,0.', en: 'Real screenshot: the queue, with the progress bar along the bottom and the wave in the top corner. The badge names the output rung: here bit-perfect at 24/192 through hw:2,0.' } },
+  ],
   // Varias capturas: el panel which-key cambia por completo entre el nivel raíz y
   // un grupo, y una sola imagen no lo cuenta. Se generan con
   // `runnir --demo OUT <nivel>`, que dibuja el panel con las mismas entradas que
