@@ -766,9 +766,37 @@ fn tidal_play(what: &str) {
         info.sample_rate.map(|r| r.to_string()).unwrap_or_else(|| "?".into()),
     );
 
-    match player::play(&info, &cfg) {
+    // Reported the moment the device opens rather than when the track ends: "which
+    // rung did it land on" is the question being asked, and waiting four minutes for
+    // the answer makes the command useless for the thing it exists to check.
+    let mut announced = false;
+    let played = player::play_parts(
+        match player::parts_of(&info) {
+            Ok(p) => p,
+            Err(e) => return eprintln!("runnir: {e}"),
+        },
+        player::hint_for(&info),
+        &info.quality,
+        &cfg,
+        true,
+        &mut |progress| {
+            if !announced {
+                if let Some(signal) = progress.signal {
+                    if signal.rung.is_some() {
+                        announced = true;
+                        for (device, why) in &signal.refused {
+                            println!("  skipped {device}: {why}");
+                        }
+                        println!("  {}", signal.badge());
+                    }
+                }
+            }
+            player::Flow::Continue
+        },
+    );
+
+    match played {
         Ok(played) => {
-            println!("  {}", played.signal.badge());
             println!(
                 "  {} frames ({}:{:02}){}",
                 played.frames,

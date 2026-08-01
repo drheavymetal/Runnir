@@ -84,9 +84,35 @@ pub struct SignalPath {
     pub resampled: Option<(u32, u32)>,
     /// TIDAL's word for what it served, which is not always what was asked for.
     pub quality: String,
+    /// Every device that was tried and would not take it, with what it said.
+    ///
+    /// Without this, landing on the laptop speakers instead of the DAC is indis-
+    /// tinguishable from choosing them: the badge names where the audio WENT, and this
+    /// is the only record of where it could not go. It is the first question anyone
+    /// asks when the good device is plugged in and the sound comes out somewhere else.
+    pub refused: Vec<(String, String)>,
 }
 
 impl SignalPath {
+    /// The short form for the status bar: depth, rate, and the rung — the three things
+    /// worth a glance. The long form is for the panel, where there is room to explain.
+    pub fn short(&self) -> String {
+        if self.decoded_rate == 0 {
+            return String::new();
+        }
+        match self.rung {
+            Some(rung) => format!("{}/{} {}", self.decoded_bits, fmt_khz(self.decoded_rate), rung.label()),
+            None => format!("{}/{}", self.decoded_bits, fmt_khz(self.decoded_rate)),
+        }
+    }
+
+    /// True when the path changed no sample value. The status bar colours by this:
+    /// bit-exact reads as accent, anything else as ordinary text, so "am I getting
+    /// what I pay for" is answered without reading a word.
+    pub fn is_bit_exact(&self) -> bool {
+        self.rung.is_some_and(|r| r.is_bit_exact())
+    }
+
     /// The status-bar line. Deliberately assembled here rather than in the drawing code
     /// so that what the user reads and what actually happened cannot drift apart.
     pub fn badge(&self) -> String {
@@ -297,10 +323,6 @@ pub struct Played {
 /// Phase 0 shape: one call, one track, no transport. The panel will drive a longer-lived
 /// version of this loop, which is why the decode and the output are already separated
 /// from the fetching.
-pub fn play(info: &StreamInfo, cfg: &TidalCfg) -> Result<Played, String> {
-    play_parts(parts_of(info)?, hint_for(info), &info.quality, cfg, true, &mut |_| Flow::Continue)
-}
-
 /// What the thing driving playback wants done next, asked once per decoded packet.
 ///
 /// The audio loop never decides any of this: it knows about decoding and about ALSA,
@@ -550,6 +572,7 @@ mod linux {
     use crate::config::Tidal as TidalCfg;
     use alsa::pcm::{Access, Format, HwParams, PCM, State};
     use alsa::{Direction, ValueOr};
+    use symphonia::core::audio::sample::i24;
 
     pub struct Sink {
         pcm: PCM,
@@ -567,19 +590,27 @@ mod linux {
         pub fn open(cfg: &TidalCfg, want: &Want, quality: &str) -> Result<Sink, String> {
             let devices = hw_devices();
             let attempts = plan(&cfg.output, cfg.bit_perfect, &devices);
-            let mut last_error = String::from("no audio device to try");
+            let mut refused: Vec<(String, String)> = Vec::new();
             for attempt in &attempts {
                 match try_open(attempt, want) {
                     Ok(mut sink) => {
                         sink.signal.quality = quality.to_string();
+                        sink.signal.refused = refused;
                         return Ok(sink);
                     }
-                    // A busy device is the single most common failure here — PipeWire is
-                    // holding the card — and it is not an error, it is the next rung.
-                    Err(e) => last_error = format!("{}: {e}", attempt.device),
+                    // A busy device is the commonest failure here — PipeWire holding the
+                    // card — and it is not an error, it is the next rung. Kept rather
+                    // than overwritten: the refusals ARE the explanation for the rung
+                    // that eventually worked.
+                    Err(e) => refused.push((attempt.device.clone(), e)),
                 }
             }
-            Err(format!("no usable audio output ({last_error})"))
+            let why = refused
+                .iter()
+                .map(|(d, e)| format!("{d}: {e}"))
+                .collect::<Vec<_>>()
+                .join("; ");
+            Err(format!("no usable audio output ({why})"))
         }
 
         /// Writes one decoded buffer. Returns the number of underruns recovered from,
@@ -590,20 +621,34 @@ mod linux {
         ) -> Result<u32, String> {
             let frames = decoded.frames();
             let samples = frames * self.channels as usize;
-            let mut underruns = 0;
             match self.format {
                 Format::S16LE => {
                     let mut buf = vec![0i16; samples];
                     decoded.copy_to_slice_interleaved(&mut buf[..]);
-                    underruns += self.write_i16(&buf)?;
+                    self.write_i16(&buf)
                 }
+                // PACKED 24: three bytes per sample, and there is no typed ALSA IO for
+                // it — `io_i32` on this device returns "operation not supported", which
+                // is what sent the first hi-res track to the laptop speakers instead of
+                // the DAC. The bytes are laid out by hand and written as bytes.
+                Format::S243LE => {
+                    let mut buf = vec![i24(0); samples];
+                    decoded.copy_to_slice_interleaved(&mut buf[..]);
+                    let mut bytes = Vec::with_capacity(samples * 3);
+                    for sample in &buf {
+                        let v = sample.0 as u32;
+                        bytes.extend_from_slice(&[v as u8, (v >> 8) as u8, (v >> 16) as u8]);
+                    }
+                    self.write_packed24(&bytes)
+                }
+                // S24LE is 24 bits inside a 32-bit word, and S32LE is a full word: both
+                // are four bytes per sample and take the i32 path.
                 _ => {
                     let mut buf = vec![0i32; samples];
                     decoded.copy_to_slice_interleaved(&mut buf[..]);
-                    underruns += self.write_i32(&buf)?;
+                    self.write_i32(&buf)
                 }
             }
-            Ok(underruns)
         }
 
         fn write_i16(&mut self, buf: &[i16]) -> Result<u32, String> {
@@ -614,6 +659,13 @@ mod linux {
         fn write_i32(&mut self, buf: &[i32]) -> Result<u32, String> {
             let io = self.pcm.io_i32().map_err(|e| e.to_string())?;
             write_all(&self.pcm, buf, self.channels as usize, |b| io.writei(b))
+        }
+
+        fn write_packed24(&mut self, bytes: &[u8]) -> Result<u32, String> {
+            let io = self.pcm.io_bytes();
+            // Three bytes per sample times the channels: what ALSA counts as one frame,
+            // and what a short write has to be advanced by.
+            write_all(&self.pcm, bytes, self.channels as usize * 3, |b| io.writei(b))
         }
 
         /// Lets the device finish what it has been given rather than cutting the last
@@ -649,10 +701,13 @@ mod linux {
     /// what was actually accepted. An underrun is recovered rather than fatal, but it is
     /// counted: silently swallowing them turns "the audio stutters" into a bug with no
     /// evidence.
+    /// `per_frame` is how many ELEMENTS of `buf` make up one frame — two `i32`s for
+    /// stereo, but six bytes when the samples are packed 24-bit. Getting it wrong does
+    /// not fail, it advances by the wrong amount and plays noise.
     fn write_all<S: Copy>(
         pcm: &PCM,
         buf: &[S],
-        channels: usize,
+        per_frame: usize,
         mut writei: impl FnMut(&[S]) -> Result<usize, alsa::Error>,
     ) -> Result<u32, String> {
         let mut offset = 0usize;
@@ -660,7 +715,7 @@ mod linux {
         while offset < buf.len() {
             match writei(&buf[offset..]) {
                 Ok(0) => break,
-                Ok(frames) => offset += frames * channels,
+                Ok(frames) => offset += frames * per_frame,
                 Err(e) => {
                     // EPIPE is an underrun: the device ran dry while we were away.
                     if e.errno() == libc::EPIPE {
@@ -741,6 +796,7 @@ mod linux {
                 padded,
                 resampled,
                 quality: String::new(),
+                refused: Vec::new(),
             },
             pcm,
         })
@@ -978,6 +1034,39 @@ impl Snapshot {
     pub fn now_playing(&self) -> Option<&tidal::Track> {
         self.queue.get(self.index)
     }
+
+    /// One line for the status bar: what is playing and what it is coming out as.
+    ///
+    /// `width` is the space actually available, and the parts drop in order of what
+    /// can be spared — the quality goes before the artist, and the artist before the
+    /// title. A bar that overflows is worse than one that says less.
+    pub fn status_line(&self, width: usize) -> Option<String> {
+        let track = self.now_playing()?;
+        if !self.playing {
+            return None;
+        }
+        let mark = if self.paused { "\u{2016}" } else { "\u{25b8}" };
+        let quality = self.signal.short();
+        let full = format!("{mark} {} \u{2014} {} \u{b7} {quality}", track.artist, track.title);
+        if full.chars().count() <= width {
+            return Some(full);
+        }
+        let no_artist = format!("{mark} {} \u{b7} {quality}", track.title);
+        if no_artist.chars().count() <= width {
+            return Some(no_artist);
+        }
+        let bare = format!("{mark} {}", track.title);
+        Some(clip(&bare, width))
+    }
+}
+
+/// Cuts to fit, keeping the front and marking the cut.
+fn clip(s: &str, width: usize) -> String {
+    if s.chars().count() <= width {
+        return s.to_string();
+    }
+    let keep = width.saturating_sub(1);
+    format!("{}\u{2026}", s.chars().take(keep).collect::<String>())
 }
 
 /// The handle the rest of the program holds. Cheap to clone, safe to keep on `App`.
@@ -1181,6 +1270,7 @@ fn play_one(
     let mut verdict = Outcome::Ended;
     let mut paused = false;
     let mut published_signal = false;
+    let mut last_tick = u64::MAX;
     // The track plays under the config it started with. A `Reconfigure` arriving now is
     // held and applied to the NEXT track — the device for this one is already open, and
     // swapping it underneath would be a gap in the middle of a song.
@@ -1240,17 +1330,29 @@ fn play_one(
             }
 
             let secs = progress.frames as f64 / progress.rate.max(1) as f64;
+            // A packet is 20-40 ms of audio, so this runs about forty times a second.
+            // The position is always recorded, but the UI is only woken when the
+            // SECOND changed or the signal path first became known: waking it per
+            // packet is a full window repaint for a number that has not moved.
+            let tick = secs as u64;
+            let mut worth_drawing = tick != last_tick;
+            last_tick = tick;
             if let Ok(mut s) = state.lock() {
                 s.position_secs = secs;
                 if !published_signal {
                     if let Some(signal) = progress.signal {
                         s.signal = signal.clone();
                         published_signal = true;
+                        worth_drawing = true;
                     }
                 }
-                s.generation += 1;
+                if worth_drawing {
+                    s.generation += 1;
+                }
             }
-            wake();
+            if worth_drawing {
+                wake();
+            }
 
             if paused { Flow::Pause } else { Flow::Continue }
         },
