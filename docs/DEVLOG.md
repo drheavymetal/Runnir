@@ -3578,6 +3578,97 @@ the URL. The token is sixteen random bytes and the link dies with the session, w
 makes it a private link rather than a service. It is not described here as anything
 cleverer than that.
 
+## 2026-08-01 - Audit rounds: what three reviewers found in the TIDAL feature
+
+Three read-only reviewers over `tidal.rs`, `player.rs`, and `daemon.rs` + `share.rs`.
+Twenty-six findings, all fixed. The ones worth remembering:
+
+### Wrong data reported as success
+
+- **`fetch` returned `Ok` holding a cut-off file** whenever a body exceeded the limit.
+  `take(limit)` reads up to the limit and stops; there is no error for "there was more".
+  A truncated song reported as a success — and it was live, because the share path capped
+  at 64 MB, which a hi-res track passes in about seven minutes. It reads one byte past
+  the limit now, to tell "exactly this big" from "bigger than this".
+- **Playlists, albums and favourites read one page and stopped.** A 250-track playlist
+  played as a 100-track playlist with nothing anywhere saying tracks were missing. There
+  is no "and 150 more" in a music panel, so the only honest option was to fetch them.
+- **`r="-1"` in a SegmentTimeline counted as one segment** instead of "repeat to the end
+  of the period", and a **`$Time$` template** passed through unexpanded into URLs with a
+  literal `$Time$` in them. Both truncate a song; both are now errors, which is what the
+  parser's own comment already claimed.
+- **The country code defaulted to `"US"`** and then lived on disk, silently stamping a
+  different licensed catalogue onto a Spanish account.
+
+### The badge lying, twice more
+
+- **`S24LE` was offered as a format with no way to write it.** ALSA refuses `io_i32` for
+  a PCM configured that way, so the device opened, the chain committed to it, and every
+  track then failed — on exactly the format list SOF laptop cards publish
+  (`S16_LE S24_LE S32_LE`). And had the write gone through, the samples needed shifting
+  into the low three bytes: symphonia hands back full-scale MSB-justified values, so
+  without that it plays full-scale noise *while the badge says BIT-PERFECT*. Same class
+  as the packed-24 bug from the morning, one format along.
+- **Anything not called `default` or `plug*` was assumed exclusive**, so
+  `output = "sysdefault:CARD=X"` or `dmix:` earned a BIT-PERFECT badge through a software
+  mixer. Only a raw `hw:` device is exclusive.
+
+### Security
+
+- **`urldecode` sliced a `String` by byte index**, so a `%` followed by an accented
+  character panicked. It runs on whatever anything on the machine sends to the callback
+  port.
+- **The share's request line was unbounded and read before the token check.** The read
+  timeout is per-recv, so a sender trickling bytes with no newline never trips it and
+  grows a String until something dies. No link needed to reach it.
+- **A track title went into the landing page unescaped.** The page carries the token in
+  its own URL and the token is the only authentication there is, so script on that page
+  would be a permanent grant of the stream to whoever collected it.
+- **The trust boundary was an environment variable with a `/tmp` fallback.** With
+  `XDG_RUNTIME_DIR` unset — ssh, `su`, some units — the socket went to a world-writable
+  directory, where another user can pre-create it: our bind fails, but the WINDOW
+  connects to theirs, sending them every command and drawing what they send back,
+  including a share URL the person is invited to hand out. There is no player without a
+  private directory now.
+- **A token could reach an error string**, and an error string reaches a toast and
+  whatever screenshot follows. The one body guaranteed to hold credentials is never
+  quoted back; its length is all that is safe to say.
+- Upstream API errors were echoed verbatim to the remote listener — account detail for
+  free. They go to the terminal instead.
+
+### Lifecycle
+
+- **Two windows opened at the same instant both started a daemon.** Both found nothing,
+  both unlinked, both bound — two players fighting for the exclusive device, and the
+  loser deleting the winner's socket on the way past. "Connect to see if anyone is
+  there" cannot settle that on its own, because both look before either binds. An
+  `flock`ed lock file does, and the kernel releases it however the process dies.
+- **A window could connect to a daemon that had already decided to die** — the watcher
+  breaks, sleeps 200 ms, then exits, and the accept loop kept serving throughout. The
+  window got a working handle to a vanishing process and a transport that silently did
+  nothing for ever. Connections are refused once it is closing, so that window starts a
+  fresh daemon instead.
+- **A failed tunnel left the port bound for the life of the daemon**, so the second
+  attempt failed with "address already in use" — an error that hides the real one and
+  never goes away.
+- **The writer thread only noticed a closed socket when it had something to write**, so
+  with the music paused it looped for ever holding a thread and a file descriptor. It
+  sends a newline every ten seconds now.
+- **Starting a share made the asking window deaf for up to 45 seconds**, because it ran
+  on the thread reading that window's commands.
+- A zero-frame ALSA write dropped the rest of the buffer and still counted it as played.
+  A failed last track left the player claiming to play for ever. A spawn failure left
+  the client count above zero so the daemon could never exit. A daemon spawned per
+  keypress was never reaped.
+
+### Still open, and honestly named
+
+Segment fetches happen inside the audio loop. On a slow link that means audible
+underruns at each segment boundary, and a transport key can sit unread for as long as
+the HTTP timeout. It needs a prefetch thread; it is not fixed here.
+
+584 tests.
+
 ## Gotchas (do not re-learn)
 
 - `runnir.json` WINS over `runnir.toml`. `Config::try_load` reads the JSON the settings
@@ -3605,6 +3696,14 @@ cleverer than that.
   none of the interactive ones: `sub_status 1002` refuses the device flow, `error 11102`
   refuses the authorization-code flow. 11102 with a loopback AND with the app redirect
   is the proof that the redirect is not what is being refused.
+- `Read::take(limit)` + `read_to_end` returns Ok on a body BIGGER than the limit,
+  holding a truncated copy. Read one byte past the limit to tell the two apart.
+- Slicing a `String` by byte index panics on multibyte text. Anything parsing bytes off
+  a socket must index the bytes, not the string.
+- A fallback-chain step that OPENS successfully and then fails on use is worse than one
+  that refuses: the chain has already committed and will not try the next rung.
+- Two processes that both check "is anyone there?" before either binds will both bind.
+  Only a lock settles it.
 - `cloudflared` prints a quick-tunnel URL SECONDS before the edge routes to it. A link
   handed over the moment it appears fails for whoever opens it first.
 - ALSA frees a card a moment AFTER the process holding it dies. An exclusive open

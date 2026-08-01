@@ -38,6 +38,19 @@ const PORT: u16 = 33344;
 /// How long cloudflared is given to publish a URL before it is judged a failure.
 const TUNNEL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(25);
 
+/// The longest request line we will read. A sender that trickles bytes and never sends
+/// a newline would otherwise grow a String until the machine gives up — and this runs
+/// BEFORE the token is checked, so it needs no link to reach.
+const MAX_REQUEST_LINE: u64 = 8 * 1024;
+
+/// How many people may be listening at once. Each one holds a thread and re-downloads
+/// the track, so an unbounded count is both a memory problem and a way to hammer
+/// somebody's TIDAL account from a link they shared with a friend.
+const MAX_LISTENERS: usize = 4;
+
+/// A listener that stops reading must not pin a thread for ever.
+const WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// What the panel needs to know about a share.
 #[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
@@ -87,7 +100,19 @@ impl Share {
                 .ok();
         }
 
-        let (tunnel, url) = open_tunnel()?;
+        let opened = open_tunnel();
+        let (tunnel, url) = match opened {
+            Ok(pair) => pair,
+            Err(e) => {
+                // The listener is already bound and its thread already running. Without
+                // this the port stays held for the life of the daemon, and the SECOND
+                // attempt fails with "address already in use" — an error that hides the
+                // real one (cloudflared missing) and never goes away.
+                stop.store(true, Ordering::Relaxed);
+                let _ = TcpStream::connect(("127.0.0.1", PORT));
+                return Err(e);
+            }
+        };
         let url = format!("{url}/r/{token}");
         // cloudflared prints the URL as soon as it has one, several seconds BEFORE the
         // edge will route to it — the first attempt at this returned nothing at all
@@ -142,8 +167,14 @@ impl Drop for Share {
 /// One request.
 fn serve(mut stream: TcpStream, token: &str, state: &Arc<Mutex<Snapshot>>, listeners: &Arc<AtomicUsize>) {
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(10)));
+    // Without this a listener that stops reading blocks a write for ever, holding a
+    // thread and the whole track's bytes with it.
+    let _ = stream.set_write_timeout(Some(WRITE_TIMEOUT));
     let mut head = String::new();
-    if BufReader::new(&stream).read_line(&mut head).is_err() {
+    // Bounded, and bounded BEFORE the token is checked: the read timeout is per-recv,
+    // so a sender trickling bytes with no newline never trips it and grows this string
+    // until something dies. Nothing is needed to reach this point.
+    if BufReader::new((&stream).take(MAX_REQUEST_LINE)).read_line(&mut head).is_err() {
         return;
     }
     let Some(target) = head.split_whitespace().nth(1) else { return };
@@ -174,6 +205,13 @@ fn serve(mut stream: TcpStream, token: &str, state: &Arc<Mutex<Snapshot>>, liste
             respond(&mut stream, "200 OK", "application/json", json.to_string().as_bytes());
         }
         "/stream" => {
+            // Each listener costs a thread and a fresh download of the track from
+            // TIDAL. Unbounded, that is both a memory problem and a way to hammer the
+            // account of whoever shared the link.
+            if listeners.load(Ordering::Relaxed) >= MAX_LISTENERS {
+                respond(&mut stream, "503 Service Unavailable", "text/plain", b"too many listeners");
+                return;
+            }
             listeners.fetch_add(1, Ordering::Relaxed);
             stream_track(&mut stream, &snapshot);
             listeners.fetch_sub(1, Ordering::Relaxed);
@@ -203,14 +241,19 @@ fn stream_track(stream: &mut TcpStream, snapshot: &Snapshot) {
     let info = match tidal::stream_info(&session, track.id, quality) {
         Ok(i) => i,
         Err(e) => {
-            respond(stream, "502 Bad Gateway", "text/plain", e.as_bytes());
+            // The reason goes to the terminal, not to the listener: an upstream error
+            // carries the verbatim API response, which is account detail a stranger
+            // holding a link has no business reading.
+            eprintln!("runnir: share could not resolve a stream: {e}");
+            respond(stream, "502 Bad Gateway", "text/plain", b"cannot reach the stream");
             return;
         }
     };
     let parts = match crate::player::parts_of(&info) {
         Ok(p) => p,
         Err(e) => {
-            respond(stream, "502 Bad Gateway", "text/plain", e.as_bytes());
+            eprintln!("runnir: share could not read a manifest: {e}");
+            respond(stream, "502 Bad Gateway", "text/plain", b"cannot read the stream");
             return;
         }
     };
@@ -267,6 +310,11 @@ fn landing_page(snapshot: &Snapshot, token: &str) -> String {
         "HIGH" => "high",
         _ => "",
     };
+    // Escaped. These come from a catalogue rather than from the listener, but the page
+    // carries the token in its own URL and the token IS the authentication — so a title
+    // that could run script would be a permanent grant of the stream to whoever
+    // collected it. One line, and the whole question goes away.
+    let (title, artist) = (escape(&title), escape(&artist));
     format!(
         "<!doctype html><meta charset=utf-8><title>{title}</title>\
          <meta name=viewport content=\"width=device-width,initial-scale=1\">\
@@ -279,6 +327,20 @@ fn landing_page(snapshot: &Snapshot, token: &str) -> String {
          <audio controls autoplay src=\"/r/{token}/stream\"></audio>\
          <p style=\"margin-top:2rem;font-size:.8rem\">shared from a runnir terminal</p></main>"
     )
+}
+
+/// The five characters that turn text into markup.
+fn escape(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            '&' => "&amp;".to_string(),
+            '<' => "&lt;".to_string(),
+            '>' => "&gt;".to_string(),
+            '"' => "&quot;".to_string(),
+            '\'' => "&#39;".to_string(),
+            other => other.to_string(),
+        })
+        .collect()
 }
 
 /// Spawns `cloudflared` and waits for it to publish a URL.
@@ -382,6 +444,33 @@ fn random_token() -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+#[test]
+    fn a_title_cannot_carry_markup_onto_the_page() {
+        // The page holds the token in its own URL, and the token is the only
+        // authentication there is — so anything that could run script on this page is a
+        // permanent grant of the stream to whoever collects it.
+        let snapshot = Snapshot {
+            queue: vec![crate::tidal::Track {
+                title: r#"<script>fetch('/'+location)</script>"#.into(),
+                artist: r#"a" onload="x"#.into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let page = landing_page(&snapshot, "tok");
+        assert!(!page.contains("<script>"), "{page}");
+        assert!(page.contains("&lt;script&gt;"));
+        assert!(!page.contains(r#"a" onload="#), "an attribute break got through");
+    }
+
+    #[test]
+    fn escaping_leaves_ordinary_titles_alone() {
+        // Including the ones this catalogue is full of.
+        assert_eq!(escape("Rodrigo: Concierto de Aranjuez"), "Rodrigo: Concierto de Aranjuez");
+        assert_eq!(escape("Alfadhirhaiti"), "Alfadhirhaiti");
+        assert_eq!(escape("Simon & Garfunkel"), "Simon &amp; Garfunkel");
+    }
 
     #[test]
     fn the_tunnel_url_is_found_in_cloudflareds_chatter() {
