@@ -894,6 +894,7 @@ fn tidal_play(what: &str) {
         &info.quality,
         &cfg,
         true,
+        &mut None,
         &mut |progress| {
             if !announced {
                 if let Some(signal) = progress.signal {
@@ -941,7 +942,7 @@ fn tidal_decode(files: &[&str], play: bool) {
         .unwrap_or("flac");
     let ext = if matches!(ext, "m4s" | "m4a" | "mp4") { "mp4" } else { ext };
 
-    match player::play_parts(parts, ext, "", &cfg, play, &mut |_| player::Flow::Continue) {
+    match player::play_parts(parts, ext, "", &cfg, play, &mut None, &mut |_| player::Flow::Continue) {
         Ok(played) => {
             let seconds = played.frames as f64 / played.signal.decoded_rate.max(1) as f64;
             println!("  {}", played.signal.badge());
@@ -2063,6 +2064,17 @@ impl ApplicationHandler<UserEvent> for App {
             return;
         }
         gpu.periodic(&self.config);
+
+        // Anything the TIDAL panel is waiting for animates a spinner, and a spinner
+        // needs a clock: nothing wakes the window while a stream is being resolved,
+        // because no state has changed yet. Ninety milliseconds is one frame.
+        if matches!(&gpu.overlay, Some(Overlay::Tidal(p)) if p.is_waiting()) {
+            gpu.window.request_redraw();
+            event_loop.set_control_flow(ControlFlow::WaitUntil(
+                Instant::now() + Duration::from_millis(90),
+            ));
+            return;
+        }
 
         // A pending AI request animates a spinner: wake often and repaint. An
         // error toast has an expiry (no reply will clear it); once it passes,

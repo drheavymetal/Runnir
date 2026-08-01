@@ -406,26 +406,31 @@ pub struct Progress<'a> {
     pub frames: u64,
     pub rate: u32,
     pub signal: Option<&'a SignalPath>,
-    /// How loud this packet was, 0..=1. Measured from the samples on their way to the
-    /// device, so what is drawn is what is being heard and not a second guess at it.
-    pub level: f32,
+    /// How loud this packet was across its length, one value per column, 0..=1.
+    /// Measured from the samples on their way to the device, so what is drawn is what
+    /// is being heard and not a second guess at it.
+    pub levels: Vec<f32>,
 }
 
-/// How many levels the wave keeps. Wide enough to fill a panel, small enough that
-/// cloning the snapshot stays free.
-pub const WAVE_LEN: usize = 96;
+/// How many columns the wave has.
+///
+/// One value per column, all of them from the SAME packet: the picture is a slice of
+/// the sound happening now, so each column rises and falls where it stands. It used to
+/// be a rolling history that scrolled sideways, which looks busier and says less — you
+/// cannot read a shape that is moving under your eye.
+pub const WAVE_LEN: usize = 48;
 
-/// Loudness of one decoded buffer, 0..=1.
+/// The loudness of one decoded buffer, cut into [`WAVE_LEN`] slices across its length.
 ///
 /// RMS rather than peak: peak jumps on a single sample and makes a bar chart that
 /// twitches, while RMS is what "loud" means to an ear. Scaled logarithmically over 60
 /// dB, because linear amplitude spends nine tenths of its range on the loudest tenth of
 /// what music does and leaves quiet passages flat against the floor.
-pub fn level_of(buf: &symphonia::core::audio::GenericAudioBufferRef<'_>) -> f32 {
+pub fn levels_of(buf: &symphonia::core::audio::GenericAudioBufferRef<'_>) -> Vec<f32> {
     let frames = buf.frames();
     let channels = buf.spec().channels().count().max(1);
     if frames == 0 {
-        return 0.0;
+        return Vec::new();
     }
     // The destination must hold frames * channels. Sizing it by frames alone panics
     // inside symphonia — "destination slice does not match number of samples" — and it
@@ -433,10 +438,19 @@ pub fn level_of(buf: &symphonia::core::audio::GenericAudioBufferRef<'_>) -> f32 
     // on claiming to be playing. Measured once, remembered here.
     let mut samples = vec![0f32; frames * channels];
     buf.copy_to_slice_interleaved(&mut samples[..]);
-    // One channel is enough for a level meter, so only every Nth sample is squared.
-    let sum: f32 = samples.iter().step_by(channels).map(|s| s * s).sum();
-    let rms = (sum / frames as f32).sqrt();
-    db_level(rms)
+
+    let per_slice = frames.div_ceil(WAVE_LEN).max(1);
+    let mut out = Vec::with_capacity(WAVE_LEN);
+    let mut frame = 0;
+    while frame < frames && out.len() < WAVE_LEN {
+        let end = (frame + per_slice).min(frames);
+        // One channel is enough for a level meter, so only every Nth sample is squared.
+        let sum: f32 = (frame..end).map(|f| samples[f * channels]).map(|v| v * v).sum();
+        let rms = (sum / (end - frame) as f32).sqrt();
+        out.push(db_level(rms));
+        frame = end;
+    }
+    out
 }
 
 /// The dB curve, split out because it is the part with a decision in it and the part a
@@ -460,6 +474,7 @@ pub fn play_parts(
     quality: &str,
     cfg: &TidalCfg,
     output: bool,
+    sink: &mut Option<Sink>,
     conductor: &mut dyn FnMut(Progress<'_>) -> Flow,
 ) -> Result<Played, String> {
     use symphonia::core::codecs::audio::AudioDecoderOptions;
@@ -501,7 +516,6 @@ pub fn play_parts(
         .make_audio_decoder(&params, &AudioDecoderOptions::default())
         .map_err(|e| format!("no decoder for this codec: {e}"))?;
 
-    let mut sink: Option<Sink> = None;
     let mut opened_yet: Option<Want> = None;
     let mut played = Played::default();
 
@@ -542,9 +556,25 @@ pub fn play_parts(
             played.signal.decoded_channels = want.channels;
             played.signal.quality = quality.to_string();
             if output {
-                let device = Sink::open(cfg, &want, quality)?;
-                played.signal = device.signal.clone();
-                sink = Some(device);
+                // The device is KEPT between tracks when the next one wants the same
+                // shape. Closing and reopening it cost a gap at every track change —
+                // and worse, the reopen hit the EBUSY of its own release and waited out
+                // the busy-patience, so an album played with a second and a half of
+                // silence between every track.
+                match sink.as_mut().filter(|s| s.takes(&want)) {
+                    Some(open) => {
+                        open.resume()?;
+                        played.signal = open.signal.clone();
+                    }
+                    None => {
+                        // A different rate or depth: the old one has to go first, and
+                        // going first is what lets the new open succeed at all.
+                        *sink = None;
+                        let device = Sink::open(cfg, &want, quality)?;
+                        played.signal = device.signal.clone();
+                        *sink = Some(device);
+                    }
+                }
             } else {
                 played.signal.device = "none (decode only)".into();
             }
@@ -557,12 +587,12 @@ pub fn play_parts(
 
         // Asked AFTER the write, so the answer is about audio that has already been
         // handed over: a pause here stops the next packet, not the one being heard.
-        let level = level_of(&decoded);
+        let levels = levels_of(&decoded);
         let mut flow = conductor(Progress {
             frames: played.frames,
             rate: played.signal.decoded_rate,
             signal: Some(&played.signal),
-            level,
+            levels: levels.clone(),
         });
         while flow == Flow::Pause {
             if let Some(sink) = sink.as_mut() {
@@ -575,7 +605,7 @@ pub fn play_parts(
                 frames: played.frames,
                 rate: played.signal.decoded_rate,
                 signal: Some(&played.signal),
-                level: 0.0,
+                levels: Vec::new(),
             });
         }
         if let Some(sink) = sink.as_mut() {
@@ -797,6 +827,28 @@ mod linux {
         /// fraction of a second off every track.
         pub fn drain(&mut self) {
             let _ = self.pcm.drain();
+        }
+
+        /// Whether this open device already fits what the next track needs.
+        ///
+        /// Rate, channels and the width actually being written — not the requested
+        /// depth, since a 16-bit track on a device opened as S32 is a different write
+        /// path even though both are "fine".
+        pub fn takes(&self, want: &Want) -> bool {
+            self.signal.decoded_rate == want.rate
+                && self.channels == want.channels
+                && self.signal.decoded_bits == want.bits
+        }
+
+        /// Puts a drained device back in a state that accepts writes.
+        pub fn resume(&mut self) -> Result<(), String> {
+            self.paused = false;
+            match self.pcm.state() {
+                // Drained or stopped: it needs preparing before it will take frames
+                // again. Running or prepared already does.
+                State::Running | State::Prepared => Ok(()),
+                _ => self.pcm.prepare().map_err(|e| e.to_string()),
+            }
         }
 
         /// Stops and restarts the stream under a pause.
@@ -1161,6 +1213,12 @@ mod other {
         }
         pub fn drain(&mut self) {}
         pub fn set_paused(&mut self, _: bool) {}
+        pub fn takes(&self, _: &Want) -> bool {
+            false
+        }
+        pub fn resume(&mut self) -> Result<(), String> {
+            Err("no audio output".into())
+        }
     }
 }
 
@@ -1211,11 +1269,16 @@ pub struct Snapshot {
     /// Bumped on every change, so a drawing pass can tell "nothing happened" from
     /// "happened to look the same".
     pub generation: u64,
-    /// The last [`WAVE_LEN`] loudness readings, oldest first — a scrolling picture of
-    /// what has just been heard. Drawn by the panel; empty when nothing is playing.
+    /// One value per column for the sound happening now, 0..=1. Drawn by the panel as
+    /// bars that rise and fall in place; empty when nothing is playing.
     pub wave: Vec<f32>,
     /// The public link, when there is one.
     pub share: Option<crate::share::State>,
+    /// True between "play this" and the first sound: resolving the stream, opening the
+    /// device, fetching the first segment. Without it the panel showed a track and a
+    /// position of zero and looked stuck — the gap is a second or two on a good link
+    /// and there was nothing on screen admitting it existed.
+    pub buffering: bool,
 }
 
 impl Snapshot {
@@ -1387,6 +1450,9 @@ fn play_queue(
     cfg: &mut TidalCfg,
     creds: &tidal::Creds,
 ) -> bool {
+    // Held across the whole queue rather than per track. See `play_parts`: reopening
+    // between tracks cost a gap and a busy-wait on the device's own release.
+    let mut sink: Option<Sink> = None;
     loop {
         let (track, index) = {
             let Ok(s) = state.lock() else { return false };
@@ -1396,13 +1462,14 @@ fn play_queue(
             }
         };
 
-        let outcome = play_one(&track, rx, state, wake, cfg, creds);
+        let outcome = play_one(&track, rx, state, wake, cfg, creds, &mut sink);
         match outcome {
             Outcome::Quit => return true,
             Outcome::Stopped => {
                 set(state, wake, |s| {
                     s.playing = false;
                     s.paused = false;
+                    s.buffering = false;
                 });
                 return false;
             }
@@ -1418,6 +1485,7 @@ fn play_queue(
                     set(state, wake, |s| {
                         s.playing = false;
                         s.paused = false;
+                        s.buffering = false;
                     });
                     return false;
                 }
@@ -1427,6 +1495,7 @@ fn play_queue(
                     set(state, wake, |s| {
                         s.playing = false;
                         s.paused = false;
+                        s.buffering = false;
                     });
                     return false;
                 }
@@ -1456,6 +1525,7 @@ enum Outcome {
 }
 
 /// Resolves and plays one track, obeying commands as they arrive.
+#[allow(clippy::too_many_arguments)]
 fn play_one(
     track: &tidal::Track,
     rx: &std::sync::mpsc::Receiver<Cmd>,
@@ -1463,7 +1533,13 @@ fn play_one(
     wake: &dyn Fn(),
     cfg: &mut TidalCfg,
     creds: &tidal::Creds,
+    sink: &mut Option<Sink>,
 ) -> Outcome {
+    set(state, wake, |s| {
+        s.buffering = true;
+        s.playing = true;
+        s.position_secs = 0.0;
+    });
     let Some(session) = tidal::Session::load() else {
         return Outcome::Failed("not signed in".into());
     };
@@ -1483,6 +1559,7 @@ fn play_one(
     set(state, wake, |s| {
         s.playing = true;
         s.paused = false;
+        s.buffering = true;
         s.position_secs = 0.0;
         s.error = None;
         // The wave belongs to the track being heard, not to the player: carrying the
@@ -1513,6 +1590,7 @@ fn play_one(
         &info.quality,
         &playing_cfg,
         true,
+        sink,
         &mut |progress| {
             // Every command waiting right now, not just one: a burst of key presses
             // must not be answered one packet at a time.
@@ -1576,15 +1654,16 @@ fn play_one(
             wave_clock += 1;
             if let Ok(mut s) = state.lock() {
                 s.position_secs = secs;
-                if s.wave.len() >= WAVE_LEN {
-                    s.wave.remove(0);
-                }
-                s.wave.push(progress.level);
+                // Replaced, not appended: the columns are a picture of the sound
+                // happening now and each one moves where it stands.
+                s.wave = progress.levels.clone();
                 if !published_signal {
                     if let Some(signal) = progress.signal {
                         s.signal = signal.clone();
                         published_signal = true;
                         worth_drawing = true;
+                        // Sound is coming out: whatever it was waiting for is done.
+                        s.buffering = false;
                     }
                 }
                 if worth_drawing {
@@ -1821,12 +1900,33 @@ mod tests {
     }
 
     #[test]
+    fn the_wave_is_one_picture_of_now_and_not_a_history() {
+        use symphonia::core::audio::{
+            AsGenericAudioBufferRef, AudioBuffer, AudioSpec, Channels,
+        };
+        let spec = AudioSpec::new(48_000, Channels::Discrete(2));
+        let mut buf = AudioBuffer::<f32>::new(spec.clone(), 480);
+        buf.render(Some(480), &[1.0, 1.0]);
+        let levels = levels_of(&buf.as_generic_audio_buffer_ref());
+        // One packet gives a whole frame of columns, so every column can move on the
+        // next one. A rolling history could only ever add one column at a time.
+        assert_eq!(levels.len(), WAVE_LEN);
+        assert!(levels.iter().all(|l| (*l - 1.0).abs() < 0.001), "full scale throughout");
+
+        // A packet with fewer frames than columns gives what it has rather than
+        // padding with silence that never happened.
+        let mut short = AudioBuffer::<f32>::new(spec, 8);
+        short.render(Some(8), &[0.5, 0.5]);
+        assert_eq!(levels_of(&short.as_generic_audio_buffer_ref()).len(), 8);
+    }
+
+    #[test]
     fn the_level_meter_sizes_its_buffer_for_every_channel() {
         // The regression that mattered: symphonia writes frames * CHANNELS into the
         // destination, and sizing it by frames alone panics on the first packet — which
         // killed the player thread while the state went on claiming to be playing.
         use symphonia::core::audio::{
-            AsGenericAudioBufferRef, Audio, AudioBuffer, AudioSpec, Channels,
+            AsGenericAudioBufferRef, AudioBuffer, AudioSpec, Channels,
         };
         // Two discrete channels — what stereo is, without needing speaker positions.
         let spec = AudioSpec::new(48_000, Channels::Discrete(2));
@@ -1834,8 +1934,9 @@ mod tests {
         // Full scale in every sample of both channels.
         buf.render(Some(64), &[1.0, 1.0]);
         // Full scale on both channels reads as the top of the meter, and does not panic.
-        let level = level_of(&buf.as_generic_audio_buffer_ref());
-        assert!((level - 1.0).abs() < 0.001, "full scale read as {level}");
+        let levels = levels_of(&buf.as_generic_audio_buffer_ref());
+        assert!(!levels.is_empty());
+        assert!(levels.iter().all(|l| (*l - 1.0).abs() < 0.001), "full scale read as {levels:?}");
     }
 
     #[test]

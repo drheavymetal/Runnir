@@ -3785,6 +3785,57 @@ message saying it was done is not the check.
 
 585 tests.
 
+## 2026-08-01 - A bar you can read, a spinner for the gap, and the device stays open
+
+Pedro, on the wave: "a progress bar and a loading icon would be more useful, by a long
+way". He was right, and the three changes are one change — the panel was spending its
+most readable row on decoration while saying nothing about the two things a person
+actually wants to know: how far through, and whether it is doing anything.
+
+**The bar took the row the wave had.** Position at the left, length at the right, a
+filled run and a single mark at the join so the exact spot reads at a glance instead of
+being guessed from where the fill ends.
+
+**The wave moved to the top corner and changed what it measures.** It used to be a
+rolling history that marched sideways: one new column per packet, everything shuffling
+left. You cannot read a shape that is moving under your eye. Now every column comes from
+the SAME packet — the buffer is cut into as many slices as there are columns — so each
+one rises and falls where it stands. Flat when nothing plays, and flat when paused,
+because bars left standing beside a paused track read as playing. Always the same width:
+a meter that appears and disappears moves everything beside it.
+
+**And a spinner, because there was a gap with nothing in it.** Between pressing Enter and
+the first sound the player resolves a stream, opens a device and fetches a segment — a
+second or two — and the panel showed a play triangle over 0:00, which is what "stuck"
+looks like. `buffering` is now part of the state, the spinner replaces the play mark
+while it is set, and it also spins beside a list that is still loading. Braille frames,
+because those eight glyphs are one thing turning rather than a sequence of unrelated
+shapes.
+
+A spinner needs a clock, and the thing it spins for reports no progress of its own —
+that is precisely why it is a spinner and not a bar. Nothing wakes the window while a
+stream resolves, so the window schedules its own repaint every ninety milliseconds while
+the panel is waiting for anything.
+
+## The gap between tracks was the busy-wait, and it was self-inflicted
+
+Pedro also said track changes were slow. They were, and the cause was yesterday's fix.
+
+The sink was local to `play_parts`, so it was dropped at the end of every track and
+opened again for the next one. ALSA frees a card a moment AFTER the holder lets go — the
+thing that made the DAC "busy" in the first place — so the reopen hit `EBUSY` **on the
+device it had just released itself**, and waited out the full second and a half of
+patience added yesterday. An album played with a second and a half of silence between
+every track, caused entirely by the code that stopped it playing through the wrong
+speaker.
+
+The device is held across the whole queue now and reopened only when the next track
+wants a different shape — a different rate, channel count or width. A drained device
+needs preparing before it takes frames again, which is the one thing reuse has to
+remember.
+
+586 tests.
+
 ## Gotchas (do not re-learn)
 
 - `runnir.json` WINS over `runnir.toml`. `Config::try_load` reads the JSON the settings
@@ -3822,6 +3873,9 @@ message saying it was done is not the check.
   Only a lock settles it.
 - `cloudflared` prints a quick-tunnel URL SECONDS before the edge routes to it. A link
   handed over the moment it appears fails for whoever opens it first.
+- Closing and reopening an ALSA device between tracks makes it wait out its OWN
+  release: the busy-patience that fixes wrong-output then costs a gap at every track
+  change. Hold the device while the format stays the same.
 - ALSA frees a card a moment AFTER the process holding it dies. An exclusive open
   attempted immediately after another process let go gets `EBUSY` and, in a fallback
   chain, silently ends up somewhere else. Wait the card out before deciding it refused.

@@ -2744,6 +2744,11 @@ pub struct TidalPanel {
     /// The player's state as of the last redraw. Refreshed from the jukebox, never
     /// mutated here.
     pub snapshot: crate::player::Snapshot,
+    /// When this panel opened. The only clock a spinner can use: the thing it spins
+    /// for — resolving a stream, opening a device, fetching a first segment — reports
+    /// no progress of its own, which is exactly why it needs a spinner rather than a
+    /// bar.
+    opened: std::time::Instant,
 }
 
 /// Where the panel is on screen and how it is divided.
@@ -2770,6 +2775,9 @@ pub enum TidalHit {
     /// Worth naming, because it must NOT be read as "outside", which closes the panel.
     Chrome,
 }
+
+/// How wide the wave is drawn in the panel's top corner.
+const WAVE_COLS: usize = 24;
 
 /// The left column. Each is a different question, not a different filter.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2884,6 +2892,7 @@ impl TidalPanel {
             show_lyrics: false,
             crumb_pending: None,
             snapshot,
+            opened: std::time::Instant::now(),
         };
         panel.reload_queue();
         panel
@@ -3034,6 +3043,13 @@ impl TidalPanel {
         };
         write(&mut g, 0, 2, &title, accent());
 
+        // The wave sits at the top, out of the way of everything that has to be read,
+        // and each column rises and falls where it stands rather than marching left.
+        // Flat when nothing is playing: a meter is only worth space when it is saying
+        // something, and a flat line says "silent" more clearly than an empty row.
+        let wave = self.wave_line(WAVE_COLS);
+        write(&mut g, 0, w.saturating_sub(WAVE_COLS + 2), &wave, if self.snapshot.playing { accent() } else { dim() });
+
         // Sources, always visible: the panel should never be a place you can get lost
         // in with no way back to a named list.
         for (i, source) in Source::ALL.iter().enumerate() {
@@ -3076,12 +3092,9 @@ impl TidalPanel {
 
         // The transport and the signal path, at the bottom, where a status bar goes.
         let bar = h.saturating_sub(3);
-        // The wave takes the place of the rule when there is one to draw: a separator
-        // and a picture of the sound want the same row, and the picture is worth more.
-        match self.wave_line(w) {
-            Some(wave) => write(&mut g, bar, 0, &wave, accent()),
-            None => write(&mut g, bar, 0, &"\u{2500}".repeat(w), dim()),
-        }
+        // Where the rule used to be: how far through the track you are. Far more use
+        // than a picture of the sound, which is why the picture moved to the corner.
+        self.render_progress(&mut g, bar, w);
         write(&mut g, bar + 1, 2, &short_tail(&self.transport_line(), w.saturating_sub(4)), normal());
         // The link takes the footer while there is one: it is the only thing on this
         // panel somebody needs to READ rather than glance at, and the terminal's hint
@@ -3136,8 +3149,9 @@ impl TidalPanel {
 
     fn render_list(&self, g: &mut Grid, side: usize, list_rows: usize, w: usize, theme: &Theme) {
         if self.rows.is_empty() {
+            let spun = self.spinner().map(|c| format!("{c} loading\u{2026}"));
             let empty = match (self.source, self.pending.is_some()) {
-                (_, true) => "loading\u{2026}",
+                (_, true) => spun.as_deref().unwrap_or("loading\u{2026}"),
                 (Source::Search, _) => "type to search \u{b7} tracks, albums, artists, playlists",
                 (Source::Queue, _) => "nothing queued",
                 (Source::Favourites, _) => "no favourites",
@@ -3217,29 +3231,83 @@ impl TidalPanel {
         }
     }
 
-    /// The sound as a row of bars, most recent on the right.
+    /// The sound now, as a row of bars that move up and down in place.
     ///
     /// Eight block glyphs rather than braille: braille packs four rows of dots into a
     /// cell and is the right tool for a plot, but a level meter is one value per column
     /// and the blocks give it eight heights with no arithmetic and no font surprises.
-    /// Nothing is drawn when nothing is playing — an idle meter is a flat line that
-    /// looks like a bug.
-    fn wave_line(&self, w: usize) -> Option<String> {
-        if !self.snapshot.playing || self.snapshot.wave.is_empty() {
+    ///
+    /// Always the same width, and flat when nothing plays. A meter that appears and
+    /// disappears moves everything beside it; a flat line reads as silence.
+    fn wave_line(&self, cols: usize) -> String {
+        const BARS: [char; 9] = [
+            '\u{2581}', '\u{2581}', '\u{2582}', '\u{2583}', '\u{2584}', '\u{2585}', '\u{2586}',
+            '\u{2587}', '\u{2588}',
+        ];
+        if !self.snapshot.playing || self.snapshot.paused || self.snapshot.wave.is_empty() {
+            return "\u{2581}".repeat(cols);
+        }
+        (0..cols)
+            .map(|i| {
+                // The frame is stretched across the columns available, so a narrow panel
+                // shows the same shape rather than the first third of it.
+                let at = i * self.snapshot.wave.len() / cols.max(1);
+                let level = self.snapshot.wave.get(at).copied().unwrap_or(0.0);
+                BARS[(level * 8.0).round().clamp(0.0, 8.0) as usize]
+            })
+            .collect()
+    }
+
+    /// One frame of the spinner, or nothing when there is nothing to wait for.
+    ///
+    /// Braille, because those eight glyphs are a rotation rather than a sequence of
+    /// unrelated shapes, and the eye reads them as one thing turning.
+    pub fn spinner(&self) -> Option<char> {
+        const FRAMES: [char; 8] = ['\u{280b}', '\u{2819}', '\u{2839}', '\u{2838}', '\u{283c}', '\u{2834}', '\u{2826}', '\u{2827}'];
+        let waiting = self.snapshot.buffering || self.pending.is_some() || self.pending_lyrics.is_some();
+        if !waiting {
             return None;
         }
-        const BARS: [char; 9] = [' ', '\u{2581}', '\u{2582}', '\u{2583}', '\u{2584}', '\u{2585}', '\u{2586}', '\u{2587}', '\u{2588}'];
-        let room = w.min(self.snapshot.wave.len());
-        let from = self.snapshot.wave.len() - room;
-        Some(
-            self.snapshot.wave[from..]
-                .iter()
-                .map(|level| {
-                    let step = (level * 8.0).round().clamp(0.0, 8.0) as usize;
-                    BARS[step]
-                })
-                .collect(),
-        )
+        let frame = (self.opened.elapsed().as_millis() / 90) as usize % FRAMES.len();
+        Some(FRAMES[frame])
+    }
+
+    /// True while something is being waited for, so the window knows to keep repainting.
+    pub fn is_waiting(&self) -> bool {
+        self.spinner().is_some()
+    }
+
+    /// How far through the track, as a bar with the times at either end.
+    fn render_progress(&self, g: &mut Grid, row: usize, w: usize) {
+        let Some(track) = self.snapshot.now_playing() else {
+            write(g, row, 0, &"\u{2500}".repeat(w), dim());
+            return;
+        };
+        let at = self.snapshot.position_secs.max(0.0) as u32;
+        let total = track.duration_secs;
+        let left = format!("{}:{:02}", at / 60, at % 60);
+        let right = format!("{}:{:02}", total / 60, total % 60);
+        // Two spaces either side of each time, so the bar never touches the digits.
+        let room = w.saturating_sub(left.chars().count() + right.chars().count() + 6);
+
+        write(g, row, 2, &left, dim());
+        write(g, row, w.saturating_sub(right.chars().count() + 2), &right, dim());
+        if room == 0 {
+            return;
+        }
+        let done = if total == 0 {
+            0
+        } else {
+            (at as usize * room / total as usize).min(room)
+        };
+        let x = left.chars().count() + 4;
+        // A filled run, then the rest as a rule. The join is a single mark so the exact
+        // position reads at a glance rather than being guessed from where the fill ends.
+        write(g, row, x, &"\u{2501}".repeat(done), accent());
+        if done < room {
+            write(g, row, x + done, "\u{25cf}", accent());
+            write(g, row, x + done + 1, &"\u{2500}".repeat(room - done - 1), dim());
+        }
     }
 
     /// `\u{25b8} Artist \u{2014} Title   1:23 / 4:56`, or an invitation when nothing is on.
@@ -3247,7 +3315,14 @@ impl TidalPanel {
         let Some(track) = self.snapshot.now_playing() else {
             return "nothing playing".to_string();
         };
-        let mark = if !self.snapshot.playing {
+        // The spinner takes the place of the play mark while it is still fetching:
+        // that gap is a second or two, and a play triangle over a position of 0:00 for
+        // two seconds is what "stuck" looks like.
+        let spun;
+        let mark = if self.snapshot.buffering {
+            spun = self.spinner().unwrap_or('\u{25b8}').to_string();
+            spun.as_str()
+        } else if !self.snapshot.playing {
             "\u{25a0}"
         } else if self.snapshot.paused {
             "\u{2016}"
@@ -5614,34 +5689,35 @@ fn a_track(title: &str) -> crate::tidal::Track {
     }
 
     #[test]
-    fn the_wave_is_only_drawn_when_there_is_sound_to_draw() {
+    fn the_wave_is_flat_when_nothing_is_playing_and_never_changes_width() {
         let mut p = TidalPanel::new(crate::player::Snapshot::default());
-        // Nothing playing: no bars. An idle meter is a flat line that reads as a bug.
-        assert_eq!(p.wave_line(20), None);
+        // Flat, not absent: a meter that appears and disappears moves everything beside
+        // it, and a flat line says "silent" more clearly than an empty row.
+        let idle = p.wave_line(10);
+        assert_eq!(idle.chars().count(), 10);
+        assert!(idle.chars().all(|c| c == '\u{2581}'), "{idle}");
 
         p.snapshot.playing = true;
-        assert_eq!(p.wave_line(20), None, "playing but nothing measured yet");
+        p.snapshot.wave = vec![0.0, 0.5, 1.0, 0.5];
+        let live = p.wave_line(10);
+        assert_eq!(live.chars().count(), 10, "the width never moves");
+        assert!(live.contains('\u{2588}'), "full scale should reach the top: {live}");
 
-        p.snapshot.wave = vec![0.0, 0.5, 1.0];
-        let line = p.wave_line(20).expect("bars");
-        assert_eq!(line.chars().count(), 3, "one column per reading, never padded");
-        assert_eq!(line.chars().next(), Some(' '), "silence is an empty column");
-        assert_eq!(line.chars().last(), Some('\u{2588}'), "full scale is a full block");
+        // Paused is silent: bars left standing beside a paused track read as playing.
+        p.snapshot.paused = true;
+        assert_eq!(p.wave_line(10), idle);
     }
 
     #[test]
-    fn a_long_wave_keeps_its_most_recent_end() {
+    fn the_wave_stretches_to_the_width_it_is_given() {
         let mut p = TidalPanel::new(crate::player::Snapshot::default());
         p.snapshot.playing = true;
-        // Old and quiet at the front, recent and loud at the back.
-        p.snapshot.wave = (0..40).map(|i| i as f32 / 40.0).collect();
-        let line = p.wave_line(8).expect("bars");
-        assert_eq!(line.chars().count(), 8);
-        // The newest reading is the loudest, and it is the one kept — 39/40 rounds up
-        // to the full block, which is what "almost full scale" should look like.
-        assert_eq!(line.chars().last(), Some('\u{2588}'));
-        // …and the oldest of the eight kept is not the oldest of the forty measured.
-        assert_ne!(line.chars().next(), Some(' '));
+        // Loud at the start, silent at the end.
+        p.snapshot.wave = (0..48).map(|i| 1.0 - i as f32 / 48.0).collect();
+        let narrow = p.wave_line(8);
+        assert_eq!(narrow.chars().count(), 8);
+        // A narrow panel shows the whole shape rather than the first sixth of it.
+        assert!(narrow.chars().next() > narrow.chars().last(), "{narrow}");
     }
 
     #[test]
