@@ -348,6 +348,45 @@ pub struct Progress<'a> {
     pub frames: u64,
     pub rate: u32,
     pub signal: Option<&'a SignalPath>,
+    /// How loud this packet was, 0..=1. Measured from the samples on their way to the
+    /// device, so what is drawn is what is being heard and not a second guess at it.
+    pub level: f32,
+}
+
+/// How many levels the wave keeps. Wide enough to fill a panel, small enough that
+/// cloning the snapshot stays free.
+pub const WAVE_LEN: usize = 96;
+
+/// Loudness of one decoded buffer, 0..=1.
+///
+/// RMS rather than peak: peak jumps on a single sample and makes a bar chart that
+/// twitches, while RMS is what "loud" means to an ear. Scaled logarithmically over 60
+/// dB, because linear amplitude spends nine tenths of its range on the loudest tenth of
+/// what music does and leaves quiet passages flat against the floor.
+pub fn level_of(buf: &symphonia::core::audio::GenericAudioBufferRef<'_>) -> f32 {
+    let frames = buf.frames();
+    if frames == 0 {
+        return 0.0;
+    }
+    // One channel is enough for a level meter, and halves the work per packet.
+    let mut samples = vec![0f32; frames];
+    buf.copy_to_slice_interleaved(&mut samples[..]);
+    let sum: f32 = samples.iter().map(|s| s * s).sum();
+    let rms = (sum / samples.len() as f32).sqrt();
+    if rms <= 0.0 {
+        return 0.0;
+    }
+    db_level(rms)
+}
+
+/// The dB curve, split out because it is the part with a decision in it and the part a
+/// test can reach without a decoded buffer.
+fn db_level(rms: f32) -> f32 {
+    if rms <= 0.0 {
+        return 0.0;
+    }
+    let db = 20.0 * rms.log10();
+    ((db + 60.0) / 60.0).clamp(0.0, 1.0)
 }
 
 /// The whole audio path, from a list of parts to the DAC.
@@ -458,20 +497,25 @@ pub fn play_parts(
 
         // Asked AFTER the write, so the answer is about audio that has already been
         // handed over: a pause here stops the next packet, not the one being heard.
+        let level = level_of(&decoded);
         let mut flow = conductor(Progress {
             frames: played.frames,
             rate: played.signal.decoded_rate,
             signal: Some(&played.signal),
+            level,
         });
         while flow == Flow::Pause {
             if let Some(sink) = sink.as_mut() {
                 sink.set_paused(true);
             }
             std::thread::sleep(PAUSE_POLL);
+            // A paused player is silent, and a wave that keeps its last shape while
+            // nothing plays looks frozen rather than paused.
             flow = conductor(Progress {
                 frames: played.frames,
                 rate: played.signal.decoded_rate,
                 signal: Some(&played.signal),
+                level: 0.0,
             });
         }
         if let Some(sink) = sink.as_mut() {
@@ -1028,6 +1072,9 @@ pub struct Snapshot {
     /// Bumped on every change, so a drawing pass can tell "nothing happened" from
     /// "happened to look the same".
     pub generation: u64,
+    /// The last [`WAVE_LEN`] loudness readings, oldest first — a scrolling picture of
+    /// what has just been heard. Drawn by the panel; empty when nothing is playing.
+    pub wave: Vec<f32>,
 }
 
 impl Snapshot {
@@ -1263,6 +1310,9 @@ fn play_one(
         s.paused = false;
         s.position_secs = 0.0;
         s.error = None;
+        // The wave belongs to the track being heard, not to the player: carrying the
+        // last one into the next song draws a shape that never happened.
+        s.wave.clear();
     });
 
     // What the conductor decided, read after the loop returns. A closure cannot return
@@ -1271,6 +1321,7 @@ fn play_one(
     let mut paused = false;
     let mut published_signal = false;
     let mut last_tick = u64::MAX;
+    let mut wave_clock = 0u32;
     // The track plays under the config it started with. A `Reconfigure` arriving now is
     // held and applied to the NEXT track — the device for this one is already open, and
     // swapping it underneath would be a gap in the middle of a song.
@@ -1331,14 +1382,24 @@ fn play_one(
 
             let secs = progress.frames as f64 / progress.rate.max(1) as f64;
             // A packet is 20-40 ms of audio, so this runs about forty times a second.
-            // The position is always recorded, but the UI is only woken when the
-            // SECOND changed or the signal path first became known: waking it per
-            // packet is a full window repaint for a number that has not moved.
+            // Everything is RECORDED every time; what is paced is the waking, because
+            // a wake is a full window repaint. The clock only needs a wake when the
+            // second changes, but the wave needs to move to look alive — so it sets
+            // its own, slower, rhythm.
             let tick = secs as u64;
             let mut worth_drawing = tick != last_tick;
             last_tick = tick;
+            if wave_clock >= WAVE_EVERY {
+                wave_clock = 0;
+                worth_drawing = true;
+            }
+            wave_clock += 1;
             if let Ok(mut s) = state.lock() {
                 s.position_secs = secs;
+                if s.wave.len() >= WAVE_LEN {
+                    s.wave.remove(0);
+                }
+                s.wave.push(progress.level);
                 if !published_signal {
                     if let Some(signal) = progress.signal {
                         s.signal = signal.clone();
@@ -1366,6 +1427,11 @@ fn play_one(
         Ok(_) => verdict,
     }
 }
+
+/// How many packets pass between wakes for the wave's sake. At 20-40 ms a packet this
+/// is roughly ten times a second: enough that the wave moves smoothly, few enough that
+/// a playing terminal is not repainting itself forty times a second for a picture.
+const WAVE_EVERY: u32 = 4;
 
 /// Seconds after which "previous" restarts the current track instead of going back.
 const PREV_RESTARTS_AFTER: f64 = 3.0;
@@ -1528,6 +1594,19 @@ mod tests {
         assert!(Rung::ExclusivePadded.is_bit_exact());
         assert!(!Rung::ExclusiveResampled.is_bit_exact());
         assert!(!Rung::Shared.is_bit_exact());
+    }
+
+#[test]
+    fn the_level_meter_spends_its_range_where_music_lives() {
+        // Silence is the floor, and anything below -60 dB is silence for a picture.
+        assert_eq!(db_level(0.0), 0.0);
+        assert_eq!(db_level(0.0001), 0.0);
+        // Full scale is the top.
+        assert!((db_level(1.0) - 1.0).abs() < 0.001);
+        // -30 dB is a normal quiet passage and must land in the MIDDLE, not squashed
+        // against the floor the way a linear scale would leave it.
+        let quiet = db_level(0.0316);
+        assert!((0.4..0.6).contains(&quiet), "-30 dB mapped to {quiet}");
     }
 
     #[test]

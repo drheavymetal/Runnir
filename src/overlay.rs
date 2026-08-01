@@ -2975,7 +2975,12 @@ impl TidalPanel {
 
         // The transport and the signal path, at the bottom, where a status bar goes.
         let bar = h.saturating_sub(3);
-        write(&mut g, bar, 0, &"\u{2500}".repeat(w), dim());
+        // The wave takes the place of the rule when there is one to draw: a separator
+        // and a picture of the sound want the same row, and the picture is worth more.
+        match self.wave_line(w) {
+            Some(wave) => write(&mut g, bar, 0, &wave, accent()),
+            None => write(&mut g, bar, 0, &"\u{2500}".repeat(w), dim()),
+        }
         write(&mut g, bar + 1, 2, &short_tail(&self.transport_line(), w.saturating_sub(4)), normal());
         let foot = match self.message.as_deref() {
             Some(msg) => msg.to_string(),
@@ -3078,6 +3083,31 @@ impl TidalPanel {
         for (i, line) in lyrics.plain.lines().take(list_rows).enumerate() {
             write(g, 3 + i, side + 2, &short_tail(line, w.saturating_sub(side + 4)), normal());
         }
+    }
+
+    /// The sound as a row of bars, most recent on the right.
+    ///
+    /// Eight block glyphs rather than braille: braille packs four rows of dots into a
+    /// cell and is the right tool for a plot, but a level meter is one value per column
+    /// and the blocks give it eight heights with no arithmetic and no font surprises.
+    /// Nothing is drawn when nothing is playing — an idle meter is a flat line that
+    /// looks like a bug.
+    fn wave_line(&self, w: usize) -> Option<String> {
+        if !self.snapshot.playing || self.snapshot.wave.is_empty() {
+            return None;
+        }
+        const BARS: [char; 9] = [' ', '\u{2581}', '\u{2582}', '\u{2583}', '\u{2584}', '\u{2585}', '\u{2586}', '\u{2587}', '\u{2588}'];
+        let room = w.min(self.snapshot.wave.len());
+        let from = self.snapshot.wave.len() - room;
+        Some(
+            self.snapshot.wave[from..]
+                .iter()
+                .map(|level| {
+                    let step = (level * 8.0).round().clamp(0.0, 8.0) as usize;
+                    BARS[step]
+                })
+                .collect(),
+        )
     }
 
     /// `\u{25b8} Artist \u{2014} Title   1:23 / 4:56`, or an invitation when nothing is on.
@@ -5370,6 +5400,37 @@ fn a_track(title: &str) -> crate::tidal::Track {
             ..Default::default()
         });
         assert_eq!(row_line(&mine), "Dormir \u{b7} mine (11 tracks)");
+    }
+
+    #[test]
+    fn the_wave_is_only_drawn_when_there_is_sound_to_draw() {
+        let mut p = TidalPanel::new(crate::player::Snapshot::default());
+        // Nothing playing: no bars. An idle meter is a flat line that reads as a bug.
+        assert_eq!(p.wave_line(20), None);
+
+        p.snapshot.playing = true;
+        assert_eq!(p.wave_line(20), None, "playing but nothing measured yet");
+
+        p.snapshot.wave = vec![0.0, 0.5, 1.0];
+        let line = p.wave_line(20).expect("bars");
+        assert_eq!(line.chars().count(), 3, "one column per reading, never padded");
+        assert_eq!(line.chars().next(), Some(' '), "silence is an empty column");
+        assert_eq!(line.chars().last(), Some('\u{2588}'), "full scale is a full block");
+    }
+
+    #[test]
+    fn a_long_wave_keeps_its_most_recent_end() {
+        let mut p = TidalPanel::new(crate::player::Snapshot::default());
+        p.snapshot.playing = true;
+        // Old and quiet at the front, recent and loud at the back.
+        p.snapshot.wave = (0..40).map(|i| i as f32 / 40.0).collect();
+        let line = p.wave_line(8).expect("bars");
+        assert_eq!(line.chars().count(), 8);
+        // The newest reading is the loudest, and it is the one kept — 39/40 rounds up
+        // to the full block, which is what "almost full scale" should look like.
+        assert_eq!(line.chars().last(), Some('\u{2588}'));
+        // …and the oldest of the eight kept is not the oldest of the forty measured.
+        assert_ne!(line.chars().next(), Some(' '));
     }
 
     #[test]
