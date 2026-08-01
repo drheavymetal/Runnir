@@ -1454,7 +1454,10 @@ fn notify(body: &str) {
 /// one type would mean each side checking whether the answer was meant for it.
 pub enum TidalAnswer {
     Found(tidal::Found),
-    Lyrics(tidal::Lyrics),
+    /// The track the words are for, and the words. The id travels with them because
+    /// the answer can arrive after the song has changed, and words for the wrong song
+    /// are worse than none.
+    Lyrics(u64, tidal::Lyrics),
 }
 
 /// Turns a search result into the rows a list draws, headings and all.

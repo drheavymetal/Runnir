@@ -2720,13 +2720,27 @@ pub struct TidalPanel {
     /// True while the query is being typed, so ordinary letters go to the box rather
     /// than to the transport.
     pub editing: bool,
-    /// The request whose answer we are still waiting for, so a slow one that lands after
-    /// a newer one is dropped rather than drawn.
+    /// The list request whose answer we are still waiting for, so a slow one that lands
+    /// after a newer one is dropped rather than drawn.
     pub pending: Option<u64>,
+    /// The same, for words. A separate slot because asking for lyrics used to cancel a
+    /// half-loaded album — the album's answer was dropped by the shared guard, the list
+    /// never arrived, and its name stayed in the trail.
+    pub pending_lyrics: Option<u64>,
     pub message: Option<String>,
     /// Words for the track being played, when they have been asked for.
     pub lyrics: Option<crate::tidal::Lyrics>,
+    /// Which track the words belong to. Without this they outlive their song: the
+    /// panel went on drawing one track's lyrics while highlighting a line by the NEXT
+    /// track's position — confidently wrong words, presented as synced.
+    pub lyrics_for: Option<u64>,
     pub show_lyrics: bool,
+    /// The trail for a list that has been ASKED for but has not arrived.
+    ///
+    /// Written on arrival rather than on request: an album that fails to load used to
+    /// leave its name over the previous, unrelated list, and a request that was
+    /// superseded left the crumb naming a list that never appeared.
+    pub crumb_pending: Option<String>,
     /// The player's state as of the last redraw. Refreshed from the jukebox, never
     /// mutated here.
     pub snapshot: crate::player::Snapshot,
@@ -2863,9 +2877,12 @@ impl TidalPanel {
             query: String::new(),
             editing: source == Source::Search,
             pending: None,
+            pending_lyrics: None,
             message: None,
             lyrics: None,
+            lyrics_for: None,
             show_lyrics: false,
+            crumb_pending: None,
             snapshot,
         };
         panel.reload_queue();
@@ -2984,6 +3001,13 @@ impl TidalPanel {
         }
         if y == 1 {
             return Some(TidalHit::Query);
+        }
+        // With the words up there is no list under the pointer, whatever the rows say.
+        // Without this, a click on a lyric line hit the row the cursor happened to be
+        // on — and on a scrolled list that is exactly the cursor's own line, so
+        // clicking a line of text started playing music.
+        if self.show_lyrics {
+            return Some(TidalHit::Chrome);
         }
         if let Some(line) = y.checked_sub(3) {
             if line < l.list_rows {
@@ -5508,6 +5532,29 @@ fn a_track(title: &str) -> crate::tidal::Track {
         // Outside the panel is nothing at all, which is what closes it.
         assert_eq!(p.hit(cols, rows, 0, 0), None);
         assert_eq!(p.hit(cols, rows, l.col + l.w, l.row + 2), None);
+    }
+
+    #[test]
+    fn a_click_on_the_words_never_reaches_the_list_behind_them() {
+        // The worst of the panel findings: the hit test did not know the list was
+        // hidden, and on a scrolled list the cursor's own line is exactly where the
+        // words are drawn — so clicking a line of TEXT started playing music.
+        let mut p = TidalPanel::new(crate::player::Snapshot::default());
+        p.rows = (0..60).map(|i| TidalRow::Track(a_track(&format!("t{i}")))).collect();
+        p.cursor = 50;
+        let (cols, rows) = (120, 40);
+        let l = p.layout(cols, rows);
+        let cursor_line = l.row + 3 + (p.cursor - l.first);
+
+        assert_eq!(p.hit(cols, rows, l.col + l.side + 4, cursor_line), Some(TidalHit::Row(50)));
+        p.show_lyrics = true;
+        assert_eq!(
+            p.hit(cols, rows, l.col + l.side + 4, cursor_line),
+            Some(TidalHit::Chrome),
+            "with the words up there is no list under the pointer"
+        );
+        // The sources column still works: it is drawn either way.
+        assert_eq!(p.hit(cols, rows, l.col + 2, l.row + 2), Some(TidalHit::Source(0)));
     }
 
     #[test]

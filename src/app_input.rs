@@ -3686,6 +3686,8 @@ impl Gpu {
                             }
                         } else if p.focus == crate::overlay::PanelFocus::Sources {
                             p.focus = crate::overlay::PanelFocus::List;
+                            // Entering Search is asking to type in it.
+                            p.editing = p.source == crate::overlay::Source::Search;
                             load = Some(p.source);
                         } else if let Some(row) = p.selected().cloned() {
                             match row {
@@ -7277,7 +7279,15 @@ impl Gpu {
         if source == Source::Search {
             if let Some(Overlay::Tidal(p)) = &mut self.overlay {
                 p.rows.clear();
-                p.editing = true;
+                // NOT armed here. Passing over Search while walking the sources column
+                // used to steal the keyboard: the next `j` was typed into the query box
+                // instead of moving, with nothing on screen saying why. Typing is armed
+                // by asking for it — `/`, Enter, or a click.
+                //
+                // And the pending request is dropped, or an answer for the source we
+                // just left arrives and is drawn under the word "Search".
+                p.pending = None;
+                p.crumb_pending = None;
             }
             self.window.request_redraw();
             return;
@@ -7345,20 +7355,33 @@ impl Gpu {
         };
         if let Some(Overlay::Tidal(p)) = &mut self.overlay {
             p.show_lyrics = true;
-            // Already have them for this track: showing them again should not cost a
-            // request, and flicking the view should be instant.
-            if p.lyrics.is_some() && p.crumb.as_deref() == Some(track.title.as_str()) {
+            // Keyed on the TRACK, which is what they belong to. It used to compare the
+            // crumb — the opened album or playlist — against the track title, so the
+            // cache never hit, and on the one day those two strings matched it would
+            // have shown the previous track's words.
+            if p.lyrics.is_some() && p.lyrics_for == Some(track.id) {
                 return;
             }
+            // Not the ones we are about to fetch: showing the last track's words while
+            // the next track's arrive is the failure this whole key is for.
+            p.lyrics = None;
+            p.lyrics_for = None;
         }
-        let seq = self.tidal_request(None);
+        // Lyrics carry their own sequence. Sharing one slot with the lists meant asking
+        // for words cancelled a half-loaded album: the album's answer was dropped by the
+        // guard, the list never arrived, and its name stayed in the trail for ever.
+        self.tidal_seq += 1;
+        let seq = self.tidal_seq;
+        if let Some(Overlay::Tidal(p)) = &mut self.overlay {
+            p.pending_lyrics = Some(seq);
+        }
         let proxy = self.proxy.clone();
         let id = track.id;
         std::thread::spawn(move || {
             let answer = crate::tidal::Session::load()
                 .ok_or_else(|| "not signed in".to_string())
                 .and_then(|session| crate::tidal::lyrics(&session, id))
-                .map(TidalAnswer::Lyrics);
+                .map(|l| TidalAnswer::Lyrics(id, l));
             let _ = proxy.send_event(UserEvent::Tidal(seq, answer));
         });
     }
@@ -7369,9 +7392,10 @@ impl Gpu {
         if let Some(Overlay::Tidal(p)) = &mut self.overlay {
             p.pending = Some(self.tidal_seq);
             p.message = None;
-            if crumb.is_some() {
-                p.crumb = crumb;
-            }
+            // Held, not applied. The trail names the list you are LOOKING at; writing it
+            // when the request goes out left an album's name over the previous list
+            // whenever the load failed or was superseded.
+            p.crumb_pending = crumb;
         }
         self.tidal_seq
     }
@@ -7397,26 +7421,46 @@ impl Gpu {
     /// An answer came back.
     fn on_tidal_results(&mut self, seq: u64, answer: Result<TidalAnswer, String>) {
         let Some(Overlay::Tidal(p)) = &mut self.overlay else { return };
-        // Not the request we are waiting for: an older one that took longer.
-        if p.pending != Some(seq) {
-            return;
+        // Two slots, because words and lists are asked for independently and either can
+        // be superseded without touching the other.
+        let for_lyrics = p.pending_lyrics == Some(seq);
+        let for_list = p.pending == Some(seq);
+        if !for_lyrics && !for_list {
+            return; // an older request that took longer
         }
-        p.pending = None;
         match answer {
-            Ok(TidalAnswer::Lyrics(lyrics)) => {
+            Ok(TidalAnswer::Lyrics(track, lyrics)) if for_lyrics => {
+                p.pending_lyrics = None;
                 if lyrics.is_empty() {
                     p.message = Some("no words for this one".into());
                     p.show_lyrics = false;
                 }
+                p.lyrics_for = Some(track);
                 p.lyrics = Some(lyrics);
             }
-            Ok(TidalAnswer::Found(found)) => {
+            Ok(TidalAnswer::Found(found)) if for_list => {
+                p.pending = None;
                 p.rows = rows_of(&found);
                 p.settle_cursor();
                 p.show_lyrics = false;
+                // The trail is written now that there is something under it.
+                p.crumb = p.crumb_pending.take();
                 p.message = found.is_empty().then(|| "nothing found".to_string());
             }
-            Err(e) => p.message = Some(e),
+            Err(e) => {
+                if for_lyrics {
+                    p.pending_lyrics = None;
+                    p.show_lyrics = false;
+                } else {
+                    p.pending = None;
+                    // The list did not change, so neither does the name over it.
+                    p.crumb_pending = None;
+                }
+                p.message = Some(e);
+            }
+            // An answer of the wrong kind for the slot it matched. Cannot happen today;
+            // dropping it is better than drawing lyrics as a list.
+            _ => {}
         }
         self.window.request_redraw();
     }
@@ -7434,12 +7478,27 @@ impl Gpu {
         let Some(jukebox) = self.jukebox.as_ref() else { return };
         let snapshot = jukebox.snapshot();
         if let Some(Overlay::Tidal(p)) = &mut self.overlay {
-            let queue_changed = p.snapshot.queue.len() != snapshot.queue.len();
+            // On the GENERATION, not on the length. Two different lists of the same
+            // size — two artists' top tracks, or another window driving the same
+            // daemon — left the rows stale, and Enter on a stale row then replayed a
+            // queue that no longer existed.
+            let moved = p.snapshot.generation != snapshot.generation;
+            let playing = snapshot.now_playing().map(|t| t.id);
+            let was_playing = p.snapshot.now_playing().map(|t| t.id);
             p.snapshot = snapshot;
-            // The queue view is a view OF the queue, so it is rebuilt rather than left
-            // to drift: enqueueing something while looking at it should show it.
-            if p.source == overlay::Source::Queue && queue_changed {
+            if p.source == overlay::Source::Queue && moved {
                 p.reload_queue();
+            }
+            // Words belong to a song. When the song changes they are not "old lyrics",
+            // they are the wrong ones — and the view would go on highlighting a line by
+            // the new track's position.
+            if playing != was_playing {
+                p.lyrics = None;
+                p.lyrics_for = None;
+                if p.show_lyrics {
+                    p.message = Some("track changed — press L for the new words".into());
+                    p.show_lyrics = false;
+                }
             }
         }
         self.window.request_redraw();

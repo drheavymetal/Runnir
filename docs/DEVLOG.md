@@ -3694,6 +3694,54 @@ Nothing contends for it — the decoder is the only reader and it holds `&mut se
 
 Verified afterwards on the real DAC: 24 bit / 192 kHz, `hw:2,0`, BIT-PERFECT.
 
+## 2026-08-01 - Audit round two: the panel
+
+A fourth reviewer over the panel and its input — the part nobody had looked at. Seven
+findings, all real, all fixed.
+
+**A click on the lyrics started playing music.** The hit test did not know the list was
+hidden, so a click on a line of words fell through to the row underneath. And on a
+scrolled list the cursor's own line is always the second from the bottom of the window,
+which is exactly where a lyric gets drawn — so clicking that line sent `Cmd::Play` with
+whatever list happened to be browsed. With the words up there is now nothing under the
+pointer but the panel.
+
+**Walking the sources column stole the keyboard.** Passing over Search armed the query
+box, so the next `j` was typed instead of moving and `q` no longer closed the panel,
+with nothing on screen explaining why. Typing is armed by asking for it — `/`, Enter, or
+a click — not by scrolling past.
+
+**Switching to Search left the previous request live**, so a favourites list could
+arrive and be drawn under the word "Search", with an empty query box above it.
+
+**The lyrics cache compared the crumb to the track title.** The crumb holds the album or
+playlist that was opened, so the cache never hit — and on the day a playlist name
+matched a track title, it would have shown the previous song's words. Keyed on the track
+id now, which is what words belong to.
+
+**Words outlived their song.** Nothing cleared them when the player advanced, so the
+panel kept drawing one track's lyrics while highlighting a line by the NEXT track's
+position: confidently wrong words, presented as synced.
+
+**The trail was written when a list was ASKED for, not when it arrived.** An album that
+failed to load left its name over the previous, unrelated list. And lyrics shared the
+one pending slot with the lists, so asking for words mid-load cancelled the album: its
+answer was dropped by the guard, the list never came, and the crumb named it for ever.
+Two slots now, and the crumb is applied on arrival.
+
+**The queue view checked the queue's LENGTH.** Two different lists of the same size —
+two artists' top tracks, or another window driving the same daemon — left the rows
+stale, and Enter on a stale row replayed a queue that no longer existed. It compares the
+generation, which exists for exactly this.
+
+Worth noting what the reviewer looked for and did not find, since it says where the
+earlier care paid off: no byte-vs-char slicing anywhere in the panel (the truncation is
+char-based, the grid writer is char-based and width-aware), no usize underflow in the
+layout arithmetic, no cursor that can index out of bounds, and the scroll offset really
+is shared between drawing and hit-testing rather than computed twice.
+
+585 tests.
+
 ## Gotchas (do not re-learn)
 
 - `runnir.json` WINS over `runnir.toml`. `Config::try_load` reads the JSON the settings
@@ -3734,6 +3782,11 @@ Verified afterwards on the real DAC: 24 bit / 192 kHz, `hw:2,0`, BIT-PERFECT.
 - ALSA frees a card a moment AFTER the process holding it dies. An exclusive open
   attempted immediately after another process let go gets `EBUSY` and, in a fallback
   chain, silently ends up somewhere else. Wait the card out before deciding it refused.
+- A hit test must know which VIEW is drawn, not just where the panel is. An overlay
+  drawn over a list makes every row underneath unreachable, and a hit test that does not
+  know it will action the row a click never saw.
+- Two kinds of request sharing one "pending" slot cancel each other. The second kind
+  needs its own, or asking for one thing silently abandons the other.
 - In a hit-test, "inside the panel but on nothing" and "outside the panel" must be
   DIFFERENT answers. Collapsing them makes clicking empty space dismiss the panel.
 - ALSA's `HintIter` does NOT list `hw:` devices — only aliases (`default`,
