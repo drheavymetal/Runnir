@@ -275,6 +275,61 @@ pub fn finish_pkce(creds: &Creds, pkce: &Pkce, code: &str) -> Result<Session, St
     Ok(session)
 }
 
+/// A session lifted from somewhere that is already signed in — the TIDAL web player's
+/// own storage, most usefully.
+///
+/// This exists because the sign-in flows are gated by what a client id is REGISTERED
+/// for, and a web player id is registered for neither the device flow (`sub_status
+/// 1002`) nor an app's redirect URI (`error 11102`). A refresh token has no such gate:
+/// it is the grant itself. Whoever is already signed in somewhere can hand that over
+/// and skip the dance entirely.
+pub struct Imported {
+    pub client_id: Option<String>,
+    pub refresh_token: String,
+}
+
+/// Finds a client id and a refresh token in pasted text, whatever shape it came in.
+///
+/// People paste a JSON blob out of devtools, or a form body, or a curl command they
+/// copied. Rather than demand one of those, this looks for the field names in any of
+/// them — the alternative is an error message about formatting for someone who is
+/// holding the right data.
+pub fn parse_import(text: &str) -> Option<Imported> {
+    let refresh_token = find_field(text, &["refresh_token", "refreshToken"])?;
+    Some(Imported { client_id: find_field(text, &["client_id", "clientId"]), refresh_token })
+}
+
+/// Looks for `"name": "value"`, `name=value` or `name": value` — the three ways these
+/// fields appear in the wild.
+fn find_field(text: &str, names: &[&str]) -> Option<String> {
+    for name in names {
+        for pattern in [format!("\"{name}\""), format!("{name}=")] {
+            let Some(at) = text.find(&pattern) else { continue };
+            let rest = &text[at + pattern.len()..];
+            let value: String = rest
+                .trim_start_matches([':', '=', ' ', '"', '\''])
+                .chars()
+                .take_while(|c| !matches!(c, '"' | '\'' | ',' | '&' | '}' | '\n' | ' '))
+                .collect();
+            if !value.is_empty() {
+                return Some(value);
+            }
+        }
+    }
+    None
+}
+
+/// Turns an imported refresh token into a working session.
+pub fn adopt(creds: &Creds, imported: &Imported) -> Result<Session, String> {
+    let stub = Session {
+        refresh_token: imported.refresh_token.clone(),
+        ..Default::default()
+    };
+    let mut session = refresh(creds, &stub)?;
+    fill_session_details(&mut session)?;
+    Ok(session)
+}
+
 /// Pulls the `code` parameter out of whatever the browser ended up showing. Accepts the
 /// whole pasted URL or a bare code, because both are what people actually paste.
 pub fn code_from_redirect(pasted: &str) -> Option<String> {
@@ -1044,6 +1099,29 @@ mod tests {
         // race a request against the expiry.
         s.expires_at = now() + REFRESH_MARGIN - 1;
         assert!(s.expired());
+    }
+
+    #[test]
+    fn a_pasted_session_is_read_out_of_any_of_the_shapes_people_paste() {
+        // Straight out of devtools.
+        let json = r#"{"clientId":"abc123","refreshToken":"eyJhbG.rest","userId":42}"#;
+        let got = parse_import(json).unwrap();
+        assert_eq!(got.client_id.as_deref(), Some("abc123"));
+        assert_eq!(got.refresh_token, "eyJhbG.rest");
+
+        // A form body, snake case.
+        let form = "grant_type=refresh_token&refresh_token=tok-1&client_id=cid-1";
+        let got = parse_import(form).unwrap();
+        assert_eq!(got.refresh_token, "tok-1");
+        assert_eq!(got.client_id.as_deref(), Some("cid-1"));
+
+        // The client id is optional; the refresh token is the thing that grants.
+        let only_token = r#"{"refresh_token": "just-this"}"#;
+        assert_eq!(parse_import(only_token).unwrap().refresh_token, "just-this");
+        assert!(parse_import(only_token).unwrap().client_id.is_none());
+
+        // Nothing usable in it at all.
+        assert!(parse_import("{\"access_token\":\"short-lived\"}").is_none());
     }
 
     #[test]

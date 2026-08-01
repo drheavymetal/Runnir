@@ -187,6 +187,12 @@ fn main() {
         // to approve and waits. Separate from the terminal for the same reason
         // `--zsa-paint` is: it is the half that needs a human and a service to both be
         // there, and it must be checkable without a window in the way.
+        // `runnir --tidal-login --import` reads a session out of pasted text on stdin.
+        // The flows above are gated by what the client id is registered FOR; a refresh
+        // token is not, so this is the way in when both of them are refused.
+        Some("--tidal-login") if args.get(2).map(String::as_str) == Some("--import") => {
+            return tidal_import();
+        }
         Some("--tidal-login") => return tidal_login(args.get(2).map(String::as_str)),
         // `runnir --tidal-play <track-id|search words>` — fetch, decode and play one
         // track, then report the signal path it came out on. This is how the audio
@@ -522,6 +528,47 @@ fn tidal_login(pasted: Option<&str>) {
         }
     }
     eprintln!("runnir: the code expired before it was approved");
+}
+
+/// Adopts a session pasted on stdin.
+fn tidal_import() {
+    let (cfg, mut creds) = match tidal_creds() {
+        Ok(v) => v,
+        Err(e) => return eprintln!("runnir: {e}"),
+    };
+    let mut text = String::new();
+    if let Err(e) = std::io::Read::read_to_string(&mut std::io::stdin(), &mut text) {
+        return eprintln!("runnir: could not read stdin: {e}");
+    }
+    let Some(imported) = tidal::parse_import(&text) else {
+        return eprintln!(
+            "runnir: no refresh_token in that text.\n  \
+             Paste the session from a signed-in TIDAL web player — it must contain a\n  \
+             refresh_token, and ideally the client_id it was issued to."
+        );
+    };
+    // A refresh token belongs to the client id it was issued to. Using the configured
+    // one instead would be refused, so the pasted id wins when there is one.
+    if let Some(id) = imported.client_id.clone() {
+        if id != creds.client_id {
+            println!("  using the client id from the pasted session ({id})");
+            creds.client_id = id;
+        }
+    }
+    let _ = cfg;
+    match tidal::adopt(&creds, &imported) {
+        Ok(session) => {
+            if let Err(e) = session.save() {
+                return eprintln!("runnir: signed in but could not save the session: {e}");
+            }
+            println!("  Signed in ({}).", session.country_code);
+            if imported.client_id.as_deref() != Some(creds.client_id.as_str()) {
+                return;
+            }
+            println!("  Put that client_id in [tidal] so refreshes keep working.");
+        }
+        Err(e) => eprintln!("runnir: that session was refused: {e}"),
+    }
 }
 
 /// Prints the browser half of a PKCE sign-in and remembers the verifier for the second
