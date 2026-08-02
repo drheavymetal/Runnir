@@ -22,6 +22,7 @@ mod layout;
 mod media;
 mod mouse;
 mod mpris;
+mod optical;
 mod overlay;
 mod pane;
 mod platform;

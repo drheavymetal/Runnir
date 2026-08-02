@@ -3956,6 +3956,67 @@ this worse than the problem.
 
 590 tests.
 
+## 2026-08-02 - Optical transfer, step 1: the wire format, ported and cross-checked
+
+Branch `feat/optical-transfer`. A file leaves runnir as animated QR codes and arrives on a
+phone through its camera — no network, no pairing, no account, no app. runnir is the
+sender; the receiver is a page on runnir's own website, so anyone with a phone and a
+browser can receive from a runnir they are standing in front of.
+
+The format is `decimen-optical-transfer` (MIT). This step is `src/optical.rs`: the whole
+wire format in Rust, and nothing drawn yet on purpose.
+
+**Why a fountain code, and why there is no last frame.** The channel is one-way — the
+screen cannot hear the camera — so a normal protocol has nothing to retransmit with.
+Instead the sender emits an endless stream where frame `seq` is the XOR of a pseudorandom
+subset of the file's blocks, and the receiver rebuilds the file from ANY ~k·1.15 distinct
+frames, in any order. Dropped frames cost time, never correctness. This is also why
+"send a final checksum frame" is the wrong instinct: there is no end, and such a frame
+would be the single one whose loss breaks everything. The checksum is in EVERY frame
+instead (`payload_fnv`), and the file's SHA-256 rides inside the container.
+
+**This module IS the wire format, and that is the whole risk.** Sender and receiver derive
+each frame's block subset independently and never compare notes. A disagreement does not
+fail loudly — it shifts a CDF boundary, flips a sampled degree, and corrupts the transfer
+silently, surfacing only as a bad checksum after the whole thing has run. Consequences:
+
+- `dlog()` is a hand-rolled natural log using only exactly specified IEEE-754 operations.
+  `f64::ln` is implementation-approximated, as is JavaScript's `Math.log`; one ulp is
+  enough to desync a laptop sender from a phone receiver. **Never "simplify" it into
+  `ln`** — there is a test whose only job is to fail if someone does.
+- The arithmetic ORDER in `soliton_cdf` is load-bearing. Floating-point addition is not
+  associative, so regrouping any expression there changes a last bit and, eventually, a
+  frame the two ends disagree about.
+- `frame_indices` consumes a PRNG draw even when it collides, because the JavaScript
+  `Set.add` does; skipping it would shift the entire stream.
+
+**Two levels of proof, because the first is not enough.** The golden vectors recorded from
+the JavaScript implementation (the exhaustive `dlog` sweep hashing to `0x27b0f3cc`, the
+CDF fingerprints, the frame subsets, the encoded-stream hashes) only prove we have not
+drifted from what was transcribed. The claim that matters — a runnir sender is decodable
+by the receiver on the website — needs the actual receiver. So `tools/optical-cross-check.mjs`
+feeds real Rust-produced frames to decimen's own JavaScript decoder, back to front, with a
+third of them dropped. Three shapes pass: one block, a gzipped multi-block text file, and
+208 blocks of incompressible bytes.
+
+    RUNNIR_OPTICAL_VECTORS=/tmp/v.json cargo test -- --ignored emit_cross_check_vectors
+    node --import tsx tools/optical-cross-check.mjs /tmp/v.json    # from a decimen checkout
+
+**The verification code.** Pedro asked for a "CVC" the receiver computes after the transfer
+so a human does not have to check anything. The automatic half already existed: the
+SHA-256 of the original bytes travels in the container and the receiver verifies it in
+full before offering the file. What was missing was something a person can read, since 64
+hex characters are not comparable by eye — so `verification_code()` projects that hash to
+six digits, shown beside the QR from the first frame (the sender has the hash at pack
+time) and on the phone when it finishes. It adds nothing to the wire and no security: it
+is derived from a hash that already travels, which is exactly what keeps runnir compatible
+with receivers that have never heard of it. The full SHA-256 remains the real check.
+
+**Licensing.** decimen is MIT and runnir is GPL-3.0-only. MIT flows into GPL, so this is
+fine; the MIT attribution travels in the module header and must stay there.
+
+617 tests, no warnings. Nothing is drawn yet — the QR encoder and the panel are step 2.
+
 ## Gotchas (do not re-learn)
 
 - `runnir.json` WINS over `runnir.toml`. `Config::try_load` reads the JSON the settings
@@ -4199,3 +4260,11 @@ this worse than the problem.
 - Panics on the PTY reader thread poison the grid mutex → whole-app crash. Keep parser paths panic-free.
 - Every new Action → add to id/title/parse/palette_list/bindings/hints. Update run_action AND run_palette_action.
 - After any feature: document it in this file, in docs.rs (F1 help), commit+push.
+- `src/optical.rs` is a WIRE FORMAT, not a utility module. `dlog()` must never become
+  `f64::ln`, and the arithmetic order in `soliton_cdf` must not be regrouped: either
+  change desyncs runnir from every decimen receiver in the world, silently. Its golden
+  vectors are recorded from the JavaScript side — a failure there means the format
+  changed, which needs a header version bump, not a re-recorded constant.
+- A fountain stream has NO last frame. Sizing a test to "1.6x frames, then drop a third"
+  starves the decoder to 1.07x and reads as a correctness failure; it needs ~1.15x
+  ARRIVING. Size the emitted count for what survives the drop, not for what is sent.
