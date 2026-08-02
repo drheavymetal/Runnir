@@ -22,24 +22,45 @@ if (!file || !width || !height) {
 }
 
 const raw = readFileSync(file);
+// A wide window shows a MOSAIC — several codes, each a different frame of the
+// same stream. Read them all: the point of the mosaic is that ONE capture
+// carries several frames, so a harness that stops at the first proves nothing
+// about the second.
 const results = await readBarcodes(
   { data: new Uint8ClampedArray(raw), width: +width, height: +height },
-  { formats: ["QRCode"], maxNumberOfSymbols: 1 },
+  { formats: ["QRCode"], maxNumberOfSymbols: 16 },
 );
-const hit = results.find((r) => r.isValid && r.bytes.length > 0);
-if (!hit) {
+const hits = results.filter((r) => r.isValid && r.bytes.length > 0);
+if (hits.length === 0) {
   console.log("FAILED — no code found in the rendered window");
   process.exit(1);
 }
 
-const parsed = parseFrame(new Uint8Array(hit.bytes));
-if (!parsed) {
-  console.log("FAILED — a code was read, but it is not a runnir frame");
+const frames = [];
+for (const hit of hits) {
+  const parsed = parseFrame(new Uint8Array(hit.bytes));
+  if (!parsed) {
+    console.log("FAILED — a code was read, but it is not a runnir frame");
+    process.exit(1);
+  }
+  frames.push(parsed.header);
+}
+
+// Every tile must carry a DIFFERENT frame. Two tiles showing the same sequence
+// number would look identical on screen and double nothing.
+const seqs = new Set(frames.map((h) => h.seq));
+if (seqs.size !== frames.length) {
+  console.log(`FAILED — ${frames.length} codes but only ${seqs.size} distinct sequence numbers`);
+  process.exit(1);
+}
+const sessions = new Set(frames.map((h) => h.sessionId));
+if (sessions.size !== 1) {
+  console.log("FAILED — the codes on screen are not from the same stream");
   process.exit(1);
 }
 
-const h = parsed.header;
+const h = frames[0];
 console.log(
-  `PASS — read a real frame off the rendered window: ` +
-    `seq=${h.seq} k=${h.k} blockLen=${h.blockLen} session=${h.sessionId}`,
+  `PASS — read ${frames.length} real frame(s) off the rendered window: ` +
+    `seq=${frames.map((f) => f.seq).join(",")} k=${h.k} blockLen=${h.blockLen} session=${h.sessionId}`,
 );

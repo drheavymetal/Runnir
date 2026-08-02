@@ -4659,7 +4659,7 @@ impl Gpu {
             }
             PromptKind::OpticalTransfer => {
                 if !value.is_empty() {
-                    self.start_optical_transfer(&value);
+                    self.start_optical_transfer(&value, config);
                 }
             }
             PromptKind::ImageWatchDir => {
@@ -7002,7 +7002,20 @@ impl Gpu {
     /// A failure opens the panel too, carrying its reason: "6.2 MB needs at least
     /// 116 bytes per frame" is worth reading, and a toast is gone before you have
     /// finished reading it.
-    pub fn start_optical_transfer(&mut self, raw: &str) {
+    pub fn start_optical_transfer(&mut self, raw: &str, config: &Config) {
+        self.start_optical_transfer_with(raw, config, None, None, None);
+    }
+
+    /// The same, with per-stream overrides for the two numbers whose right value
+    /// depends on the camera in front of the screen rather than on the machine.
+    pub fn start_optical_transfer_with(
+        &mut self,
+        raw: &str,
+        config: &Config,
+        fps: Option<u32>,
+        tiles: Option<usize>,
+        bytes_per_code: Option<usize>,
+    ) {
         let path = self.resolve_transfer_path(raw);
         let label = path.display().to_string();
         let started = std::fs::read(&path)
@@ -7016,8 +7029,9 @@ impl Gpu {
                     &name,
                     crate::transfer::media_type_for(&path),
                     &bytes,
-                    crate::transfer::DEFAULT_FRAME_BYTES,
-                    crate::transfer::DEFAULT_FPS,
+                    bytes_per_code.unwrap_or(crate::transfer::DEFAULT_FRAME_BYTES),
+                    fps.unwrap_or(config.transfer.fps),
+                    tiles.unwrap_or(config.transfer.tiles),
                 )
             });
         let cell = self.renderer.cell_size();
@@ -7768,8 +7782,8 @@ impl Gpu {
                 self.window.request_redraw();
                 ControlResponse::ok(self.ui_state())
             }
-            ControlRequest::Transfer { path } => {
-                self.start_optical_transfer(&path);
+            ControlRequest::Transfer { path, fps, tiles, bytes } => {
+                self.start_optical_transfer_with(&path, config, fps, tiles, bytes);
                 // The panel carries its own failure, so the response is ok either
                 // way; `ui_state` says which overlay is actually up.
                 ControlResponse::ok(self.ui_state())

@@ -15,6 +15,7 @@ import { isSnippet, snippetText } from '../receive/vendor/snippet.ts'
 import { estimateTransferProgress, expectedFountainOverhead, formatDuration } from '../receive/vendor/progress.ts'
 import { NoSignalHintTimer } from '../receive/vendor/no-signal.ts'
 import { DecodeWorkerPool } from '../receive/vendor/worker-pool.ts'
+import { mosaicWorker, symbolsToRequest } from '../receive/mosaic.ts'
 import { useLang } from '../i18n.jsx'
 
 // Diez segundos de cámara sin un solo frame decodificado: el emisor casi seguro
@@ -114,6 +115,10 @@ export default function ReceivePage() {
   const state = useRef({
     stream: null,
     pool: null,
+    // Cuántos códigos ha traído la mejor captura hasta ahora: 1 hasta que se vea
+    // un mosaico de verdad. Es un objeto para que el worker envuelto y el bucle
+    // de captura miren el mismo valor sin re-crear el pool.
+    symbolsSeen: { current: 1 },
     decoder: null,
     streamKey: '',
     startTs: 0,
@@ -216,7 +221,11 @@ export default function ReceivePage() {
     const ctx = grab.getContext('2d', { willReadFrequently: true })
     ctx.drawImage(video, 0, 0)
     const img = ctx.getImageData(0, 0, vw, vh)
-    s.pool.submit({ id: s.frameId++, buf: img.data.buffer, w: vw, h: vh }, [img.data.buffer])
+    // Buscar más de un símbolo cuesta tiempo real, y ese tiempo ES la velocidad
+    // de la transferencia. Se pide uno salvo que ya se haya visto un mosaico, y
+    // una captura de cada doce mira más ancho por si lo hay.
+    const max = symbolsToRequest(s.symbolsSeen.current, s.frameId)
+    s.pool.submit({ id: s.frameId++, buf: img.data.buffer, w: vw, h: vh, max }, [img.data.buffer])
   }, [])
 
   const scheduleFrame = useCallback((gen) => {
@@ -280,7 +289,13 @@ export default function ReceivePage() {
       return
     }
     setPhase('starting')
-    const base = { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 960 } }
+    // Resolución: la palanca más grande del receptor. Un símbolo V40 son 185
+    // módulos con zona tranquila, así que a 960 px de alto y con el código
+    // ocupando media pantalla salen ~2,5 px por módulo — justo donde zxing
+    // empieza a fallar, y un fallo aquí es una captura entera tirada. Pedir
+    // 1920x1440 dobla los píxeles por módulo con el mismo encuadre. `ideal`
+    // degrada solo en la cámara que no llegue.
+    const base = { facingMode: 'environment', width: { ideal: 1920 }, height: { ideal: 1440 } }
     try {
       try {
         // iOS trata `ideal` como una sugerencia y entrega 30. Pedir `exact`
@@ -299,13 +314,30 @@ export default function ReceivePage() {
     const video = videoRef.current
     video.srcObject = s.stream
     await video.play().catch(() => undefined)
+    // Enfoque continuo cuando el navegador lo deje: el motivo número uno de una
+    // captura ilegible es el autofocus buscando por el temblor de la mano, y a
+    // 30 capturas por segundo cada rebusca se lleva decenas de frames.
+    try {
+      const track = s.stream.getVideoTracks()[0]
+      if (track?.getCapabilities?.().focusMode?.includes('continuous')) {
+        await track.applyConstraints({ advanced: [{ focusMode: 'continuous' }] })
+      }
+    } catch {
+      // No en todos los navegadores, y una restricción rechazada no es motivo
+      // para no recibir.
+    }
     const settings = s.stream.getVideoTracks()[0]?.getSettings()
     setCamera(`${settings?.width}×${settings?.height} @ ${Math.round(settings?.frameRate ?? 0)} fps · ${DEFAULT_WORKERS} ${t(T.workers)}`)
     setStatus(t(T.searching))
 
     if (!s.pool) {
       s.pool = new DecodeWorkerPool(
-        () => new Worker(new URL('../receive/worker.ts', import.meta.url), { type: 'module' }),
+        () =>
+          mosaicWorker(
+            () => new Worker(new URL('../receive/worker.ts', import.meta.url), { type: 'module' }),
+            onDecoded,
+            s.symbolsSeen,
+          ),
         onDecoded,
       )
     }
@@ -346,19 +378,29 @@ export default function ReceivePage() {
 
       {phase === 'live' && progress && (
         <div className="receive-progress">
+          {/* Los dos números que se miran mientras sostienes el móvil, y por eso
+              van primero y grandes: cuánto queda, y si mover el móvil mejora la
+              velocidad. Enterrados en una línea de detalle no se leen a un
+              brazo de distancia. */}
+          <div className="receive-headline">
+            <span className="receive-pct">
+              {progress.percent < 10 ? progress.percent.toFixed(1) : progress.percent.toFixed(0)}
+              <span className="receive-unit">%</span>
+            </span>
+            <span className="receive-rate">
+              {progress.frames >= 4 ? progress.goodput.toFixed(1) : '—'}
+              <span className="receive-unit">KB/s</span>
+            </span>
+          </div>
           <div className="receive-bar"><span style={{ width: `${progress.percent.toFixed(1)}%` }} /></div>
           <div className="receive-progress-row">
-            <span>
-              {progress.percent < 10 ? progress.percent.toFixed(1) : progress.percent.toFixed(0)}% ·{' '}
-              {progress.solved}/{progress.k} {t(T.blocks)}
-            </span>
+            <span>{progress.solved}/{progress.k} {t(T.blocks)}</span>
             <span>
               {progress.eta === undefined
                 ? progress.phase === 'decoding'
                   ? `${progress.frames} ${t(T.frames)} · ${t(T.decoding)}`
                   : t(T.estimating)
                 : `${t(T.about)} ${formatDuration(progress.eta)} · ${progress.frames} ${t(T.frames)}`}
-              {progress.frames >= 4 && ` · ${progress.goodput.toFixed(1)} KB/s`}
             </span>
           </div>
           <p className="receive-metrics">

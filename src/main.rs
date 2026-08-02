@@ -565,8 +565,17 @@ fn tidal_scene(path_out: &str, state: &str) {
 /// a real file's size and block count get looked at.
 fn transfer_scene(path_out: &str, file: &str) {
     use crate::render::Rect;
-    const WIDTH: u32 = 1400;
-    const HEIGHT: u32 = 1000;
+    // Overridable because the MOSAIC only appears on a window wide enough to
+    // hold a second code at full size, and the scene is the only way to put the
+    // real wgpu pipeline — image quad, linear sampler, sRGB surface — in front
+    // of a decoder. `RUNNIR_DEMO_SIZE=2400x1000` is the wide case.
+    let (width, height) = std::env::var("RUNNIR_DEMO_SIZE")
+        .ok()
+        .and_then(|v| {
+            let (w, h) = v.split_once('x')?;
+            Some((w.trim().parse().ok()?, h.trim().parse().ok()?))
+        })
+        .unwrap_or((1400u32, 1000u32));
 
     let (label, started) = if file.is_empty() {
         // Big enough to take hundreds of blocks, and incompressible so the panel
@@ -586,6 +595,7 @@ fn transfer_scene(path_out: &str, file: &str) {
                 &invented,
                 transfer::DEFAULT_FRAME_BYTES,
                 transfer::DEFAULT_FPS,
+                transfer::DEFAULT_TILES,
             ),
         )
     } else {
@@ -601,15 +611,16 @@ fn transfer_scene(path_out: &str, file: &str) {
                     &bytes,
                     transfer::DEFAULT_FRAME_BYTES,
                     transfer::DEFAULT_FPS,
+                    transfer::DEFAULT_TILES,
                 )
             });
         (file.to_string(), started)
     };
 
-    render::offscreen_scene(path_out, WIDTH, HEIGHT, 16.0, |r| {
+    render::offscreen_scene(path_out, width, height, 16.0, |r| {
         let (cw, ch) = r.cell_size();
-        let cols = (WIDTH as f32 / cw) as usize;
-        let rows = (HEIGHT as f32 / ch) as usize;
+        let cols = (width as f32 / cw) as usize;
+        let rows = (height as f32 / ch) as usize;
         let mut panel = overlay::TransferPanel::new(label.clone(), (cw, ch), started);
         // The panel paints on its clock, and the scene has none: tick it once so
         // there is a frame to draw.
@@ -619,7 +630,7 @@ fn transfer_scene(path_out: &str, file: &str) {
         let pen = Pen { fg: Color::Rgb(0xd4, 0xd6, 0xd9), ..Pen::default() };
         let mut g = Grid::new(cols, rows);
         g.write_str(0, 0, "~/projects/runnir ❯ ", pen);
-        let panes = vec![(g, Rect { x: 0.0, y: 0.0, w: WIDTH as f32, h: HEIGHT as f32 }, None, true)];
+        let panes = vec![(g, Rect { x: 0.0, y: 0.0, w: width as f32, h: height as f32 }, None, true)];
 
         let panels = overlay.render(cols, rows, &config::Theme::default());
         let specs: Vec<(Grid, Rect)> = panels

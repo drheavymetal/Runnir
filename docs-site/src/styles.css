@@ -399,6 +399,17 @@ td .id { font-family: var(--mono); color: var(--fg-faint); font-size: 12px; }
 .receive-video { width: 100%; max-width: 640px; border-radius: 10px; background: #000; display: block; }
 .receive-camera { font-family: var(--mono); font-size: 12px; color: var(--fg-faint); margin: 8px 0 0; }
 .receive-progress { margin: 20px 0; max-width: 640px; }
+/* El porcentaje y la velocidad, a tamaño de leerse de reojo mientras apuntas
+   el móvil a la pantalla: tabular para que los dígitos no bailen al cambiar. */
+.receive-headline { display: flex; align-items: baseline; justify-content: space-between; gap: 16px; margin-bottom: 10px; }
+.receive-pct, .receive-rate { font-family: var(--mono); font-size: 40px; line-height: 1; font-variant-numeric: tabular-nums; }
+.receive-pct { color: var(--green); }
+.receive-rate { color: var(--fg); font-size: 30px; }
+.receive-unit { font-size: 15px; color: var(--fg-dim); margin-left: 4px; }
+@media (max-width: 480px) {
+  .receive-pct { font-size: 34px; }
+  .receive-rate { font-size: 24px; }
+}
 .receive-bar { height: 10px; border-radius: 5px; background: var(--bg-raise); border: 1px solid var(--border); overflow: hidden; }
 .receive-bar span { display: block; height: 100%; background: var(--green); transition: width .25s linear; }
 .receive-progress-row { display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; font-family: var(--mono); font-size: 13px; color: var(--fg-dim); margin-top: 8px; }

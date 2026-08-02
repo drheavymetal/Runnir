@@ -40,6 +40,9 @@ pub struct Config {
     /// subscription behind it.
     #[serde(default)]
     pub tidal: Tidal,
+    /// Sending a file out through the screen as QR codes.
+    #[serde(default)]
+    pub transfer: Transfer,
     /// Extra keybindings, merged over the built-in ones. `"ctrl+shift+t" = "new_tab"`.
     /// A `"leader+v"` key binds on the leader layer instead of as a plain chord.
     pub keys: HashMap<String, String>,
@@ -101,6 +104,7 @@ impl Default for Config {
             behaviour: Behaviour::default(),
             clipboard: ClipboardCfg::default(),
             tidal: Tidal::default(),
+            transfer: Transfer::default(),
             ai: Ai::default(),
             watch: Watch::default(),
             media: Media::default(),
@@ -470,6 +474,36 @@ impl Default for Explorer {
             show_hidden: false,
             open_on_start: false,
         }
+    }
+}
+
+// ---- optical transfer -----------------------------------------------------
+
+/// Sending a file out through the screen as QR codes (leader q).
+///
+/// Both settings trade against the same thing — whether the camera can read what
+/// is on the glass — and neither has a right answer that does not depend on the
+/// screen, the phone and the light in the room. They are here so the answer can
+/// be measured rather than argued about.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Transfer {
+    /// Codes per second. The ceiling is the CAMERA, not the screen: a phone
+    /// captures 30 or 60 frames a second and the two clocks are not locked, so
+    /// past about half the capture rate most frames are caught mid-change and
+    /// decode as nothing. Raising this past that point sends more and delivers
+    /// less.
+    pub fps: u32,
+    /// How many codes to show at once, or 0 to fit as many as the window takes
+    /// without shrinking the modules. A number above what fits at full size
+    /// trades sharpness for count — worth trying up close with a good camera,
+    /// and a loss at arm's length.
+    pub tiles: usize,
+}
+
+impl Default for Transfer {
+    fn default() -> Self {
+        Self { fps: crate::transfer::DEFAULT_FPS, tiles: crate::transfer::DEFAULT_TILES }
     }
 }
 

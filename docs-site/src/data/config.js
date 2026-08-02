@@ -7,6 +7,13 @@
 // d (description) is an { es, en } pair.
 export const CONFIG_GROUPS = [
   {
+    group: '[transfer]',
+    rows: [
+      { k: 'fps', v: '30', d: { es: 'Códigos por segundo. El techo lo pone la CÁMARA, no la pantalla: un móvil captura 30 o 60 frames por segundo y los dos relojes no están sincronizados, así que por encima de la mitad de esa tasa la mayoría de capturas pillan un código a medio cambiar y no decodifican nada. Subirlo más allá emite más y entrega menos.', en: 'Codes per second. The ceiling is the CAMERA, not the screen: a phone captures 30 or 60 frames a second and the two clocks are not locked, so past about half that rate most captures catch a code mid-change and decode as nothing. Raising it further sends more and delivers less.' } },
+      { k: 'tiles', v: '0', d: { es: 'Cuántos códigos a la vez, o 0 para poner los que quepan sin encoger los módulos. En una ventana 16:9 eso son dos, gratis: el código se dimensiona por el lado corto, así que el segundo ocupa espacio que era margen blanco. Un número mayor del que cabe cambia nitidez por cantidad — vale la pena de cerca y con buena cámara, y se pierde a distancia de brazo. El modo automático además se limita solo a lo que la máquina puede pintar a tiempo: un código cuesta unos 8 ms, casi todo el encode del QR.', en: 'How many codes at once, or 0 to fit as many as the window takes without shrinking the modules. On a 16:9 window that is two, for free: a code is sized by the short axis, so the second one sits in what was white margin. A number larger than what fits trades sharpness for count — worth it up close with a good camera, a loss at arm\u2019s length. The automatic answer also holds itself to what the machine can paint in time: a code costs about 8 ms, nearly all of it the QR encode.' } },
+    ],
+  },
+  {
     group: '[tidal]',
     rows: [
       { k: 'client_id', v: '""', d: { es: 'Credencial de TIDAL. Sin client_id y client_secret el panel no existe. Nunca van compiladas en el binario: el repositorio es público.', en: 'TIDAL credential. Without client_id and client_secret the panel does not exist. Never compiled into the binary: this repository is public.' } },

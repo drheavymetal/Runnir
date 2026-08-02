@@ -111,7 +111,26 @@ pub enum ControlRequest {
     /// A verb of its own rather than `action --id optical_transfer`, because that
     /// one can only open the prompt: an action carries no argument, and the whole
     /// point of driving this from outside is naming the file.
-    Transfer { path: String },
+    Transfer {
+        path: String,
+        /// Codes per second, overriding `[transfer] fps` for this stream only.
+        /// Here because the right number depends on the camera pointed at it,
+        /// and comparing two numbers should not mean editing a config file and
+        /// starting over.
+        #[serde(default)]
+        fps: Option<u32>,
+        /// Codes on screen at once, overriding `[transfer] tiles`. Same reason:
+        /// whether a mosaic pays is a question about a phone and a screen, and
+        /// it is answered by trying both.
+        #[serde(default)]
+        tiles: Option<usize>,
+        /// Payload bytes per code, which chooses the QR VERSION and therefore how
+        /// big a module is on screen. The default is the densest symbol that
+        /// exists; a smaller one carries less per code and is far easier to read,
+        /// and which of those wins is a property of the room, not of the format.
+        #[serde(default)]
+        bytes: Option<usize>,
+    },
     /// Turn the wheel at a cell. `lines` is signed the way a wheel is: positive is
     /// up, away from the user. The pointer goes to the cell first, because every
     /// wheel target here is chosen by what is UNDER the pointer.
@@ -238,6 +257,9 @@ pub fn parse_client_args(cmd: &str, flags: &[String]) -> Result<ControlRequest, 
                 .or_else(|| m.get("file"))
                 .ok_or("transfer needs --path (e.g. --path ~/notes.md)")?
                 .clone(),
+            fps: opt_u32(&m, "fps")?,
+            tiles: opt_usize(&m, "tiles")?,
+            bytes: opt_usize(&m, "bytes")?,
         },
         "action" => ControlRequest::Action {
             id: m.get("id").ok_or("action needs --id (e.g. --id git_panel)")?.clone(),
@@ -283,6 +305,12 @@ fn opt_u64(m: &HashMap<String, String>, key: &str) -> Result<Option<u64>, String
 fn opt_usize(m: &HashMap<String, String>, key: &str) -> Result<Option<usize>, String> {
     m.get(key)
         .map(|v| v.parse::<usize>().map_err(|_| format!("--{key} wants a number, got {v:?}")))
+        .transpose()
+}
+
+fn opt_u32(m: &HashMap<String, String>, key: &str) -> Result<Option<u32>, String> {
+    m.get(key)
+        .map(|v| v.parse::<u32>().map_err(|_| format!("--{key} wants a number, got {v:?}")))
         .transpose()
 }
 

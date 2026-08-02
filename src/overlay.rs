@@ -4548,13 +4548,14 @@ impl TransferPanel {
     /// Advance the stream and paint the frame if its time has come. `true` when
     /// the window needs repainting.
     pub fn tick(&mut self, cols: usize, rows: usize, now: std::time::Instant) -> bool {
-        let (w, h) = qr_pixels(cols, rows, self.cell);
+        let cell = self.cell;
         let Some(t) = &mut self.transfer else { return false };
+        let area = qr_area(cols, rows, cell, t);
         // Paint whenever the frame moved OR nothing has been painted yet — the
         // first draw after opening has no picture and would show an empty square.
-        let advanced = t.advance(now);
+        let advanced = t.advance(now, &area.layout);
         if advanced || t.painted().is_none() {
-            t.raster(w, h);
+            t.raster(&area.layout, area.px.0, area.px.1);
             return true;
         }
         false
@@ -4572,7 +4573,12 @@ impl TransferPanel {
     }
 
     fn render(&self, cols: usize, rows: usize, theme: &Theme) -> Vec<Panel> {
-        let (qr_cols, qr_rows) = qr_cells(cols, rows, self.cell);
+        let area = self
+            .transfer
+            .as_ref()
+            .map(|t| qr_area(cols, rows, self.cell, t))
+            .unwrap_or_default();
+        let (qr_cols, qr_rows) = area.cells;
         let w = (qr_cols + 4).clamp(46, cols.saturating_sub(2).max(46));
         let h = (qr_rows + 5).min(rows.saturating_sub(2).max(8));
         let mut g = panel_grid(w, h, theme);
@@ -4627,8 +4633,20 @@ impl TransferPanel {
         // Passes rather than a percentage, because there is nothing to be a
         // percentage OF: the stream has no end, and a receiver that started late
         // still finishes. Under one pass means nobody can have it yet.
+        // The mosaic is named only when there is one: "1x1" would be noise on the
+        // one line a person reads while holding a phone up to the screen.
+        let (gx, gy) = t.grid();
+        let mosaic = if gx * gy > 1 {
+            // A painter that cannot keep up is worth saying out loud: past the
+            // frame interval a bigger mosaic delivers FEWER codes, and nothing
+            // else on screen would show it.
+            let behind = if t.painter_behind() { " (painter behind)" } else { "" };
+            format!(" \u{b7} {gx}x{gy} \u{d7}{}px{behind}", area.layout.scale)
+        } else {
+            String::new()
+        };
         let left = format!(
-            "{status} \u{b7} {} blocks \u{b7} V{} \u{b7} {} fps \u{b7} pass {pass:.0}s \u{b7} {:.1} sent in {}s",
+            "{status} \u{b7} {} blocks \u{b7} V{} \u{b7} {} fps{mosaic} \u{b7} pass {pass:.0}s \u{b7} {:.1} sent in {}s",
             t.blocks(),
             t.version,
             t.fps,
@@ -4654,31 +4672,65 @@ impl TransferPanel {
     }
 }
 
-/// The cells the code occupies: the largest square area that fits, measured in
-/// whole cells, since cells are the only unit the panel can place anything in.
+/// Where the codes go: the grid, the cells it occupies, and the pixels those
+/// cells measure.
 ///
 /// Shared by `tick` and `render` rather than stored, so the pixels that get
 /// painted and the cells they are placed in can never disagree — and they must
 /// not. The renderer stretches a texture to fill its quad, so a texture that is
 /// not exactly the quad's size gets resampled, which blurs precisely the module
 /// edges a decoder measures.
-fn qr_cells(cols: usize, rows: usize, cell: (f32, f32)) -> (usize, usize) {
-    let (cw, ch) = (cell.0.max(1.0), cell.1.max(1.0));
-    let side = (cols.saturating_sub(6) as f32 * cw).min(rows.saturating_sub(6) as f32 * ch).max(64.0);
-    // Floor, not ceil: a cell more than the square needs would push the panel past
-    // the window on the tight axis.
-    (((side / cw).floor() as usize).max(1), ((side / ch).floor() as usize).max(1))
+#[derive(Clone, Copy)]
+struct QrArea {
+    cells: (usize, usize),
+    px: (u32, u32),
+    layout: crate::transfer::Layout,
 }
 
-/// The same area in pixels — exactly what the renderer's quad will measure.
-fn qr_pixels(cols: usize, rows: usize, cell: (f32, f32)) -> (u32, u32) {
-    let (qc, qr) = qr_cells(cols, rows, cell);
-    ((qc as f32 * cell.0).round() as u32, (qr as f32 * cell.1).round() as u32)
+impl Default for QrArea {
+    fn default() -> Self {
+        Self { cells: (1, 1), px: (64, 64), layout: crate::transfer::Layout::default() }
+    }
+}
+
+/// Fit the mosaic to the window.
+///
+/// Two passes, and the second one is not optional. The first asks what fits in
+/// the space available; the answer is in pixels, and the panel can only place
+/// things in whole cells, so rounding to cells can land just under what the
+/// first answer wanted. Re-planning against the cells that actually exist means
+/// the drawn mosaic is never bigger than its quad — and a texture bigger than
+/// its quad is exactly the resampling this panel spends all its effort avoiding.
+fn qr_area(cols: usize, rows: usize, cell: (f32, f32), t: &crate::transfer::Transfer) -> QrArea {
+    let (cw, ch) = (cell.0.max(1.0), cell.1.max(1.0));
+    let (max_cols, max_rows) = (cols.saturating_sub(6).max(1), rows.saturating_sub(6).max(1));
+    let avail_w = (max_cols as f32 * cw).max(64.0) as u32;
+    let avail_h = (max_rows as f32 * ch).max(64.0) as u32;
+
+    let first = t.layout_for(avail_w, avail_h);
+    let cells = (
+        ((first.drawn.0 as f32 / cw).ceil() as usize).clamp(1, max_cols),
+        ((first.drawn.1 as f32 / ch).ceil() as usize).clamp(1, max_rows),
+    );
+    let px = ((cells.0 as f32 * cw).round() as u32, (cells.1 as f32 * ch).round() as u32);
+    QrArea { cells, px, layout: t.layout_for(px.0, px.1) }
 }
 
 #[cfg(test)]
 mod transfer_tests {
     use super::*;
+
+    fn a_transfer() -> crate::transfer::Transfer {
+        crate::transfer::Transfer::start(
+            "a.bin",
+            "application/octet-stream",
+            &vec![7u8; 40_000],
+            crate::transfer::DEFAULT_FRAME_BYTES,
+            30,
+            0,
+        )
+        .unwrap()
+    }
 
     /// The invariant the demo scene caught being broken: the texture has to be
     /// exactly the size of the quad it is drawn into.
@@ -4689,35 +4741,101 @@ mod transfer_tests {
     /// entire feature. No byte-level test can see this; only the pixels can.
     #[test]
     fn the_painted_pixels_are_exactly_the_cells_they_are_drawn_into() {
+        let t = a_transfer();
         for cell in [(10.0f32, 22.0f32), (8.0, 16.0), (12.5, 27.0), (7.0, 15.0)] {
             for (cols, rows) in [(140usize, 45usize), (80, 24), (200, 60), (40, 12)] {
-                let (qc, qr) = qr_cells(cols, rows, cell);
-                let (pw, ph) = qr_pixels(cols, rows, cell);
-                assert_eq!(pw, (qc as f32 * cell.0).round() as u32, "{cols}x{rows} at {cell:?}");
-                assert_eq!(ph, (qr as f32 * cell.1).round() as u32, "{cols}x{rows} at {cell:?}");
+                let a = qr_area(cols, rows, cell, &t);
+                assert_eq!(a.px.0, (a.cells.0 as f32 * cell.0).round() as u32, "{cols}x{rows} at {cell:?}");
+                assert_eq!(a.px.1, (a.cells.1 as f32 * cell.1).round() as u32, "{cols}x{rows} at {cell:?}");
+            }
+        }
+    }
+
+    /// The mosaic must never be bigger than the box it is painted into, or the
+    /// renderer scales the texture down to fit its quad and every module edge
+    /// softens — the one thing this panel exists to prevent.
+    #[test]
+    fn the_drawn_mosaic_always_fits_inside_the_pixels_it_was_given() {
+        let t = a_transfer();
+        for cell in [(10.0f32, 22.0f32), (8.0, 16.0), (12.5, 27.0), (7.0, 15.0)] {
+            for (cols, rows) in [(140usize, 45usize), (94, 46), (80, 24), (200, 60), (40, 12), (300, 100)] {
+                let a = qr_area(cols, rows, cell, &t);
+                // A window with no room for even a one-pixel-per-module code is
+                // the one exception, and it predates the mosaic: the panel draws
+                // an oversized texture that the renderer scales down, because a
+                // useless code beats an empty square. Scale 1 is that floor.
+                assert!(
+                    (a.layout.drawn.0 <= a.px.0 && a.layout.drawn.1 <= a.px.1) || a.layout.scale == 1,
+                    "{cols}x{rows} at {cell:?}: drawn {:?} exceeds box {:?}",
+                    a.layout.drawn,
+                    a.px
+                );
             }
         }
     }
 
     #[test]
     fn the_code_area_never_outgrows_the_window_it_is_drawn_in() {
-        // Floor rather than ceil on both axes: one cell too many pushes the panel
-        // off the edge on the tight axis, and the tight axis is height on every
-        // terminal, because a cell is twice as tall as it is wide.
+        // One cell too many pushes the panel off the edge on the tight axis, and
+        // the tight axis is height on every terminal, because a cell is twice as
+        // tall as it is wide.
+        let t = a_transfer();
         for (cols, rows) in [(140usize, 45usize), (80, 24), (30, 8), (300, 100)] {
-            let (qc, qr) = qr_cells(cols, rows, (10.0, 22.0));
-            assert!(qc + 4 <= cols.max(46), "{qc} cells wide does not fit in {cols}");
-            assert!(qr + 5 <= rows || rows < 14, "{qr} cells tall does not fit in {rows}");
+            let a = qr_area(cols, rows, (10.0, 22.0), &t);
+            assert!(a.cells.0 + 4 <= cols.max(46), "{} cells wide does not fit in {cols}", a.cells.0);
+            assert!(a.cells.1 + 5 <= rows || rows < 14, "{} cells tall does not fit in {rows}", a.cells.1);
         }
+    }
+
+    /// A wide window does NOT quietly start tiling.
+    ///
+    /// It looked like free throughput — a code is sized by the short axis, so a
+    /// 16:9 window has room beside it at the same pixels per module — and a real
+    /// phone showed it is not: framing a wider window puts every code on a
+    /// smaller share of the SENSOR, and the modules stop resolving. Whether that
+    /// pays depends on the screen and the distance, so it is the setting's call.
+    #[test]
+    fn a_wide_window_does_not_tile_on_its_own() {
+        let t = a_transfer();
+        let wide = qr_area(200, 46, (10.0, 22.0), &t);
+        assert_eq!(wide.layout.grid, (1, 1), "the automatic answer is one code, however wide the window");
+        // Extra WIDTH changes nothing at all: the code is square and the height
+        // binds, so the same window made twice as wide draws the same code. That
+        // spare width is what a mosaic would have spent, and spending it is now
+        // a decision rather than a default.
+        let square = qr_area(94, 46, (10.0, 22.0), &t);
+        assert_eq!(wide.layout.scale, square.layout.scale);
+        assert_eq!(wide.layout.drawn, square.layout.drawn);
+    }
+
+    /// An explicit tile count is honoured, because the person who set it knows
+    /// something runnir does not: how big the screen is and how close the phone
+    /// gets.
+    #[test]
+    fn an_explicit_tile_count_tiles() {
+        let t = crate::transfer::Transfer::start(
+            "a.bin",
+            "application/octet-stream",
+            &vec![7u8; 40_000],
+            crate::transfer::DEFAULT_FRAME_BYTES,
+            30,
+            2,
+        )
+        .unwrap();
+        let wide = qr_area(200, 46, (10.0, 22.0), &t);
+        assert_eq!(wide.layout.tiles(), 2, "two codes were asked for: {:?}", wide.layout.grid);
+        assert!(wide.layout.drawn.0 <= wide.px.0 && wide.layout.drawn.1 <= wide.px.1);
     }
 
     #[test]
     fn a_window_too_small_still_asks_for_a_drawable_area() {
         // A terminal dragged down to nothing must not produce a zero-sized image.
-        let (qc, qr) = qr_cells(1, 1, (10.0, 22.0));
-        assert!(qc >= 1 && qr >= 1);
-        let (pw, ph) = qr_pixels(2, 2, (10.0, 22.0));
-        assert!(pw > 0 && ph > 0);
+        let t = a_transfer();
+        let tiny = qr_area(1, 1, (10.0, 22.0), &t);
+        assert!(tiny.cells.0 >= 1 && tiny.cells.1 >= 1);
+        let small = qr_area(2, 2, (10.0, 22.0), &t);
+        assert!(small.px.0 > 0 && small.px.1 > 0);
+        assert_eq!(tiny.layout.tiles(), 1, "a window with no room shows one code, not none");
     }
 }
 

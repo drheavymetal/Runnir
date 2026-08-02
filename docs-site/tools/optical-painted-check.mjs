@@ -21,41 +21,55 @@ import { fnv1a, parseFrame, unpackFile } from "../src/receive/vendor/protocol.ts
 const dir = process.argv[2];
 const meta = JSON.parse(readFileSync(`${dir}/index.json`, "utf8"));
 const files = readdirSync(dir).filter((f) => f.endsWith(".rgba")).sort();
-console.log(`${files.length} painted frames, ${meta.px}px, V${meta.version}, k=${meta.blocks}`);
+// A drawn image may hold a MOSAIC of codes; older index files only had `px`.
+const width = meta.w ?? meta.px;
+const height = meta.h ?? meta.px;
+const tiles = meta.tiles ?? 1;
+console.log(
+  `${files.length} painted images, ${width}x${height}, ${meta.grid ?? "1x1"} codes each, V${meta.version}, k=${meta.blocks}`,
+);
 
 let unreadable = 0;
+let codes = 0;
 let decoder = null;
 const seen = new Set();
 
 for (const file of files) {
   const raw = readFileSync(`${dir}/${file}`);
   const results = await readBarcodes(
-    { data: new Uint8ClampedArray(raw), width: meta.px, height: meta.px },
-    { formats: ["QRCode"], maxNumberOfSymbols: 1 },
+    { data: new Uint8ClampedArray(raw), width, height },
+    { formats: ["QRCode"], maxNumberOfSymbols: tiles },
   );
-  const hit = results.find((r) => r.isValid && r.bytes.length > 0);
-  if (!hit) {
+  const hits = results.filter((r) => r.isValid && r.bytes.length > 0);
+  if (hits.length === 0) {
     unreadable++;
     console.log(`  UNREADABLE ${file}`);
     continue;
   }
-  const parsed = parseFrame(new Uint8Array(hit.bytes));
-  if (!parsed) {
-    unreadable++;
-    console.log(`  read but did not parse: ${file}`);
-    continue;
+  // Every tile in the image has to come back, not just one: a mosaic that reads
+  // as a single code is a mosaic that bought nothing.
+  if (hits.length < tiles) {
+    console.log(`  PARTIAL ${file}: ${hits.length}/${tiles} codes`);
   }
-  if (!decoder) {
-    const h = parsed.header;
-    decoder = new LTDecoder(h.k, h.blockLen, h.sessionId, h.totalLen);
-    decoder.fnv = h.payloadFnv;
+  for (const hit of hits) {
+    const parsed = parseFrame(new Uint8Array(hit.bytes));
+    if (!parsed) {
+      console.log(`  read but did not parse: ${file}`);
+      continue;
+    }
+    codes++;
+    if (!decoder) {
+      const h = parsed.header;
+      decoder = new LTDecoder(h.k, h.blockLen, h.sessionId, h.totalLen);
+      decoder.fnv = h.payloadFnv;
+    }
+    seen.add(parsed.header.seq);
+    decoder.addFrame(parsed.header.seq, parsed.block);
   }
-  seen.add(parsed.header.seq);
-  decoder.addFrame(parsed.header.seq, parsed.block);
-  if (decoder.isComplete) break;
+  if (decoder?.isComplete) break;
 }
 
-console.log(`  ${files.length - unreadable}/${files.length} frames read by zxing`);
+console.log(`  ${files.length - unreadable}/${files.length} images read by zxing, ${codes} codes total`);
 if (unreadable > 0) console.log(`  ${unreadable} unreadable`);
 
 if (!decoder?.isComplete) {

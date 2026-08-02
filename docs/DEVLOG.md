@@ -4139,6 +4139,119 @@ blank. Caught by reading `git status` and noticing `i18n.jsx` was not in it.
 Still nothing has been tested against an actual camera. That is step 4, and it needs a
 phone in a hand.
 
+## 2026-08-03 - Optical transfer, step 5: a real camera, then the mosaic
+
+**Step 4 happened: a phone read it.** Pedro pointed his phone at a window sending
+`logo.png` (968 KB, a PNG, so no gzip win and a real ~16 s pass) and the file arrived and
+opened. That was the one claim four levels of testing could not make.
+
+Two things came out of the session, both about throughput.
+
+**30 fps, not 24.** The ceiling was never the screen; it is the CAMERA. A phone delivers
+30 or 60 captures a second and the two clocks are not locked, so as the sender approaches
+the capture rate most captures land mid-transition — and half of one code plus half of the
+next decodes as nothing. Rolling shutter makes it worse: the sensor reads by rows, so a
+change mid-readout puts the top of frame N above the bottom of frame N+1. Half the capture
+rate is the first number where every drawn frame is certain to get one clean look, which
+is 30 against a 60 fps camera and the reason decimen's 60 was never right for us either.
+
+**A mosaic, built and then demoted to a setting.** More codes per capture rather than more
+captures per second. A code is sized by the SHORT axis — it is square, a window is not — so
+a 16:9 window has room for a second one beside it at exactly the same pixels per module.
+That looked like free throughput in space that was white margin, and it shipped as the
+automatic behaviour for about an hour.
+
+**Then a phone said no.** Pedro measured 16 KB/s, which is five or six codes delivered out
+of the thirty going out. The arithmetic was right and the optics were not: the pixels that
+decide a transfer belong to the CAMERA, and framing a 1920px window instead of a 950px one
+puts each code on half the sensor width it had. The modules stop resolving and captures
+that used to decode return nothing — losing more than the second code ever added. Whether
+the trade pays depends on the physical size of the screen and how close the phone is, which
+runnir cannot see and the person holding the phone can. So `tiles = 0` now means ONE code
+as big as the window allows, and a mosaic is `[transfer] tiles = N`.
+
+Every tile is an ordinary QR carrying a different frame of the same stream, so nothing about
+the wire format changes and a decimen receiver that has never heard of mosaics still reads
+whichever code it locks onto. It works because a fountain stream has no order: four codes
+arriving together are worth what four codes arriving in sequence are worth.
+
+**The cost, which is the second reason not to tile by default.** Measured on this laptop,
+release build (`cargo test --release -- --ignored --nocapture cost_of_a_mosaic`):
+
+    1 code  12.8 ms per drawn frame   38% of a 30 fps budget
+    2 codes 25.7 ms                   77%
+    4 codes 52.6 ms                  158%  <- slower than not doing it
+
+Split further: **8 ms of that is the QR encode**, 0.4 ms is the painting, the rest is the
+fountain's XOR. So the ceiling on a mosaic is the encoder, not the camera and not the
+window, and the way to four codes is a faster encode or an encode off the UI thread. Past
+the frame interval the panel says `(painter behind)` rather than overriding the setting:
+the count is only ever set by hand, and the person who set it is the one who can judge it.
+
+**What the receiver had to learn, and what it cost when it over-learned.** `worker.ts` asked
+zxing for one symbol, so a mosaic would have delivered one code per capture and bought
+nothing. Widening it to sixteen made every capture 26 ms instead of 10 — and on a phone,
+several times that. Capture time IS transfer speed, so the fix was worse than the bug for
+everyone not using a mosaic. It now asks for ONE, and probes with four every twelfth
+capture; the moment more than one code comes back it keeps asking for that many. A mosaic is
+found rather than assumed, and the common case pays nothing.
+
+    maxNumberOfSymbols=1   16.8 ms      =2   16.9 ms
+    maxNumberOfSymbols=4   24.9 ms      =16  26.2 ms
+
+**Two receiver changes that matter more than the mosaic ever did.** The camera was being
+asked for 1280x960. A V40 symbol is 185 modules, so a code filling half the view lands at
+about 2.5 pixels a module — precisely where zxing starts failing, and a failure here throws
+away a whole capture. It now asks for 1920x1440, which doubles pixels per module at the same
+framing, and requests continuous focus where the browser exposes it: autofocus hunting from
+hand tremor is the single most common way to lose a run of captures.
+
+**Levers, and a way to try them.** `runnir @ transfer` takes `--fps`, `--tiles` and
+`--bytes`, none of which touch the config file, because the right values are a property of a
+room — a screen, a camera, a distance — and comparing two of them should not mean editing a
+file and starting over. `--bytes 1465` is a version-27 symbol: 129 modules instead of 185,
+so half the payload per code and each module 1.4x bigger. When the scarce thing is
+legibility rather than density, that is the trade to make.
+
+The page now leads with the two numbers a person actually reads while holding a phone up: a
+big percentage and a big KB/s. They were both already computed and both buried in a detail
+line, which at arm's length is the same as not being there.
+
+**Proof, at the two levels that could catch it.****Proof, at the two levels that could catch it.** `RUNNIR_PAINTED_TILES=4` paints mosaics
+and the painted harness now reads ALL symbols from each image and rebuilds the file
+(13 images x 4 codes = 52 codes, file recovered, verification code agreeing). And the scene
+harness goes through the real wgpu pipeline on a wide window:
+
+    RUNNIR_PAINTED_FRAMES=/tmp/p RUNNIR_PAINTED_TILES=4 cargo test -- --ignored emit_painted_frames
+    node --import tsx docs-site/tools/optical-painted-check.mjs /tmp/p
+
+    RUNNIR_DEMO_SIZE=2400x1000 runnir --demo /tmp/wide.png transfer
+    magick /tmp/wide.png -depth 8 RGBA:/tmp/wide.raw
+    node --import tsx docs-site/tools/optical-scene-check.mjs /tmp/wide.raw 2400 1000
+    # PASS - read 2 real frame(s): seq=0,1 k=86 blockLen=2933
+
+The scene check also asserts the tiles carry DIFFERENT sequence numbers from the SAME
+session. Two tiles showing the same frame would look like a mosaic and double nothing, and
+that is a mistake the pixels cannot show you.
+
+**None of it touched a vendored file.** The vendored `worker-pool.ts` expects one decode per
+submitted frame, so rather than edit it, `src/receive/mosaic.ts` wraps a worker in something
+the pool still recognises — the `PoolWorker` interface is structural — and hands the extra
+symbols to the same sink. The upstream file stays byte-identical and can be re-vendored
+without replaying anything.
+
+**A SIGSEGV on the way out, unrelated and pre-existing.** A window closed after the camera
+test dumped core: the `runnir-dnd` thread borrows winit's `wl_display` via
+`Backend::from_foreign_display`, and when its dispatch loop ends at shutdown the
+`Connection` DROPS, calling `wl_proxy_destroy` on proxies belonging to a display the main
+thread is destroying at the same time. The safety note in `dnd.rs` says the display
+outlives the terminal's use of it "because winit drops it only at exit" — which is exactly
+when the dnd thread is also still using it. Not fixed here; it belongs to its own change,
+and the two candidates are `mem::forget` on a connection we never owned, or signalling and
+joining the thread before the window goes.
+
+639 tests, no warnings, the web builds.
+
 ## Gotchas (do not re-learn)
 
 - `runnir.json` WINS over `runnir.toml`. `Config::try_load` reads the JSON the settings
@@ -4382,6 +4495,17 @@ phone in a hand.
 - Panics on the PTY reader thread poison the grid mutex → whole-app crash. Keep parser paths panic-free.
 - Every new Action → add to id/title/parse/palette_list/bindings/hints. Update run_action AND run_palette_action.
 - After any feature: document it in this file, in docs.rs (F1 help), commit+push.
+- A MOSAIC tile is an ordinary QR and the wire format knows nothing about it. That is what
+  keeps a decimen receiver working against a runnir mosaic, and it only holds because the
+  sequence steps by a WHOLE mosaic: two tiles carrying the same `seq` would be one frame
+  drawn twice. `advance` takes the layout for that reason and nothing else.
+- The mosaic's ceiling is the QR ENCODE, not the camera and not the window. 8 ms a code on
+  this laptop, paid `fps` times a second, in the event loop. Before adding tiles anywhere,
+  run `cost_of_a_mosaic` — past the frame interval, more codes means fewer codes delivered.
+- More codes on screen is NOT more throughput, and a phone proved it: a wider window means
+  each code lands on a smaller share of the SENSOR. Anything that makes the drawn code
+  smaller has to be measured against a camera, never reasoned about in bytes. The same trap
+  swallowed `maxNumberOfSymbols` on the receiving side — capture time is transfer speed.
 - `src/optical.rs` is a WIRE FORMAT, not a utility module. `dlog()` must never become
   `f64::ln`, and the arithmetic order in `soliton_cdf` must not be regrouped: either
   change desyncs runnir from every decimen receiver in the world, silently. Its golden

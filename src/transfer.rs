@@ -27,22 +27,47 @@ pub const DEFAULT_FRAME_BYTES: usize = 2953;
 /// decimen's browser sender defaults to 60 because it runs full-screen on a
 /// desktop monitor. runnir defaults lower on purpose: the phone camera is the
 /// bottleneck either way, an LCD needs time to actually settle on a new pattern,
-/// and a frame the camera catches mid-transition is a frame wasted. Their own
-/// guidance is that 24 on a 60 Hz screen is comfortable.
-pub const DEFAULT_FPS: u32 = 24;
+/// and a frame the camera catches mid-transition is a frame wasted.
+///
+/// 30 rather than their 60 because a phone delivers 30 or 60 captured frames a
+/// second and the two clocks are not locked: at the camera's own rate most
+/// captures land mid-transition, and half of a QR from each of two frames
+/// decodes as nothing. Half the capture rate is the first number at which every
+/// drawn frame is certain to get one clean look.
+pub const DEFAULT_FPS: u32 = 30;
+
+/// How many codes to show at once. 0 means one code, as big as the window
+/// allows, which is what a phone at arm's length actually wants.
+///
+/// Tiling is the only way past the frame-rate ceiling and it looks free — a code
+/// is sized by the SHORT axis, so a 16:9 window has room for a second one beside
+/// it at identical pixels per module. It is not free, and a real phone said so:
+/// the pixels that decide a transfer belong to the CAMERA, and framing a wider
+/// window puts every code on a smaller share of the sensor. Whether the trade
+/// pays depends on how big the screen is and how close the phone gets, which is
+/// information runnir does not have and the person holding the phone does.
+pub const DEFAULT_TILES: usize = 0;
+
+/// Ceiling on tiles, whatever the window or the setting asks for.
+///
+/// Each tile is a whole QR encode and paint per drawn frame, so the cost is
+/// linear in tiles and paid `fps` times a second. Sixteen at 30 fps is already
+/// 480 encodes a second.
+const MAX_TILES: usize = 16;
 
 /// Modules of white around the code. Four is the QR standard's quiet zone, and
 /// a decoder that cannot find it will not even look at the symbol.
 const QUIET_MODULES: u32 = 4;
 
-/// How big the code is allowed to get in pixels, per side.
+/// How much of the window the codes may cover, per axis, in pixels.
 ///
 /// A version-40 symbol is 177 modules wide; with the quiet zone, 185. At four
 /// screen pixels per module that is 740 px, which is about the smallest that
 /// reads from a hand-held phone at arm's length. Bigger is better right up to
 /// the size of the window, so this ceiling only exists to keep a 4K window from
-/// uploading a 30 MB texture every frame.
-const MAX_BOX_PX: u32 = 1400;
+/// uploading a huge texture every frame — the whole mosaic is re-uploaded `fps`
+/// times a second, so the area is a bandwidth budget, not just a size.
+const MAX_BOX_PX: u32 = 2200;
 
 /// One drawn frame: the pixels, and the serial the renderer caches them by.
 ///
@@ -57,6 +82,37 @@ pub struct Raster {
     pub serial: u64,
 }
 
+/// How many codes go on screen, how big, and how much room that really needs.
+///
+/// Resolved once from the space available and then carried around, rather than
+/// recomputed by whoever needs a piece of it. The pixels that get painted and the
+/// cells they are placed in have to agree exactly — a texture that is not its
+/// quad's size is resampled, and resampling is what a decoder cannot afford — so
+/// there is one answer and everybody is handed it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Layout {
+    /// Codes across and down.
+    pub grid: (u32, u32),
+    /// Screen pixels per module. Always a whole number.
+    pub scale: u32,
+    /// What the grid actually covers, quiet zones included.
+    pub drawn: (u32, u32),
+}
+
+impl Layout {
+    pub fn tiles(&self) -> u32 {
+        self.grid.0 * self.grid.1
+    }
+}
+
+impl Default for Layout {
+    /// One code, one pixel per module. Only ever used by a panel that has no
+    /// transfer to ask, which draws an error instead of a code.
+    fn default() -> Self {
+        Self { grid: (1, 1), scale: 1, drawn: (0, 0) }
+    }
+}
+
 /// A live transfer. Frames advance on a clock, not on a request: a camera that
 /// misses one simply gets a different one, and the file arrives anyway.
 pub struct Transfer {
@@ -68,14 +124,25 @@ pub struct Transfer {
     /// changes under it.
     pub version: i16,
     pub started: Instant,
+    /// Codes put on the glass, not screen refreshes: with a mosaic one drawn
+    /// frame carries several, and it is the codes a receiver counts.
     pub frames_sent: u64,
     pub paused: bool,
+    /// Tiles asked for, 0 for automatic. Kept rather than resolved once because
+    /// the answer depends on the window, which resizes.
+    pub tiles_req: usize,
     packed: PackedFile,
     encoder: LtEncoder,
     seq: u32,
     last_advance: Instant,
+    /// The grid the last drawn frame used. What [`Self::advance`] steps the
+    /// sequence by, so every tile on screen carries a different frame.
+    grid: (u32, u32),
+    /// What one code cost to produce last time, dominated by the QR encode.
+    /// Reported rather than acted on: see [`Self::painter_behind`].
+    per_tile: Option<Duration>,
     cached: Option<Raster>,
-    cached_for: (u32, u32, u32),
+    cached_for: (u32, u32, u32, u32, u32),
 }
 
 impl Transfer {
@@ -85,6 +152,7 @@ impl Transfer {
         bytes: &[u8],
         frame_bytes: usize,
         fps: u32,
+        tiles: usize,
     ) -> Result<Self, String> {
         if frame_bytes <= optical::HEADER_LEN {
             return Err(format!("a frame must be larger than its {}-byte header", optical::HEADER_LEN));
@@ -111,12 +179,15 @@ impl Transfer {
             started: now,
             frames_sent: 0,
             paused: false,
+            tiles_req: tiles.min(MAX_TILES),
             packed,
             encoder,
             seq: 0,
             last_advance: now,
+            grid: (1, 1),
+            per_tile: None,
             cached: None,
-            cached_for: (0, 0, 0),
+            cached_for: (0, 0, 0, 0, 0),
         })
     }
 
@@ -141,12 +212,33 @@ impl Transfer {
         self.encoder.k
     }
 
+    /// Codes on screen at once, as they were last drawn.
+    pub fn grid(&self) -> (u32, u32) {
+        self.grid
+    }
+
+    /// Whether drawing a frame now costs more than the gap between frames.
+    ///
+    /// Past that line the stream does not merely stop speeding up, it SLOWS
+    /// DOWN: more codes asked for, fewer codes on the glass. The panel says so
+    /// rather than quietly overriding the setting, because a tile count is only
+    /// ever set by hand and the person who set it is the one who can judge
+    /// whether their screen and their phone make it worth having.
+    pub fn painter_behind(&self) -> bool {
+        let Some(per_tile) = self.per_tile else { return false };
+        per_tile * self.grid.0 * self.grid.1 > self.interval()
+    }
+
     /// Frames a receiver needs before it can rebuild the file, and therefore the
     /// shortest time this can possibly take. Reported rather than the file size
     /// because "17 seconds" is the answer to "how long do I hold my phone here".
+    ///
+    /// A mosaic divides it: the codes go out `fps` times a second, several at a
+    /// time, and a camera that resolves them reads them all from one capture.
     pub fn shortest_pass(&self) -> Duration {
         let needed = (self.encoder.k as f64 * 1.15).ceil();
-        Duration::from_secs_f64(needed / f64::from(self.fps))
+        let per_second = f64::from(self.fps) * f64::from(self.grid.0 * self.grid.1);
+        Duration::from_secs_f64(needed / per_second)
     }
 
     /// How many complete passes have gone by. A receiver that starts late still
@@ -157,9 +249,81 @@ impl Transfer {
         self.frames_sent as f64 / needed
     }
 
+    /// How many codes fit in `avail_w` by `avail_h` pixels, and how big.
+    ///
+    /// The automatic answer never sacrifices sharpness: it takes the scale ONE
+    /// code would get — set by the short axis, because a code is square and a
+    /// window is not — and then fits as many codes as the long axis has room for
+    /// at that same scale. On a 16:9 window that is a second code in space that
+    /// was white margin, at identical pixels per module. It is the one place
+    /// where throughput is genuinely free.
+    ///
+    /// An explicit tile count is allowed to shrink the modules, because someone
+    /// standing close with a good camera can spend sharpness on count. The grid
+    /// for a given count is whichever arrangement leaves the modules biggest.
+    pub fn layout_for(&self, avail_w: u32, avail_h: u32) -> Layout {
+        let total = symbol_modules(self.version);
+        let avail_w = avail_w.min(MAX_BOX_PX);
+        let avail_h = avail_h.min(MAX_BOX_PX);
+        let fit = |gx: u32, gy: u32| -> u32 {
+            std::cmp::min(avail_w / (gx * total), avail_h / (gy * total))
+        };
+        let (grid, scale) = match self.tiles_req {
+            0 => {
+                // ONE code, as big as the window allows. Measured against a real
+                // phone: a mosaic is a loss on a laptop screen, and the reason is
+                // optical rather than arithmetic.
+                //
+                // Filling spare width with a second code looked free — same
+                // pixels per module, twice the goodput. But the pixels that
+                // decide the transfer are the CAMERA's, not the screen's. Framing
+                // a 1920px window instead of a 950px one puts each code on half
+                // the sensor width it had, so the modules resolve worse and more
+                // captures decode as nothing. Whether that trade pays depends on
+                // the physical size of the screen and how close the phone is —
+                // neither of which runnir can see, which is exactly why this is
+                // not a decision it should be making on its own.
+                //
+                // `[transfer] tiles = N` is for someone who has that information:
+                // a big monitor, or a phone held close.
+                let scale = std::cmp::max(1, fit(1, 1));
+                ((1, 1), scale)
+            }
+            n => {
+                let n = n.clamp(1, MAX_TILES) as u32;
+                let mut best = ((1, 1), 0);
+                for gx in 1..=n {
+                    let gy = n.div_ceil(gx);
+                    let scale = fit(gx, gy);
+                    // Ties go to the arrangement already found, which is the one
+                    // with fewer columns — a taller stack on a wide window would
+                    // waste the axis that had the room.
+                    if scale > best.1 {
+                        best = ((gx, gy), scale);
+                    }
+                }
+                if best.1 == 0 {
+                    // Nothing fits at a whole pixel per module. One code, as
+                    // small as it has to be, beats an empty panel.
+                    ((1, 1), std::cmp::max(1, fit(1, 1)))
+                } else {
+                    best
+                }
+            }
+        };
+        Layout { grid, scale, drawn: (grid.0 * total * scale, grid.1 * total * scale) }
+    }
+
     /// Move to the next frame if its time has come. `true` when the picture
     /// changed and the window needs repainting.
-    pub fn advance(&mut self, now: Instant) -> bool {
+    ///
+    /// `layout` is the grid about to be drawn: the sequence steps by a whole
+    /// mosaic, so no two codes on the glass at the same time carry the same
+    /// frame. A resize between this and the paint can repeat or skip a few
+    /// sequence numbers, which a fountain does not care about — a repeated frame
+    /// is a frame the receiver already had, and there is nothing to skip past.
+    pub fn advance(&mut self, now: Instant, layout: &Layout) -> bool {
+        self.grid = layout.grid;
         if self.paused {
             return false;
         }
@@ -171,10 +335,11 @@ impl Transfer {
         // frames would show two symbols within one screen refresh, and the second
         // one is one the camera never had a chance to see.
         self.last_advance = now;
+        let tiles = layout.tiles();
         if self.frames_sent > 0 {
-            self.seq = self.seq.wrapping_add(1);
+            self.seq = self.seq.wrapping_add(tiles);
         }
-        self.frames_sent += 1;
+        self.frames_sent += u64::from(tiles);
         self.cached = None;
         true
     }
@@ -185,18 +350,25 @@ impl Transfer {
     /// the stream advances, and a fresh texture serial on every repaint would
     /// re-upload the same picture — at these sizes, tens of megabytes a second
     /// of nothing.
-    pub fn raster(&mut self, box_w: u32, box_h: u32) -> &Raster {
-        let box_w = box_w.clamp(64, MAX_BOX_PX);
-        let box_h = box_h.clamp(64, MAX_BOX_PX);
-        if self.cached.is_none() || self.cached_for != (self.seq, box_w, box_h) {
-            let frame = self.encoder.frame(
-                self.seq,
-                self.packed.container.len(),
-                self.packed.payload_fnv,
-            );
-            let raster = paint_qr(&frame, self.version, box_w, box_h);
+    pub fn raster(&mut self, layout: &Layout, box_w: u32, box_h: u32) -> &Raster {
+        let box_w = box_w.max(64);
+        let box_h = box_h.max(64);
+        let key = (self.seq, box_w, box_h, layout.grid.0, layout.grid.1);
+        if self.cached.is_none() || self.cached_for != key {
+            let frames: Vec<Vec<u8>> = (0..layout.tiles())
+                .map(|i| {
+                    self.encoder.frame(
+                        self.seq.wrapping_add(i),
+                        self.packed.container.len(),
+                        self.packed.payload_fnv,
+                    )
+                })
+                .collect();
+            let started = Instant::now();
+            let raster = paint_mosaic(&frames, self.version, layout, box_w, box_h);
+            self.per_tile = Some(started.elapsed() / layout.tiles().max(1));
             self.cached = Some(raster);
-            self.cached_for = (self.seq, box_w, box_h);
+            self.cached_for = key;
         }
         self.cached.as_ref().expect("just filled")
     }
@@ -270,44 +442,54 @@ fn encode_byte_mode(bytes: &[u8], version: i16) -> Result<QrCode, qrcode::types:
 /// The box is not square, because a terminal cell is about twice as tall as it is
 /// wide and a whole number of them almost never lands on a square. The extra goes
 /// to the white margin, which the quiet zone wanted anyway.
-fn paint_qr(bytes: &[u8], version: i16, box_w: u32, box_h: u32) -> Raster {
-    let code = encode_byte_mode(bytes, version)
-        .expect("the version was pinned by encoding a frame-sized probe the same way");
-    let width = code.width() as u32;
-    let colors = code.to_colors();
-    let total = width + 2 * QUIET_MODULES;
-    // At least one pixel per module even in a box too small to be readable: a
-    // shrunken window should show a useless code, not panic or vanish.
-    let scale = std::cmp::max(1, std::cmp::min(box_w, box_h) / total);
-    let drawn = total * scale;
-    let w = std::cmp::max(box_w, drawn);
-    let h = std::cmp::max(box_h, drawn);
-    let origin_x = (w - drawn) / 2 + QUIET_MODULES * scale;
-    let origin_y = (h - drawn) / 2 + QUIET_MODULES * scale;
+fn paint_mosaic(frames: &[Vec<u8>], version: i16, layout: &Layout, box_w: u32, box_h: u32) -> Raster {
+    let total = symbol_modules(version);
+    let side = total * layout.scale;
+    let w = std::cmp::max(box_w, layout.drawn.0);
+    let h = std::cmp::max(box_h, layout.drawn.1);
+    // The whole mosaic is centred as a block, so the gaps between codes are the
+    // quiet zones themselves and nothing has to be spaced by eye.
+    let left = (w - layout.drawn.0) / 2;
+    let top = (h - layout.drawn.1) / 2;
 
     // White, not the theme's background: the quiet zone and the light modules are
     // half of the contrast a camera measures, and a themed panel would be reading
     // a code printed on grey.
     let mut rgba = vec![0xffu8; (w * h * 4) as usize];
-    for my in 0..width {
-        for mx in 0..width {
-            if colors[(my * width + mx) as usize] != qrcode::Color::Dark {
-                continue;
-            }
-            let x0 = origin_x + mx * scale;
-            let y0 = origin_y + my * scale;
-            for y in y0..y0 + scale {
-                let row = (y * w) as usize * 4;
-                for x in x0..x0 + scale {
-                    let i = row + x as usize * 4;
-                    rgba[i] = 0;
-                    rgba[i + 1] = 0;
-                    rgba[i + 2] = 0;
+    for (i, bytes) in frames.iter().enumerate() {
+        let code = encode_byte_mode(bytes, version)
+            .expect("the version was pinned by encoding a frame-sized probe the same way");
+        let width = code.width() as u32;
+        let colors = code.to_colors();
+        let tile = i as u32;
+        let origin_x = left + (tile % layout.grid.0) * side + QUIET_MODULES * layout.scale;
+        let origin_y = top + (tile / layout.grid.0) * side + QUIET_MODULES * layout.scale;
+        for my in 0..width {
+            for mx in 0..width {
+                if colors[(my * width + mx) as usize] != qrcode::Color::Dark {
+                    continue;
+                }
+                let x0 = origin_x + mx * layout.scale;
+                let y0 = origin_y + my * layout.scale;
+                for y in y0..y0 + layout.scale {
+                    let row = (y * w) as usize * 4;
+                    for x in x0..x0 + layout.scale {
+                        let i = row + x as usize * 4;
+                        rgba[i] = 0;
+                        rgba[i + 1] = 0;
+                        rgba[i + 2] = 0;
+                    }
                 }
             }
         }
     }
     Raster { rgba: Arc::new(rgba), w, h, serial: crate::grid::next_image_serial() }
+}
+
+/// Modules across one drawn code, quiet zone included. A version-`v` symbol is
+/// `4v + 17` modules; version 40 with its quiet zone is 185.
+fn symbol_modules(version: i16) -> u32 {
+    (4 * version.max(1) as u32) + 17 + 2 * QUIET_MODULES
 }
 
 /// A fresh session id per transfer, so a receiver that was watching the previous
@@ -409,7 +591,7 @@ mod tests {
 
     #[test]
     fn a_transfer_reports_what_the_person_holding_the_phone_needs() {
-        let t = Transfer::start("a.jpg", "image/jpeg", &sample(), DEFAULT_FRAME_BYTES, 24).unwrap();
+        let t = Transfer::start("a.jpg", "image/jpeg", &sample(), DEFAULT_FRAME_BYTES, 24, 1).unwrap();
         assert_eq!(t.version, 40);
         assert_eq!(t.original_size(), 40_000);
         assert!(t.blocks() >= 14, "40 KB does not fit in fewer blocks than that");
@@ -422,7 +604,7 @@ mod tests {
     fn a_payload_too_big_for_the_frame_size_is_refused_before_anything_is_drawn() {
         // k is a u16, so 6 MB at 100 bytes a frame runs out of block numbers.
         let big = incompressible(6 * 1024 * 1024);
-        let err = match Transfer::start("a.jpg", "image/jpeg", &big, 100, 24) {
+        let err = match Transfer::start("a.jpg", "image/jpeg", &big, 100, 24, 1) {
             Err(e) => e,
             Ok(_) => panic!("a payload that outruns the block numbering must be refused"),
         };
@@ -431,7 +613,7 @@ mod tests {
 
     #[test]
     fn a_frame_no_larger_than_its_header_is_refused() {
-        let err = match Transfer::start("a.bin", "text/plain", b"hello", 20, 24) {
+        let err = match Transfer::start("a.bin", "text/plain", b"hello", 20, 24, 1) {
             Err(e) => e,
             Ok(_) => panic!("a frame with no room for a payload must be refused"),
         };
@@ -441,32 +623,34 @@ mod tests {
     #[test]
     fn frames_advance_on_the_clock_and_never_skip_ahead() {
         let mut t =
-            Transfer::start("a.bin", "application/octet-stream", &sample(), DEFAULT_FRAME_BYTES, 20)
+            Transfer::start("a.bin", "application/octet-stream", &sample(), DEFAULT_FRAME_BYTES, 20, 1)
                 .unwrap();
+        let one = t.layout_for(800, 800);
         let t0 = Instant::now();
-        assert!(t.advance(t0), "the first frame shows immediately");
+        assert!(t.advance(t0, &one), "the first frame shows immediately");
         assert_eq!(t.frames_sent, 1);
         // Too soon: the camera has not had a chance to read what is up there.
-        assert!(!t.advance(t0 + Duration::from_millis(10)));
+        assert!(!t.advance(t0 + Duration::from_millis(10), &one));
         assert_eq!(t.frames_sent, 1);
-        assert!(t.advance(t0 + Duration::from_millis(60)));
+        assert!(t.advance(t0 + Duration::from_millis(60), &one));
         assert_eq!(t.frames_sent, 2);
 
         // A long stall must not then flush a burst of frames through in one
         // repaint: every one of those but the last would be unreadable.
         let after = t0 + Duration::from_secs(5);
-        assert!(t.advance(after));
-        assert!(!t.advance(after));
+        assert!(t.advance(after, &one));
+        assert!(!t.advance(after, &one));
         assert_eq!(t.frames_sent, 3);
     }
 
     #[test]
     fn a_paused_transfer_holds_its_frame() {
-        let mut t = Transfer::start("a.bin", "text/plain", &sample(), DEFAULT_FRAME_BYTES, 20).unwrap();
+        let mut t = Transfer::start("a.bin", "text/plain", &sample(), DEFAULT_FRAME_BYTES, 20, 1).unwrap();
+        let one = t.layout_for(800, 800);
         let t0 = Instant::now();
-        t.advance(t0);
+        t.advance(t0, &one);
         t.paused = true;
-        assert!(!t.advance(t0 + Duration::from_secs(1)));
+        assert!(!t.advance(t0 + Duration::from_secs(1), &one));
         assert_eq!(t.frames_sent, 1);
     }
 
@@ -489,25 +673,27 @@ mod tests {
         // actually panicked. Kept short: a version-40 encode costs about a tenth
         // of a second in a debug build, and the two cases above are the ones that
         // pin the bug — this only checks that the real path reaches them.
-        let mut t = Transfer::start("a.txt", "text/plain", &incompressible(90_000), DEFAULT_FRAME_BYTES, 24)
+        let mut t = Transfer::start("a.txt", "text/plain", &incompressible(90_000), DEFAULT_FRAME_BYTES, 24, 1)
             .unwrap();
+        let lay = t.layout_for(200, 200);
         let mut now = Instant::now();
         for _ in 0..20 {
-            t.advance(now);
+            t.advance(now, &lay);
             now += Duration::from_millis(50);
-            t.raster(200, 200);
+            t.raster(&lay, 200, 200);
         }
     }
 
     #[test]
     fn every_frame_is_a_real_decodable_qr_of_the_pinned_version() {
         let mut t =
-            Transfer::start("a.bin", "application/octet-stream", &sample(), DEFAULT_FRAME_BYTES, 24)
+            Transfer::start("a.bin", "application/octet-stream", &sample(), DEFAULT_FRAME_BYTES, 24, 1)
                 .unwrap();
+        let lay = t.layout_for(800, 800);
         let mut seen = Vec::new();
         for i in 0..5 {
-            t.advance(Instant::now() + Duration::from_millis(i * 100));
-            let r = t.raster(800, 800);
+            t.advance(Instant::now() + Duration::from_millis(i * 100), &lay);
+            let r = t.raster(&lay, 800, 800);
             assert_eq!(r.rgba.len(), (r.w * r.h * 4) as usize);
             seen.push(r.serial);
         }
@@ -522,9 +708,10 @@ mod tests {
         // The renderer filters linearly, so a fractional scale blurs exactly the
         // edges a decoder measures. Check by reading the pixels back: every run of
         // equal pixels along the first module row must be a multiple of the scale.
-        let mut t = Transfer::start("a.bin", "text/plain", b"hello there", 2953, 24).unwrap();
-        t.advance(Instant::now());
-        let r = t.raster(900, 900);
+        let mut t = Transfer::start("a.bin", "text/plain", b"hello there", 2953, 24, 1).unwrap();
+        let lay = t.layout_for(900, 900);
+        t.advance(Instant::now(), &lay);
+        let r = t.raster(&lay, 900, 900);
         let px = r.w as usize;
         // V40 plus the quiet zone is 185 modules; 900/185 = 4 pixels each.
         let scale = 900 / (177 + 2 * 4);
@@ -548,9 +735,10 @@ mod tests {
     fn the_quiet_zone_is_white_all_the_way_round() {
         // A decoder that cannot find the quiet zone does not even look at the
         // symbol, and the panel background is not white.
-        let mut t = Transfer::start("a.bin", "text/plain", b"hello there", 2953, 24).unwrap();
-        t.advance(Instant::now());
-        let r = t.raster(800, 800);
+        let mut t = Transfer::start("a.bin", "text/plain", b"hello there", 2953, 24, 1).unwrap();
+        let lay = t.layout_for(800, 800);
+        t.advance(Instant::now(), &lay);
+        let r = t.raster(&lay, 800, 800);
         let px = r.w as usize;
         for i in 0..px {
             for (x, y) in [(i, 0), (i, px - 1), (0, i), (px - 1, i)] {
@@ -567,9 +755,10 @@ mod tests {
     #[test]
     fn a_tiny_box_still_produces_a_code_rather_than_a_panic() {
         // A window dragged small must show a useless code, not crash the terminal.
-        let mut t = Transfer::start("a.bin", "text/plain", b"hello there", 2953, 24).unwrap();
-        t.advance(Instant::now());
-        let r = t.raster(1, 1);
+        let mut t = Transfer::start("a.bin", "text/plain", b"hello there", 2953, 24, 1).unwrap();
+        let lay = t.layout_for(1, 1);
+        t.advance(Instant::now(), &lay);
+        let r = t.raster(&lay, 1, 1);
         assert!(r.w >= 185, "the box grows to hold one pixel per module: {}", r.w);
     }
 
@@ -577,11 +766,12 @@ mod tests {
     fn two_transfers_of_the_same_file_get_different_sessions() {
         // Or a receiver watching the first would feed the second's frames into the
         // decoder it already had.
-        let mut a = Transfer::start("a.bin", "text/plain", &sample(), 2953, 24).unwrap();
-        let mut b = Transfer::start("a.bin", "text/plain", &sample(), 2953, 24).unwrap();
-        a.advance(Instant::now());
-        b.advance(Instant::now());
-        assert_ne!(a.raster(400, 400).rgba, b.raster(400, 400).rgba);
+        let mut a = Transfer::start("a.bin", "text/plain", &sample(), 2953, 24, 1).unwrap();
+        let mut b = Transfer::start("a.bin", "text/plain", &sample(), 2953, 24, 1).unwrap();
+        let lay = a.layout_for(400, 400);
+        a.advance(Instant::now(), &lay);
+        b.advance(Instant::now(), &lay);
+        assert_ne!(a.raster(&lay, 400, 400).rgba, b.raster(&lay, 400, 400).rgba);
     }
 
     /// Paint real frames for the optical cross-check.
@@ -603,19 +793,35 @@ mod tests {
         };
         std::fs::create_dir_all(&dir).unwrap();
 
+        // A mosaic is the interesting case: several codes in ONE image, which is
+        // what a camera really sees on a wide window. `RUNNIR_PAINTED_TILES=4`
+        // paints four per frame, and the harness has to read them all.
+        let tiles: usize = std::env::var("RUNNIR_PAINTED_TILES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1);
+
         let bytes = incompressible(60_000);
         let mut t =
-            Transfer::start("painted.bin", "image/jpeg", &bytes, DEFAULT_FRAME_BYTES, 24).unwrap();
-        // Enough to rebuild the file with room to spare, so a failure means the
-        // decoder could not READ a frame rather than that it ran out of them.
-        let count = (t.blocks() as f64 * 2.0).ceil() as usize + 8;
+            Transfer::start("painted.bin", "image/jpeg", &bytes, DEFAULT_FRAME_BYTES, 24, tiles)
+                .unwrap();
         // Three pixels per module: below that a decoder starts failing on its own
         // account, and this test is not about how small a code can get.
-        let box_px = (185 * 3) as u32;
+        let unit = (185 * 3) as u32;
+        let lay = t.layout_for(unit * tiles.max(1) as u32, unit);
+        let (box_w, box_h) = lay.drawn;
+        // Enough to rebuild the file with room to spare, so a failure means the
+        // decoder could not READ a frame rather than that it ran out of them.
+        // Counted in DRAWN images, each of which now carries `tiles` frames.
+        let count = ((t.blocks() as f64 * 2.0).ceil() as usize + 8).div_ceil(lay.tiles() as usize);
 
         let index = format!(
-            "{{\"frames\":{count},\"px\":{box_px},\"blocks\":{},\"version\":{},\
+            "{{\"frames\":{count},\"px\":{box_w},\"w\":{box_w},\"h\":{box_h},\
+             \"tiles\":{},\"grid\":\"{}x{}\",\"blocks\":{},\"version\":{},\
              \"name\":\"painted.bin\",\"size\":{},\"code\":\"{}\"}}\n",
+            lay.tiles(),
+            lay.grid.0,
+            lay.grid.1,
             t.blocks(),
             t.version,
             bytes.len(),
@@ -623,13 +829,109 @@ mod tests {
         );
         let mut now = Instant::now();
         for i in 0..count {
-            t.advance(now);
+            t.advance(now, &lay);
             now += Duration::from_millis(100);
-            let r = t.raster(box_px, box_px);
+            let r = t.raster(&lay, box_w, box_h);
             std::fs::write(format!("{dir}/frame-{i:04}.rgba"), r.rgba.as_slice()).unwrap();
         }
         std::fs::write(format!("{dir}/index.json"), index).unwrap();
-        eprintln!("painted {count} frames of {box_px}px into {dir}");
+        eprintln!(
+            "painted {count} images of {box_w}x{box_h} ({}x{} codes each) into {dir}",
+            lay.grid.0, lay.grid.1
+        );
+    }
+
+    /// What a mosaic costs, measured rather than assumed.
+    ///
+    /// Every tile is a whole version-40 encode plus its paint, and the bill
+    /// arrives `fps` times a second. This is the number that decides whether a
+    /// grid is worth offering at all — if painting a frame takes longer than the
+    /// interval between frames, the stream slows down instead of speeding up.
+    ///
+    /// Measured on an Iris Xe laptop, release build: 12.8 ms for one code, and
+    /// it scales linearly — 2 codes 26 ms, 4 codes 53 ms. Split further, 8 ms of
+    /// that is the QR ENCODE and 0.4 ms is the painting; the rest is the
+    /// fountain's XOR. So the ceiling on a mosaic is the encoder, not the
+    /// camera, and it lands at two codes on a 30 fps budget of 33 ms.
+    ///
+    /// Ignored because it is a measurement, not an assertion:
+    /// `cargo test --release -- --ignored --nocapture cost_of_a_mosaic`
+    #[test]
+    #[ignore = "a measurement, not an assertion; run it explicitly"]
+    fn cost_of_a_mosaic() {
+        let bytes = incompressible(300_000);
+        for tiles in [1usize, 2, 4, 8] {
+            let mut t =
+                Transfer::start("m.bin", "image/jpeg", &bytes, DEFAULT_FRAME_BYTES, 30, tiles)
+                    .unwrap();
+            let unit = 185 * 4;
+            let lay = t.layout_for(unit * tiles as u32, unit * tiles as u32);
+            let mut now = Instant::now();
+            let start = Instant::now();
+            const ROUNDS: u32 = 10;
+            for _ in 0..ROUNDS {
+                t.advance(now, &lay);
+                now += Duration::from_millis(100);
+                t.raster(&lay, lay.drawn.0, lay.drawn.1);
+            }
+            let each = start.elapsed() / ROUNDS;
+            let budget = Duration::from_secs_f64(1.0 / 30.0);
+            eprintln!(
+                "{}x{} = {} codes at x{}px: {:?} per drawn frame ({:.0}% of a 30 fps budget)",
+                lay.grid.0,
+                lay.grid.1,
+                lay.tiles(),
+                lay.scale,
+                each,
+                each.as_secs_f64() / budget.as_secs_f64() * 100.0
+            );
+        }
+    }
+
+    #[test]
+    fn every_tile_of_a_mosaic_carries_a_different_frame() {
+        // Two tiles showing the same sequence number would be the same picture
+        // twice: it would look like a mosaic and double nothing. The sequence
+        // steps by a whole mosaic for exactly this reason.
+        let mut t =
+            Transfer::start("a.bin", "image/jpeg", &incompressible(80_000), DEFAULT_FRAME_BYTES, 30, 4)
+                .unwrap();
+        let lay = t.layout_for(185 * 4 * 4, 185 * 4);
+        assert_eq!(lay.tiles(), 4, "four codes should fit across that box: {:?}", lay.grid);
+
+        let now = Instant::now();
+        t.advance(now, &lay);
+        assert_eq!(t.frames_sent, 4, "a drawn frame puts four codes on the glass");
+        t.advance(now + Duration::from_millis(100), &lay);
+        assert_eq!(t.frames_sent, 8);
+        // Four codes a frame at 30 fps is 120 a second, so the pass is four times
+        // shorter than the same file through a single code.
+        let one = Transfer::start("a.bin", "image/jpeg", &incompressible(80_000), DEFAULT_FRAME_BYTES, 30, 1)
+            .unwrap();
+        assert!(
+            t.shortest_pass().as_secs_f64() < one.shortest_pass().as_secs_f64() / 3.5,
+            "four tiles should cut the pass by about four: {:?} vs {:?}",
+            t.shortest_pass(),
+            one.shortest_pass()
+        );
+    }
+
+    #[test]
+    fn an_explicit_tile_count_may_shrink_the_modules_but_the_automatic_one_never_does() {
+        let auto =
+            Transfer::start("a.bin", "image/jpeg", &incompressible(80_000), DEFAULT_FRAME_BYTES, 30, 0)
+                .unwrap();
+        let forced =
+            Transfer::start("a.bin", "image/jpeg", &incompressible(80_000), DEFAULT_FRAME_BYTES, 30, 4)
+                .unwrap();
+        // A square box with room for exactly one code at four pixels a module.
+        let (w, h) = (185 * 4, 185 * 4);
+        let a = auto.layout_for(w, h);
+        let f = forced.layout_for(w, h);
+        assert_eq!(a.tiles(), 1, "there is no room for a second code at full size");
+        assert_eq!(a.scale, 4);
+        assert_eq!(f.tiles(), 4, "an explicit count is allowed to spend sharpness");
+        assert_eq!(f.scale, 2, "and it spends it by halving the modules");
     }
 
     #[test]
