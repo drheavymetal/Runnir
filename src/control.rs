@@ -106,6 +106,12 @@ pub enum ControlRequest {
         #[serde(default)]
         button: Option<String>,
     },
+    /// Send a file out through the screen as a QR stream, for a phone camera.
+    ///
+    /// A verb of its own rather than `action --id optical_transfer`, because that
+    /// one can only open the prompt: an action carries no argument, and the whole
+    /// point of driving this from outside is naming the file.
+    Transfer { path: String },
     /// Turn the wheel at a cell. `lines` is signed the way a wheel is: positive is
     /// up, away from the user. The pointer goes to the cell first, because every
     /// wheel target here is chosen by what is UNDER the pointer.
@@ -225,6 +231,13 @@ pub fn parse_client_args(cmd: &str, flags: &[String]) -> Result<ControlRequest, 
             col: opt_usize(&m, "col")?.ok_or("wheel needs --col")?,
             row: opt_usize(&m, "row")?.ok_or("wheel needs --row")?,
             lines: opt_f32(&m, "lines")?,
+        },
+        "transfer" => ControlRequest::Transfer {
+            path: m
+                .get("path")
+                .or_else(|| m.get("file"))
+                .ok_or("transfer needs --path (e.g. --path ~/notes.md)")?
+                .clone(),
         },
         "action" => ControlRequest::Action {
             id: m.get("id").ok_or("action needs --id (e.g. --id git_panel)")?.clone(),

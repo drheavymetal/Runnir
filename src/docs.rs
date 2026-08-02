@@ -747,6 +747,33 @@ leaves it up. It dies when the sharing is stopped or when the last window closes
 Worth being plain about: this re-transmits audio you are licensed to listen to, to
 whoever holds the URL.
 
+# Optical transfer — a file to a phone, through the screen (leader q)
+
+leader q asks for a file and fills the window with QR codes that keep changing. Point a
+phone camera at it, with runnir's website open on the phone, and the file arrives. No
+network between the two, no pairing, no account, no app: the only channel is light.
+
+  leader q                 ask which file to send
+  runnir @ transfer --path FILE   the same thing from a script
+  space                    pause on the frame that is showing
+  esc or q                 close
+
+Why it works with no handshake: the codes are not the file in order. Each one is a
+fountain-coded mixture, and the phone rebuilds the file from ANY 115 or so frames out of
+every 100 it needs, in any order. So there is no frame you can miss, no beginning to
+catch, and nothing to retransmit. It also means there is no last frame and no progress
+bar that reaches the end — the panel counts passes instead.
+
+The panel shows a six-digit code, and the phone shows one when it finishes. They match
+when the phone holds the file that was on screen. Nothing depends on you checking: the
+receiver verifies the full SHA-256 by itself and refuses a file that does not match.
+
+How long it takes: about 60 KB a second at the default settings. Text, configs, diffs and
+small images are seconds; a megabyte is closer to twenty. The file is gzipped first when
+that helps, and the panel says so.
+
+It only goes one way. runnir has no camera, so a phone cannot send to it.
+
 # TIDAL — checking things without playing them
 
   runnir --tidal-devices        what the output chain would try, in order

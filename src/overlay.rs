@@ -39,6 +39,8 @@ pub enum Overlay {
     Map(MapPanel),
     /// TIDAL: what is playing, the queue, and search.
     Tidal(TidalPanel),
+    /// A file leaving through the screen as QR codes, for a phone camera.
+    Transfer(TransferPanel),
 }
 
 impl Overlay {
@@ -65,6 +67,7 @@ impl Overlay {
             Overlay::Verbs(p) => p.render(cols, rows, theme),
             Overlay::Map(p) => p.render(cols, rows, theme),
             Overlay::Tidal(p) => p.render(cols, rows, theme),
+            Overlay::Transfer(p) => p.render(cols, rows, theme),
         }
     }
 }
@@ -4154,6 +4157,8 @@ pub enum PromptKind {
     PipeScrollback,
     /// A directory to auto-preview new images from (empty clears the watch).
     ImageWatchDir,
+    /// A path to send out through the screen as a QR stream.
+    OpticalTransfer,
     /// A commit message, typed in the git panel. Confirming commits the staged set
     /// and reopens the panel on the result.
     GitCommit,
@@ -4508,6 +4513,212 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
         }
     }
     out
+}
+
+// ---- optical transfer -----------------------------------------------------
+
+/// A file leaving through the screen: an endless stream of QR codes for a phone
+/// camera to read.
+///
+/// The panel is mostly picture on purpose. Everything a person needs while
+/// holding a phone at a monitor is on two lines — what is going, and how long a
+/// pass takes — and the rest of the window belongs to the code, because how big
+/// the code is drawn is the single thing that decides whether this works at all.
+pub struct TransferPanel {
+    pub transfer: Option<crate::transfer::Transfer>,
+    /// Why there is nothing to show. A transfer that cannot start says so here
+    /// rather than opening an empty panel or a toast that scrolls away.
+    pub error: Option<String>,
+    /// The path as it was asked for, kept for the header even when the transfer
+    /// failed to start.
+    pub label: String,
+    /// Cell size in pixels. The panel has to know it: a QR has to come out SQUARE
+    /// on the glass, and a cell is about twice as tall as it is wide.
+    pub cell: (f32, f32),
+}
+
+impl TransferPanel {
+    pub fn new(label: String, cell: (f32, f32), transfer: Result<crate::transfer::Transfer, String>) -> Self {
+        match transfer {
+            Ok(t) => Self { transfer: Some(t), error: None, label, cell },
+            Err(e) => Self { transfer: None, error: Some(e), label, cell },
+        }
+    }
+
+    /// Advance the stream and paint the frame if its time has come. `true` when
+    /// the window needs repainting.
+    pub fn tick(&mut self, cols: usize, rows: usize, now: std::time::Instant) -> bool {
+        let (w, h) = qr_pixels(cols, rows, self.cell);
+        let Some(t) = &mut self.transfer else { return false };
+        // Paint whenever the frame moved OR nothing has been painted yet — the
+        // first draw after opening has no picture and would show an empty square.
+        let advanced = t.advance(now);
+        if advanced || t.painted().is_none() {
+            t.raster(w, h);
+            return true;
+        }
+        false
+    }
+
+    /// The interval to wake the window at, or `None` when nothing is moving.
+    pub fn frame_interval(&self) -> Option<std::time::Duration> {
+        self.transfer.as_ref().filter(|t| !t.paused).map(|t| t.interval())
+    }
+
+    pub fn toggle_pause(&mut self) {
+        if let Some(t) = &mut self.transfer {
+            t.paused = !t.paused;
+        }
+    }
+
+    fn render(&self, cols: usize, rows: usize, theme: &Theme) -> Vec<Panel> {
+        let (qr_cols, qr_rows) = qr_cells(cols, rows, self.cell);
+        let w = (qr_cols + 4).clamp(46, cols.saturating_sub(2).max(46));
+        let h = (qr_rows + 5).min(rows.saturating_sub(2).max(8));
+        let mut g = panel_grid(w, h, theme);
+
+        let Some(t) = &self.transfer else {
+            write(&mut g, 0, 2, "Optical transfer", accent());
+            write(&mut g, 2, 2, &elide(&self.label, w.saturating_sub(4)), dim());
+            let why = self.error.as_deref().unwrap_or("nothing to send");
+            write(
+                &mut g,
+                4,
+                2,
+                &elide(why, w.saturating_sub(4)),
+                Pen { fg: Color::Rgb(0xe0, 0x6c, 0x75), bg: bg(), ..Pen::default() },
+            );
+            write(&mut g, h - 1, 2, "esc close", dim());
+            let col = cols.saturating_sub(w) / 2;
+            let row = rows.saturating_sub(h) / 3;
+            return vec![Panel { grid: g, col, row }];
+        };
+
+        // Header: what is going, and what it turned into on the way out. The
+        // transmitted size is worth its own words only when gzip changed it.
+        let size = if t.is_compressed() {
+            format!(
+                "{} \u{2192} {} gzipped",
+                crate::transfer::human(t.original_size()),
+                crate::transfer::human(t.transmitted_size())
+            )
+        } else {
+            crate::transfer::human(t.original_size())
+        };
+        write(&mut g, 0, 2, &elide(&t.name, w.saturating_sub(size.chars().count() + 6)), accent());
+        if w > size.chars().count() + 4 {
+            write(&mut g, 0, w - size.chars().count() - 2, &size, dim());
+        }
+
+        if let Some(r) = t.painted() {
+            // Centred on the cell grid. The texture is already the box size with
+            // the code centred inside it at a whole number of pixels per module,
+            // so the renderer draws it 1:1 and its linear filter has nothing to
+            // blur — which is the difference between a decodable code and a soft
+            // one.
+            let at_col = (w.saturating_sub(qr_cols)) / 2;
+            g.place_image_at(r.serial, r.rgba.clone(), (r.w, r.h), (1, at_col), (qr_cols, qr_rows));
+        }
+
+        // The footer says the two things a person actually asks: how long do I
+        // hold this here, and did the right thing arrive.
+        let pass = t.shortest_pass().as_secs_f64();
+        let status = if t.paused { "paused" } else { "sending" };
+        // Passes rather than a percentage, because there is nothing to be a
+        // percentage OF: the stream has no end, and a receiver that started late
+        // still finishes. Under one pass means nobody can have it yet.
+        let left = format!(
+            "{status} \u{b7} {} blocks \u{b7} V{} \u{b7} {} fps \u{b7} pass {pass:.0}s \u{b7} {:.1} sent in {}s",
+            t.blocks(),
+            t.version,
+            t.fps,
+            t.passes(),
+            t.elapsed().as_secs()
+        );
+        write(&mut g, h - 2, 2, &elide(&left, w.saturating_sub(4)), dim());
+        let code = format!("code {}", t.verification_code());
+        if w > left.chars().count() + code.chars().count() + 6 {
+            write(&mut g, h - 2, w - code.chars().count() - 2, &code, accent());
+        }
+        write(
+            &mut g,
+            h - 1,
+            2,
+            &elide("point a phone camera at this \u{b7} space pause \u{b7} esc close", w.saturating_sub(4)),
+            dim(),
+        );
+
+        let col = cols.saturating_sub(w) / 2;
+        let row = rows.saturating_sub(h) / 4;
+        vec![Panel { grid: g, col, row }]
+    }
+}
+
+/// The cells the code occupies: the largest square area that fits, measured in
+/// whole cells, since cells are the only unit the panel can place anything in.
+///
+/// Shared by `tick` and `render` rather than stored, so the pixels that get
+/// painted and the cells they are placed in can never disagree — and they must
+/// not. The renderer stretches a texture to fill its quad, so a texture that is
+/// not exactly the quad's size gets resampled, which blurs precisely the module
+/// edges a decoder measures.
+fn qr_cells(cols: usize, rows: usize, cell: (f32, f32)) -> (usize, usize) {
+    let (cw, ch) = (cell.0.max(1.0), cell.1.max(1.0));
+    let side = (cols.saturating_sub(6) as f32 * cw).min(rows.saturating_sub(6) as f32 * ch).max(64.0);
+    // Floor, not ceil: a cell more than the square needs would push the panel past
+    // the window on the tight axis.
+    (((side / cw).floor() as usize).max(1), ((side / ch).floor() as usize).max(1))
+}
+
+/// The same area in pixels — exactly what the renderer's quad will measure.
+fn qr_pixels(cols: usize, rows: usize, cell: (f32, f32)) -> (u32, u32) {
+    let (qc, qr) = qr_cells(cols, rows, cell);
+    ((qc as f32 * cell.0).round() as u32, (qr as f32 * cell.1).round() as u32)
+}
+
+#[cfg(test)]
+mod transfer_tests {
+    use super::*;
+
+    /// The invariant the demo scene caught being broken: the texture has to be
+    /// exactly the size of the quad it is drawn into.
+    ///
+    /// It was painted as a square while the cells it occupied were 860x858, so
+    /// the renderer stretched it by two pixels on one axis — a fraction of a
+    /// module of blur, on the one thing in the window whose sharpness is the
+    /// entire feature. No byte-level test can see this; only the pixels can.
+    #[test]
+    fn the_painted_pixels_are_exactly_the_cells_they_are_drawn_into() {
+        for cell in [(10.0f32, 22.0f32), (8.0, 16.0), (12.5, 27.0), (7.0, 15.0)] {
+            for (cols, rows) in [(140usize, 45usize), (80, 24), (200, 60), (40, 12)] {
+                let (qc, qr) = qr_cells(cols, rows, cell);
+                let (pw, ph) = qr_pixels(cols, rows, cell);
+                assert_eq!(pw, (qc as f32 * cell.0).round() as u32, "{cols}x{rows} at {cell:?}");
+                assert_eq!(ph, (qr as f32 * cell.1).round() as u32, "{cols}x{rows} at {cell:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_code_area_never_outgrows_the_window_it_is_drawn_in() {
+        // Floor rather than ceil on both axes: one cell too many pushes the panel
+        // off the edge on the tight axis, and the tight axis is height on every
+        // terminal, because a cell is twice as tall as it is wide.
+        for (cols, rows) in [(140usize, 45usize), (80, 24), (30, 8), (300, 100)] {
+            let (qc, qr) = qr_cells(cols, rows, (10.0, 22.0));
+            assert!(qc + 4 <= cols.max(46), "{qc} cells wide does not fit in {cols}");
+            assert!(qr + 5 <= rows || rows < 14, "{qr} cells tall does not fit in {rows}");
+        }
+    }
+
+    #[test]
+    fn a_window_too_small_still_asks_for_a_drawable_area() {
+        // A terminal dragged down to nothing must not produce a zero-sized image.
+        let (qc, qr) = qr_cells(1, 1, (10.0, 22.0));
+        assert!(qc >= 1 && qr >= 1);
+        let (pw, ph) = qr_pixels(2, 2, (10.0, 22.0));
+        assert!(pw > 0 && ph > 0);
+    }
 }
 
 // Silence unused warnings for helper kept for symmetry.

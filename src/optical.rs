@@ -38,7 +38,7 @@
 //! (optionally gzipped), its name, its media type, and the SHA-256 of the
 //! ORIGINAL bytes — see [`pack_file`].
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use sha2::{Digest, Sha256};
 
@@ -284,15 +284,18 @@ impl LtEncoder {
     }
 }
 
+#[cfg(test)]
 struct PendingFrame {
     idx: HashSet<u32>,
     words: Vec<u32>,
 }
 
-/// LT decoder. runnir only ever sends, so this exists for the round-trip tests —
+/// LT decoder. Test-only, and deliberately so: runnir has no camera and will
+/// never receive. It exists for the round-trip tests —
 /// which is the point: the encoder is the half that has to be right, and a
 /// decoder that was ported from the same source is the cheapest way to say so
 /// without a browser in the loop.
+#[cfg(test)]
 pub struct LtDecoder {
     pub k: usize,
     pub block_len: usize,
@@ -305,10 +308,11 @@ pub struct LtDecoder {
     solved: Vec<Option<Vec<u32>>>,
     solved_count: usize,
     pending: Vec<Option<PendingFrame>>,
-    by_block: HashMap<u32, HashSet<usize>>,
+    by_block: std::collections::HashMap<u32, HashSet<usize>>,
     seen: HashSet<u32>,
 }
 
+#[cfg(test)]
 impl LtDecoder {
     pub fn new(k: usize, block_len: usize, session_id: u16, total_len: usize) -> Self {
         Self {
@@ -323,7 +327,7 @@ impl LtDecoder {
             solved: vec![None; k],
             solved_count: 0,
             pending: Vec::new(),
-            by_block: HashMap::new(),
+            by_block: std::collections::HashMap::new(),
             seen: HashSet::new(),
         }
     }
@@ -423,6 +427,7 @@ impl LtDecoder {
     }
 }
 
+#[cfg(test)]
 fn xor_into(dst: &mut [u32], src: &[u32]) {
     for (d, s) in dst.iter_mut().zip(src.iter()) {
         *d ^= *s;
@@ -455,6 +460,7 @@ pub fn pack_frame(h: &FrameHeader, block: &[u8]) -> Vec<u8> {
     out
 }
 
+#[cfg(test)]
 pub fn parse_frame(bytes: &[u8]) -> Option<(FrameHeader, &[u8])> {
     if bytes.len() <= HEADER_LEN || bytes[0] != MAGIC0 || bytes[1] != MAGIC1 {
         return None;
@@ -669,9 +675,10 @@ fn gzip(bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
     Ok(encoder.finish()?)
 }
 
-/// Unpack a `DCF2` container. runnir does not receive, so this is here to close
-/// the round trip in tests — and to keep the two halves of the format written
-/// down in one place.
+/// The receiving side of the container. Test-only for the same reason as
+/// [`LtDecoder`]: it closes the round trip, and keeps both halves of the format
+/// written down in one place rather than only the half runnir runs.
+#[cfg(test)]
 pub struct UnpackedFile {
     pub name: String,
     pub media_type: String,
@@ -680,6 +687,7 @@ pub struct UnpackedFile {
     pub compression: Compression,
 }
 
+#[cfg(test)]
 impl UnpackedFile {
     /// Recompute the code from the bytes that actually arrived. Equal to the
     /// sender's only if the file is the one that was on screen.
@@ -698,6 +706,7 @@ impl UnpackedFile {
     }
 }
 
+#[cfg(test)]
 pub fn unpack_file(container: &[u8]) -> anyhow::Result<UnpackedFile> {
     if container.len() < FILE_HEADER_LEN || container[..4] != FILE_MAGIC {
         anyhow::bail!("the recovered file header is invalid");
@@ -751,6 +760,7 @@ pub fn unpack_file(container: &[u8]) -> anyhow::Result<UnpackedFile> {
     })
 }
 
+#[cfg(test)]
 fn gunzip(bytes: &[u8], max_bytes: usize) -> anyhow::Result<Vec<u8>> {
     use std::io::Read;
     let mut out = Vec::new();

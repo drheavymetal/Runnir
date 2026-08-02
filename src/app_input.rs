@@ -872,6 +872,7 @@ impl Gpu {
             Action::WarRoom => self.open_war_room(config),
             Action::WarRoomClose => self.close_war_room(config),
             Action::SetImageWatchDir => self.set_image_watch_dir(),
+            Action::OpticalTransfer => self.open_optical_prompt(),
             Action::SaveProjectSession => self.save_project_session_cmd(),
             Action::RestoreProjectSession => self.restore_project_session_cmd(config),
             Action::NowPlaying => self.open_now_playing(),
@@ -3159,6 +3160,7 @@ impl Gpu {
             Some(Overlay::Verbs(_)) => "verbs",
             Some(Overlay::Tidal(_)) => "tidal",
             Some(Overlay::Map(_)) => "map",
+            Some(Overlay::Transfer(_)) => "transfer",
             Some(_) => "other",
         };
         let mut out = json!({
@@ -3417,6 +3419,24 @@ impl Gpu {
         }
         match self.overlay.as_mut().unwrap() {
             Overlay::Git(_) => self.git_panel_key(key, config),
+            // Almost nothing to drive: the stream runs itself, and a key that did
+            // something clever would mostly be a key pressed by accident while
+            // holding a phone in the other hand.
+            Overlay::Transfer(p) => match key {
+                Key::Named(NamedKey::Escape) => {
+                    self.overlay = None;
+                    self.window.request_redraw();
+                }
+                Key::Character(c) if c.as_str() == "q" => {
+                    self.overlay = None;
+                    self.window.request_redraw();
+                }
+                Key::Named(NamedKey::Space) => {
+                    p.toggle_pause();
+                    self.window.request_redraw();
+                }
+                _ => {}
+            },
             Overlay::Docker(_) => self.docker_panel_key(key, config),
             // The properties panel: move over the nine permission bits, toggle them,
             // and nothing touches the disk until Enter.
@@ -4107,6 +4127,7 @@ impl Gpu {
             Action::WarRoom => self.open_war_room(config),
             Action::WarRoomClose => self.close_war_room(config),
             Action::SetImageWatchDir => self.set_image_watch_dir(),
+            Action::OpticalTransfer => self.open_optical_prompt(),
             Action::SaveProjectSession => self.save_project_session_cmd(),
             Action::RestoreProjectSession => self.restore_project_session_cmd(config),
             Action::NowPlaying => self.open_now_playing(),
@@ -4634,6 +4655,11 @@ impl Gpu {
                 if !value.trim().is_empty() {
                     self.open_git_panel(config);
                     self.git_exec(vec!["tag".into(), value.trim().to_string()]);
+                }
+            }
+            PromptKind::OpticalTransfer => {
+                if !value.is_empty() {
+                    self.start_optical_transfer(&value);
                 }
             }
             PromptKind::ImageWatchDir => {
@@ -6960,6 +6986,63 @@ impl Gpu {
 
     /// Opens a prompt to set (or clear, with an empty line) the watched directory at
     /// runtime, pre-filled with the current one.
+    /// Ask which file goes out through the screen.
+    ///
+    /// A prompt rather than a picker because the answer is usually already in
+    /// your head or in the pane behind you — and because the remote control
+    /// takes the same path, so there is one way in, not two.
+    fn open_optical_prompt(&mut self) {
+        let prompt = Prompt::new(PromptKind::OpticalTransfer, "Send which file to a phone?", Vec::new());
+        self.overlay = Some(Overlay::Prompt(prompt));
+        self.window.request_redraw();
+    }
+
+    /// Open the panel on a path, whether it worked or not.
+    ///
+    /// A failure opens the panel too, carrying its reason: "6.2 MB needs at least
+    /// 116 bytes per frame" is worth reading, and a toast is gone before you have
+    /// finished reading it.
+    pub fn start_optical_transfer(&mut self, raw: &str) {
+        let path = self.resolve_transfer_path(raw);
+        let label = path.display().to_string();
+        let started = std::fs::read(&path)
+            .map_err(|e| format!("cannot read {}: {e}", path.display()))
+            .and_then(|bytes| {
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "transfer.bin".to_string());
+                crate::transfer::Transfer::start(
+                    &name,
+                    crate::transfer::media_type_for(&path),
+                    &bytes,
+                    crate::transfer::DEFAULT_FRAME_BYTES,
+                    crate::transfer::DEFAULT_FPS,
+                )
+            });
+        let cell = self.renderer.cell_size();
+        self.overlay = Some(Overlay::Transfer(overlay::TransferPanel::new(label, cell, started)));
+        self.window.request_redraw();
+    }
+
+    /// A relative path is relative to the focused pane's directory, not to
+    /// whatever runnir itself was launched from — the pane is where you are.
+    fn resolve_transfer_path(&self, raw: &str) -> std::path::PathBuf {
+        let raw = raw.trim();
+        let expanded = match raw.strip_prefix("~/") {
+            Some(rest) => dirs::home_dir().map(|h| h.join(rest)),
+            None => None,
+        };
+        let path = expanded.unwrap_or_else(|| std::path::PathBuf::from(raw));
+        if path.is_absolute() {
+            return path;
+        }
+        match self.tab_ref().focused_ref().cwd() {
+            Some(cwd) => cwd.join(path),
+            None => path,
+        }
+    }
+
     fn set_image_watch_dir(&mut self) {
         let current = self
             .image_watch
@@ -7683,6 +7766,12 @@ impl Gpu {
                 let delta = MouseScrollDelta::LineDelta(0.0, lines.unwrap_or(1.0));
                 self.on_wheel(delta, config, ModifiersState::empty());
                 self.window.request_redraw();
+                ControlResponse::ok(self.ui_state())
+            }
+            ControlRequest::Transfer { path } => {
+                self.start_optical_transfer(&path);
+                // The panel carries its own failure, so the response is ok either
+                // way; `ui_state` says which overlay is actually up.
                 ControlResponse::ok(self.ui_state())
             }
             ControlRequest::Action { id } => {

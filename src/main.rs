@@ -39,6 +39,7 @@ mod shell_integration;
 mod tab;
 mod themes;
 mod tidal;
+mod transfer;
 mod verbs;
 mod warroom;
 mod watch;
@@ -298,6 +299,13 @@ fn main() {
                 Some(s) if s.starts_with("tidal") => {
                     tidal_scene(path, s.strip_prefix("tidal:").unwrap_or(""))
                 }
+                // `transfer[:file]` draws the QR panel. Worth having for the same
+                // reason the TIDAL one was: how big the code is drawn and whether
+                // its quiet zone survives the layout are things to LOOK at, and a
+                // window with a phone in front of it is the slowest way to find out.
+                Some(s) if s.starts_with("transfer") => {
+                    transfer_scene(path, s.strip_prefix("transfer:").unwrap_or(""))
+                }
                 Some(level) => leader_scene(path, level),
                 None => demo_scene(path),
             };
@@ -329,10 +337,13 @@ fn print_help() {
          runnir @ CMD [flags]       remote-control a running terminal\n\n\
          Remote control (like kitty @): ls, send-text, get-text, focus-tab,\n  \
          launch, new-tab, close-tab, set-colors. Example: runnir @ send-text --text 'ls\\n'\n  \
-         Driving runnir itself: key, click, drag, wheel, action — e.g.\n  \
+         Driving runnir itself: key, click, drag, wheel, action, transfer — e.g.\n  \
          runnir @ action --id git_panel, runnir @ key --chord enter,\n  \
          runnir @ drag --col 40 --row 6 --to-col 60. They answer with what is\n  \
-         on screen, so a script can check what it just did.\n\n\
+         on screen, so a script can check what it just did.\n  \
+         runnir @ transfer --path FILE sends that file to a phone camera as a\n  \
+         stream of QR codes — no network, no pairing; the receiver is a page on\n  \
+         runnir's website.\n\n\
          Press F1 inside runnir for the full key reference.",
         env!("CARGO_PKG_VERSION")
     );
@@ -527,6 +538,84 @@ fn tidal_scene(path_out: &str, state: &str) {
         let (cw, ch) = r.cell_size();
         let cols = (WIDTH as f32 / cw) as usize;
         let rows = (HEIGHT as f32 / ch) as usize;
+        let pen = Pen { fg: Color::Rgb(0xd4, 0xd6, 0xd9), ..Pen::default() };
+        let mut g = Grid::new(cols, rows);
+        g.write_str(0, 0, "~/projects/runnir ❯ ", pen);
+        let panes = vec![(g, Rect { x: 0.0, y: 0.0, w: WIDTH as f32, h: HEIGHT as f32 }, None, true)];
+
+        let panels = overlay.render(cols, rows, &config::Theme::default());
+        let specs: Vec<(Grid, Rect)> = panels
+            .into_iter()
+            .map(|p| {
+                let rect = Rect {
+                    x: p.col as f32 * cw,
+                    y: p.row as f32 * ch,
+                    w: p.grid.cols() as f32 * cw,
+                    h: p.grid.rows() as f32 * ch,
+                };
+                (p.grid, rect)
+            })
+            .collect();
+        (panes, Some(specs))
+    });
+}
+
+/// Draws the optical transfer panel to a PNG. With no argument it invents a file,
+/// so the scene needs nothing on disk; with one it sends that path, which is how
+/// a real file's size and block count get looked at.
+fn transfer_scene(path_out: &str, file: &str) {
+    use crate::render::Rect;
+    const WIDTH: u32 = 1400;
+    const HEIGHT: u32 = 1000;
+
+    let (label, started) = if file.is_empty() {
+        // Big enough to take hundreds of blocks, and incompressible so the panel
+        // shows the sizes a real photo would rather than a gzip win.
+        let mut state: u32 = 0x5eed_1234;
+        let invented: Vec<u8> = (0..250_000)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (state >> 24) as u8
+            })
+            .collect();
+        (
+            "invented.jpg".to_string(),
+            transfer::Transfer::start(
+                "invented.jpg",
+                "image/jpeg",
+                &invented,
+                transfer::DEFAULT_FRAME_BYTES,
+                transfer::DEFAULT_FPS,
+            ),
+        )
+    } else {
+        let path = std::path::PathBuf::from(file);
+        let name =
+            path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let started = std::fs::read(&path)
+            .map_err(|e| format!("cannot read {file}: {e}"))
+            .and_then(|bytes| {
+                transfer::Transfer::start(
+                    &name,
+                    transfer::media_type_for(&path),
+                    &bytes,
+                    transfer::DEFAULT_FRAME_BYTES,
+                    transfer::DEFAULT_FPS,
+                )
+            });
+        (file.to_string(), started)
+    };
+
+    render::offscreen_scene(path_out, WIDTH, HEIGHT, 16.0, |r| {
+        let (cw, ch) = r.cell_size();
+        let cols = (WIDTH as f32 / cw) as usize;
+        let rows = (HEIGHT as f32 / ch) as usize;
+        let mut panel = overlay::TransferPanel::new(label.clone(), (cw, ch), started);
+        // The panel paints on its clock, and the scene has none: tick it once so
+        // there is a frame to draw.
+        panel.tick(cols, rows, std::time::Instant::now());
+        let overlay = Overlay::Transfer(panel);
+
         let pen = Pen { fg: Color::Rgb(0xd4, 0xd6, 0xd9), ..Pen::default() };
         let mut g = Grid::new(cols, rows);
         g.write_str(0, 0, "~/projects/runnir ❯ ", pen);
@@ -2189,6 +2278,28 @@ impl ApplicationHandler<UserEvent> for App {
         }
         gpu.periodic(&self.config);
 
+        // An optical transfer is an animation with a deadline: the whole feature is
+        // "a new code appears N times a second", and nothing else in the window
+        // changes to wake it. The panel is ticked here rather than in the draw
+        // because painting a frame is what MOVES the stream on, and a draw pass
+        // that also advanced state would emit a frame per repaint — including the
+        // repaints that a mouse moving over the window causes.
+        if matches!(&gpu.overlay, Some(Overlay::Transfer(_))) {
+            // The size is read before the panel is borrowed: `grid_cells` needs the
+            // renderer and the window, which live on the same struct as the overlay.
+            let (cols, rows) = gpu.grid_cells();
+            let Some(Overlay::Transfer(p)) = &mut gpu.overlay else { unreachable!() };
+            let changed = p.tick(cols, rows, Instant::now());
+            let interval = p.frame_interval();
+            if changed {
+                gpu.window.request_redraw();
+            }
+            if let Some(interval) = interval {
+                event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + interval));
+                return;
+            }
+        }
+
         // Anything the TIDAL panel is waiting for animates a spinner, and a spinner
         // needs a clock: nothing wakes the window while a stream is being resolved,
         // because no state has changed yet. Ninety milliseconds is one frame.
@@ -2679,6 +2790,22 @@ impl Gpu {
 
     fn tab(&mut self) -> &mut Tab {
         &mut self.tabs[self.active]
+    }
+
+    /// The window in whole cells, the same arithmetic `build_overlay` does — an
+    /// overlay that ticks and an overlay that draws have to agree on the size.
+    fn grid_cells(&self) -> (usize, usize) {
+        let (cw, ch) = self.renderer.cell_size();
+        let size = self.window.inner_size();
+        (
+            (size.width as f32 / cw).floor().max(1.0) as usize,
+            (size.height as f32 / ch).floor().max(1.0) as usize,
+        )
+    }
+
+    /// The active tab without taking a mutable borrow, for the read-only paths.
+    fn tab_ref(&self) -> &Tab {
+        &self.tabs[self.active]
     }
 
     fn new_pane_id(&mut self) -> u64 {

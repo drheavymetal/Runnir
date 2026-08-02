@@ -4017,6 +4017,82 @@ fine; the MIT attribution travels in the module header and must stay there.
 
 617 tests, no warnings. Nothing is drawn yet — the QR encoder and the panel are step 2.
 
+## 2026-08-02 - Optical transfer, step 2: the codes on screen
+
+`src/transfer.rs`, the QR panel, and the paths in. `leader q` asks for a file and fills
+the window with codes; `runnir @ transfer --path FILE` does the same from a script, which
+is what the remote control is for — an action carries no argument, so the panel could
+never have been driven by `action --id` alone.
+
+**Defaults, and why they are not decimen's.** 2953 bytes a frame, which is exactly a
+version-40 symbol at error correction L — the densest a QR gets, and density is goodput
+because the frame rate is capped by the screen and the camera rather than by us. But 24
+fps, not their 60: the browser sender runs full-screen on a desktop monitor, an LCD needs
+time to settle on a new pattern, and a frame the camera catches mid-transition is wasted.
+Their own note says 24 on a 60 Hz screen is comfortable.
+
+The version is pinned from the frame SIZE at start, not learned from the first frame.
+Every frame is the same length, so the answer is the same either way — but resolving it up
+front means there is no state that could be wrong for one frame, and the receiver never
+sees the symbol size change under it.
+
+**The sharpness problem, which is the whole panel.** The renderer's image sampler filters
+LINEARLY (`ImageLayer`, `render.rs`) and photos need that, so it could not be changed.
+Two consequences, and the second one was a real bug:
+
+- The code is painted at a WHOLE number of pixels per module and centred, with white
+  padding — never stretched to fit. A fractional module scale blurs exactly the edges a
+  decoder measures.
+- The texture must be exactly the size of the quad it is drawn into. It was painted square
+  while occupying 860x858 pixels of cells, so the renderer stretched it two pixels on one
+  axis. Now the field is the cell area's real dimensions and the extra goes to the white
+  margin, which the quiet zone wanted anyway.
+
+**The demo scene found that, and nothing else could have.** `runnir --demo out.png
+transfer` draws the panel with an invented 244 KB file — no disk, no camera. Same lesson
+as the TIDAL colours: reading the code, both versions look correct.
+
+**Three levels of proof now.** Golden vectors (step 1), then the painted frames, then the
+rendered window:
+
+    RUNNIR_PAINTED_FRAMES=/tmp/p cargo test -- --ignored emit_painted_frames
+    node --import tsx tools/optical-painted-check.mjs /tmp/p     # 50/50 read, file rebuilt
+
+    runnir --demo /tmp/scene.png transfer
+    magick /tmp/scene.png -depth 8 RGBA:/tmp/scene.raw
+    node --import tsx tools/optical-scene-check.mjs /tmp/scene.raw 1400 1000
+
+The last one decodes a frame out of a window that went through the real wgpu pipeline —
+image quad, linear sampler, sRGB surface — and reads `seq=0 k=86 blockLen=2933`. Any of
+those stages could have softened the code past a decoder with every byte-level test still
+green.
+
+**What the panel says, and what it does not.** Passes, not a percentage: the stream has no
+end and a receiver that starts late still finishes, so there is nothing for a percentage
+to be of. The six-digit code is beside the frame from the start, because the sender has
+the hash at pack time. Nothing depends on anyone comparing it — the receiver verifies the
+full SHA-256 by itself — it is there for the person holding the phone.
+
+The frame clock lives in the event loop, not in the draw. Advancing state in a draw pass
+would emit a frame per repaint, including the repaints a mouse moving over the window
+causes, and every one of those but the last is a frame the camera never had a chance to
+read.
+
+**A one-in-fifteen flaky test was a real bug, and the worst kind.** `QrCode::with_version`
+runs the crate's optimal segmentation, which may split data into numeric, alphanumeric and
+byte runs. Usually smaller; here fatal. A version-40 L symbol holds exactly 2953 bytes in
+byte mode, leaving four spare bits, and every extra segment costs a mode indicator and a
+length field — twenty. So a frame whose bytes happened to hold a long ASCII digit run got
+segmented into something that no longer fit, and that frame alone failed to encode.
+
+In production that is an occasional frame that refuses to draw, on data that is different
+every frame by design. Unreproducible. The fix is `Bits::push_byte_data` + `QrCode::with_bits`,
+which the crate documents precisely as the way to avoid the segmenter — and which is why
+decimen passes `mode: "byte"` explicitly. `pin_version` now probes through the same
+function, so the version that was pinned and the version that draws cannot disagree.
+
+634 tests, no warnings. The receiver on runnir's website is step 3.
+
 ## Gotchas (do not re-learn)
 
 - `runnir.json` WINS over `runnir.toml`. `Config::try_load` reads the JSON the settings
@@ -4265,6 +4341,13 @@ fine; the MIT attribution travels in the module header and must stay there.
   change desyncs runnir from every decimen receiver in the world, silently. Its golden
   vectors are recorded from the JavaScript side — a failure there means the format
   changed, which needs a header version bump, not a re-recorded constant.
+- Never encode a QR with `QrCode::new`/`with_version` for a frame near a version's
+  capacity: the optimal segmenter can produce MORE bits than plain byte mode, and at 2953
+  bytes there are four bits of slack. Go through `Bits::push_byte_data` + `with_bits`.
+- The image sampler is LINEAR and must stay that way (photos need it), so anything drawn
+  for a machine to read must be painted at an integer pixel scale AND in a texture exactly
+  the size of the quad it lands in. Cells are ~10x22 px, so a square texture in a whole
+  number of cells is almost never square: the difference gets stretched.
 - A fountain stream has NO last frame. Sizing a test to "1.6x frames, then drop a third"
   starves the decoder to 1.07x and reads as a correctness failure; it needs ~1.15x
   ARRIVING. Size the emitted count for what survives the drop, not for what is sent.
