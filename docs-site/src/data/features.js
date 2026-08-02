@@ -73,6 +73,24 @@ export const FEATURES = [
     },
   },
   {
+    key: 'optical-transfer', section: 'distinctive', status: 'dev',
+    title: { es: 'Transferencia óptica: un fichero al móvil por la pantalla', en: 'Optical transfer: a file to a phone through the screen' },
+    natural: {
+      es: 'Leader Q pide un fichero y llena la ventana de códigos QR que van cambiando. Apuntas la cámara del móvil, con la web de runnir abierta en él, y el fichero llega. No hay red entre los dos, ni emparejamiento, ni cuenta, ni aplicación: el único canal es la luz. Funciona porque los códigos no son el fichero en orden, sino mezclas de un fountain code: el móvil lo reconstruye con CUALQUIER 115 de cada 100 frames que necesita, en el orden que sea. Así que no hay frame que puedas perderte, ni principio que pillar, ni nada que retransmitir — y tampoco último frame ni barra que llegue al final: el panel cuenta pasadas. Va en una sola dirección; runnir no tiene cámara. El receptor verifica el SHA-256 completo él solo y rechaza lo que no cuadre, y además enseña seis dígitos que coinciden con los que runnir tiene en pantalla desde el primer frame.',
+      en: 'Leader Q asks for a file and fills the window with QR codes that keep changing. Point a phone camera at it, with runnir\u2019s website open on the phone, and the file arrives. No network between the two, no pairing, no account, no app: the only channel is light. It works because the codes are not the file in order but fountain-coded mixtures: the phone rebuilds it from ANY 115 out of every 100 frames it needs, in any order. So there is no frame you can miss, no beginning to catch and nothing to retransmit \u2014 and no last frame either, and no bar that reaches the end: the panel counts passes instead. It goes one way only; runnir has no camera. The receiver verifies the full SHA-256 by itself and refuses anything that does not match, and shows six digits that match the ones runnir has had on screen since the first frame.',
+    },
+    keys: [
+      'Leader Q',
+      { es: 'Espacio · pausar en el frame que está', en: 'Space · pause on the frame showing' },
+      { es: 'Esc o Q · cerrar', en: 'Esc or Q · close' },
+    ],
+    example: 'runnir @ transfer --path ~/notes.md',
+    note: {
+      es: 'Unos 60 KB/s con los valores por defecto (2953 bytes por frame, que es un QR versión 40 exacto, a 24 fps). Texto, configs y diffs son segundos; un megabyte, unos veinte. El fichero se gzipea antes cuando eso ayuda. El formato es el de decimen-optical-transfer (MIT), portado byte a byte, así que un receptor de decimen guardado hace meses también lee lo que emite runnir.',
+      en: 'About 60 KB/s at the defaults (2953 bytes a frame, which is exactly a version-40 QR, at 24 fps). Text, configs and diffs are seconds; a megabyte is closer to twenty. The file is gzipped first when that helps. The format is decimen-optical-transfer\u2019s (MIT), ported byte for byte, so a decimen receiver saved months ago reads what runnir sends too.',
+    },
+  },
+  {
     key: 'tidal-share', section: 'distinctive', status: 'dev',
     title: { es: 'Compartir lo que suena', en: 'Share what is playing' },
     natural: {

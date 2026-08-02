@@ -8,14 +8,15 @@
 // A failure here means a code was painted wrong (scale, quiet zone, contrast,
 // version), which is invisible to every byte-level test.
 //
-// Usage, from a decimen checkout with its dependencies installed:
+// Usage, from the repository root (the deps live in docs-site, which is why
+// this script does too):
 //   RUNNIR_PAINTED_FRAMES=/tmp/painted cargo test -- --ignored emit_painted_frames
-//   node --import tsx optical-painted-check.mjs /tmp/painted
+//   node --import tsx docs-site/tools/optical-painted-check.mjs /tmp/painted
 
 import { readFileSync, readdirSync } from "node:fs";
 import { readBarcodes } from "zxing-wasm/reader";
-import { LTDecoder } from "./shared/fountain.ts";
-import { fnv1a, parseFrame, unpackFile } from "./shared/protocol.ts";
+import { LTDecoder } from "../src/receive/vendor/fountain.ts";
+import { fnv1a, parseFrame, unpackFile } from "../src/receive/vendor/protocol.ts";
 
 const dir = process.argv[2];
 const meta = JSON.parse(readFileSync(`${dir}/index.json`, "utf8"));

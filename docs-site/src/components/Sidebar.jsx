@@ -40,6 +40,7 @@ export default function Sidebar({ view, setView, query, setQuery, counts, active
         <button className={`nav-tab ${view === 'instalacion' ? 'active' : ''}`} onClick={() => setView('instalacion')}>{t(UI.navInstall)}</button>
         <button className={`nav-tab ${view === 'atajos' ? 'active' : ''}`} onClick={() => setView('atajos')}>{t(UI.navShortcuts)}</button>
         <button className={`nav-tab ${view === 'config' ? 'active' : ''}`} onClick={() => setView('config')}>{t(UI.navConfig)}</button>
+        <button className={`nav-tab ${view === 'recibir' ? 'active' : ''}`} onClick={() => setView('recibir')}>{t(UI.navReceive)}</button>
       </div>
 
       {view === 'guia' && (
@@ -71,7 +72,10 @@ export default function Sidebar({ view, setView, query, setQuery, counts, active
 
       {view !== 'guia' && (
         <p className="brand-sub" style={{ margin: '8px 6px' }}>
-          {view === 'instalacion' ? t(UI.subInstall) : view === 'atajos' ? t(UI.subShortcuts) : t(UI.subConfig)}
+          {view === 'instalacion' ? t(UI.subInstall)
+            : view === 'atajos' ? t(UI.subShortcuts)
+            : view === 'recibir' ? t(UI.subReceive)
+            : t(UI.subConfig)}
         </p>
       )}
     </aside>

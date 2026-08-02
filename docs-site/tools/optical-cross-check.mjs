@@ -6,8 +6,8 @@
 // Usage: node cross-check.mjs /path/to/vectors.json
 
 import { readFileSync } from "node:fs";
-import { LTDecoder } from "./shared/fountain.ts";
-import { fnv1a, parseFrame, unpackFile } from "./shared/protocol.ts";
+import { LTDecoder } from "../src/receive/vendor/fountain.ts";
+import { fnv1a, parseFrame, unpackFile } from "../src/receive/vendor/protocol.ts";
 
 const cases = JSON.parse(readFileSync(process.argv[2], "utf8"));
 let failed = 0;

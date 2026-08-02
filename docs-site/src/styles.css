@@ -381,3 +381,55 @@ td .id { font-family: var(--mono); color: var(--fg-faint); font-size: 12px; }
 .intro-foot { font-size: 14px; color: var(--fg-dim); margin: 0 0 4px; }
 .intro-link { background: none; border: 0; padding: 0; font: inherit; color: var(--green-bright); cursor: pointer; text-decoration: underline; text-underline-offset: 3px; }
 .intro-link:hover { color: var(--green); }
+
+/* ---- receptor óptico ---------------------------------------------------
+   La página que se abre en el móvil, no en el escritorio: todo lo de aquí se
+   dimensiona para un pulgar y para una pantalla estrecha en vertical. */
+.receive h1 { font-size: clamp(22px, 5vw, 30px); margin: 28px 0 10px; }
+.receive .blurb { max-width: 62ch; margin-bottom: 22px; }
+.receive-start {
+  font: inherit; font-family: var(--mono); font-size: 16px;
+  background: var(--green); color: #0d0d0f; border: 0; border-radius: 10px;
+  padding: 14px 22px; cursor: pointer; width: 100%; max-width: 340px;
+}
+.receive-start:disabled { opacity: .6; cursor: default; }
+.receive-error { color: #e06c75; font-size: 14px; line-height: 1.6; max-width: 62ch; margin: 14px 0; }
+/* El vídeo va a ancho completo: encuadrar un código a pulso ya es bastante
+   difícil sin una vista previa del tamaño de un sello. */
+.receive-video { width: 100%; max-width: 640px; border-radius: 10px; background: #000; display: block; }
+.receive-camera { font-family: var(--mono); font-size: 12px; color: var(--fg-faint); margin: 8px 0 0; }
+.receive-progress { margin: 20px 0; max-width: 640px; }
+.receive-bar { height: 10px; border-radius: 5px; background: var(--bg-raise); border: 1px solid var(--border); overflow: hidden; }
+.receive-bar span { display: block; height: 100%; background: var(--green); transition: width .25s linear; }
+.receive-progress-row { display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; font-family: var(--mono); font-size: 13px; color: var(--fg-dim); margin-top: 8px; }
+.receive-metrics { font-family: var(--mono); font-size: 11px; color: var(--fg-faint); margin: 6px 0 0; }
+.receive-hint { background: var(--bg-raise); border: 1px solid var(--border); border-radius: 10px; padding: 16px 18px; margin: 18px 0; max-width: 640px; }
+.receive-hint strong { display: block; font-family: var(--mono); font-size: 14px; color: var(--green-bright); margin-bottom: 10px; }
+.receive-hint ul { margin: 0 0 12px; padding-left: 18px; }
+.receive-hint li { font-size: 14px; line-height: 1.6; color: var(--fg-dim); margin-bottom: 6px; }
+.receive-result { margin: 22px 0; max-width: 640px; }
+.receive-done { font-family: var(--mono); font-size: 18px; color: var(--green-bright); margin-bottom: 8px; }
+.receive-failed { font-family: var(--mono); font-size: 18px; color: #e06c75; margin-bottom: 8px; }
+.receive-summary { font-size: 14px; line-height: 1.6; color: var(--fg-dim); margin: 0 0 12px; }
+/* El código en grande y con separación: se compara de un vistazo contra la
+   pantalla que emite, no se lee con cuidado. */
+.receive-code { font-family: var(--mono); font-size: 15px; color: var(--fg-dim); margin: 0 0 4px; }
+.receive-code strong { font-size: 26px; color: var(--green-bright); letter-spacing: 3px; }
+.receive-code-note { font-size: 12px; line-height: 1.6; color: var(--fg-faint); max-width: 56ch; margin: 0 0 16px; }
+.receive-actions { display: flex; gap: 12px; flex-wrap: wrap; margin: 14px 0; }
+.receive-download {
+  font-family: var(--mono); font-size: 15px; text-decoration: none;
+  background: var(--green); color: #0d0d0f; border-radius: 8px; padding: 12px 18px;
+}
+.receive-text-button {
+  font: inherit; font-family: var(--mono); font-size: 14px; cursor: pointer;
+  background: var(--bg-raise); color: var(--fg); border: 1px solid var(--border);
+  border-radius: 8px; padding: 12px 18px;
+}
+.receive-snippet {
+  font-family: var(--mono); font-size: 13px; line-height: 1.55; color: var(--fg);
+  background: var(--bg-raise); border: 1px solid var(--border); border-radius: 8px;
+  padding: 14px; margin: 8px 0; white-space: pre-wrap; word-break: break-word;
+  max-height: 50vh; overflow: auto;
+}
+.receive-preview { max-width: 100%; border-radius: 8px; margin-top: 12px; display: block; }

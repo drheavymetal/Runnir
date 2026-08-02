@@ -5,14 +5,15 @@
 // the linear sampler, the sRGB surface — and any of those could soften the code
 // enough to stop a decoder, with nothing in the byte-level tests noticing.
 //
-// Usage, from a decimen checkout with its dependencies installed:
+// Usage, from the repository root (the deps live in docs-site, which is why
+// this script does too):
 //   runnir --demo /tmp/scene.png transfer
 //   magick /tmp/scene.png -depth 8 RGBA:/tmp/scene.raw
-//   node --import tsx optical-scene-check.mjs /tmp/scene.raw 1400 1000
+//   node --import tsx docs-site/tools/optical-scene-check.mjs /tmp/scene.raw 1400 1000
 
 import { readFileSync } from "node:fs";
 import { readBarcodes } from "zxing-wasm/reader";
-import { parseFrame } from "./shared/protocol.ts";
+import { parseFrame } from "../src/receive/vendor/protocol.ts";
 
 const [, , file, width, height] = process.argv;
 if (!file || !width || !height) {

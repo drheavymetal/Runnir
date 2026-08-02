@@ -6,6 +6,7 @@ import KeybindingsPage from './components/KeybindingsPage.jsx'
 import ConfigPage from './components/ConfigPage.jsx'
 import InstallPage from './components/InstallPage.jsx'
 import Intro from './components/Intro.jsx'
+import ReceivePage from './components/ReceivePage.jsx'
 import { SECTIONS } from './data/sections.js'
 import { FEATURES } from './data/features.js'
 import { useLang, UI } from './i18n.jsx'
@@ -22,7 +23,7 @@ function matches(f, q, t) {
   return hay.includes(q)
 }
 
-const VIEWS = ['guia', 'instalacion', 'atajos', 'config']
+const VIEWS = ['guia', 'instalacion', 'atajos', 'config', 'recibir']
 function initialView() {
   const h = typeof window !== 'undefined' ? window.location.hash.replace('#', '') : ''
   return VIEWS.includes(h) ? h : 'guia'
@@ -126,6 +127,7 @@ export default function App() {
         {view === 'instalacion' && <InstallPage query={query} />}
         {view === 'atajos' && <KeybindingsPage query={query} />}
         {view === 'config' && <ConfigPage query={query} />}
+        {view === 'recibir' && <ReceivePage />}
       </main>
     </div>
   )

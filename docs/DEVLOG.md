@@ -4093,6 +4093,52 @@ function, so the version that was pinned and the version that draws cannot disag
 
 634 tests, no warnings. The receiver on runnir's website is step 3.
 
+## 2026-08-02 - Optical transfer, step 3: the receiver on runnir's own website
+
+`docs-site` gets a fifth view (`#recibir`): open it on a phone, point the camera at a
+runnir window that is sending, and the file arrives. That is the whole feature — the
+sender is worth nothing without somewhere for the bytes to land, and the point was that
+ANYONE can receive, with no app to install.
+
+**Vendored verbatim, presentation rewritten.** `src/receive/vendor/` holds decimen's
+`protocol.ts`, `fountain.ts`, `progress.ts`, `no-signal.ts`, `worker-pool.ts` and
+`snippet.ts` unchanged, with a banner saying not to edit them and the MIT licence beside
+them. They are the same wire format `src/optical.rs` was ported from, and an edit that
+looks harmless desynchronises the receiver from every sender in the world, silently. The
+DOM code was not vendored: it was written against decimen's own markup, and this site is
+React with two languages.
+
+Field lessons that came with the vendored logic and would have cost a day each to
+rediscover: iOS treats `frameRate: {ideal: 60}` as a suggestion and delivers 30, so ask
+`exact` first; `requestVideoFrameCallback` chains survive a stopped stream and resume on
+the next one, so capture needs a generation counter or it zombies; and progress must track
+frames COLLECTED, because LT peeling back-loads its cascade and a blocks-solved bar looks
+stalled and then teleports.
+
+**The harnesses now test what ships.** They imported the reference checkout; they import
+`docs-site/src/receive/vendor/` now, and live in `docs-site/tools/` because that is where
+the dependencies are (a bare import resolves from the importing FILE, not the cwd). All
+three still pass against the vendored copies: the wire cross-check, the 50 painted frames,
+and the frame read back out of a rendered window.
+
+**https on the dev and preview servers**, via `@vitejs/plugin-basic-ssl`. `getUserMedia`
+does not exist at all on an insecure origin — localhost is exempt, a phone on the LAN is
+not. Without it the page is untestable on the only device it is for, and it would have
+been untestable until the Cloudflare token is rotated and the site deployed. Now
+`npm run preview` serves the real build over https on the LAN and a phone can have it
+today. The certificate is self-signed, so the phone warns once.
+
+Also on the site: the feature entry, the `Leader Q` keybinding row, and the receiver's own
+styles, sized for a thumb and a narrow screen rather than a desktop.
+
+**A missing i18n key renders NOTHING and builds clean.** The nav tab for the new view went
+in before its `UI.navReceive` string did, and `t(undefined)` returns `undefined`, which
+React draws as an empty button. The build was green, the bundle was fine, and the tab was
+blank. Caught by reading `git status` and noticing `i18n.jsx` was not in it.
+
+Still nothing has been tested against an actual camera. That is step 4, and it needs a
+phone in a hand.
+
 ## Gotchas (do not re-learn)
 
 - `runnir.json` WINS over `runnir.toml`. `Config::try_load` reads the JSON the settings
@@ -4341,6 +4387,15 @@ function, so the version that was pinned and the version that draws cannot disag
   change desyncs runnir from every decimen receiver in the world, silently. Its golden
   vectors are recorded from the JavaScript side — a failure there means the format
   changed, which needs a header version bump, not a re-recorded constant.
+- A missing key in `docs-site/src/i18n.jsx` is SILENT: `t()` returns undefined and React
+  renders an empty element. Adding a nav tab or a label means adding its string in the same
+  change, because nothing will tell you otherwise.
+- `docs-site/src/receive/vendor/` is vendored wire format, not site code. Do not edit it to
+  fix a lint or a style: re-vendor upstream and re-run the Rust golden vectors. The
+  receiver and every sender derive each frame's block subset independently.
+- The camera needs a SECURE origin. `getUserMedia` is not merely blocked on plain http, it
+  is absent, so feature-detecting it reports "no camera on this device". localhost is
+  exempt; a phone on the LAN is not, which is why the dev and preview servers run https.
 - Never encode a QR with `QrCode::new`/`with_version` for a frame near a version's
   capacity: the optimal segmenter can produce MORE bits than plain byte mode, and at 2953
   bytes there are four bits of slack. Go through `Bits::push_byte_data` + `with_bits`.
