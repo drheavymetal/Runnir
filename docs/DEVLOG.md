@@ -4252,6 +4252,64 @@ joining the thread before the window goes.
 
 639 tests, no warnings, the web builds.
 
+## 2026-08-03 - Optical transfer, step 6: measuring against a real phone
+
+Everything below came from a phone pointed at a screen, and almost all of it contradicted
+something reasoned earlier the same night. Recorded in that order deliberately: the wrong
+turns are the useful part.
+
+**The numbers, in the order they arrived.**
+
+    V40 @ 24 fps                16.0 KB/s   ~5.5 codes/s read (of 24 sent)
+    V20 @ 10 fps                 3.0 KB/s   ~3.5 codes/s read
+    V27 @ 15 fps                 6.5 KB/s   ~5.3 codes/s read (of 15)
+    V27 @ 25 fps                 9.0 KB/s   ~7.3 codes/s read (of 25), capture 30/s
+
+**Frame rate, twice wrong.** 24 -> 30 (reasoned: half the capture rate) -> 10 (measured:
+beat 5, 15, 24 and 30) -> and then 10 turned out to be an artifact. With a receiver capped
+around 5 codes a second, showing a code longer simply wastes fewer of them; it looks like
+the screen is the problem. Once the receiver stopped being the cap, 25 fps beat 15 by half
+again. The default of 10 is now known to be too low and is waiting on one more measurement
+before it moves.
+
+**Bigger modules do NOT buy reads.** The strongest result of the night. Going from V40 to
+V20 nearly doubles module size and the codes-read-per-second barely moved (5.5 -> 3.5),
+while the payload per code collapsed — so throughput fell by five. Codes read per second is
+roughly CONSTANT at 5-7 regardless of what the sender does. Two consequences: legibility is
+not the binding constraint, and the sender should therefore carry the MOST bytes per code
+it can, which is V40. Every sender-side lever built today — fps, symbol size, mosaic —
+moves bytes per code; none of them moves the constant.
+
+**So the cap is the receiver, and it got four changes.**
+
+- Camera asked for 1280x960, which puts a V40 code filling half the view at ~2.5 px a
+  module. Now 1920x1440, plus continuous focus where the browser exposes it.
+- `maxNumberOfSymbols: 16` cost 26 ms a capture against 10 for one. Now asks for one and
+  probes with four every twelfth capture, so a mosaic is found rather than assumed.
+- `drawImage` + `getImageData` at 1920x1440 copied 11 MB per capture ON THE MAIN THREAD.
+  Now `createImageBitmap` (no copy) transferred to the worker, which draws it on an
+  `OffscreenCanvas`; the fallback path stays for Safari without it.
+- `tryHarder` was measured and exonerated: 9.0 ms against 7.5 with it off, on a clean
+  frame. Left on, because it is the option that reads marginal ones.
+
+**The open question, and the instrument for it.** `capture/s` counted ATTEMPTS, including
+the ones dropped because every worker was busy — so "30 cap, 7 dec" was ambiguous between
+23 illegible and 23 never tried, which want opposite fixes. The metrics line now carries
+`drop`. If drops are high the ceiling is decode capacity (more workers, and crop to where
+the code was last seen rather than scanning 2.7 M pixels), and if drops are near zero it is
+optical after all.
+
+**The target.** Pedro wants ~100 KB/s. That is 35 V40 codes a second READ, against 5-7
+today, so it does not arrive by tuning the sender. Colour multiplexing was considered and
+deferred: black + red + green is two channels, so x2 not x3; the camera pipeline
+subsamples chroma to a quarter resolution, which is exactly the module-scale detail it
+would have to carry; and multiplying a bottleneck of 5 by two does not close a factor of
+seven. If it is ever built, the luma channel stays a valid ordinary QR so decimen receivers
+keep working, and the premise gets measured with a colour test card first.
+
+**Unvalidated at the end of the session**: the bitmap capture path and the `drop` metric
+are committed but were never seen running on the phone. First thing to check tomorrow.
+
 ## Gotchas (do not re-learn)
 
 - `runnir.json` WINS over `runnir.toml`. `Config::try_load` reads the JSON the settings
@@ -4506,6 +4564,15 @@ joining the thread before the window goes.
   each code lands on a smaller share of the SENSOR. Anything that makes the drawn code
   smaller has to be measured against a camera, never reasoned about in bytes. The same trap
   swallowed `maxNumberOfSymbols` on the receiving side — capture time is transfer speed.
+- Codes READ per second is roughly constant at 5-7 whatever the sender does, so the sender
+  should carry the most bytes per code it can. Anyone about to make the symbol smaller "so
+  it reads better" should measure first: V20 read no better than V40 and delivered a fifth.
+- A receiver capped below the send rate makes a LOW frame rate look optimal, because the
+  waste is what shrinks. Never tune sender timing while the receiver is the bottleneck —
+  that is how 10 fps got measured as best and then stopped being true an hour later.
+- `install.sh` resets to what ORIGIN has. Committing, installing and then pushing installs
+  the commit BEFORE the one just made, silently and with a cheerful success message. Push
+  first, then install.
 - `src/optical.rs` is a WIRE FORMAT, not a utility module. `dlog()` must never become
   `f64::ln`, and the arithmetic order in `soliton_cdf` must not be regrouped: either
   change desyncs runnir from every decimen receiver in the world, silently. Its golden

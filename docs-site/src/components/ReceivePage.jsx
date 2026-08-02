@@ -119,6 +119,10 @@ export default function ReceivePage() {
     // un mosaico de verdad. Es un objeto para que el worker envuelto y el bucle
     // de captura miren el mismo valor sin re-crear el pool.
     symbolsSeen: { current: 1 },
+    // Sacar los píxeles del hilo principal necesita las dos cosas: bitmaps aquí
+    // y OffscreenCanvas dentro del worker. Safari viejo no tiene la segunda.
+    canBitmap:
+      typeof createImageBitmap === 'function' && typeof OffscreenCanvas === 'function',
     decoder: null,
     streamKey: '',
     startTs: 0,
@@ -127,6 +131,10 @@ export default function ReceivePage() {
     frameId: 0,
     captureTimes: [],
     decodeTimes: [],
+    // Capturas tiradas porque todos los workers estaban ocupados. Sin este
+    // número, "30 capturas y 7 lecturas" es ambiguo entre 23 ilegibles y 23 ni
+    // intentadas, y los dos casos piden arreglos opuestos.
+    dropTimes: [],
     noSignal: new NoSignalHintTimer(NO_SIGNAL_AFTER_MS),
     statsTimer: undefined,
   })
@@ -212,7 +220,35 @@ export default function ReceivePage() {
     s.captureTimes.push(performance.now())
     // Todos los workers ocupados: se tira el frame. El fountain lo absorbe como
     // cualquier otro fallo, y un frame viejo vale menos que el siguiente.
-    if (s.pool.busyCount === s.pool.size) return
+    if (s.pool.busyCount === s.pool.size) {
+      s.dropTimes.push(performance.now())
+      return
+    }
+    // Buscar más de un símbolo cuesta tiempo real, y ese tiempo ES la velocidad
+    // de la transferencia. Se pide uno salvo que ya se haya visto un mosaico, y
+    // una captura de cada doce mira más ancho por si lo hay.
+    const max = symbolsToRequest(s.symbolsSeen.current, s.frameId)
+    const id = s.frameId++
+
+    // Los píxeles NO pasan por el hilo principal cuando el navegador sabe hacer
+    // bitmaps: a 1920x1440 una captura son 11 MB, y copiarlos aquí en cada frame
+    // estrangulaba el bucle de captura entero — que es el techo real de la
+    // transferencia. `createImageBitmap` no copia, y el bitmap viaja al worker
+    // por transferencia, así que el dibujado y la lectura los paga el pool.
+    if (s.canBitmap) {
+      createImageBitmap(video).then(
+        (bitmap) => {
+          if (!s.pool || !s.pool.submit({ id, bitmap, w: vw, h: vh, max }, [bitmap])) bitmap.close()
+        },
+        () => {
+          // Un navegador que dice que sabe y luego falla: se vuelve al camino
+          // lento en vez de dejar de recibir.
+          s.canBitmap = false
+        },
+      )
+      return
+    }
+
     const grab = canvasRef.current
     if (grab.width !== vw || grab.height !== vh) {
       grab.width = vw
@@ -221,11 +257,7 @@ export default function ReceivePage() {
     const ctx = grab.getContext('2d', { willReadFrequently: true })
     ctx.drawImage(video, 0, 0)
     const img = ctx.getImageData(0, 0, vw, vh)
-    // Buscar más de un símbolo cuesta tiempo real, y ese tiempo ES la velocidad
-    // de la transferencia. Se pide uno salvo que ya se haya visto un mosaico, y
-    // una captura de cada doce mira más ancho por si lo hay.
-    const max = symbolsToRequest(s.symbolsSeen.current, s.frameId)
-    s.pool.submit({ id: s.frameId++, buf: img.data.buffer, w: vw, h: vh, max }, [img.data.buffer])
+    s.pool.submit({ id, buf: img.data.buffer, w: vw, h: vh, max }, [img.data.buffer])
   }, [])
 
   const scheduleFrame = useCallback((gen) => {
@@ -250,6 +282,7 @@ export default function ReceivePage() {
     const prune = (a) => { while (a.length > 0 && a[0] < now - STATS_WINDOW_MS) a.shift() }
     prune(s.captureTimes)
     prune(s.decodeTimes)
+    prune(s.dropTimes)
     if (s.noSignal.tick(now)) setNoSignal(true)
     if (!s.decoder) {
       setProgress(null)
@@ -276,6 +309,7 @@ export default function ReceivePage() {
       payload: s.decoder.totalLen,
       capture: s.captureTimes.length / (STATS_WINDOW_MS / 1000),
       decode: s.decodeTimes.length / (STATS_WINDOW_MS / 1000),
+      drop: s.dropTimes.length / (STATS_WINDOW_MS / 1000),
     })
   }, [])
 
@@ -404,8 +438,9 @@ export default function ReceivePage() {
             </span>
           </div>
           <p className="receive-metrics">
-            {progress.capture.toFixed(0)} fps cap · {progress.decode.toFixed(1)} fps dec ·{' '}
-            {progress.frames}/{progress.dup} · k={progress.k} · {Math.round(progress.payload / 1024)} KB
+            {progress.capture.toFixed(0)} cap · {progress.decode.toFixed(1)} dec ·{' '}
+            {progress.drop.toFixed(0)} drop · {progress.frames}/{progress.dup} · k={progress.k} ·{' '}
+            {Math.round(progress.payload / 1024)} KB
           </p>
         </div>
       )}

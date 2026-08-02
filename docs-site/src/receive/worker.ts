@@ -40,15 +40,21 @@ const ctx = self as unknown as {
 // capture throughput — which IS transfer speed. So the page asks for one symbol
 // normally and probes wider now and then; see `mosaic.ts`.
 ctx.onmessage = async (e: MessageEvent) => {
-  const { id, buf, w, h, max } = e.data as {
+  const { id, buf, bitmap, w, h, max } = e.data as {
     id: number;
-    buf: ArrayBuffer;
+    buf?: ArrayBuffer;
+    bitmap?: ImageBitmap;
     w: number;
     h: number;
     max?: number;
   };
   try {
-    const img = new ImageData(new Uint8ClampedArray(buf), w, h);
+    // A bitmap arrives by TRANSFER, so the megabytes never crossed the main
+    // thread: at 1920x1440 a capture is 11 MB, and copying that per frame in the
+    // event loop was throttling the whole receiver. Drawing it here spreads the
+    // cost across the pool instead. Older Safari has no OffscreenCanvas inside a
+    // worker, so the page still sends raw pixels when that is all it can do.
+    const img = bitmap ? drawToImageData(bitmap) : new ImageData(new Uint8ClampedArray(buf!), w, h);
     const results = await readBarcodes(img, {
       formats: ["QRCode"],
       maxNumberOfSymbols: Math.max(1, max ?? 1),
@@ -59,6 +65,17 @@ ctx.onmessage = async (e: MessageEvent) => {
     ctx.postMessage({ id, symbols: [] });
   }
 };
+
+function drawToImageData(bitmap: ImageBitmap): ImageData {
+  const canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
+  const c2d = canvas.getContext("2d", { willReadFrequently: true }) as OffscreenCanvasRenderingContext2D;
+  c2d.drawImage(bitmap, 0, 0);
+  const out = c2d.getImageData(0, 0, bitmap.width, bitmap.height);
+  // Frees the backing memory now rather than at the next GC. At several frames a
+  // second these are the largest allocations the receiver makes.
+  bitmap.close();
+  return out;
+}
 
 // Warm the WASM so the first real frame does not pay instantiation.
 void readBarcodes(new ImageData(8, 8), { formats: ["QRCode"] })
