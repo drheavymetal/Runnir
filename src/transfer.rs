@@ -29,12 +29,18 @@ pub const DEFAULT_FRAME_BYTES: usize = 2953;
 /// bottleneck either way, an LCD needs time to actually settle on a new pattern,
 /// and a frame the camera catches mid-transition is a frame wasted.
 ///
-/// 30 rather than their 60 because a phone delivers 30 or 60 captured frames a
-/// second and the two clocks are not locked: at the camera's own rate most
-/// captures land mid-transition, and half of a QR from each of two frames
-/// decodes as nothing. Half the capture rate is the first number at which every
-/// drawn frame is certain to get one clean look.
-pub const DEFAULT_FPS: u32 = 30;
+/// 10, and that number is measured rather than argued. 24, 30 and 15 were all
+/// worse against a real phone, and 5 was worse than 10 in the other direction.
+///
+/// Reasoning got this wrong twice. The theory said half the capture rate, so 30
+/// against a 60 fps camera, on the grounds that a code needs one clean look. But
+/// a clean look is not one capture interval: the phone is hand-held, so it needs
+/// long enough to hold still, for autofocus to settle, and for an exposure that
+/// is not smeared across a change. A hundred milliseconds a code buys all three.
+/// Duplicate captures of the same code cost nothing — the fountain discards a
+/// sequence number it already has — so showing a code for longer than strictly
+/// necessary is close to free, while showing it for too little is total loss.
+pub const DEFAULT_FPS: u32 = 10;
 
 /// How many codes to show at once. 0 means one code, as big as the window
 /// allows, which is what a phone at arm's length actually wants.
