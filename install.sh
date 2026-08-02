@@ -188,10 +188,15 @@ fetch_source() {
 	mkdir -p "$DATA_DIR"
 	if [ -d "$SRC_DIR/.git" ]; then
 		info "updating source in $SRC_DIR"
-		git -C "$SRC_DIR" fetch --depth 1 origin
 		_ref=$(tracked_ref)
-		git -C "$SRC_DIR" fetch --depth 1 origin "$_ref" 2>/dev/null || true
-		git -C "$SRC_DIR" checkout -q "$_ref" 2>/dev/null || true
+		# An explicit refspec, because the checkout is a --depth 1 clone and those
+		# are single-branch: `fetch origin <ref>` lands in FETCH_HEAD and creates
+		# no remote-tracking branch, so the reset below would fail on an unknown
+		# revision. This is what makes switching refs work at all.
+		git -C "$SRC_DIR" fetch --depth 1 origin \
+			"+refs/heads/$_ref:refs/remotes/origin/$_ref" 2>/dev/null \
+			|| die "no branch or tag named $_ref on $REPO_URL"
+		git -C "$SRC_DIR" checkout -q -B "$_ref" "origin/$_ref" 2>/dev/null || true
 		git -C "$SRC_DIR" reset --hard "origin/$_ref"
 	else
 		info "cloning $REPO_URL"
