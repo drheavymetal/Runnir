@@ -4388,6 +4388,52 @@ with nothing after it must be an error, not a transfer of a file called `--fps`.
 are now a whitelist (`BARE_FLAGS`), so `--color` alone means on and everything else still
 fails loudly.
 
+## 2026-08-03 - Sharing said "opening" for ever, and the reason was one command early
+
+Reported as the Cloudflare share doing nothing: the panel says opening and no URL ever
+arrives. Nothing wrong with the tunnel — `cloudflared` was installed, and there was one
+running. That was the problem.
+
+**What was actually on the machine.** A player daemon 3h29m old, `/proc/<pid>/exe`
+reading `runnir (deleted)` — the binary had been replaced under it twice by the day's
+installs — with a `cloudflared` child of its own from 3h14m ago. The share command had
+gone to a three-hour-old program that already had a tunnel, and `set_share` returns
+early when one is held: *already sharing; asking twice is not an error*. Which it is
+not, unless the asking window has never seen the answer.
+
+**Why the stale-daemon guard did not fire.** It exists, it works, and it is one command
+too late. `Remote::connect` returned as soon as the socket was open; the build stamp
+travels in the daemon's first SNAPSHOT, which the reader thread parses milliseconds
+afterwards. So the sequence was: connect, send the command the person just pressed,
+*then* notice the daemon is from another build. The guard in `player()` only runs on the
+NEXT call, so the first action of a freshly opened window always went to the old daemon.
+
+Sharing is precisely the shape of command that gets pressed once and then stared at.
+
+**The fix is to ask before answering.** `connect` now reads the first snapshot
+synchronously — the daemon's writer pushes one the moment a client attaches, so this
+costs nothing in the normal case — and if the build differs it retires that daemon,
+waits for it to let go of the socket and the lock, starts a current one and connects to
+that. The handle handed back is always to a daemon of this build.
+
+Two details that would have made it subtly wrong:
+
+- The **same `BufReader`** is handed to the reader thread, not a fresh one over the same
+  socket. A second reader would start after whatever the first had buffered, dropping
+  snapshots — and the writer batches, so that is not hypothetical.
+- The read timeout is **cleared** before the thread takes it. Left on, the reader loop
+  would end after two idle seconds and the window would decide the player had gone.
+
+The seeded snapshot is a small bonus: a panel opened now draws what is playing rather
+than an empty frame followed by a correction.
+
+**And the tunnel outlived everything.** `Share::stop` and the drop glue close it, and
+neither runs when a process is signalled — which is how a daemon ends nearly every time,
+including every `kill` of a stale one. The orphan found today had been holding a public
+hostname for three hours, pointing at a port nothing was listening on. `cloudflared` is
+now spawned with `PR_SET_PDEATHSIG`, so it dies with the daemon whatever kills it, plus
+the `getppid() == 1` check for the parent that dies between fork and exec.
+
 ## 2026-08-03 - Colour measured +73%, and the frame rate became automatic
 
 The colour layer was built as an experiment with the analysis against it. The phone
@@ -4509,6 +4555,13 @@ started with. It was already correct, and it is the hot path for playback.
 
 ## Gotchas (do not re-learn)
 
+- Detecting a bad peer ASYNCHRONOUSLY means the first command still goes to it. The
+  stale-daemon check rode in on the first snapshot, which lands after `connect` has
+  returned, so exactly one command per window went to the wrong process — and the first
+  command is the one somebody just pressed. Identity belongs in the handshake.
+- A child process spawned by a daemon needs `PR_SET_PDEATHSIG`. Destructors and cleanup
+  paths do not run when a process is signalled, and `kill` is how a daemon usually ends.
+  A `cloudflared` was found holding a public hostname three hours after its parent died.
 - A budget that is exactly filled is a budget that is exceeded. Two codes cost ~25 ms to
   paint and 40 fps allows 25 ms, which measured MUCH worse rather than merely equal: the
   upload and the rest of the frame need the same interval. Any self-limiter timing its
