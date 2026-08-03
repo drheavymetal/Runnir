@@ -488,11 +488,13 @@ impl Default for Explorer {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Transfer {
-    /// Codes per second. The ceiling is the CAMERA, not the screen: a phone
-    /// captures 30 or 60 frames a second and the two clocks are not locked, so
-    /// past about half the capture rate most frames are caught mid-change and
-    /// decode as nothing. Raising this past that point sends more and delivers
-    /// less.
+    /// Codes per second, or 0 for automatic — the fastest this machine can
+    /// actually paint, up to 30.
+    ///
+    /// 30 rather than more because that is where the receiver saturates: it
+    /// reads about 9 codes a second, and 30 frames in colour already put 60 on
+    /// the glass. An explicit number is obeyed even when the painter cannot keep
+    /// up, and the panel says so — same rule as `tiles`.
     pub fps: u32,
     /// How many codes to show at once, or 0 to fit as many as the window takes
     /// without shrinking the modules. A number above what fits at full size
@@ -502,9 +504,13 @@ pub struct Transfer {
     /// Carry a second code in the colour of the first: red and green hold the
     /// ordinary black-and-white code, blue holds another frame of the same
     /// stream. Twice the codes out of the same square of screen, at the cost of
-    /// a second scan per capture on the receiver — so it is a win only when the
-    /// phone is not already the bottleneck, which is why it is off by default.
-    /// The base code stays a completely ordinary QR either way.
+    /// a second scan per capture on the receiver.
+    ///
+    /// On, because it measured +73% against a real phone. The base code stays a
+    /// completely ordinary QR either way, so nothing that could read a runnir
+    /// stream before stops being able to. Turn it off for a phone whose metrics
+    /// line shows it dropping captures — there the second scan costs more than
+    /// the second code brings.
     pub color: bool,
 }
 

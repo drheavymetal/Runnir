@@ -4655,7 +4655,15 @@ impl TransferPanel {
             "{status} \u{b7} {} blocks \u{b7} V{} \u{b7} {} fps{mosaic}{color}{behind} \u{b7} pass {pass:.0}s \u{b7} {:.1} sent in {}s",
             t.blocks(),
             t.version,
-            t.fps,
+            // The rate it is RUNNING at, which is not always the one asked for:
+            // the automatic setting steps down to what this machine paints in
+            // time. A panel that showed the request would be reporting a number
+            // nothing on screen obeys.
+            if t.fps_is_automatic() {
+                format!("{} auto", t.effective_fps())
+            } else {
+                t.effective_fps().to_string()
+            },
             t.passes(),
             t.elapsed().as_secs()
         );

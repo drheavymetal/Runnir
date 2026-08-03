@@ -22,25 +22,46 @@ use crate::optical::{self, LtEncoder, PackedFile};
 /// because the frame rate is capped by the screen and the camera, not by us.
 pub const DEFAULT_FRAME_BYTES: usize = 2953;
 
-/// Frames per second.
+/// Frames per second, or **0 for automatic** — which is the default, and means
+/// the fastest rate this machine can actually paint, up to [`AUTO_FPS_MAX`].
 ///
-/// decimen's browser sender defaults to 60 because it runs full-screen on a
-/// desktop monitor. runnir defaults lower on purpose: the phone camera is the
-/// bottleneck either way, an LCD needs time to actually settle on a new pattern,
-/// and a frame the camera catches mid-transition is a frame wasted.
+/// The same sentinel the tile count uses, and for the same reason: the right
+/// number depends on hardware runnir can measure and a room it cannot, so it
+/// answers the half it knows and leaves the other half to a person with a phone.
 ///
-/// 10, and that number is measured rather than argued. 24, 30 and 15 were all
-/// worse against a real phone, and 5 was worse than 10 in the other direction.
+/// The history is worth keeping, because reasoning got this wrong three times.
+/// The theory said half the capture rate — 30 against a 60 fps camera — on the
+/// grounds that a code needs one clean look. Then a measurement said 10, on the
+/// grounds that a hand-held phone needs time to settle. Then 10 turned out to be
+/// an artifact of a receiver capped at ~5 codes a second: with the receiver
+/// fixed, and with each capture carrying two codes in colour, 30 beat 25 and 40
+/// was much worse. So the shape of the answer is not a constant at all — it is
+/// "as fast as the painter can go", with the ceiling set by the receiver
+/// saturating rather than by the screen.
+pub const DEFAULT_FPS: u32 = 0;
+
+/// The fastest the automatic rate will choose.
 ///
-/// Reasoning got this wrong twice. The theory said half the capture rate, so 30
-/// against a 60 fps camera, on the grounds that a code needs one clean look. But
-/// a clean look is not one capture interval: the phone is hand-held, so it needs
-/// long enough to hold still, for autofocus to settle, and for an exposure that
-/// is not smeared across a change. A hundred milliseconds a code buys all three.
-/// Duplicate captures of the same code cost nothing — the fountain discards a
-/// sequence number it already has — so showing a code for longer than strictly
-/// necessary is close to free, while showing it for too little is total loss.
-pub const DEFAULT_FPS: u32 = 10;
+/// Measured against a real phone on 2026-08-03: 30 beat 25, and 40 was much
+/// worse. Above this the sender is not the constraint anyway — the receiver
+/// reads about 9 codes a second, and 30 frames a second in colour already puts
+/// 60 on the glass. Past saturation more frames buy nothing but a chance the
+/// painter falls behind, which costs.
+pub const AUTO_FPS_MAX: u32 = 30;
+
+/// The slowest the automatic rate will drop to on a machine that cannot paint.
+/// Below this the stream is barely a stream, and a person is better told than
+/// silently throttled — which the panel does.
+pub const AUTO_FPS_MIN: u32 = 5;
+
+/// How much of the frame interval the painting may take before the automatic
+/// rate steps down.
+///
+/// Not 1.0: painting is not all a frame does. The texture still has to be
+/// uploaded and the rest of the window drawn, and they share the interval. The
+/// measurement that fixes this: two codes cost ~25 ms to paint, which fits a
+/// 40 fps interval of 25 ms exactly — and 40 fps measured MUCH worse than 30.
+const PAINT_HEADROOM: f64 = 1.3;
 
 /// How many codes to show at once. 0 means one code, as big as the window
 /// allows, which is what a phone at arm's length actually wants.
@@ -54,11 +75,20 @@ pub const DEFAULT_FPS: u32 = 10;
 /// information runnir does not have and the person holding the phone does.
 pub const DEFAULT_TILES: usize = 0;
 
-/// Carry a second code in colour on top of the first. Off by default, and the
-/// reasons are in [`paint_mosaic`] and worth reading before turning it on: it
-/// doubles what the sender emits and roughly doubles what the receiver has to
-/// decode, so it pays only when the receiver is NOT the bottleneck.
-pub const DEFAULT_COLOR: bool = false;
+/// Carry a second code in colour on top of the first. On, because it measured
+/// **+73%** against the same file and phone in the same session: 22.5 KB/s at 30
+/// fps in colour, against 13 KB/s at best without it.
+///
+/// That result settles the doubt it was built to settle. The worry was that a
+/// second scan per capture would cancel the second code, which would be true if
+/// decoding were the constraint — and the +73% says it is not: the constraint is
+/// how many codes each capture YIELDS, which is exactly what colour changes. The
+/// scheme, and why the base code stays an ordinary QR for every other receiver
+/// in the world, is in [`paint_mosaic`].
+///
+/// `--color 0` turns it off, which is worth reaching for on a phone slow enough
+/// that its metrics line shows captures being dropped.
+pub const DEFAULT_COLOR: bool = true;
 
 /// Ceiling on tiles, whatever the window or the setting asks for.
 ///
@@ -190,7 +220,9 @@ impl Transfer {
         let now = Instant::now();
         Ok(Self {
             name: name.to_string(),
-            fps: fps.clamp(1, 120),
+            // 0 survives on purpose: it is the automatic rate, not a rate of
+            // zero. Everything reads [`Self::effective_fps`] rather than this.
+            fps: fps.min(120),
             version,
             started: now,
             frames_sent: 0,
@@ -234,6 +266,34 @@ impl Transfer {
         self.grid
     }
 
+    /// The rate this stream actually runs at.
+    ///
+    /// An explicit `fps` is obeyed, even when the painter cannot keep up — the
+    /// panel says so instead, exactly as it does for an explicit tile count. The
+    /// person who typed a number is the one who can judge whether their screen
+    /// and their phone make it worth having.
+    ///
+    /// Automatic (`fps = 0`) asks for [`AUTO_FPS_MAX`] and steps down to what
+    /// this machine measured itself painting. Until the first frame has been
+    /// painted there is nothing to measure and it asks for the ceiling, which is
+    /// the right guess: the cost is known one frame later and costs one frame.
+    pub fn effective_fps(&self) -> u32 {
+        if self.fps > 0 {
+            return self.fps;
+        }
+        let Some(per_code) = self.per_tile else { return AUTO_FPS_MAX };
+        let frame = per_code.as_secs_f64() * f64::from(self.codes_per_frame()) * PAINT_HEADROOM;
+        if frame <= 0.0 {
+            return AUTO_FPS_MAX;
+        }
+        ((1.0 / frame).floor() as u32).clamp(AUTO_FPS_MIN, AUTO_FPS_MAX)
+    }
+
+    /// Whether the rate is being chosen rather than obeyed.
+    pub fn fps_is_automatic(&self) -> bool {
+        self.fps == 0
+    }
+
     /// Codes carried by one tile: two in colour mode, one otherwise.
     ///
     /// A tile is one square of screen either way. What colour buys is a second
@@ -271,7 +331,7 @@ impl Transfer {
     /// this is the floor if every code sent is read, which no camera manages.
     pub fn shortest_pass(&self) -> Duration {
         let needed = (self.encoder.k as f64 * 1.15).ceil();
-        let per_second = f64::from(self.fps) * f64::from(self.codes_per_frame());
+        let per_second = f64::from(self.effective_fps()) * f64::from(self.codes_per_frame());
         Duration::from_secs_f64(needed / per_second)
     }
 
@@ -361,7 +421,7 @@ impl Transfer {
         if self.paused {
             return false;
         }
-        let interval = Duration::from_secs_f64(1.0 / f64::from(self.fps));
+        let interval = self.interval();
         if self.frames_sent > 0 && now.duration_since(self.last_advance) < interval {
             return false;
         }
@@ -421,7 +481,7 @@ impl Transfer {
     /// How long the interval between frames is, which is also how often a window
     /// showing this has to wake up.
     pub fn interval(&self) -> Duration {
-        Duration::from_secs_f64(1.0 / f64::from(self.fps))
+        Duration::from_secs_f64(1.0 / f64::from(self.effective_fps()))
     }
 
     pub fn elapsed(&self) -> Duration {
@@ -1020,6 +1080,24 @@ mod tests {
             let each = start.elapsed() / ROUNDS;
             let budget = Duration::from_secs_f64(1.0 / 30.0);
             eprintln!(
+                "  automatic rate here: {} fps",
+                {
+                    let mut auto = Transfer::start(
+                        "m.bin",
+                        "image/jpeg",
+                        &bytes,
+                        DEFAULT_FRAME_BYTES,
+                        0,
+                        tiles,
+                        color,
+                    )
+                    .unwrap();
+                    auto.advance(Instant::now(), &lay);
+                    auto.raster(&lay, lay.drawn.0, lay.drawn.1);
+                    auto.effective_fps()
+                }
+            );
+            eprintln!(
                 "{}x{}{} = {} codes at x{}px: {:?} per drawn frame ({:.0}% of a 30 fps budget)",
                 lay.grid.0,
                 lay.grid.1,
@@ -1158,6 +1236,62 @@ mod tests {
             colour.shortest_pass(),
             plain.shortest_pass()
         );
+    }
+
+    #[test]
+    fn the_automatic_rate_steps_down_to_what_the_machine_paints_and_an_explicit_one_does_not() {
+        let file = incompressible(80_000);
+        let mut auto =
+            Transfer::start("a.bin", "image/jpeg", &file, DEFAULT_FRAME_BYTES, 0, 1, true).unwrap();
+        assert!(auto.fps_is_automatic());
+        // Nothing painted yet, nothing measured: it asks for the ceiling, which
+        // is the right guess to be wrong by one frame about.
+        assert_eq!(auto.effective_fps(), AUTO_FPS_MAX);
+
+        let lay = auto.layout_for(185 * 4, 185 * 4);
+        auto.advance(Instant::now(), &lay);
+        auto.raster(&lay, lay.drawn.0, lay.drawn.1);
+        let chosen = auto.effective_fps();
+        assert!(
+            (AUTO_FPS_MIN..=AUTO_FPS_MAX).contains(&chosen),
+            "the automatic rate stays inside its bounds: {chosen}"
+        );
+        // Above the floor, whatever it chose has to be a rate it can paint. AT
+        // the floor it may not be, and that is deliberate: a machine too slow for
+        // five frames a second is told rather than throttled to a standstill.
+        // Asserting the floor is always paintable would be asserting something
+        // about the machine — and a debug build paints an order of magnitude
+        // slower than the release one this ships as.
+        assert!(
+            chosen == AUTO_FPS_MIN || !auto.painter_behind(),
+            "the automatic rate chose {chosen}, which it cannot paint"
+        );
+
+        // More codes per frame is more painting, so the rate it settles on can
+        // only go one way. This holds whatever the machine — which is the point
+        // of checking the direction rather than the number.
+        let mut mono =
+            Transfer::start("a.bin", "image/jpeg", &file, DEFAULT_FRAME_BYTES, 0, 1, false).unwrap();
+        mono.advance(Instant::now(), &lay);
+        mono.raster(&lay, lay.drawn.0, lay.drawn.1);
+        assert!(
+            auto.effective_fps() <= mono.effective_fps(),
+            "colour paints two codes a frame, so it cannot choose a faster rate than mono: {} vs {}",
+            auto.effective_fps(),
+            mono.effective_fps()
+        );
+
+        // An explicit rate is obeyed, even an absurd one: the panel warns rather
+        // than overriding a number a person typed.
+        let mut forced =
+            Transfer::start("a.bin", "image/jpeg", &file, DEFAULT_FRAME_BYTES, 120, 8, true).unwrap();
+        assert!(!forced.fps_is_automatic());
+        assert_eq!(forced.effective_fps(), 120);
+        let lay = forced.layout_for(185 * 8, 185 * 8);
+        forced.advance(Instant::now(), &lay);
+        forced.raster(&lay, lay.drawn.0, lay.drawn.1);
+        assert_eq!(forced.effective_fps(), 120, "an explicit rate is never stepped down");
+        assert!(forced.painter_behind(), "sixteen codes at 120 fps cannot possibly be painted");
     }
 
     #[test]

@@ -4388,6 +4388,72 @@ with nothing after it must be an error, not a transfer of a file called `--fps`.
 are now a whitelist (`BARE_FLAGS`), so `--color` alone means on and everything else still
 fails loudly.
 
+## 2026-08-03 - Colour measured +73%, and the frame rate became automatic
+
+The colour layer was built as an experiment with the analysis against it. The phone
+settled it, same file and same session throughout:
+
+    mono  @24 (earlier)   16.0 KB/s   ~5.5 codes/s read
+    mono  @30             13.0 KB/s   ~5.2 codes/s   (never got past 13)
+    colour @25            19.4 KB/s   ~7.8 codes/s
+    colour @30            22.5 KB/s   ~9.0 codes/s   <- +73% over mono
+    colour @40            much worse — the painter cannot keep up
+
+**+73% with a second scan per capture is the interesting part**, because it refutes the
+reason colour was deferred. If decode capacity were the constraint, the extra scan would
+have cancelled the extra code exactly. It did not, so the constraint was never decoding:
+it is how many codes each CAPTURE yields. The camera hands over the captures it hands
+over, and until today each one carried at most one code. That is also why every
+sender-side lever measured flat yesterday — they all move bytes per code, and none of
+them moved codes per capture.
+
+The gap between +73% and the theoretical +100% is the blue channel failing more often
+than the luma one, which is exactly what chroma subsampling predicted. It fails cheaply:
+a lost extra is a frame the fountain never notices.
+
+It also fixes the ceiling of the scheme at x2. Splitting red from green would break the
+property that makes it compatible — pure red is luma 76 and green 150, neither dark nor
+light — and the base code would stop being an ordinary QR.
+
+**40 fps was worse, in the way the arithmetic said it would be.** Two codes cost ~25 ms
+to paint and a 40 fps interval is 25 ms, so the painter falls behind and the stream
+sends fewer codes than asked for. `painter_behind` had just moved out of the mosaic note
+into its own warning for exactly this case, and it fired.
+
+### The frame rate is now automatic, like the tile count
+
+`fps = 0` is the default and means "as fast as this machine paints", up to
+`AUTO_FPS_MAX = 30`. The same sentinel and the same rule as `tiles`: runnir answers the
+half it can measure — its own paint cost — and leaves the half it cannot see to whoever
+is holding the phone. An explicit `--fps` is obeyed even when it cannot be painted, and
+the panel warns instead of overruling it.
+
+Two numbers make it work. The ceiling is 30 because that is where the RECEIVER saturates:
+about nine codes a second read, against sixty already on the glass at 30 fps in colour.
+More frames past that buy nothing but a chance of falling behind. And the headroom factor
+is 1.3, not 1.0, because painting is not all a frame does — the upload and the rest of
+the window share the interval, which is precisely why 40 fps at 25 ms of paint measured
+much worse rather than merely equal.
+
+Measured on this machine (release), the automatic rate picks:
+
+    1 code           30 fps      1x1 colour (2 codes)   30 fps
+    4 codes          13 fps      1x2 colour (4 codes)   15 fps
+
+So the default configuration — one tile, colour, automatic — lands on exactly the 30 fps
+that measured best, and a heavier mosaic steps itself down instead of quietly sending
+fewer codes than it claims.
+
+The test for this deliberately does NOT assert that the chosen rate is paintable at the
+floor: a debug build paints an order of magnitude slower than the release one this ships
+as, so that assertion would have been a test of the profile. It asserts the bounds, the
+implication above the floor, and that colour — two codes a frame — can never choose a
+faster rate than mono. That last one holds on any machine, which is the point.
+
+**The default for colour is now on.** The base code stays an ordinary QR, so nothing that
+could read a runnir stream before stops being able to; the only cost lands on a phone slow
+enough to be dropping captures, and `--color 0` is for that.
+
 ## 2026-08-03 - The TIDAL session only refreshed on the path that played music
 
 Reported as "my TIDAL token expired, how do I sign in again". It had not needed a sign-in:
@@ -4443,6 +4509,10 @@ started with. It was already correct, and it is the hot path for playback.
 
 ## Gotchas (do not re-learn)
 
+- A budget that is exactly filled is a budget that is exceeded. Two codes cost ~25 ms to
+  paint and 40 fps allows 25 ms, which measured MUCH worse rather than merely equal: the
+  upload and the rest of the frame need the same interval. Any self-limiter timing its
+  own work needs headroom over the measurement, not equality with it.
 - A channel left free does not stay free-looking. Painting the base code with the blue
   channel unset tints every dark module blue — a stream that still decodes, on a screen
   that looks broken. Without a second layer the blue channel has to FOLLOW the first.

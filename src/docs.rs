@@ -767,7 +767,8 @@ network between the two, no pairing, no account, no app: the only channel is lig
 
 Per-stream settings, for comparing two runs without editing a config file:
 
-  runnir @ transfer --path FILE --fps 25      codes per second
+  runnir @ transfer --path FILE --fps 25      codes per second (0 = as fast as
+                                              this machine can paint, up to 30)
   runnir @ transfer --path FILE --tiles 2     codes on screen at once
   runnir @ transfer --path FILE --bytes 1273  payload per code (picks the QR version)
   runnir @ transfer --path FILE --color       carry a second code in colour
@@ -782,9 +783,16 @@ The panel shows a six-digit code, and the phone shows one when it finishes. They
 when the phone holds the file that was on screen. Nothing depends on you checking: the
 receiver verifies the full SHA-256 by itself and refuses a file that does not match.
 
-How long it takes: about 60 KB a second at the default settings. Text, configs, diffs and
-small images are seconds; a megabyte is closer to twenty. The file is gzipped first when
-that helps, and the panel says so.
+How long it takes: about 22 KB a second at the defaults, measured against a real phone
+at arm's length rather than calculated. Text, configs, diffs and small images are
+seconds; half a megabyte is about twenty. The file is gzipped first when that helps, and
+the panel says so.
+
+The rate is automatic by default: runnir times its own painting and runs as fast as it
+can keep up with, to a ceiling of 30 codes a second. The ceiling is where the RECEIVER
+saturates — a phone reads about nine codes a second, and 30 frames in colour already put
+sixty on the glass. An explicit --fps is obeyed instead, and the panel warns rather than
+overruling it when the painter cannot keep up.
 
 Colour (--color, or [transfer] color) puts TWO codes in the same square. Red and green
 carry an ordinary black-and-white code; blue carries another frame of the same stream.
@@ -793,11 +801,12 @@ normal code, so nothing was added to the format and a receiver that knows nothin
 colour still reads half the stream at full speed. runnir's own receiver finds the second
 layer by looking for it, and marks its metrics line with the word color when it has.
 
-Whether colour is faster is a question about the phone, which is why it is off by
-default and a switch rather than a decision. It doubles what goes out and roughly
-doubles what the receiver has to decode, so it wins when the phone is not already the
-thing holding the transfer up — few dropped captures on the receiver's metrics line —
-and buys nothing when it is. It also costs a second QR encode per frame here: at 25 fps
+Colour is on by default because it measured +73% against a real phone: 22.5 KB a second
+with it, against 13 at best without. That result also answers the doubt it was built to
+settle — a second scan per capture would have cancelled the second code if decoding were
+the constraint, so the constraint is how many codes each capture YIELDS. Turn it off
+(--color 0) for a phone whose metrics line shows captures being dropped: there the second
+scan costs more than the second code brings. It also costs a second QR encode per frame here: at 25 fps
 that fits comfortably, and past that the panel warns that the painter is behind rather
 than quietly sending fewer codes than asked for.
 
