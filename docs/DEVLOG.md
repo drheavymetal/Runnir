@@ -4310,6 +4310,84 @@ keep working, and the premise gets measured with a colour test card first.
 **Unvalidated at the end of the session**: the bitmap capture path and the `drop` metric
 are committed but were never seen running on the phone. First thing to check tomorrow.
 
+## 2026-08-03 - Optical transfer, step 7: two codes in one square, in colour
+
+Asked for as an experiment, and built as one: `--color` / `[transfer] color`, off by
+default. The 03-08 analysis had deferred colour on three counts and none of them has been
+refuted — this makes it measurable instead of arguable.
+
+**The scheme, and the one property that makes it safe.** Each tile carries two frames of
+the same stream. Red and green hold the ordinary code; blue holds the second one.
+
+    base dark, extra dark    black   (0,0,0)        luma 0    blue 0
+    base dark, extra light   blue    (0,0,255)      luma ~29  blue 255
+    base light, extra dark   yellow  (255,255,0)    luma ~226 blue 0
+    base light, extra light  white   (255,255,255)  luma 255  blue 255
+
+Read as BRIGHTNESS — which is what every QR decoder does, and what a camera's luma plane
+carries at full resolution — black and blue are dark, yellow and white are light, so the
+base code is a completely ordinary QR symbol. Nothing was added to the wire format and
+nothing anywhere announces that colour is in use. decimen's receivers, and any QR app,
+keep working and simply read half the stream. The extra code is the blue channel on its
+own, and it inherits the base code's quiet zone for free because white is blue-light.
+
+Four colours, no blending, no intermediate value for a camera to resolve.
+
+**What it costs, which is the whole question.** The receiver has to scan a second image
+per capture, so it roughly doubles decode time — and the 03-08 measurements said codes
+read per second were constant at 5-7 whatever the sender did, i.e. the receiver was the
+bottleneck. Doubling both sides of a bottleneck is a wash. Colour pays exactly when the
+receiver is NOT the cap: few dropped captures, spare workers, or optics marginal enough
+that many captures fail anyway (a failed extra costs nothing the fountain notices). The
+`drop` metric added the same day is what answers it, which is why this is worth running
+now rather than after.
+
+Chroma subsampling remains the other half of the doubt: the camera pipeline carries the
+blue-difference channel at a quarter resolution, which is precisely the module-scale
+detail the second layer has to survive. That is why the layers are two independent
+fountain frames rather than half of each frame's bits — the extra one failing is a
+missed frame, never a corrupted file.
+
+**Sender cost, measured** (`cost_of_a_mosaic`, release, Iris Xe):
+
+    1x1              1 code    12.6 ms
+    1x2              2 codes   26.2 ms
+    1x1 colour       2 codes   25.3 ms
+    1x2 colour       4 codes   50.1 ms
+
+So colour and the mosaic cost the same per code: the bill is the QR encode, not the
+pixels. Two codes fit a 25 fps budget (40 ms) and do not fit 40 fps, which is why
+`painter_behind` moved out of the mosaic note and became its own warning — with colour a
+SINGLE tile can fall behind, and the old wording could only appear on a mosaic.
+
+**Proved without a camera, at both levels that can be.** `RUNNIR_PAINTED_COLOR=1` paints
+the real raster and `optical-painted-check.mjs` reads it exactly as before, then reads the
+blue channel the way the receiver's worker does: 25 images, 28 codes, 14 of them off the
+blue channel, file rebuilt and SHA-256 verified. `RUNNIR_DEMO_COLOR=1` renders a window
+through the whole wgpu pipeline (image quad, linear sampler, sRGB surface) and
+`optical-scene-check.mjs … color` read two distinct frames, seq 0 and 1, out of one
+window. The monochrome path was re-run through all four harnesses unchanged.
+
+The Rust tests are pixel-level, because there is no QR decoder in the crate graph and the
+decode proof belongs to the JS harnesses anyway: the dark-by-brightness pixels of a colour
+painting are asserted to be exactly the black pixels of the plain painting of the same
+frame, and the blue channel exactly the plain painting of the other one.
+
+**The receiver finds colour rather than being told.** There is no flag on the wire, so
+`scanBluePlane` probes one capture in twenty-four and latches on the first blue-channel
+code it sees — the same bargain, and the same shape, as the mosaic probe. Two counts come
+back from the worker instead of one: codes from the ordinary scan drive the mosaic latch,
+codes from the blue channel drive the colour latch. Sharing one number would have made a
+colour stream look like a two-tile mosaic and sent zxing hunting for symbols that are not
+on screen. The blue plane is built by overwriting red and green IN PLACE, after the first
+read has resolved: a second 11 MB array per capture is exactly the allocation that the
+bitmap-transfer work removed from the main thread a day earlier.
+
+**Bare `--color`.** `parse_flags` demands a value for every flag on purpose — `--path`
+with nothing after it must be an error, not a transfer of a file called `--fps`. Switches
+are now a whitelist (`BARE_FLAGS`), so `--color` alone means on and everything else still
+fails loudly.
+
 ## 2026-08-03 - The TIDAL session only refreshed on the path that played music
 
 Reported as "my TIDAL token expired, how do I sign in again". It had not needed a sign-in:
@@ -4365,6 +4443,9 @@ started with. It was already correct, and it is the hot path for playback.
 
 ## Gotchas (do not re-learn)
 
+- A channel left free does not stay free-looking. Painting the base code with the blue
+  channel unset tints every dark module blue — a stream that still decodes, on a screen
+  that looks broken. Without a second layer the blue channel has to FOLLOW the first.
 - A token refresh that lives in ONE code path is a token refresh for that path only. The
   TIDAL panel loaded the session raw while playback renewed it, so search failed while the
   music played. Anything with an expiry needs a single door that every caller goes through

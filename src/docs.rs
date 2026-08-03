@@ -765,6 +765,13 @@ network between the two, no pairing, no account, no app: the only channel is lig
   space                    pause on the frame that is showing
   esc or q                 close
 
+Per-stream settings, for comparing two runs without editing a config file:
+
+  runnir @ transfer --path FILE --fps 25      codes per second
+  runnir @ transfer --path FILE --tiles 2     codes on screen at once
+  runnir @ transfer --path FILE --bytes 1273  payload per code (picks the QR version)
+  runnir @ transfer --path FILE --color       carry a second code in colour
+
 Why it works with no handshake: the codes are not the file in order. Each one is a
 fountain-coded mixture, and the phone rebuilds the file from ANY 115 or so frames out of
 every 100 it needs, in any order. So there is no frame you can miss, no beginning to
@@ -778,6 +785,21 @@ receiver verifies the full SHA-256 by itself and refuses a file that does not ma
 How long it takes: about 60 KB a second at the default settings. Text, configs, diffs and
 small images are seconds; a megabyte is closer to twenty. The file is gzipped first when
 that helps, and the panel says so.
+
+Colour (--color, or [transfer] color) puts TWO codes in the same square. Red and green
+carry an ordinary black-and-white code; blue carries another frame of the same stream.
+Read as brightness — which is what any QR decoder does — the first one is a completely
+normal code, so nothing was added to the format and a receiver that knows nothing about
+colour still reads half the stream at full speed. runnir's own receiver finds the second
+layer by looking for it, and marks its metrics line with the word color when it has.
+
+Whether colour is faster is a question about the phone, which is why it is off by
+default and a switch rather than a decision. It doubles what goes out and roughly
+doubles what the receiver has to decode, so it wins when the phone is not already the
+thing holding the transfer up — few dropped captures on the receiver's metrics line —
+and buys nothing when it is. It also costs a second QR encode per frame here: at 25 fps
+that fits comfortably, and past that the panel warns that the painter is behind rather
+than quietly sending fewer codes than asked for.
 
 It only goes one way. runnir has no camera, so a phone cannot send to it.
 

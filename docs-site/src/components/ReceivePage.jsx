@@ -15,7 +15,7 @@ import { isSnippet, snippetText } from '../receive/vendor/snippet.ts'
 import { estimateTransferProgress, expectedFountainOverhead, formatDuration } from '../receive/vendor/progress.ts'
 import { NoSignalHintTimer } from '../receive/vendor/no-signal.ts'
 import { DecodeWorkerPool } from '../receive/vendor/worker-pool.ts'
-import { mosaicWorker, symbolsToRequest } from '../receive/mosaic.ts'
+import { mosaicWorker, scanBluePlane, symbolsToRequest } from '../receive/mosaic.ts'
 import { useLang } from '../i18n.jsx'
 
 // Diez segundos de cámara sin un solo frame decodificado: el emisor casi seguro
@@ -119,6 +119,10 @@ export default function ReceivePage() {
     // un mosaico de verdad. Es un objeto para que el worker envuelto y el bucle
     // de captura miren el mismo valor sin re-crear el pool.
     symbolsSeen: { current: 1 },
+    // Si el emisor va en color, cada captura lleva un segundo código en el canal
+    // azul. No hay nada en el formato que lo anuncie —por diseño, que es lo que
+    // mantiene el código base como un QR normal— así que se descubre mirando.
+    colorSeen: { current: false },
     // Sacar los píxeles del hilo principal necesita las dos cosas: bitmaps aquí
     // y OffscreenCanvas dentro del worker. Safari viejo no tiene la segunda.
     canBitmap:
@@ -228,6 +232,10 @@ export default function ReceivePage() {
     // de la transferencia. Se pide uno salvo que ya se haya visto un mosaico, y
     // una captura de cada doce mira más ancho por si lo hay.
     const max = symbolsToRequest(s.symbolsSeen.current, s.frameId)
+    // Y una de cada veinticuatro mira además el canal azul, por si el emisor
+    // manda en color: es un decode entero más, así que se paga de tanto en tanto
+    // hasta que aparezca uno, y a partir de ahí siempre.
+    const blue = scanBluePlane(s.colorSeen.current, s.frameId)
     const id = s.frameId++
 
     // Los píxeles NO pasan por el hilo principal cuando el navegador sabe hacer
@@ -238,7 +246,7 @@ export default function ReceivePage() {
     if (s.canBitmap) {
       createImageBitmap(video).then(
         (bitmap) => {
-          if (!s.pool || !s.pool.submit({ id, bitmap, w: vw, h: vh, max }, [bitmap])) bitmap.close()
+          if (!s.pool || !s.pool.submit({ id, bitmap, w: vw, h: vh, max, blue }, [bitmap])) bitmap.close()
         },
         () => {
           // Un navegador que dice que sabe y luego falla: se vuelve al camino
@@ -257,7 +265,7 @@ export default function ReceivePage() {
     const ctx = grab.getContext('2d', { willReadFrequently: true })
     ctx.drawImage(video, 0, 0)
     const img = ctx.getImageData(0, 0, vw, vh)
-    s.pool.submit({ id, buf: img.data.buffer, w: vw, h: vh, max }, [img.data.buffer])
+    s.pool.submit({ id, buf: img.data.buffer, w: vw, h: vh, max, blue }, [img.data.buffer])
   }, [])
 
   const scheduleFrame = useCallback((gen) => {
@@ -310,6 +318,9 @@ export default function ReceivePage() {
       capture: s.captureTimes.length / (STATS_WINDOW_MS / 1000),
       decode: s.decodeTimes.length / (STATS_WINDOW_MS / 1000),
       drop: s.dropTimes.length / (STATS_WINDOW_MS / 1000),
+      // Si está en color se dice, porque cambia lo que significan los otros
+      // números: cada captura cuesta dos decodificaciones en vez de una.
+      color: s.colorSeen.current,
     })
   }, [])
 
@@ -371,6 +382,7 @@ export default function ReceivePage() {
             () => new Worker(new URL('../receive/worker.ts', import.meta.url), { type: 'module' }),
             onDecoded,
             s.symbolsSeen,
+            s.colorSeen,
           ),
         onDecoded,
       )
@@ -440,7 +452,7 @@ export default function ReceivePage() {
           <p className="receive-metrics">
             {progress.capture.toFixed(0)} cap · {progress.decode.toFixed(1)} dec ·{' '}
             {progress.drop.toFixed(0)} drop · {progress.frames}/{progress.dup} · k={progress.k} ·{' '}
-            {Math.round(progress.payload / 1024)} KB
+            {Math.round(progress.payload / 1024)} KB{progress.color ? ' · color' : ''}
           </p>
         </div>
       )}

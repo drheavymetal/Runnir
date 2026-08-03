@@ -31,25 +31,49 @@ console.log(
 
 let unreadable = 0;
 let codes = 0;
+let blueCodes = 0;
 let decoder = null;
 const seen = new Set();
 
+// A colour stream carries a SECOND code per tile in the blue channel, and the
+// claim that makes it safe is that the first one is still an ordinary QR. So the
+// pixels are read exactly as before — no special case, no hint that colour is in
+// use — and the extra codes come from a second pass over the blue channel alone,
+// which is what the receiver's worker does.
+const color = meta.color === true;
+
 for (const file of files) {
   const raw = readFileSync(`${dir}/${file}`);
-  const results = await readBarcodes(
-    { data: new Uint8ClampedArray(raw), width, height },
-    { formats: ["QRCode"], maxNumberOfSymbols: tiles },
-  );
+  const options = { formats: ["QRCode"], maxNumberOfSymbols: tiles };
+  const pixels = new Uint8ClampedArray(raw);
+  const results = await readBarcodes({ data: pixels, width, height }, options);
   const hits = results.filter((r) => r.isValid && r.bytes.length > 0);
+  const baseCount = hits.length;
+  if (color) {
+    // In place, over the same buffer, once the first read has finished with it.
+    for (let i = 0; i < pixels.length; i += 4) {
+      pixels[i] = pixels[i + 2];
+      pixels[i + 1] = pixels[i + 2];
+    }
+    const extra = (await readBarcodes({ data: pixels, width, height }, options)).filter(
+      (r) => r.isValid && r.bytes.length > 0,
+    );
+    blueCodes += extra.length;
+    if (extra.length < tiles) {
+      console.log(`  PARTIAL BLUE ${file}: ${extra.length}/${tiles} codes`);
+    }
+    hits.push(...extra);
+  }
   if (hits.length === 0) {
     unreadable++;
     console.log(`  UNREADABLE ${file}`);
     continue;
   }
   // Every tile in the image has to come back, not just one: a mosaic that reads
-  // as a single code is a mosaic that bought nothing.
-  if (hits.length < tiles) {
-    console.log(`  PARTIAL ${file}: ${hits.length}/${tiles} codes`);
+  // as a single code is a mosaic that bought nothing. Counted on the ordinary
+  // scan alone, which is the one every decoder in the world performs.
+  if (baseCount < tiles) {
+    console.log(`  PARTIAL ${file}: ${baseCount}/${tiles} codes`);
   }
   for (const hit of hits) {
     const parsed = parseFrame(new Uint8Array(hit.bytes));
@@ -70,6 +94,7 @@ for (const file of files) {
 }
 
 console.log(`  ${files.length - unreadable}/${files.length} images read by zxing, ${codes} codes total`);
+if (color) console.log(`  ${blueCodes} of them came off the blue channel`);
 if (unreadable > 0) console.log(`  ${unreadable} unreadable`);
 
 if (!decoder?.isComplete) {

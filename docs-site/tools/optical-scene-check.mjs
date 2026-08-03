@@ -10,30 +10,53 @@
 //   runnir --demo /tmp/scene.png transfer
 //   magick /tmp/scene.png -depth 8 RGBA:/tmp/scene.raw
 //   node --import tsx docs-site/tools/optical-scene-check.mjs /tmp/scene.raw 1400 1000
+//
+// Add `color` as a fourth argument for a window rendered with
+// `RUNNIR_DEMO_COLOR=1`: the blue channel then carries a second code per tile,
+// and this reads it the way the receiver's worker does. It is opt-in because a
+// PLAIN window's blue channel is its base code again — reading it unasked would
+// return every frame twice and look like a stream sending duplicates.
 
 import { readFileSync } from "node:fs";
 import { readBarcodes } from "zxing-wasm/reader";
 import { parseFrame } from "../src/receive/vendor/protocol.ts";
 
-const [, , file, width, height] = process.argv;
+const [, , file, width, height, mode] = process.argv;
 if (!file || !width || !height) {
-  console.error("usage: optical-scene-check.mjs <scene.raw> <width> <height>");
+  console.error("usage: optical-scene-check.mjs <scene.raw> <width> <height> [color]");
   process.exit(2);
 }
+const color = mode === "color";
 
 const raw = readFileSync(file);
 // A wide window shows a MOSAIC — several codes, each a different frame of the
 // same stream. Read them all: the point of the mosaic is that ONE capture
 // carries several frames, so a harness that stops at the first proves nothing
 // about the second.
-const results = await readBarcodes(
-  { data: new Uint8ClampedArray(raw), width: +width, height: +height },
-  { formats: ["QRCode"], maxNumberOfSymbols: 16 },
-);
+const pixels = new Uint8ClampedArray(raw);
+const options = { formats: ["QRCode"], maxNumberOfSymbols: 16 };
+const results = await readBarcodes({ data: pixels, width: +width, height: +height }, options);
 const hits = results.filter((r) => r.isValid && r.bytes.length > 0);
 if (hits.length === 0) {
   console.log("FAILED — no code found in the rendered window");
   process.exit(1);
+}
+if (color) {
+  // The same in-place channel copy the worker does, after the ordinary read has
+  // taken its copy. This is the pass that would catch the sRGB surface or the
+  // linear sampler pulling the four colours toward each other.
+  for (let i = 0; i < pixels.length; i += 4) {
+    pixels[i] = pixels[i + 2];
+    pixels[i + 1] = pixels[i + 2];
+  }
+  const extra = (
+    await readBarcodes({ data: pixels, width: +width, height: +height }, options)
+  ).filter((r) => r.isValid && r.bytes.length > 0);
+  if (extra.length === 0) {
+    console.log("FAILED — nothing readable in the blue channel of a colour window");
+    process.exit(1);
+  }
+  hits.push(...extra);
 }
 
 const frames = [];

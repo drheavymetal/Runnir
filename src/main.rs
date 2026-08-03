@@ -576,6 +576,11 @@ fn transfer_scene(path_out: &str, file: &str) {
             Some((w.trim().parse().ok()?, h.trim().parse().ok()?))
         })
         .unwrap_or((1400u32, 1000u32));
+    // `RUNNIR_DEMO_COLOR=1` paints the two-layer colour scheme. Worth being able
+    // to look at: whether the four colours survive the sRGB surface and the
+    // linear sampler is a question about pixels, and this is the only way to see
+    // the real ones without a camera.
+    let color = std::env::var("RUNNIR_DEMO_COLOR").is_ok_and(|v| v != "0" && !v.is_empty());
 
     let (label, started) = if file.is_empty() {
         // Big enough to take hundreds of blocks, and incompressible so the panel
@@ -596,6 +601,7 @@ fn transfer_scene(path_out: &str, file: &str) {
                 transfer::DEFAULT_FRAME_BYTES,
                 transfer::DEFAULT_FPS,
                 transfer::DEFAULT_TILES,
+                color,
             ),
         )
     } else {
@@ -612,6 +618,7 @@ fn transfer_scene(path_out: &str, file: &str) {
                     transfer::DEFAULT_FRAME_BYTES,
                     transfer::DEFAULT_FPS,
                     transfer::DEFAULT_TILES,
+                    color,
                 )
             });
         (file.to_string(), started)

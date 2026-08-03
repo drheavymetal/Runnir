@@ -499,11 +499,22 @@ pub struct Transfer {
     /// trades sharpness for count — worth trying up close with a good camera,
     /// and a loss at arm's length.
     pub tiles: usize,
+    /// Carry a second code in the colour of the first: red and green hold the
+    /// ordinary black-and-white code, blue holds another frame of the same
+    /// stream. Twice the codes out of the same square of screen, at the cost of
+    /// a second scan per capture on the receiver — so it is a win only when the
+    /// phone is not already the bottleneck, which is why it is off by default.
+    /// The base code stays a completely ordinary QR either way.
+    pub color: bool,
 }
 
 impl Default for Transfer {
     fn default() -> Self {
-        Self { fps: crate::transfer::DEFAULT_FPS, tiles: crate::transfer::DEFAULT_TILES }
+        Self {
+            fps: crate::transfer::DEFAULT_FPS,
+            tiles: crate::transfer::DEFAULT_TILES,
+            color: crate::transfer::DEFAULT_COLOR,
+        }
     }
 }
 

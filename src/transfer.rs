@@ -54,6 +54,12 @@ pub const DEFAULT_FPS: u32 = 10;
 /// information runnir does not have and the person holding the phone does.
 pub const DEFAULT_TILES: usize = 0;
 
+/// Carry a second code in colour on top of the first. Off by default, and the
+/// reasons are in [`paint_mosaic`] and worth reading before turning it on: it
+/// doubles what the sender emits and roughly doubles what the receiver has to
+/// decode, so it pays only when the receiver is NOT the bottleneck.
+pub const DEFAULT_COLOR: bool = false;
+
 /// Ceiling on tiles, whatever the window or the setting asks for.
 ///
 /// Each tile is a whole QR encode and paint per drawn frame, so the cost is
@@ -137,6 +143,9 @@ pub struct Transfer {
     /// Tiles asked for, 0 for automatic. Kept rather than resolved once because
     /// the answer depends on the window, which resizes.
     pub tiles_req: usize,
+    /// Whether every tile carries a second frame in its colour. See
+    /// [`paint_mosaic`] for the scheme and [`Self::layers`] for what it costs.
+    pub color: bool,
     packed: PackedFile,
     encoder: LtEncoder,
     seq: u32,
@@ -159,6 +168,7 @@ impl Transfer {
         frame_bytes: usize,
         fps: u32,
         tiles: usize,
+        color: bool,
     ) -> Result<Self, String> {
         if frame_bytes <= optical::HEADER_LEN {
             return Err(format!("a frame must be larger than its {}-byte header", optical::HEADER_LEN));
@@ -186,6 +196,7 @@ impl Transfer {
             frames_sent: 0,
             paused: false,
             tiles_req: tiles.min(MAX_TILES),
+            color,
             packed,
             encoder,
             seq: 0,
@@ -223,6 +234,21 @@ impl Transfer {
         self.grid
     }
 
+    /// Codes carried by one tile: two in colour mode, one otherwise.
+    ///
+    /// A tile is one square of screen either way. What colour buys is a second
+    /// code in the SAME square, so everything counted in codes — the pass
+    /// length, the sequence step, the paint budget — multiplies by this and
+    /// nothing counted in screen area does.
+    pub fn layers(&self) -> u32 {
+        if self.color { 2 } else { 1 }
+    }
+
+    /// Codes put on the glass by one drawn frame.
+    pub fn codes_per_frame(&self) -> u32 {
+        self.grid.0 * self.grid.1 * self.layers()
+    }
+
     /// Whether drawing a frame now costs more than the gap between frames.
     ///
     /// Past that line the stream does not merely stop speeding up, it SLOWS
@@ -231,8 +257,8 @@ impl Transfer {
     /// ever set by hand and the person who set it is the one who can judge
     /// whether their screen and their phone make it worth having.
     pub fn painter_behind(&self) -> bool {
-        let Some(per_tile) = self.per_tile else { return false };
-        per_tile * self.grid.0 * self.grid.1 > self.interval()
+        let Some(per_code) = self.per_tile else { return false };
+        per_code * self.codes_per_frame() > self.interval()
     }
 
     /// Frames a receiver needs before it can rebuild the file, and therefore the
@@ -241,9 +267,11 @@ impl Transfer {
     ///
     /// A mosaic divides it: the codes go out `fps` times a second, several at a
     /// time, and a camera that resolves them reads them all from one capture.
+    /// Colour divides it again, for the same reason and with the same caveat —
+    /// this is the floor if every code sent is read, which no camera manages.
     pub fn shortest_pass(&self) -> Duration {
         let needed = (self.encoder.k as f64 * 1.15).ceil();
-        let per_second = f64::from(self.fps) * f64::from(self.grid.0 * self.grid.1);
+        let per_second = f64::from(self.fps) * f64::from(self.codes_per_frame());
         Duration::from_secs_f64(needed / per_second)
     }
 
@@ -341,11 +369,13 @@ impl Transfer {
         // frames would show two symbols within one screen refresh, and the second
         // one is one the camera never had a chance to see.
         self.last_advance = now;
-        let tiles = layout.tiles();
+        // Codes, not tiles: in colour mode one tile carries two frames, and both
+        // of them have to be sequence numbers this stream has not used yet.
+        let codes = layout.tiles() * self.layers();
         if self.frames_sent > 0 {
-            self.seq = self.seq.wrapping_add(tiles);
+            self.seq = self.seq.wrapping_add(codes);
         }
-        self.frames_sent += u64::from(tiles);
+        self.frames_sent += u64::from(codes);
         self.cached = None;
         true
     }
@@ -361,7 +391,10 @@ impl Transfer {
         let box_h = box_h.max(64);
         let key = (self.seq, box_w, box_h, layout.grid.0, layout.grid.1);
         if self.cached.is_none() || self.cached_for != key {
-            let frames: Vec<Vec<u8>> = (0..layout.tiles())
+            // The first `tiles` frames are the ones a plain decoder sees; the
+            // rest, in colour mode, ride in the blue channel of the same tiles.
+            let codes = layout.tiles() * self.layers();
+            let frames: Vec<Vec<u8>> = (0..codes)
                 .map(|i| {
                     self.encoder.frame(
                         self.seq.wrapping_add(i),
@@ -371,8 +404,8 @@ impl Transfer {
                 })
                 .collect();
             let started = Instant::now();
-            let raster = paint_mosaic(&frames, self.version, layout, box_w, box_h);
-            self.per_tile = Some(started.elapsed() / layout.tiles().max(1));
+            let raster = paint_mosaic(&frames, self.version, layout, box_w, box_h, self.color);
+            self.per_tile = Some(started.elapsed() / codes.max(1));
             self.cached = Some(raster);
             self.cached_for = key;
         }
@@ -448,7 +481,51 @@ fn encode_byte_mode(bytes: &[u8], version: i16) -> Result<QrCode, qrcode::types:
 /// The box is not square, because a terminal cell is about twice as tall as it is
 /// wide and a whole number of them almost never lands on a square. The extra goes
 /// to the white margin, which the quiet zone wanted anyway.
-fn paint_mosaic(frames: &[Vec<u8>], version: i16, layout: &Layout, box_w: u32, box_h: u32) -> Raster {
+///
+/// # Colour
+///
+/// With `color`, each tile carries TWO codes at once: `frames[i]` as usual, and
+/// `frames[tiles + i]` in the blue channel of the same modules. Four colours,
+/// chosen so that neither reader has to know about the other:
+///
+/// ```text
+///   base dark, extra dark    black   (0,0,0)        luma 0    blue 0
+///   base dark, extra light   blue    (0,0,255)      luma ~29  blue 255
+///   base light, extra dark   yellow  (255,255,0)    luma ~226 blue 0
+///   base light, extra light  white   (255,255,255)  luma 255  blue 255
+/// ```
+///
+/// Read as brightness — which is what an ordinary QR decoder does, and what a
+/// camera's luma plane carries at full resolution — black and blue are dark and
+/// yellow and white are light, so the BASE code is a completely ordinary QR
+/// symbol. That is not a nicety: decimen's own receivers, and any QR app at all,
+/// keep reading a colour stream and simply get half of it. Nothing was added to
+/// the wire format, and there is no flag anywhere saying colour is in use.
+///
+/// The blue channel is the extra code, on its own, with the same modules and the
+/// same quiet zone — white surroundings are blue-light, so its quiet zone comes
+/// free from the base code's.
+///
+/// What this costs, and why it is off by default: the receiver has to scan a
+/// second image per capture, so it roughly doubles decode time. Measured against
+/// a phone on 2026-08-03, codes read per second were constant at 5-7 no matter
+/// what the sender did, which says the receiver was the bottleneck — and doubling
+/// both sides of a bottleneck is a wash. Colour pays exactly when it is NOT: when
+/// the phone reports few dropped captures, when the pool has spare workers, or
+/// when the optics are marginal enough that many captures fail anyway (a failed
+/// extra costs nothing the fountain notices). The camera also subsamples chroma
+/// to a quarter resolution, which is precisely the module-scale detail the blue
+/// plane has to carry, so the extra layer is expected to fail more often than the
+/// base one. It failing is harmless; that is the whole reason it is a second
+/// fountain frame rather than half of each frame's bits.
+fn paint_mosaic(
+    frames: &[Vec<u8>],
+    version: i16,
+    layout: &Layout,
+    box_w: u32,
+    box_h: u32,
+    color: bool,
+) -> Raster {
     let total = symbol_modules(version);
     let side = total * layout.scale;
     let w = std::cmp::max(box_w, layout.drawn.0);
@@ -462,28 +539,64 @@ fn paint_mosaic(frames: &[Vec<u8>], version: i16, layout: &Layout, box_w: u32, b
     // half of the contrast a camera measures, and a themed panel would be reading
     // a code printed on grey.
     let mut rgba = vec![0xffu8; (w * h * 4) as usize];
-    for (i, bytes) in frames.iter().enumerate() {
-        let code = encode_byte_mode(bytes, version)
-            .expect("the version was pinned by encoding a frame-sized probe the same way");
+    let tiles = layout.tiles() as usize;
+    let encode = |bytes: &[u8]| {
+        encode_byte_mode(bytes, version)
+            .expect("the version was pinned by encoding a frame-sized probe the same way")
+    };
+    for (tile, bytes) in frames.iter().take(tiles).enumerate() {
+        let code = encode(bytes);
         let width = code.width() as u32;
-        let colors = code.to_colors();
-        let tile = i as u32;
+        let base = code.to_colors();
+        // The second layer is optional per tile rather than per image only so a
+        // short `frames` slice cannot index out of bounds; in practice the caller
+        // always sends either `tiles` or `2 * tiles` of them.
+        let extra = color
+            .then(|| frames.get(tiles + tile))
+            .flatten()
+            .map(|bytes| encode(bytes).to_colors());
+        let tile = tile as u32;
         let origin_x = left + (tile % layout.grid.0) * side + QUIET_MODULES * layout.scale;
         let origin_y = top + (tile / layout.grid.0) * side + QUIET_MODULES * layout.scale;
         for my in 0..width {
             for mx in 0..width {
-                if colors[(my * width + mx) as usize] != qrcode::Color::Dark {
+                let at = (my * width + mx) as usize;
+                let base_dark = base[at] == qrcode::Color::Dark;
+                let extra_dark = extra.as_ref().is_some_and(|e| e[at] == qrcode::Color::Dark);
+                // The background is already white, so a module that is light in
+                // both layers is nothing to do. Skipping it also keeps the
+                // monochrome path exactly as cheap as it was.
+                if !base_dark && !extra_dark {
                     continue;
                 }
+                // Red and green carry the base code, blue carries the extra one.
+                // Every pixel is one of the four corners of that pair, which is
+                // why there is no blending anywhere and no intermediate value a
+                // camera would have to resolve.
+                let rg = if base_dark { 0 } else { 0xff };
+                // With no second layer the blue channel follows the base code, so
+                // a dark module is black and not blue. Colour has to be something
+                // that was asked for, never a tint that appears because a channel
+                // happened to be free.
+                let b = match &extra {
+                    Some(_) => {
+                        if extra_dark {
+                            0
+                        } else {
+                            0xff
+                        }
+                    }
+                    None => rg,
+                };
                 let x0 = origin_x + mx * layout.scale;
                 let y0 = origin_y + my * layout.scale;
                 for y in y0..y0 + layout.scale {
                     let row = (y * w) as usize * 4;
                     for x in x0..x0 + layout.scale {
                         let i = row + x as usize * 4;
-                        rgba[i] = 0;
-                        rgba[i + 1] = 0;
-                        rgba[i + 2] = 0;
+                        rgba[i] = rg;
+                        rgba[i + 1] = rg;
+                        rgba[i + 2] = b;
                     }
                 }
             }
@@ -597,7 +710,7 @@ mod tests {
 
     #[test]
     fn a_transfer_reports_what_the_person_holding_the_phone_needs() {
-        let t = Transfer::start("a.jpg", "image/jpeg", &sample(), DEFAULT_FRAME_BYTES, 24, 1).unwrap();
+        let t = Transfer::start("a.jpg", "image/jpeg", &sample(), DEFAULT_FRAME_BYTES, 24, 1, false).unwrap();
         assert_eq!(t.version, 40);
         assert_eq!(t.original_size(), 40_000);
         assert!(t.blocks() >= 14, "40 KB does not fit in fewer blocks than that");
@@ -610,7 +723,7 @@ mod tests {
     fn a_payload_too_big_for_the_frame_size_is_refused_before_anything_is_drawn() {
         // k is a u16, so 6 MB at 100 bytes a frame runs out of block numbers.
         let big = incompressible(6 * 1024 * 1024);
-        let err = match Transfer::start("a.jpg", "image/jpeg", &big, 100, 24, 1) {
+        let err = match Transfer::start("a.jpg", "image/jpeg", &big, 100, 24, 1, false) {
             Err(e) => e,
             Ok(_) => panic!("a payload that outruns the block numbering must be refused"),
         };
@@ -619,7 +732,7 @@ mod tests {
 
     #[test]
     fn a_frame_no_larger_than_its_header_is_refused() {
-        let err = match Transfer::start("a.bin", "text/plain", b"hello", 20, 24, 1) {
+        let err = match Transfer::start("a.bin", "text/plain", b"hello", 20, 24, 1, false) {
             Err(e) => e,
             Ok(_) => panic!("a frame with no room for a payload must be refused"),
         };
@@ -629,7 +742,7 @@ mod tests {
     #[test]
     fn frames_advance_on_the_clock_and_never_skip_ahead() {
         let mut t =
-            Transfer::start("a.bin", "application/octet-stream", &sample(), DEFAULT_FRAME_BYTES, 20, 1)
+            Transfer::start("a.bin", "application/octet-stream", &sample(), DEFAULT_FRAME_BYTES, 20, 1, false)
                 .unwrap();
         let one = t.layout_for(800, 800);
         let t0 = Instant::now();
@@ -651,7 +764,7 @@ mod tests {
 
     #[test]
     fn a_paused_transfer_holds_its_frame() {
-        let mut t = Transfer::start("a.bin", "text/plain", &sample(), DEFAULT_FRAME_BYTES, 20, 1).unwrap();
+        let mut t = Transfer::start("a.bin", "text/plain", &sample(), DEFAULT_FRAME_BYTES, 20, 1, false).unwrap();
         let one = t.layout_for(800, 800);
         let t0 = Instant::now();
         t.advance(t0, &one);
@@ -679,7 +792,7 @@ mod tests {
         // actually panicked. Kept short: a version-40 encode costs about a tenth
         // of a second in a debug build, and the two cases above are the ones that
         // pin the bug — this only checks that the real path reaches them.
-        let mut t = Transfer::start("a.txt", "text/plain", &incompressible(90_000), DEFAULT_FRAME_BYTES, 24, 1)
+        let mut t = Transfer::start("a.txt", "text/plain", &incompressible(90_000), DEFAULT_FRAME_BYTES, 24, 1, false)
             .unwrap();
         let lay = t.layout_for(200, 200);
         let mut now = Instant::now();
@@ -693,7 +806,7 @@ mod tests {
     #[test]
     fn every_frame_is_a_real_decodable_qr_of_the_pinned_version() {
         let mut t =
-            Transfer::start("a.bin", "application/octet-stream", &sample(), DEFAULT_FRAME_BYTES, 24, 1)
+            Transfer::start("a.bin", "application/octet-stream", &sample(), DEFAULT_FRAME_BYTES, 24, 1, false)
                 .unwrap();
         let lay = t.layout_for(800, 800);
         let mut seen = Vec::new();
@@ -714,7 +827,7 @@ mod tests {
         // The renderer filters linearly, so a fractional scale blurs exactly the
         // edges a decoder measures. Check by reading the pixels back: every run of
         // equal pixels along the first module row must be a multiple of the scale.
-        let mut t = Transfer::start("a.bin", "text/plain", b"hello there", 2953, 24, 1).unwrap();
+        let mut t = Transfer::start("a.bin", "text/plain", b"hello there", 2953, 24, 1, false).unwrap();
         let lay = t.layout_for(900, 900);
         t.advance(Instant::now(), &lay);
         let r = t.raster(&lay, 900, 900);
@@ -741,7 +854,7 @@ mod tests {
     fn the_quiet_zone_is_white_all_the_way_round() {
         // A decoder that cannot find the quiet zone does not even look at the
         // symbol, and the panel background is not white.
-        let mut t = Transfer::start("a.bin", "text/plain", b"hello there", 2953, 24, 1).unwrap();
+        let mut t = Transfer::start("a.bin", "text/plain", b"hello there", 2953, 24, 1, false).unwrap();
         let lay = t.layout_for(800, 800);
         t.advance(Instant::now(), &lay);
         let r = t.raster(&lay, 800, 800);
@@ -761,7 +874,7 @@ mod tests {
     #[test]
     fn a_tiny_box_still_produces_a_code_rather_than_a_panic() {
         // A window dragged small must show a useless code, not crash the terminal.
-        let mut t = Transfer::start("a.bin", "text/plain", b"hello there", 2953, 24, 1).unwrap();
+        let mut t = Transfer::start("a.bin", "text/plain", b"hello there", 2953, 24, 1, false).unwrap();
         let lay = t.layout_for(1, 1);
         t.advance(Instant::now(), &lay);
         let r = t.raster(&lay, 1, 1);
@@ -772,8 +885,8 @@ mod tests {
     fn two_transfers_of_the_same_file_get_different_sessions() {
         // Or a receiver watching the first would feed the second's frames into the
         // decoder it already had.
-        let mut a = Transfer::start("a.bin", "text/plain", &sample(), 2953, 24, 1).unwrap();
-        let mut b = Transfer::start("a.bin", "text/plain", &sample(), 2953, 24, 1).unwrap();
+        let mut a = Transfer::start("a.bin", "text/plain", &sample(), 2953, 24, 1, false).unwrap();
+        let mut b = Transfer::start("a.bin", "text/plain", &sample(), 2953, 24, 1, false).unwrap();
         let lay = a.layout_for(400, 400);
         a.advance(Instant::now(), &lay);
         b.advance(Instant::now(), &lay);
@@ -807,10 +920,22 @@ mod tests {
             .and_then(|v| v.parse().ok())
             .unwrap_or(1);
 
+        // `RUNNIR_PAINTED_COLOR=1` paints the two-layer colour scheme, which the
+        // harness then has to read TWICE — once as brightness for the base code
+        // and once off the blue channel for the extra one.
+        let color = std::env::var("RUNNIR_PAINTED_COLOR").is_ok_and(|v| v != "0" && !v.is_empty());
+
         let bytes = incompressible(60_000);
-        let mut t =
-            Transfer::start("painted.bin", "image/jpeg", &bytes, DEFAULT_FRAME_BYTES, 24, tiles)
-                .unwrap();
+        let mut t = Transfer::start(
+            "painted.bin",
+            "image/jpeg",
+            &bytes,
+            DEFAULT_FRAME_BYTES,
+            24,
+            tiles,
+            color,
+        )
+        .unwrap();
         // Three pixels per module: below that a decoder starts failing on its own
         // account, and this test is not about how small a code can get.
         let unit = (185 * 3) as u32;
@@ -818,12 +943,14 @@ mod tests {
         let (box_w, box_h) = lay.drawn;
         // Enough to rebuild the file with room to spare, so a failure means the
         // decoder could not READ a frame rather than that it ran out of them.
-        // Counted in DRAWN images, each of which now carries `tiles` frames.
-        let count = ((t.blocks() as f64 * 2.0).ceil() as usize + 8).div_ceil(lay.tiles() as usize);
+        // Counted in DRAWN images, each of which now carries `tiles` frames, or
+        // twice that in colour.
+        let per_image = (lay.tiles() * t.layers()) as usize;
+        let count = ((t.blocks() as f64 * 2.0).ceil() as usize + 8).div_ceil(per_image);
 
         let index = format!(
             "{{\"frames\":{count},\"px\":{box_w},\"w\":{box_w},\"h\":{box_h},\
-             \"tiles\":{},\"grid\":\"{}x{}\",\"blocks\":{},\"version\":{},\
+             \"tiles\":{},\"color\":{color},\"grid\":\"{}x{}\",\"blocks\":{},\"version\":{},\
              \"name\":\"painted.bin\",\"size\":{},\"code\":\"{}\"}}\n",
             lay.tiles(),
             lay.grid.0,
@@ -866,10 +993,20 @@ mod tests {
     #[ignore = "a measurement, not an assertion; run it explicitly"]
     fn cost_of_a_mosaic() {
         let bytes = incompressible(300_000);
-        for tiles in [1usize, 2, 4, 8] {
-            let mut t =
-                Transfer::start("m.bin", "image/jpeg", &bytes, DEFAULT_FRAME_BYTES, 30, tiles)
-                    .unwrap();
+        // Colour is measured beside the mosaic because it is the same bill in a
+        // different currency: two encodes for one tile rather than two tiles.
+        // Whether they cost the same is the question the number answers.
+        for (tiles, color) in [(1usize, false), (2, false), (4, false), (8, false), (1, true), (2, true)] {
+            let mut t = Transfer::start(
+                "m.bin",
+                "image/jpeg",
+                &bytes,
+                DEFAULT_FRAME_BYTES,
+                30,
+                tiles,
+                color,
+            )
+            .unwrap();
             let unit = 185 * 4;
             let lay = t.layout_for(unit * tiles as u32, unit * tiles as u32);
             let mut now = Instant::now();
@@ -883,10 +1020,11 @@ mod tests {
             let each = start.elapsed() / ROUNDS;
             let budget = Duration::from_secs_f64(1.0 / 30.0);
             eprintln!(
-                "{}x{} = {} codes at x{}px: {:?} per drawn frame ({:.0}% of a 30 fps budget)",
+                "{}x{}{} = {} codes at x{}px: {:?} per drawn frame ({:.0}% of a 30 fps budget)",
                 lay.grid.0,
                 lay.grid.1,
-                lay.tiles(),
+                if color { " colour" } else { "" },
+                lay.tiles() * t.layers(),
                 lay.scale,
                 each,
                 each.as_secs_f64() / budget.as_secs_f64() * 100.0
@@ -900,7 +1038,7 @@ mod tests {
         // twice: it would look like a mosaic and double nothing. The sequence
         // steps by a whole mosaic for exactly this reason.
         let mut t =
-            Transfer::start("a.bin", "image/jpeg", &incompressible(80_000), DEFAULT_FRAME_BYTES, 30, 4)
+            Transfer::start("a.bin", "image/jpeg", &incompressible(80_000), DEFAULT_FRAME_BYTES, 30, 4, false)
                 .unwrap();
         let lay = t.layout_for(185 * 4 * 4, 185 * 4);
         assert_eq!(lay.tiles(), 4, "four codes should fit across that box: {:?}", lay.grid);
@@ -912,7 +1050,7 @@ mod tests {
         assert_eq!(t.frames_sent, 8);
         // Four codes a frame at 30 fps is 120 a second, so the pass is four times
         // shorter than the same file through a single code.
-        let one = Transfer::start("a.bin", "image/jpeg", &incompressible(80_000), DEFAULT_FRAME_BYTES, 30, 1)
+        let one = Transfer::start("a.bin", "image/jpeg", &incompressible(80_000), DEFAULT_FRAME_BYTES, 30, 1, false)
             .unwrap();
         assert!(
             t.shortest_pass().as_secs_f64() < one.shortest_pass().as_secs_f64() / 3.5,
@@ -922,13 +1060,113 @@ mod tests {
         );
     }
 
+    /// The colour scheme, checked where it matters: in the pixels.
+    ///
+    /// `paint_mosaic` is called directly rather than through two `Transfer`s,
+    /// because each transfer draws its own session id and would encode different
+    /// bytes — and the whole claim here is about two paintings of the SAME frame.
+    fn painted(frames: &[Vec<u8>], color: bool) -> (Raster, u32) {
+        let version = pin_version(DEFAULT_FRAME_BYTES).unwrap();
+        let scale = 3;
+        let side = symbol_modules(version) * scale;
+        let layout = Layout { grid: (1, 1), scale, drawn: (side, side) };
+        (paint_mosaic(frames, version, &layout, side, side, color), side)
+    }
+
+    /// Rec. 601 brightness, which is what a decoder reduces colour to and what a
+    /// camera's luma plane carries at full resolution.
+    fn luma(px: &[u8]) -> u32 {
+        (299 * px[0] as u32 + 587 * px[1] as u32 + 114 * px[2] as u32) / 1000
+    }
+
+    #[test]
+    fn a_colour_frame_is_still_an_ordinary_qr_code_in_black_and_white() {
+        // The claim that makes colour safe to ship: a decoder that knows nothing
+        // about it — decimen's receivers, any QR app — reads the base code and
+        // simply never sees the second one. So the DARK-BY-BRIGHTNESS pixels of a
+        // colour painting have to be exactly the black pixels of the plain one.
+        let base = vec![0xa5u8; DEFAULT_FRAME_BYTES];
+        let extra = vec![0x5au8; DEFAULT_FRAME_BYTES];
+        let (mono, side) = painted(std::slice::from_ref(&base), false);
+        let (colour, _) = painted(&[base.clone(), extra.clone()], true);
+        let (extra_alone, _) = painted(std::slice::from_ref(&extra), false);
+        assert_eq!(mono.rgba.len(), colour.rgba.len());
+
+        let mut colours = std::collections::BTreeSet::new();
+        for i in (0..(side * side * 4) as usize).step_by(4) {
+            let c = &colour.rgba[i..i + 4];
+            colours.insert((c[0], c[1], c[2]));
+            assert_eq!(
+                luma(c) < 128,
+                mono.rgba[i] == 0,
+                "brightness at pixel {} disagrees with the plain painting",
+                i / 4
+            );
+            // And the blue channel on its own is the extra code, module for
+            // module, quiet zone included — the white surround is blue-light, so
+            // the second code inherits the first one's quiet zone for free.
+            assert_eq!(
+                c[2] == 0,
+                extra_alone.rgba[i] == 0,
+                "the blue channel at pixel {} is not the second code",
+                i / 4
+            );
+        }
+        // Four corners of a two-bit choice and nothing in between: no blending,
+        // no intermediate value for a camera to resolve.
+        assert_eq!(
+            colours,
+            [(0, 0, 0), (0, 0, 0xff), (0xff, 0xff, 0), (0xff, 0xff, 0xff)].into_iter().collect(),
+        );
+    }
+
+    #[test]
+    fn without_colour_nothing_is_tinted() {
+        // The blue channel follows the base code when there is no second layer.
+        // Left free it would paint every dark module blue — a stream that still
+        // decodes, on a screen that looks broken.
+        let (mono, side) = painted(&[vec![0xa5u8; DEFAULT_FRAME_BYTES]], false);
+        for i in (0..(side * side * 4) as usize).step_by(4) {
+            assert_eq!(mono.rgba[i], mono.rgba[i + 2], "pixel {} is tinted", i / 4);
+            assert_eq!(mono.rgba[i], mono.rgba[i + 1], "pixel {} is tinted", i / 4);
+        }
+    }
+
+    #[test]
+    fn colour_sends_two_frames_per_tile_and_halves_the_pass() {
+        let file = incompressible(80_000);
+        let mut plain =
+            Transfer::start("a.bin", "image/jpeg", &file, DEFAULT_FRAME_BYTES, 30, 1, false).unwrap();
+        let mut colour =
+            Transfer::start("a.bin", "image/jpeg", &file, DEFAULT_FRAME_BYTES, 30, 1, true).unwrap();
+        let lay = plain.layout_for(185 * 4, 185 * 4);
+        assert_eq!(lay.tiles(), 1);
+
+        let now = Instant::now();
+        plain.advance(now, &lay);
+        colour.advance(now, &lay);
+        assert_eq!(plain.frames_sent, 1);
+        assert_eq!(colour.frames_sent, 2, "one tile, two codes");
+        // The sequence has to step by both, or the next drawn frame repeats one
+        // the receiver already has and the second layer buys nothing.
+        colour.advance(now + Duration::from_millis(100), &lay);
+        assert_eq!(colour.frames_sent, 4);
+        assert!(
+            (colour.shortest_pass().as_secs_f64() * 2.0 - plain.shortest_pass().as_secs_f64()).abs()
+                < 1e-6,
+            "colour should halve the shortest pass: {:?} vs {:?}",
+            colour.shortest_pass(),
+            plain.shortest_pass()
+        );
+    }
+
     #[test]
     fn an_explicit_tile_count_may_shrink_the_modules_but_the_automatic_one_never_does() {
         let auto =
-            Transfer::start("a.bin", "image/jpeg", &incompressible(80_000), DEFAULT_FRAME_BYTES, 30, 0)
+            Transfer::start("a.bin", "image/jpeg", &incompressible(80_000), DEFAULT_FRAME_BYTES, 30, 0, false)
                 .unwrap();
         let forced =
-            Transfer::start("a.bin", "image/jpeg", &incompressible(80_000), DEFAULT_FRAME_BYTES, 30, 4)
+            Transfer::start("a.bin", "image/jpeg", &incompressible(80_000), DEFAULT_FRAME_BYTES, 30, 4, false)
                 .unwrap();
         // A square box with room for exactly one code at four pixels a module.
         let (w, h) = (185 * 4, 185 * 4);

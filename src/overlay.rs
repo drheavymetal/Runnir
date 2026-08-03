@@ -4637,16 +4637,22 @@ impl TransferPanel {
         // one line a person reads while holding a phone up to the screen.
         let (gx, gy) = t.grid();
         let mosaic = if gx * gy > 1 {
-            // A painter that cannot keep up is worth saying out loud: past the
-            // frame interval a bigger mosaic delivers FEWER codes, and nothing
-            // else on screen would show it.
-            let behind = if t.painter_behind() { " (painter behind)" } else { "" };
-            format!(" \u{b7} {gx}x{gy} \u{d7}{}px{behind}", area.layout.scale)
+            format!(" \u{b7} {gx}x{gy} \u{d7}{}px", area.layout.scale)
         } else {
             String::new()
         };
+        // A painter that cannot keep up is worth saying out loud: past the frame
+        // interval, asking for more codes per frame delivers FEWER of them, and
+        // nothing else on screen would show it. Its own segment rather than part
+        // of the mosaic note, because colour doubles the encodes per frame too —
+        // and it can fall behind with a single tile.
+        let behind = if t.painter_behind() { " (painter behind)" } else { "" };
+        // Colour is named whenever it is on, unlike the mosaic: a stream that is
+        // sending two codes per tile looks exactly like one that is not, and the
+        // person comparing two runs needs to know which one they are watching.
+        let color = if t.color { " \u{b7} colour \u{d7}2" } else { "" };
         let left = format!(
-            "{status} \u{b7} {} blocks \u{b7} V{} \u{b7} {} fps{mosaic} \u{b7} pass {pass:.0}s \u{b7} {:.1} sent in {}s",
+            "{status} \u{b7} {} blocks \u{b7} V{} \u{b7} {} fps{mosaic}{color}{behind} \u{b7} pass {pass:.0}s \u{b7} {:.1} sent in {}s",
             t.blocks(),
             t.version,
             t.fps,
@@ -4728,6 +4734,7 @@ mod transfer_tests {
             crate::transfer::DEFAULT_FRAME_BYTES,
             30,
             0,
+            false,
         )
         .unwrap()
     }
@@ -4820,6 +4827,7 @@ mod transfer_tests {
             crate::transfer::DEFAULT_FRAME_BYTES,
             30,
             2,
+            false,
         )
         .unwrap();
         let wide = qr_area(200, 46, (10.0, 22.0), &t);

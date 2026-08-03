@@ -7003,7 +7003,7 @@ impl Gpu {
     /// 116 bytes per frame" is worth reading, and a toast is gone before you have
     /// finished reading it.
     pub fn start_optical_transfer(&mut self, raw: &str, config: &Config) {
-        self.start_optical_transfer_with(raw, config, None, None, None);
+        self.start_optical_transfer_with(raw, config, None, None, None, None);
     }
 
     /// The same, with per-stream overrides for the two numbers whose right value
@@ -7015,6 +7015,7 @@ impl Gpu {
         fps: Option<u32>,
         tiles: Option<usize>,
         bytes_per_code: Option<usize>,
+        color: Option<bool>,
     ) {
         let path = self.resolve_transfer_path(raw);
         let label = path.display().to_string();
@@ -7032,6 +7033,7 @@ impl Gpu {
                     bytes_per_code.unwrap_or(crate::transfer::DEFAULT_FRAME_BYTES),
                     fps.unwrap_or(config.transfer.fps),
                     tiles.unwrap_or(config.transfer.tiles),
+                    color.unwrap_or(config.transfer.color),
                 )
             });
         let cell = self.renderer.cell_size();
@@ -7778,8 +7780,8 @@ impl Gpu {
                 self.window.request_redraw();
                 ControlResponse::ok(self.ui_state())
             }
-            ControlRequest::Transfer { path, fps, tiles, bytes } => {
-                self.start_optical_transfer_with(&path, config, fps, tiles, bytes);
+            ControlRequest::Transfer { path, fps, tiles, bytes, color } => {
+                self.start_optical_transfer_with(&path, config, fps, tiles, bytes, color);
                 // The panel carries its own failure, so the response is ok either
                 // way; `ui_state` says which overlay is actually up.
                 ControlResponse::ok(self.ui_state())
