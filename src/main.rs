@@ -724,10 +724,7 @@ fn tidal_creds() -> Result<(config::Tidal, tidal::Creds), String> {
             cfg.client_secret_env
         ));
     }
-    let creds = tidal::Creds {
-        client_id: cfg.client_id.clone(),
-        client_secret: cfg.client_secret(),
-    };
+    let creds = tidal::Creds::from_config(&cfg);
     Ok((cfg, creds))
 }
 
@@ -926,11 +923,10 @@ fn open_in_browser(url: &str) -> Result<(), String> {
 /// A bare number is a track id; anything else is something to search for, because
 /// typing a track id is not how anyone finds music.
 fn tidal_find(what: &str) -> Result<(config::Tidal, tidal::Session, tidal::Track), String> {
-    let (cfg, creds) = tidal_creds()?;
-    let session = tidal::Session::load()
-        .ok_or_else(|| "not signed in — run: runnir --tidal-login".to_string())?;
-    let session = tidal::ensure_fresh(&creds, &session)
-        .map_err(|e| format!("could not refresh the session: {e}"))?;
+    // The credentials are checked first for their explanation of what is missing, then
+    // the session comes from the one place that refreshes it.
+    let (cfg, _) = tidal_creds()?;
+    let session = tidal::current()?;
     let track = match what.parse::<u64>() {
         Ok(id) => tidal::track(&session, id)?,
         Err(_) => tidal::search_tracks(&session, what, 1)?
@@ -943,14 +939,10 @@ fn tidal_find(what: &str) -> Result<(config::Tidal, tidal::Session, tidal::Track
 
 /// Walks the catalogue once and prints what came back.
 fn tidal_browse(what: &str) {
-    let (_, creds) = match tidal_creds() {
-        Ok(v) => v,
-        Err(e) => return eprintln!("runnir: {e}"),
-    };
-    let Some(session) = tidal::Session::load() else {
-        return eprintln!("runnir: not signed in — run: runnir --tidal-login");
-    };
-    let session = match tidal::ensure_fresh(&creds, &session) {
+    if let Err(e) = tidal_creds() {
+        return eprintln!("runnir: {e}");
+    }
+    let session = match tidal::current() {
         Ok(s) => s,
         Err(e) => return eprintln!("runnir: {e}"),
     };
@@ -1079,9 +1071,9 @@ fn tidal_play(what: &str) {
         Ok(v) => v,
         Err(e) => return eprintln!("runnir: {e}"),
     };
-    let session = match tidal::Session::load() {
-        Some(s) => s,
-        None => return eprintln!("runnir: not signed in"),
+    let session = match tidal::current() {
+        Ok(s) => s,
+        Err(e) => return eprintln!("runnir: {e}"),
     };
     println!(
         "  {} — {} [{}]  ({}, {}:{:02})",

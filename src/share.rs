@@ -231,9 +231,15 @@ fn stream_track(stream: &mut TcpStream, snapshot: &Snapshot) {
         respond(stream, "409 Conflict", "text/plain", b"nothing is playing");
         return;
     };
-    let Some(session) = tidal::Session::load() else {
-        respond(stream, "503 Service Unavailable", "text/plain", b"not signed in");
-        return;
+    // Refreshed, not merely loaded: a share link is meant to outlive the hour an access
+    // token lasts, and a listener arriving after that hour is exactly who this is for.
+    let session = match tidal::current() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("runnir: share has no usable TIDAL session: {e}");
+            respond(stream, "503 Service Unavailable", "text/plain", b"not signed in");
+            return;
+        }
     };
     // The tier the listener gets is the tier that is playing, because the badge on the
     // page says so and it must not be a different claim from what is sent.

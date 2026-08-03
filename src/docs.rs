@@ -724,6 +724,13 @@ The browser lands on a tidal.com page that looks broken. That is expected: the g
 code is in its address bar, and pasting the whole address finishes the sign-in. The code
 lasts about a minute.
 
+Signing in once is meant to be the last of it. An access token lasts an hour and every
+call that needs one renews it first, so a session on disk keeps working for as long as
+TIDAL honours its refresh token — days or weeks, without asking again. Only if TIDAL
+refuses that token does anything have to be done, and the panel says which command:
+sign-in is gated by what a client id is registered for, and an id lifted from the web
+player only accepts --import.
+
 # TIDAL — one player for every window
 
 The player runs in its own process, so the music belongs to the session and not to a

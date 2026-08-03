@@ -7422,8 +7422,7 @@ impl Gpu {
         let seq = self.tidal_request(None);
         let proxy = self.proxy.clone();
         std::thread::spawn(move || {
-            let answer = crate::tidal::Session::load()
-                .ok_or_else(|| "not signed in".to_string())
+            let answer = crate::tidal::current()
                 .and_then(|session| match source {
                     Source::Favourites => crate::tidal::favourite_tracks(&session)
                         .map(|t| crate::tidal::Found { tracks: t, ..Default::default() }),
@@ -7460,8 +7459,7 @@ impl Gpu {
         let seq = self.tidal_request(Some(crumb));
         let proxy = self.proxy.clone();
         std::thread::spawn(move || {
-            let answer = crate::tidal::Session::load()
-                .ok_or_else(|| "not signed in".to_string())
+            let answer = crate::tidal::current()
                 .and_then(|session| work(&session))
                 .map(|tracks| TidalAnswer::Found(crate::tidal::Found { tracks, ..Default::default() }));
             let _ = proxy.send_event(UserEvent::Tidal(seq, answer));
@@ -7505,8 +7503,7 @@ impl Gpu {
         let proxy = self.proxy.clone();
         let id = track.id;
         std::thread::spawn(move || {
-            let answer = crate::tidal::Session::load()
-                .ok_or_else(|| "not signed in".to_string())
+            let answer = crate::tidal::current()
                 .and_then(|session| crate::tidal::lyrics(&session, id))
                 .map(|l| TidalAnswer::Lyrics(id, l));
             let _ = proxy.send_event(UserEvent::Tidal(seq, answer));
@@ -7537,8 +7534,7 @@ impl Gpu {
         }
         let proxy = self.proxy.clone();
         std::thread::spawn(move || {
-            let found = crate::tidal::Session::load()
-                .ok_or_else(|| "not signed in".to_string())
+            let found = crate::tidal::current()
                 .and_then(|session| crate::tidal::search(&session, &query, 30))
                 .map(TidalAnswer::Found);
             let _ = proxy.send_event(UserEvent::Tidal(seq, found));

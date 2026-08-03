@@ -4310,7 +4310,66 @@ keep working, and the premise gets measured with a colour test card first.
 **Unvalidated at the end of the session**: the bitmap capture path and the `drop` metric
 are committed but were never seen running on the phone. First thing to check tomorrow.
 
+## 2026-08-03 - The TIDAL session only refreshed on the path that played music
+
+Reported as "my TIDAL token expired, how do I sign in again". It had not needed a sign-in:
+the refresh token was alive and the stored session was two days stale. One command that
+goes through `ensure_fresh` renewed it in a round trip.
+
+**The shape of the bug.** `ensure_fresh` has existed since the feature landed, with a 60
+second margin, and it writes the renewed session back to disk so no caller can forget to.
+Five call sites never asked for it and loaded the session raw:
+
+    src/player.rs:1592     play a track      ensure_fresh
+    src/main.rs            CLI browse/play   ensure_fresh
+    src/app_input.rs       sources           raw
+    src/app_input.rs       open a container   raw
+    src/app_input.rs       lyrics            raw
+    src/app_input.rs       search            raw
+    src/share.rs:234       stream to listener raw
+
+So playback renewed the token every track while the panel around it never did. That is why
+the symptom was so odd — music kept playing and search said the session was expired, on the
+same machine, at the same second. A path that loads the session raw is correct for exactly
+one hour after a sign-in, which is long enough to look fine everywhere it is written.
+
+**The fix is one door, not five renewals.** `tidal::current()` loads, refreshes if the
+session has aged out, saves, and hands back something good for the next call. Every entry
+point that touches the catalogue goes through it. It reads the credentials from the config
+itself rather than taking them as an argument, because the callers are worker threads
+spawned off the UI thread and the share server's request handler, and none of them holds a
+`Config` — threading one through four call sites is four chances for a fifth to skip it,
+which is the bug that was just fixed.
+
+**Refreshes are serialised, and the check is repeated inside the lock.** Opening the panel
+fires several requests at once and all of them would have found the same stale session.
+Whoever waits re-reads the file the winner wrote instead of refreshing from the copy it
+read before waiting. Across processes there is no such lock — the daemon has its own creds
+and its own `ensure_fresh` — but that is harmless: TIDAL does not rotate the refresh token,
+and a response that omits one keeps the old.
+
+**"Expired" and "revoked" are different sentences.** A refused refresh token (`invalid_grant`,
+HTTP 401) is the only case a person has to act on, and it says which command. A timeout or a
+502 says nothing about the session, and answering those with "sign in again" would send
+someone to redo a login that, with a client id lifted from the web player, cannot complete
+at all: `sub_status 1002` refuses the device flow and `error 11102` refuses the redirect.
+`--import` is the only door that opens for that id, so the message names it.
+
+**Verified against the real account, both ways.** With `expires_at` forced into the past,
+a catalogue call renewed the session and wrote it back. With the refresh token corrupted as
+well, the same call reported the revoked message rather than a raw HTTP error. 641 tests
+green, no warnings.
+
+**Not changed**: `player.rs` keeps its own `ensure_fresh` with the credentials the daemon was
+started with. It was already correct, and it is the hot path for playback.
+
 ## Gotchas (do not re-learn)
+
+- A token refresh that lives in ONE code path is a token refresh for that path only. The
+  TIDAL panel loaded the session raw while playback renewed it, so search failed while the
+  music played. Anything with an expiry needs a single door that every caller goes through
+  — the alternative is a bug that stays hidden for exactly the token's lifetime after each
+  sign-in.
 
 - `runnir.json` WINS over `runnir.toml`. `Config::try_load` reads the JSON the settings
   panel writes and only falls back to the TOML when that file is absent. Editing the
