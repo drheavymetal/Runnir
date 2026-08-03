@@ -23,10 +23,30 @@ function matches(f, q, t) {
   return hay.includes(q)
 }
 
-const VIEWS = ['guia', 'instalacion', 'atajos', 'config', 'recibir']
+// Identificadores de vista en INGLÉS, como el resto de nombres del proyecto (el
+// texto se traduce; los nombres no). Aparecen en la URL, así que son parte de la
+// interfaz pública del sitio.
+//
+// View identifiers in ENGLISH, like every other name in the project: text gets
+// translated, names do not. They show up in the URL, so they are part of the
+// site's public surface.
+const VIEWS = ['guide', 'install', 'shortcuts', 'config', 'receive']
+
+// Los nombres castellanos que tuvo el sitio antes. Un enlace guardado o pegado en
+// un chat no debería llevar a la portada en silencio. / The Spanish names the
+// site used to have: a saved or pasted link should not land on the front page
+// without a word.
+const RENAMED = {
+  guia: 'guide',
+  instalacion: 'install',
+  atajos: 'shortcuts',
+  recibir: 'receive',
+}
+
 function initialView() {
   const h = typeof window !== 'undefined' ? window.location.hash.replace('#', '') : ''
-  return VIEWS.includes(h) ? h : 'guia'
+  if (VIEWS.includes(h)) return h
+  return RENAMED[h] ?? 'guide'
 }
 
 export default function App() {
@@ -35,7 +55,7 @@ export default function App() {
   const setView = (v) => {
     setViewState(v)
     if (typeof window !== 'undefined') {
-      window.location.hash = v === 'guia' ? '' : v
+      window.location.hash = v === 'guide' ? '' : v
       window.scrollTo({ top: 0 })
     }
   }
@@ -64,7 +84,7 @@ export default function App() {
 
   // Scrollspy: resalta la sección visible en la barra lateral.
   useEffect(() => {
-    if (view !== 'guia') return
+    if (view !== 'guide') return
     const obs = new IntersectionObserver(
       (entries) => {
         for (const e of entries) {
@@ -80,7 +100,7 @@ export default function App() {
     return () => obs.disconnect()
   }, [view, q])
 
-  const goHome = () => { setView('guia'); setQuery(''); window.scrollTo({ top: 0, behavior: 'smooth' }) }
+  const goHome = () => { setView('guide'); setQuery(''); window.scrollTo({ top: 0, behavior: 'smooth' }) }
 
   return (
     <div className="layout">
@@ -91,10 +111,10 @@ export default function App() {
       />
 
       <main className="content">
-        {view === 'guia' && (
+        {view === 'guide' && (
           <div className="wrap">
-            {!q && <Hero onInstall={() => setView('instalacion')} />}
-            {!q && <Intro onInstall={() => setView('instalacion')} />}
+            {!q && <Hero onInstall={() => setView('install')} />}
+            {!q && <Intro onInstall={() => setView('install')} />}
 
             {q && filtered.length === 0 && (
               <p className="empty">{t(UI.emptyPrefix)} “{query}”. {t(UI.emptySuffix)}</p>
@@ -124,10 +144,10 @@ export default function App() {
           </div>
         )}
 
-        {view === 'instalacion' && <InstallPage query={query} />}
-        {view === 'atajos' && <KeybindingsPage query={query} />}
+        {view === 'install' && <InstallPage query={query} />}
+        {view === 'shortcuts' && <KeybindingsPage query={query} />}
         {view === 'config' && <ConfigPage query={query} />}
-        {view === 'recibir' && <ReceivePage />}
+        {view === 'receive' && <ReceivePage />}
       </main>
     </div>
   )
