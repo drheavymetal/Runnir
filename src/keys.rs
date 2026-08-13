@@ -163,7 +163,12 @@ fn encode_kitty_inner(
             NamedKey::Enter => KittyKey::Unicode(13),
             NamedKey::Tab => KittyKey::Unicode(9),
             NamedKey::Escape => KittyKey::Unicode(27),
-            NamedKey::Backspace => KittyKey::Unicode(127),
+            // Ctrl+Backspace: the kitty protocol spells it CSI 127;5u, but several
+            // TUI line editors (Cursor CLI among them) misread that as "delete
+            // whole line" instead of backward-kill-word. Report codepoint 119 ('w')
+            // so the CSI comes out as CSI 119;5u — the kitty form of Ctrl+W — which
+            // those same editors treat as "delete the word to the left".
+            NamedKey::Backspace => KittyKey::Unicode(if ctrl { 119 } else { 127 }),
             NamedKey::Space => {
                 // Space is a text-producing key: like a letter it keeps its plain
                 // text unless a forcing modifier or report-all sends it to CSI form.
@@ -348,14 +353,10 @@ fn named_key(key: NamedKey, mods: ModifiersState, mode: KeyMode) -> Option<Vec<u
         NamedKey::Enter => b("\r"),
         NamedKey::Backspace => {
             // Plain Backspace: DEL, not BS. Every Unix terminal has done this since
-            // the VT220, and erase=^? in termios depends on it. Alt+Backspace sends
-            // ESC-DEL, which readline/fish/zsh treat as backward-kill-word.
-            // Ctrl+Backspace sends Ctrl+W (\x17) instead: that is the termios `werase`
-            // char, so every line editor — including TUIs that don't understand
-            // ESC-DEL (Cursor CLI among them) — deletes the word to the left.
-            if mods.control_key() {
-                b("\x17")
-            } else if mods.alt_key() {
+            // the VT220, and erase=^? in termios depends on it. Ctrl+Backspace and
+            // Alt+Backspace both send ESC-DEL, which readline/fish/zsh treat as
+            // backward-kill-word — "delete the whole word".
+            if mods.control_key() || mods.alt_key() {
                 b("\x1b\x7f")
             } else {
                 b("\x7f")
