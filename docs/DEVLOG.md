@@ -3956,7 +3956,624 @@ this worse than the problem.
 
 590 tests.
 
+## 2026-08-02 - Optical transfer, step 1: the wire format, ported and cross-checked
+
+Branch `feat/optical-transfer`. A file leaves runnir as animated QR codes and arrives on a
+phone through its camera — no network, no pairing, no account, no app. runnir is the
+sender; the receiver is a page on runnir's own website, so anyone with a phone and a
+browser can receive from a runnir they are standing in front of.
+
+The format is `decimen-optical-transfer` (MIT). This step is `src/optical.rs`: the whole
+wire format in Rust, and nothing drawn yet on purpose.
+
+**Why a fountain code, and why there is no last frame.** The channel is one-way — the
+screen cannot hear the camera — so a normal protocol has nothing to retransmit with.
+Instead the sender emits an endless stream where frame `seq` is the XOR of a pseudorandom
+subset of the file's blocks, and the receiver rebuilds the file from ANY ~k·1.15 distinct
+frames, in any order. Dropped frames cost time, never correctness. This is also why
+"send a final checksum frame" is the wrong instinct: there is no end, and such a frame
+would be the single one whose loss breaks everything. The checksum is in EVERY frame
+instead (`payload_fnv`), and the file's SHA-256 rides inside the container.
+
+**This module IS the wire format, and that is the whole risk.** Sender and receiver derive
+each frame's block subset independently and never compare notes. A disagreement does not
+fail loudly — it shifts a CDF boundary, flips a sampled degree, and corrupts the transfer
+silently, surfacing only as a bad checksum after the whole thing has run. Consequences:
+
+- `dlog()` is a hand-rolled natural log using only exactly specified IEEE-754 operations.
+  `f64::ln` is implementation-approximated, as is JavaScript's `Math.log`; one ulp is
+  enough to desync a laptop sender from a phone receiver. **Never "simplify" it into
+  `ln`** — there is a test whose only job is to fail if someone does.
+- The arithmetic ORDER in `soliton_cdf` is load-bearing. Floating-point addition is not
+  associative, so regrouping any expression there changes a last bit and, eventually, a
+  frame the two ends disagree about.
+- `frame_indices` consumes a PRNG draw even when it collides, because the JavaScript
+  `Set.add` does; skipping it would shift the entire stream.
+
+**Two levels of proof, because the first is not enough.** The golden vectors recorded from
+the JavaScript implementation (the exhaustive `dlog` sweep hashing to `0x27b0f3cc`, the
+CDF fingerprints, the frame subsets, the encoded-stream hashes) only prove we have not
+drifted from what was transcribed. The claim that matters — a runnir sender is decodable
+by the receiver on the website — needs the actual receiver. So `tools/optical-cross-check.mjs`
+feeds real Rust-produced frames to decimen's own JavaScript decoder, back to front, with a
+third of them dropped. Three shapes pass: one block, a gzipped multi-block text file, and
+208 blocks of incompressible bytes.
+
+    RUNNIR_OPTICAL_VECTORS=/tmp/v.json cargo test -- --ignored emit_cross_check_vectors
+    node --import tsx tools/optical-cross-check.mjs /tmp/v.json    # from a decimen checkout
+
+**The verification code.** Pedro asked for a "CVC" the receiver computes after the transfer
+so a human does not have to check anything. The automatic half already existed: the
+SHA-256 of the original bytes travels in the container and the receiver verifies it in
+full before offering the file. What was missing was something a person can read, since 64
+hex characters are not comparable by eye — so `verification_code()` projects that hash to
+six digits, shown beside the QR from the first frame (the sender has the hash at pack
+time) and on the phone when it finishes. It adds nothing to the wire and no security: it
+is derived from a hash that already travels, which is exactly what keeps runnir compatible
+with receivers that have never heard of it. The full SHA-256 remains the real check.
+
+**Licensing.** decimen is MIT and runnir is GPL-3.0-only. MIT flows into GPL, so this is
+fine; the MIT attribution travels in the module header and must stay there.
+
+617 tests, no warnings. Nothing is drawn yet — the QR encoder and the panel are step 2.
+
+## 2026-08-02 - Optical transfer, step 2: the codes on screen
+
+`src/transfer.rs`, the QR panel, and the paths in. `leader q` asks for a file and fills
+the window with codes; `runnir @ transfer --path FILE` does the same from a script, which
+is what the remote control is for — an action carries no argument, so the panel could
+never have been driven by `action --id` alone.
+
+**Defaults, and why they are not decimen's.** 2953 bytes a frame, which is exactly a
+version-40 symbol at error correction L — the densest a QR gets, and density is goodput
+because the frame rate is capped by the screen and the camera rather than by us. But 24
+fps, not their 60: the browser sender runs full-screen on a desktop monitor, an LCD needs
+time to settle on a new pattern, and a frame the camera catches mid-transition is wasted.
+Their own note says 24 on a 60 Hz screen is comfortable.
+
+The version is pinned from the frame SIZE at start, not learned from the first frame.
+Every frame is the same length, so the answer is the same either way — but resolving it up
+front means there is no state that could be wrong for one frame, and the receiver never
+sees the symbol size change under it.
+
+**The sharpness problem, which is the whole panel.** The renderer's image sampler filters
+LINEARLY (`ImageLayer`, `render.rs`) and photos need that, so it could not be changed.
+Two consequences, and the second one was a real bug:
+
+- The code is painted at a WHOLE number of pixels per module and centred, with white
+  padding — never stretched to fit. A fractional module scale blurs exactly the edges a
+  decoder measures.
+- The texture must be exactly the size of the quad it is drawn into. It was painted square
+  while occupying 860x858 pixels of cells, so the renderer stretched it two pixels on one
+  axis. Now the field is the cell area's real dimensions and the extra goes to the white
+  margin, which the quiet zone wanted anyway.
+
+**The demo scene found that, and nothing else could have.** `runnir --demo out.png
+transfer` draws the panel with an invented 244 KB file — no disk, no camera. Same lesson
+as the TIDAL colours: reading the code, both versions look correct.
+
+**Three levels of proof now.** Golden vectors (step 1), then the painted frames, then the
+rendered window:
+
+    RUNNIR_PAINTED_FRAMES=/tmp/p cargo test -- --ignored emit_painted_frames
+    node --import tsx tools/optical-painted-check.mjs /tmp/p     # 50/50 read, file rebuilt
+
+    runnir --demo /tmp/scene.png transfer
+    magick /tmp/scene.png -depth 8 RGBA:/tmp/scene.raw
+    node --import tsx tools/optical-scene-check.mjs /tmp/scene.raw 1400 1000
+
+The last one decodes a frame out of a window that went through the real wgpu pipeline —
+image quad, linear sampler, sRGB surface — and reads `seq=0 k=86 blockLen=2933`. Any of
+those stages could have softened the code past a decoder with every byte-level test still
+green.
+
+**What the panel says, and what it does not.** Passes, not a percentage: the stream has no
+end and a receiver that starts late still finishes, so there is nothing for a percentage
+to be of. The six-digit code is beside the frame from the start, because the sender has
+the hash at pack time. Nothing depends on anyone comparing it — the receiver verifies the
+full SHA-256 by itself — it is there for the person holding the phone.
+
+The frame clock lives in the event loop, not in the draw. Advancing state in a draw pass
+would emit a frame per repaint, including the repaints a mouse moving over the window
+causes, and every one of those but the last is a frame the camera never had a chance to
+read.
+
+**A one-in-fifteen flaky test was a real bug, and the worst kind.** `QrCode::with_version`
+runs the crate's optimal segmentation, which may split data into numeric, alphanumeric and
+byte runs. Usually smaller; here fatal. A version-40 L symbol holds exactly 2953 bytes in
+byte mode, leaving four spare bits, and every extra segment costs a mode indicator and a
+length field — twenty. So a frame whose bytes happened to hold a long ASCII digit run got
+segmented into something that no longer fit, and that frame alone failed to encode.
+
+In production that is an occasional frame that refuses to draw, on data that is different
+every frame by design. Unreproducible. The fix is `Bits::push_byte_data` + `QrCode::with_bits`,
+which the crate documents precisely as the way to avoid the segmenter — and which is why
+decimen passes `mode: "byte"` explicitly. `pin_version` now probes through the same
+function, so the version that was pinned and the version that draws cannot disagree.
+
+634 tests, no warnings. The receiver on runnir's website is step 3.
+
+## 2026-08-02 - Optical transfer, step 3: the receiver on runnir's own website
+
+`docs-site` gets a fifth view (`#recibir`): open it on a phone, point the camera at a
+runnir window that is sending, and the file arrives. That is the whole feature — the
+sender is worth nothing without somewhere for the bytes to land, and the point was that
+ANYONE can receive, with no app to install.
+
+**Vendored verbatim, presentation rewritten.** `src/receive/vendor/` holds decimen's
+`protocol.ts`, `fountain.ts`, `progress.ts`, `no-signal.ts`, `worker-pool.ts` and
+`snippet.ts` unchanged, with a banner saying not to edit them and the MIT licence beside
+them. They are the same wire format `src/optical.rs` was ported from, and an edit that
+looks harmless desynchronises the receiver from every sender in the world, silently. The
+DOM code was not vendored: it was written against decimen's own markup, and this site is
+React with two languages.
+
+Field lessons that came with the vendored logic and would have cost a day each to
+rediscover: iOS treats `frameRate: {ideal: 60}` as a suggestion and delivers 30, so ask
+`exact` first; `requestVideoFrameCallback` chains survive a stopped stream and resume on
+the next one, so capture needs a generation counter or it zombies; and progress must track
+frames COLLECTED, because LT peeling back-loads its cascade and a blocks-solved bar looks
+stalled and then teleports.
+
+**The harnesses now test what ships.** They imported the reference checkout; they import
+`docs-site/src/receive/vendor/` now, and live in `docs-site/tools/` because that is where
+the dependencies are (a bare import resolves from the importing FILE, not the cwd). All
+three still pass against the vendored copies: the wire cross-check, the 50 painted frames,
+and the frame read back out of a rendered window.
+
+**https on the dev and preview servers**, via `@vitejs/plugin-basic-ssl`. `getUserMedia`
+does not exist at all on an insecure origin — localhost is exempt, a phone on the LAN is
+not. Without it the page is untestable on the only device it is for, and it would have
+been untestable until the Cloudflare token is rotated and the site deployed. Now
+`npm run preview` serves the real build over https on the LAN and a phone can have it
+today. The certificate is self-signed, so the phone warns once.
+
+Also on the site: the feature entry, the `Leader Q` keybinding row, and the receiver's own
+styles, sized for a thumb and a narrow screen rather than a desktop.
+
+**A missing i18n key renders NOTHING and builds clean.** The nav tab for the new view went
+in before its `UI.navReceive` string did, and `t(undefined)` returns `undefined`, which
+React draws as an empty button. The build was green, the bundle was fine, and the tab was
+blank. Caught by reading `git status` and noticing `i18n.jsx` was not in it.
+
+Still nothing has been tested against an actual camera. That is step 4, and it needs a
+phone in a hand.
+
+## 2026-08-03 - Optical transfer, step 5: a real camera, then the mosaic
+
+**Step 4 happened: a phone read it.** Pedro pointed his phone at a window sending
+`logo.png` (968 KB, a PNG, so no gzip win and a real ~16 s pass) and the file arrived and
+opened. That was the one claim four levels of testing could not make.
+
+Two things came out of the session, both about throughput.
+
+**30 fps, not 24.** The ceiling was never the screen; it is the CAMERA. A phone delivers
+30 or 60 captures a second and the two clocks are not locked, so as the sender approaches
+the capture rate most captures land mid-transition — and half of one code plus half of the
+next decodes as nothing. Rolling shutter makes it worse: the sensor reads by rows, so a
+change mid-readout puts the top of frame N above the bottom of frame N+1. Half the capture
+rate is the first number where every drawn frame is certain to get one clean look, which
+is 30 against a 60 fps camera and the reason decimen's 60 was never right for us either.
+
+**A mosaic, built and then demoted to a setting.** More codes per capture rather than more
+captures per second. A code is sized by the SHORT axis — it is square, a window is not — so
+a 16:9 window has room for a second one beside it at exactly the same pixels per module.
+That looked like free throughput in space that was white margin, and it shipped as the
+automatic behaviour for about an hour.
+
+**Then a phone said no.** Pedro measured 16 KB/s, which is five or six codes delivered out
+of the thirty going out. The arithmetic was right and the optics were not: the pixels that
+decide a transfer belong to the CAMERA, and framing a 1920px window instead of a 950px one
+puts each code on half the sensor width it had. The modules stop resolving and captures
+that used to decode return nothing — losing more than the second code ever added. Whether
+the trade pays depends on the physical size of the screen and how close the phone is, which
+runnir cannot see and the person holding the phone can. So `tiles = 0` now means ONE code
+as big as the window allows, and a mosaic is `[transfer] tiles = N`.
+
+Every tile is an ordinary QR carrying a different frame of the same stream, so nothing about
+the wire format changes and a decimen receiver that has never heard of mosaics still reads
+whichever code it locks onto. It works because a fountain stream has no order: four codes
+arriving together are worth what four codes arriving in sequence are worth.
+
+**The cost, which is the second reason not to tile by default.** Measured on this laptop,
+release build (`cargo test --release -- --ignored --nocapture cost_of_a_mosaic`):
+
+    1 code  12.8 ms per drawn frame   38% of a 30 fps budget
+    2 codes 25.7 ms                   77%
+    4 codes 52.6 ms                  158%  <- slower than not doing it
+
+Split further: **8 ms of that is the QR encode**, 0.4 ms is the painting, the rest is the
+fountain's XOR. So the ceiling on a mosaic is the encoder, not the camera and not the
+window, and the way to four codes is a faster encode or an encode off the UI thread. Past
+the frame interval the panel says `(painter behind)` rather than overriding the setting:
+the count is only ever set by hand, and the person who set it is the one who can judge it.
+
+**What the receiver had to learn, and what it cost when it over-learned.** `worker.ts` asked
+zxing for one symbol, so a mosaic would have delivered one code per capture and bought
+nothing. Widening it to sixteen made every capture 26 ms instead of 10 — and on a phone,
+several times that. Capture time IS transfer speed, so the fix was worse than the bug for
+everyone not using a mosaic. It now asks for ONE, and probes with four every twelfth
+capture; the moment more than one code comes back it keeps asking for that many. A mosaic is
+found rather than assumed, and the common case pays nothing.
+
+    maxNumberOfSymbols=1   16.8 ms      =2   16.9 ms
+    maxNumberOfSymbols=4   24.9 ms      =16  26.2 ms
+
+**Two receiver changes that matter more than the mosaic ever did.** The camera was being
+asked for 1280x960. A V40 symbol is 185 modules, so a code filling half the view lands at
+about 2.5 pixels a module — precisely where zxing starts failing, and a failure here throws
+away a whole capture. It now asks for 1920x1440, which doubles pixels per module at the same
+framing, and requests continuous focus where the browser exposes it: autofocus hunting from
+hand tremor is the single most common way to lose a run of captures.
+
+**Levers, and a way to try them.** `runnir @ transfer` takes `--fps`, `--tiles` and
+`--bytes`, none of which touch the config file, because the right values are a property of a
+room — a screen, a camera, a distance — and comparing two of them should not mean editing a
+file and starting over. `--bytes 1465` is a version-27 symbol: 129 modules instead of 185,
+so half the payload per code and each module 1.4x bigger. When the scarce thing is
+legibility rather than density, that is the trade to make.
+
+The page now leads with the two numbers a person actually reads while holding a phone up: a
+big percentage and a big KB/s. They were both already computed and both buried in a detail
+line, which at arm's length is the same as not being there.
+
+**Proof, at the two levels that could catch it.****Proof, at the two levels that could catch it.** `RUNNIR_PAINTED_TILES=4` paints mosaics
+and the painted harness now reads ALL symbols from each image and rebuilds the file
+(13 images x 4 codes = 52 codes, file recovered, verification code agreeing). And the scene
+harness goes through the real wgpu pipeline on a wide window:
+
+    RUNNIR_PAINTED_FRAMES=/tmp/p RUNNIR_PAINTED_TILES=4 cargo test -- --ignored emit_painted_frames
+    node --import tsx docs-site/tools/optical-painted-check.mjs /tmp/p
+
+    RUNNIR_DEMO_SIZE=2400x1000 runnir --demo /tmp/wide.png transfer
+    magick /tmp/wide.png -depth 8 RGBA:/tmp/wide.raw
+    node --import tsx docs-site/tools/optical-scene-check.mjs /tmp/wide.raw 2400 1000
+    # PASS - read 2 real frame(s): seq=0,1 k=86 blockLen=2933
+
+The scene check also asserts the tiles carry DIFFERENT sequence numbers from the SAME
+session. Two tiles showing the same frame would look like a mosaic and double nothing, and
+that is a mistake the pixels cannot show you.
+
+**None of it touched a vendored file.** The vendored `worker-pool.ts` expects one decode per
+submitted frame, so rather than edit it, `src/receive/mosaic.ts` wraps a worker in something
+the pool still recognises — the `PoolWorker` interface is structural — and hands the extra
+symbols to the same sink. The upstream file stays byte-identical and can be re-vendored
+without replaying anything.
+
+**A SIGSEGV on the way out, unrelated and pre-existing.** A window closed after the camera
+test dumped core: the `runnir-dnd` thread borrows winit's `wl_display` via
+`Backend::from_foreign_display`, and when its dispatch loop ends at shutdown the
+`Connection` DROPS, calling `wl_proxy_destroy` on proxies belonging to a display the main
+thread is destroying at the same time. The safety note in `dnd.rs` says the display
+outlives the terminal's use of it "because winit drops it only at exit" — which is exactly
+when the dnd thread is also still using it. Not fixed here; it belongs to its own change,
+and the two candidates are `mem::forget` on a connection we never owned, or signalling and
+joining the thread before the window goes.
+
+639 tests, no warnings, the web builds.
+
+## 2026-08-03 - Optical transfer, step 6: measuring against a real phone
+
+Everything below came from a phone pointed at a screen, and almost all of it contradicted
+something reasoned earlier the same night. Recorded in that order deliberately: the wrong
+turns are the useful part.
+
+**The numbers, in the order they arrived.**
+
+    V40 @ 24 fps                16.0 KB/s   ~5.5 codes/s read (of 24 sent)
+    V20 @ 10 fps                 3.0 KB/s   ~3.5 codes/s read
+    V27 @ 15 fps                 6.5 KB/s   ~5.3 codes/s read (of 15)
+    V27 @ 25 fps                 9.0 KB/s   ~7.3 codes/s read (of 25), capture 30/s
+
+**Frame rate, twice wrong.** 24 -> 30 (reasoned: half the capture rate) -> 10 (measured:
+beat 5, 15, 24 and 30) -> and then 10 turned out to be an artifact. With a receiver capped
+around 5 codes a second, showing a code longer simply wastes fewer of them; it looks like
+the screen is the problem. Once the receiver stopped being the cap, 25 fps beat 15 by half
+again. The default of 10 is now known to be too low and is waiting on one more measurement
+before it moves.
+
+**Bigger modules do NOT buy reads.** The strongest result of the night. Going from V40 to
+V20 nearly doubles module size and the codes-read-per-second barely moved (5.5 -> 3.5),
+while the payload per code collapsed — so throughput fell by five. Codes read per second is
+roughly CONSTANT at 5-7 regardless of what the sender does. Two consequences: legibility is
+not the binding constraint, and the sender should therefore carry the MOST bytes per code
+it can, which is V40. Every sender-side lever built today — fps, symbol size, mosaic —
+moves bytes per code; none of them moves the constant.
+
+**So the cap is the receiver, and it got four changes.**
+
+- Camera asked for 1280x960, which puts a V40 code filling half the view at ~2.5 px a
+  module. Now 1920x1440, plus continuous focus where the browser exposes it.
+- `maxNumberOfSymbols: 16` cost 26 ms a capture against 10 for one. Now asks for one and
+  probes with four every twelfth capture, so a mosaic is found rather than assumed.
+- `drawImage` + `getImageData` at 1920x1440 copied 11 MB per capture ON THE MAIN THREAD.
+  Now `createImageBitmap` (no copy) transferred to the worker, which draws it on an
+  `OffscreenCanvas`; the fallback path stays for Safari without it.
+- `tryHarder` was measured and exonerated: 9.0 ms against 7.5 with it off, on a clean
+  frame. Left on, because it is the option that reads marginal ones.
+
+**The open question, and the instrument for it.** `capture/s` counted ATTEMPTS, including
+the ones dropped because every worker was busy — so "30 cap, 7 dec" was ambiguous between
+23 illegible and 23 never tried, which want opposite fixes. The metrics line now carries
+`drop`. If drops are high the ceiling is decode capacity (more workers, and crop to where
+the code was last seen rather than scanning 2.7 M pixels), and if drops are near zero it is
+optical after all.
+
+**The target.** Pedro wants ~100 KB/s. That is 35 V40 codes a second READ, against 5-7
+today, so it does not arrive by tuning the sender. Colour multiplexing was considered and
+deferred: black + red + green is two channels, so x2 not x3; the camera pipeline
+subsamples chroma to a quarter resolution, which is exactly the module-scale detail it
+would have to carry; and multiplying a bottleneck of 5 by two does not close a factor of
+seven. If it is ever built, the luma channel stays a valid ordinary QR so decimen receivers
+keep working, and the premise gets measured with a colour test card first.
+
+**Unvalidated at the end of the session**: the bitmap capture path and the `drop` metric
+are committed but were never seen running on the phone. First thing to check tomorrow.
+
+## 2026-08-03 - Optical transfer, step 7: two codes in one square, in colour
+
+Asked for as an experiment, and built as one: `--color` / `[transfer] color`, off by
+default. The 03-08 analysis had deferred colour on three counts and none of them has been
+refuted — this makes it measurable instead of arguable.
+
+**The scheme, and the one property that makes it safe.** Each tile carries two frames of
+the same stream. Red and green hold the ordinary code; blue holds the second one.
+
+    base dark, extra dark    black   (0,0,0)        luma 0    blue 0
+    base dark, extra light   blue    (0,0,255)      luma ~29  blue 255
+    base light, extra dark   yellow  (255,255,0)    luma ~226 blue 0
+    base light, extra light  white   (255,255,255)  luma 255  blue 255
+
+Read as BRIGHTNESS — which is what every QR decoder does, and what a camera's luma plane
+carries at full resolution — black and blue are dark, yellow and white are light, so the
+base code is a completely ordinary QR symbol. Nothing was added to the wire format and
+nothing anywhere announces that colour is in use. decimen's receivers, and any QR app,
+keep working and simply read half the stream. The extra code is the blue channel on its
+own, and it inherits the base code's quiet zone for free because white is blue-light.
+
+Four colours, no blending, no intermediate value for a camera to resolve.
+
+**What it costs, which is the whole question.** The receiver has to scan a second image
+per capture, so it roughly doubles decode time — and the 03-08 measurements said codes
+read per second were constant at 5-7 whatever the sender did, i.e. the receiver was the
+bottleneck. Doubling both sides of a bottleneck is a wash. Colour pays exactly when the
+receiver is NOT the cap: few dropped captures, spare workers, or optics marginal enough
+that many captures fail anyway (a failed extra costs nothing the fountain notices). The
+`drop` metric added the same day is what answers it, which is why this is worth running
+now rather than after.
+
+Chroma subsampling remains the other half of the doubt: the camera pipeline carries the
+blue-difference channel at a quarter resolution, which is precisely the module-scale
+detail the second layer has to survive. That is why the layers are two independent
+fountain frames rather than half of each frame's bits — the extra one failing is a
+missed frame, never a corrupted file.
+
+**Sender cost, measured** (`cost_of_a_mosaic`, release, Iris Xe):
+
+    1x1              1 code    12.6 ms
+    1x2              2 codes   26.2 ms
+    1x1 colour       2 codes   25.3 ms
+    1x2 colour       4 codes   50.1 ms
+
+So colour and the mosaic cost the same per code: the bill is the QR encode, not the
+pixels. Two codes fit a 25 fps budget (40 ms) and do not fit 40 fps, which is why
+`painter_behind` moved out of the mosaic note and became its own warning — with colour a
+SINGLE tile can fall behind, and the old wording could only appear on a mosaic.
+
+**Proved without a camera, at both levels that can be.** `RUNNIR_PAINTED_COLOR=1` paints
+the real raster and `optical-painted-check.mjs` reads it exactly as before, then reads the
+blue channel the way the receiver's worker does: 25 images, 28 codes, 14 of them off the
+blue channel, file rebuilt and SHA-256 verified. `RUNNIR_DEMO_COLOR=1` renders a window
+through the whole wgpu pipeline (image quad, linear sampler, sRGB surface) and
+`optical-scene-check.mjs … color` read two distinct frames, seq 0 and 1, out of one
+window. The monochrome path was re-run through all four harnesses unchanged.
+
+The Rust tests are pixel-level, because there is no QR decoder in the crate graph and the
+decode proof belongs to the JS harnesses anyway: the dark-by-brightness pixels of a colour
+painting are asserted to be exactly the black pixels of the plain painting of the same
+frame, and the blue channel exactly the plain painting of the other one.
+
+**The receiver finds colour rather than being told.** There is no flag on the wire, so
+`scanBluePlane` probes one capture in twenty-four and latches on the first blue-channel
+code it sees — the same bargain, and the same shape, as the mosaic probe. Two counts come
+back from the worker instead of one: codes from the ordinary scan drive the mosaic latch,
+codes from the blue channel drive the colour latch. Sharing one number would have made a
+colour stream look like a two-tile mosaic and sent zxing hunting for symbols that are not
+on screen. The blue plane is built by overwriting red and green IN PLACE, after the first
+read has resolved: a second 11 MB array per capture is exactly the allocation that the
+bitmap-transfer work removed from the main thread a day earlier.
+
+**Bare `--color`.** `parse_flags` demands a value for every flag on purpose — `--path`
+with nothing after it must be an error, not a transfer of a file called `--fps`. Switches
+are now a whitelist (`BARE_FLAGS`), so `--color` alone means on and everything else still
+fails loudly.
+
+## 2026-08-03 - Sharing said "opening" for ever, and the reason was one command early
+
+Reported as the Cloudflare share doing nothing: the panel says opening and no URL ever
+arrives. Nothing wrong with the tunnel — `cloudflared` was installed, and there was one
+running. That was the problem.
+
+**What was actually on the machine.** A player daemon 3h29m old, `/proc/<pid>/exe`
+reading `runnir (deleted)` — the binary had been replaced under it twice by the day's
+installs — with a `cloudflared` child of its own from 3h14m ago. The share command had
+gone to a three-hour-old program that already had a tunnel, and `set_share` returns
+early when one is held: *already sharing; asking twice is not an error*. Which it is
+not, unless the asking window has never seen the answer.
+
+**Why the stale-daemon guard did not fire.** It exists, it works, and it is one command
+too late. `Remote::connect` returned as soon as the socket was open; the build stamp
+travels in the daemon's first SNAPSHOT, which the reader thread parses milliseconds
+afterwards. So the sequence was: connect, send the command the person just pressed,
+*then* notice the daemon is from another build. The guard in `player()` only runs on the
+NEXT call, so the first action of a freshly opened window always went to the old daemon.
+
+Sharing is precisely the shape of command that gets pressed once and then stared at.
+
+**The fix is to ask before answering.** `connect` now reads the first snapshot
+synchronously — the daemon's writer pushes one the moment a client attaches, so this
+costs nothing in the normal case — and if the build differs it retires that daemon,
+waits for it to let go of the socket and the lock, starts a current one and connects to
+that. The handle handed back is always to a daemon of this build.
+
+Two details that would have made it subtly wrong:
+
+- The **same `BufReader`** is handed to the reader thread, not a fresh one over the same
+  socket. A second reader would start after whatever the first had buffered, dropping
+  snapshots — and the writer batches, so that is not hypothetical.
+- The read timeout is **cleared** before the thread takes it. Left on, the reader loop
+  would end after two idle seconds and the window would decide the player had gone.
+
+The seeded snapshot is a small bonus: a panel opened now draws what is playing rather
+than an empty frame followed by a correction.
+
+**And the tunnel outlived everything.** `Share::stop` and the drop glue close it, and
+neither runs when a process is signalled — which is how a daemon ends nearly every time,
+including every `kill` of a stale one. The orphan found today had been holding a public
+hostname for three hours, pointing at a port nothing was listening on. `cloudflared` is
+now spawned with `PR_SET_PDEATHSIG`, so it dies with the daemon whatever kills it, plus
+the `getppid() == 1` check for the parent that dies between fork and exec.
+
+## 2026-08-03 - Colour measured +73%, and the frame rate became automatic
+
+The colour layer was built as an experiment with the analysis against it. The phone
+settled it, same file and same session throughout:
+
+    mono  @24 (earlier)   16.0 KB/s   ~5.5 codes/s read
+    mono  @30             13.0 KB/s   ~5.2 codes/s   (never got past 13)
+    colour @25            19.4 KB/s   ~7.8 codes/s
+    colour @30            22.5 KB/s   ~9.0 codes/s   <- +73% over mono
+    colour @40            much worse — the painter cannot keep up
+
+**+73% with a second scan per capture is the interesting part**, because it refutes the
+reason colour was deferred. If decode capacity were the constraint, the extra scan would
+have cancelled the extra code exactly. It did not, so the constraint was never decoding:
+it is how many codes each CAPTURE yields. The camera hands over the captures it hands
+over, and until today each one carried at most one code. That is also why every
+sender-side lever measured flat yesterday — they all move bytes per code, and none of
+them moved codes per capture.
+
+The gap between +73% and the theoretical +100% is the blue channel failing more often
+than the luma one, which is exactly what chroma subsampling predicted. It fails cheaply:
+a lost extra is a frame the fountain never notices.
+
+It also fixes the ceiling of the scheme at x2. Splitting red from green would break the
+property that makes it compatible — pure red is luma 76 and green 150, neither dark nor
+light — and the base code would stop being an ordinary QR.
+
+**40 fps was worse, in the way the arithmetic said it would be.** Two codes cost ~25 ms
+to paint and a 40 fps interval is 25 ms, so the painter falls behind and the stream
+sends fewer codes than asked for. `painter_behind` had just moved out of the mosaic note
+into its own warning for exactly this case, and it fired.
+
+### The frame rate is now automatic, like the tile count
+
+`fps = 0` is the default and means "as fast as this machine paints", up to
+`AUTO_FPS_MAX = 30`. The same sentinel and the same rule as `tiles`: runnir answers the
+half it can measure — its own paint cost — and leaves the half it cannot see to whoever
+is holding the phone. An explicit `--fps` is obeyed even when it cannot be painted, and
+the panel warns instead of overruling it.
+
+Two numbers make it work. The ceiling is 30 because that is where the RECEIVER saturates:
+about nine codes a second read, against sixty already on the glass at 30 fps in colour.
+More frames past that buy nothing but a chance of falling behind. And the headroom factor
+is 1.3, not 1.0, because painting is not all a frame does — the upload and the rest of
+the window share the interval, which is precisely why 40 fps at 25 ms of paint measured
+much worse rather than merely equal.
+
+Measured on this machine (release), the automatic rate picks:
+
+    1 code           30 fps      1x1 colour (2 codes)   30 fps
+    4 codes          13 fps      1x2 colour (4 codes)   15 fps
+
+So the default configuration — one tile, colour, automatic — lands on exactly the 30 fps
+that measured best, and a heavier mosaic steps itself down instead of quietly sending
+fewer codes than it claims.
+
+The test for this deliberately does NOT assert that the chosen rate is paintable at the
+floor: a debug build paints an order of magnitude slower than the release one this ships
+as, so that assertion would have been a test of the profile. It asserts the bounds, the
+implication above the floor, and that colour — two codes a frame — can never choose a
+faster rate than mono. That last one holds on any machine, which is the point.
+
+**The default for colour is now on.** The base code stays an ordinary QR, so nothing that
+could read a runnir stream before stops being able to; the only cost lands on a phone slow
+enough to be dropping captures, and `--color 0` is for that.
+
+## 2026-08-03 - The TIDAL session only refreshed on the path that played music
+
+Reported as "my TIDAL token expired, how do I sign in again". It had not needed a sign-in:
+the refresh token was alive and the stored session was two days stale. One command that
+goes through `ensure_fresh` renewed it in a round trip.
+
+**The shape of the bug.** `ensure_fresh` has existed since the feature landed, with a 60
+second margin, and it writes the renewed session back to disk so no caller can forget to.
+Five call sites never asked for it and loaded the session raw:
+
+    src/player.rs:1592     play a track      ensure_fresh
+    src/main.rs            CLI browse/play   ensure_fresh
+    src/app_input.rs       sources           raw
+    src/app_input.rs       open a container   raw
+    src/app_input.rs       lyrics            raw
+    src/app_input.rs       search            raw
+    src/share.rs:234       stream to listener raw
+
+So playback renewed the token every track while the panel around it never did. That is why
+the symptom was so odd — music kept playing and search said the session was expired, on the
+same machine, at the same second. A path that loads the session raw is correct for exactly
+one hour after a sign-in, which is long enough to look fine everywhere it is written.
+
+**The fix is one door, not five renewals.** `tidal::current()` loads, refreshes if the
+session has aged out, saves, and hands back something good for the next call. Every entry
+point that touches the catalogue goes through it. It reads the credentials from the config
+itself rather than taking them as an argument, because the callers are worker threads
+spawned off the UI thread and the share server's request handler, and none of them holds a
+`Config` — threading one through four call sites is four chances for a fifth to skip it,
+which is the bug that was just fixed.
+
+**Refreshes are serialised, and the check is repeated inside the lock.** Opening the panel
+fires several requests at once and all of them would have found the same stale session.
+Whoever waits re-reads the file the winner wrote instead of refreshing from the copy it
+read before waiting. Across processes there is no such lock — the daemon has its own creds
+and its own `ensure_fresh` — but that is harmless: TIDAL does not rotate the refresh token,
+and a response that omits one keeps the old.
+
+**"Expired" and "revoked" are different sentences.** A refused refresh token (`invalid_grant`,
+HTTP 401) is the only case a person has to act on, and it says which command. A timeout or a
+502 says nothing about the session, and answering those with "sign in again" would send
+someone to redo a login that, with a client id lifted from the web player, cannot complete
+at all: `sub_status 1002` refuses the device flow and `error 11102` refuses the redirect.
+`--import` is the only door that opens for that id, so the message names it.
+
+**Verified against the real account, both ways.** With `expires_at` forced into the past,
+a catalogue call renewed the session and wrote it back. With the refresh token corrupted as
+well, the same call reported the revoked message rather than a raw HTTP error. 641 tests
+green, no warnings.
+
+**Not changed**: `player.rs` keeps its own `ensure_fresh` with the credentials the daemon was
+started with. It was already correct, and it is the hot path for playback.
+
 ## Gotchas (do not re-learn)
+
+- Detecting a bad peer ASYNCHRONOUSLY means the first command still goes to it. The
+  stale-daemon check rode in on the first snapshot, which lands after `connect` has
+  returned, so exactly one command per window went to the wrong process — and the first
+  command is the one somebody just pressed. Identity belongs in the handshake.
+- A child process spawned by a daemon needs `PR_SET_PDEATHSIG`. Destructors and cleanup
+  paths do not run when a process is signalled, and `kill` is how a daemon usually ends.
+  A `cloudflared` was found holding a public hostname three hours after its parent died.
+- A budget that is exactly filled is a budget that is exceeded. Two codes cost ~25 ms to
+  paint and 40 fps allows 25 ms, which measured MUCH worse rather than merely equal: the
+  upload and the rest of the frame need the same interval. Any self-limiter timing its
+  own work needs headroom over the measurement, not equality with it.
+- A channel left free does not stay free-looking. Painting the base code with the blue
+  channel unset tints every dark module blue — a stream that still decodes, on a screen
+  that looks broken. Without a second layer the blue channel has to FOLLOW the first.
+- A token refresh that lives in ONE code path is a token refresh for that path only. The
+  TIDAL panel loaded the session raw while playback renewed it, so search failed while the
+  music played. Anything with an expiry needs a single door that every caller goes through
+  — the alternative is a bug that stays hidden for exactly the token's lifetime after each
+  sign-in.
 
 - `runnir.json` WINS over `runnir.toml`. `Config::try_load` reads the JSON the settings
   panel writes and only falls back to the TOML when that file is absent. Editing the
@@ -4199,3 +4816,47 @@ this worse than the problem.
 - Panics on the PTY reader thread poison the grid mutex → whole-app crash. Keep parser paths panic-free.
 - Every new Action → add to id/title/parse/palette_list/bindings/hints. Update run_action AND run_palette_action.
 - After any feature: document it in this file, in docs.rs (F1 help), commit+push.
+- A MOSAIC tile is an ordinary QR and the wire format knows nothing about it. That is what
+  keeps a decimen receiver working against a runnir mosaic, and it only holds because the
+  sequence steps by a WHOLE mosaic: two tiles carrying the same `seq` would be one frame
+  drawn twice. `advance` takes the layout for that reason and nothing else.
+- The mosaic's ceiling is the QR ENCODE, not the camera and not the window. 8 ms a code on
+  this laptop, paid `fps` times a second, in the event loop. Before adding tiles anywhere,
+  run `cost_of_a_mosaic` — past the frame interval, more codes means fewer codes delivered.
+- More codes on screen is NOT more throughput, and a phone proved it: a wider window means
+  each code lands on a smaller share of the SENSOR. Anything that makes the drawn code
+  smaller has to be measured against a camera, never reasoned about in bytes. The same trap
+  swallowed `maxNumberOfSymbols` on the receiving side — capture time is transfer speed.
+- Codes READ per second is roughly constant at 5-7 whatever the sender does, so the sender
+  should carry the most bytes per code it can. Anyone about to make the symbol smaller "so
+  it reads better" should measure first: V20 read no better than V40 and delivered a fifth.
+- A receiver capped below the send rate makes a LOW frame rate look optimal, because the
+  waste is what shrinks. Never tune sender timing while the receiver is the bottleneck —
+  that is how 10 fps got measured as best and then stopped being true an hour later.
+- `install.sh` resets to what ORIGIN has. Committing, installing and then pushing installs
+  the commit BEFORE the one just made, silently and with a cheerful success message. Push
+  first, then install.
+- `src/optical.rs` is a WIRE FORMAT, not a utility module. `dlog()` must never become
+  `f64::ln`, and the arithmetic order in `soliton_cdf` must not be regrouped: either
+  change desyncs runnir from every decimen receiver in the world, silently. Its golden
+  vectors are recorded from the JavaScript side — a failure there means the format
+  changed, which needs a header version bump, not a re-recorded constant.
+- A missing key in `docs-site/src/i18n.jsx` is SILENT: `t()` returns undefined and React
+  renders an empty element. Adding a nav tab or a label means adding its string in the same
+  change, because nothing will tell you otherwise.
+- `docs-site/src/receive/vendor/` is vendored wire format, not site code. Do not edit it to
+  fix a lint or a style: re-vendor upstream and re-run the Rust golden vectors. The
+  receiver and every sender derive each frame's block subset independently.
+- The camera needs a SECURE origin. `getUserMedia` is not merely blocked on plain http, it
+  is absent, so feature-detecting it reports "no camera on this device". localhost is
+  exempt; a phone on the LAN is not, which is why the dev and preview servers run https.
+- Never encode a QR with `QrCode::new`/`with_version` for a frame near a version's
+  capacity: the optimal segmenter can produce MORE bits than plain byte mode, and at 2953
+  bytes there are four bits of slack. Go through `Bits::push_byte_data` + `with_bits`.
+- The image sampler is LINEAR and must stay that way (photos need it), so anything drawn
+  for a machine to read must be painted at an integer pixel scale AND in a texture exactly
+  the size of the quad it lands in. Cells are ~10x22 px, so a square texture in a whole
+  number of cells is almost never square: the difference gets stretched.
+- A fountain stream has NO last frame. Sizing a test to "1.6x frames, then drop a third"
+  starves the decoder to 1.07x and reads as a correctness failure; it needs ~1.15x
+  ARRIVING. Size the emitted count for what survives the drop, not for what is sent.

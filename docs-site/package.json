@@ -8,14 +8,20 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
+    "check:optical": "node --import tsx tools/optical-cross-check.mjs",
+    "check:painted": "node --import tsx tools/optical-painted-check.mjs",
+    "check:scene": "node --import tsx tools/optical-scene-check.mjs",
     "deploy": "vite build && wrangler pages deploy dist --project-name runnir-docs --branch main --commit-dirty=true"
   },
   "dependencies": {
     "react": "^18.3.1",
-    "react-dom": "^18.3.1"
+    "react-dom": "^18.3.1",
+    "zxing-wasm": "^3.1.2"
   },
   "devDependencies": {
+    "@vitejs/plugin-basic-ssl": "^1.2.0",
     "@vitejs/plugin-react": "^4.3.4",
+    "tsx": "^4.23.2",
     "vite": "^5.4.11",
     "wrangler": "^4.112.0"
   }

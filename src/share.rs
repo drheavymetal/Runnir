@@ -231,9 +231,15 @@ fn stream_track(stream: &mut TcpStream, snapshot: &Snapshot) {
         respond(stream, "409 Conflict", "text/plain", b"nothing is playing");
         return;
     };
-    let Some(session) = tidal::Session::load() else {
-        respond(stream, "503 Service Unavailable", "text/plain", b"not signed in");
-        return;
+    // Refreshed, not merely loaded: a share link is meant to outlive the hour an access
+    // token lasts, and a listener arriving after that hour is exactly who this is for.
+    let session = match tidal::current() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("runnir: share has no usable TIDAL session: {e}");
+            respond(stream, "503 Service Unavailable", "text/plain", b"not signed in");
+            return;
+        }
     };
     // The tier the listener gets is the tier that is playing, because the badge on the
     // page says so and it must not be a different claim from what is sent.
@@ -374,11 +380,36 @@ fn escape(s: &str) -> String {
 
 /// Spawns `cloudflared` and waits for it to publish a URL.
 fn open_tunnel() -> Result<(std::process::Child, String), String> {
-    let mut child = std::process::Command::new("cloudflared")
-        .args(["tunnel", "--no-autoupdate", "--url", &format!("http://localhost:{PORT}")])
+    let mut cmd = std::process::Command::new("cloudflared");
+    cmd.args(["tunnel", "--no-autoupdate", "--url", &format!("http://localhost:{PORT}")])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    // Die with the daemon, whatever kills it.
+    //
+    // `Share::stop` and the drop glue close the tunnel on the way out, and neither runs
+    // when the process is signalled — which is how a daemon actually ends most of the
+    // time, including every `kill` of a stale one. The orphan then outlives everything:
+    // a `cloudflared` from hours ago, still holding a public hostname, pointing at a
+    // port nobody is listening on any more. One was found alive three hours after its
+    // daemon had been replaced.
+    #[cfg(target_os = "linux")]
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        cmd.pre_exec(|| {
+            // SAFETY: async-signal-safe, and touches nothing but this new process.
+            // A parent that died between fork and here is caught by the second check:
+            // the signal would already have been delivered and missed.
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::getppid() == 1 {
+                std::process::exit(0);
+            }
+            Ok(())
+        });
+    }
+    let mut child = cmd
         .spawn()
         .map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {

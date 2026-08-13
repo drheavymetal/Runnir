@@ -47,6 +47,15 @@ impl Creds {
     pub fn is_empty(&self) -> bool {
         self.client_id.is_empty() || self.client_secret.is_empty()
     }
+
+    /// The credentials out of a `[tidal]` block.
+    ///
+    /// Through `client_secret()` and never off the field, because the environment
+    /// variable wins over the file and a copy that reads the field directly is a
+    /// machine where the secret lives in the environment and nothing works.
+    pub fn from_config(cfg: &crate::config::Tidal) -> Creds {
+        Creds { client_id: cfg.client_id.clone(), client_secret: cfg.client_secret() }
+    }
 }
 
 /// A signed-in session, as persisted between runs.
@@ -568,6 +577,78 @@ pub fn ensure_fresh(creds: &Creds, session: &Session) -> Result<Session, String>
     let next = refresh(creds, session)?;
     next.save()?;
     Ok(next)
+}
+
+/// What to say when there is no session at all. One string, because it names a command
+/// and two copies of it drift into naming two.
+pub const NOT_SIGNED_IN: &str = "not signed in — run: runnir --tidal-login";
+
+/// What to say when the refresh token itself is dead. A different sentence from the one
+/// above on purpose: the machine IS signed in as far as it can tell, and the fix is not
+/// the same command for a client id that only accepts an imported session.
+pub const SESSION_REVOKED: &str =
+    "the TIDAL session was revoked — run: runnir --tidal-login --import";
+
+/// True when TIDAL refused the refresh token rather than failing to answer. Only this
+/// case needs a human; a timeout or a 500 is worth retrying and must not send anyone
+/// off to sign in again.
+pub fn is_revoked(err: &str) -> bool {
+    err.contains("invalid_grant") || err.contains("HTTP 401")
+}
+
+/// Serialises refreshes so that a panel opening four requests at once does not spend
+/// four round trips proving the same thing. The lock is around the whole load-refresh-
+/// save, so whoever loses the race re-reads the file the winner just wrote instead of
+/// refreshing from the copy it read before waiting.
+static REFRESH: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// The session to make the next API call with: loaded from disk, refreshed if it has
+/// aged out, and saved back.
+///
+/// **Every** entry point that touches the catalogue goes through here. A path that
+/// loads the session raw works for one hour and then reports "expired" on a machine
+/// that is signed in with a perfectly good refresh token sitting beside it. That was
+/// exactly the shape of the bug this replaces: playback refreshed (`player.rs` calls
+/// `ensure_fresh`), the panel did not, so search and lyrics died overnight while the
+/// music kept playing.
+///
+/// The credentials are read from the config here rather than passed in, because the
+/// callers are worker threads spawned off the UI thread and the share server's request
+/// handler — none of them holds a `Config`, and threading one through four call sites
+/// is four chances to add a fifth that does not. The config file is the source of
+/// truth for a client id in any case, and it is only read when a refresh is due.
+pub fn current() -> Result<Session, String> {
+    let session = Session::load().ok_or(NOT_SIGNED_IN)?;
+    if !session.expired() {
+        return Ok(session);
+    }
+    // Poisoning is not a reason to stop refreshing: the guarded data is `()`. A panic
+    // in another thread's refresh says nothing about whether this one can succeed.
+    let _guard = REFRESH.lock().unwrap_or_else(|e| e.into_inner());
+    // Re-read under the lock. Waiting for a refresh and then refreshing again from the
+    // stale copy read before the wait is the race this whole function exists to lose.
+    let session = Session::load().ok_or(NOT_SIGNED_IN)?;
+    if !session.expired() {
+        return Ok(session);
+    }
+    let cfg = crate::config::Config::load().tidal;
+    let creds = Creds::from_config(&cfg);
+    if creds.is_empty() {
+        return Err("no TIDAL credentials in [tidal]".into());
+    }
+    match refresh(&creds, &session) {
+        Ok(next) => {
+            // A failure to write is reported, not fatal: the token in hand is good for
+            // the next hour and refusing to use it would turn a permissions problem
+            // into "TIDAL is broken".
+            if let Err(e) = next.save() {
+                eprintln!("runnir: could not save the refreshed TIDAL session: {e}");
+            }
+            Ok(next)
+        }
+        Err(e) if is_revoked(&e) => Err(SESSION_REVOKED.to_string()),
+        Err(e) => Err(format!("could not refresh the TIDAL session: {e}")),
+    }
 }
 
 fn session_from_token_response(body: &str, prev: Option<&Session>) -> Result<Session, String> {
@@ -1558,6 +1639,42 @@ mod tests {
         // race a request against the expiry.
         s.expires_at = now() + REFRESH_MARGIN - 1;
         assert!(s.expired());
+    }
+
+    #[test]
+    fn only_a_refused_refresh_token_asks_for_a_new_sign_in() {
+        // TIDAL's answer when the grant itself is gone. This is the one case where a
+        // human has to do something.
+        assert!(is_revoked(r#"HTTP 401: {"error":"invalid_grant"}"#));
+        assert!(is_revoked("HTTP 401: Unauthorized"));
+        // Everything else is the network having a bad minute. Telling someone to sign
+        // in again over a timeout sends them to redo a login that was never broken —
+        // and with this client id, to a login flow that cannot even complete.
+        assert!(!is_revoked("timed out reading response"));
+        assert!(!is_revoked("HTTP 503: upstream unavailable"));
+        assert!(!is_revoked("dns error: no record found"));
+    }
+
+    #[test]
+    fn the_credentials_come_from_the_config_block() {
+        let cfg = crate::config::Tidal {
+            client_id: "cid".into(),
+            client_secret: "from-the-file".into(),
+            // Empty so the test reads the file's field and not whatever this machine
+            // happens to have exported. `client_secret()` prefers the environment, and
+            // a test that depended on that would be a test of the machine.
+            client_secret_env: String::new(),
+            ..Default::default()
+        };
+        let creds = Creds::from_config(&cfg);
+        assert_eq!(creds.client_id, "cid");
+        assert_eq!(creds.client_secret, "from-the-file");
+        assert!(!creds.is_empty());
+
+        // Half a credential is not a credential: the device flow rejects a client id
+        // without the secret that proves it, so the panel must not reach the network.
+        let half = crate::config::Tidal { client_secret: String::new(), ..cfg };
+        assert!(Creds::from_config(&half).is_empty());
     }
 
     #[test]

@@ -65,11 +65,16 @@ export const UI = {
   navInstall: { es: 'Instalación', en: 'Install' },
   navShortcuts: { es: 'Atajos', en: 'Shortcuts' },
   navConfig: { es: 'Config', en: 'Config' },
+  navReceive: { es: 'Recibir', en: 'Receive' },
   navSections: { es: 'Secciones', en: 'Sections' },
 
   subInstall: { es: 'Cómo instalar runnir.', en: 'How to install runnir.' },
   subShortcuts: { es: 'Referencia de atajos.', en: 'Keybinding reference.' },
   subConfig: { es: 'Todas las opciones de configuración.', en: 'Every config option.' },
+  subReceive: {
+    es: 'Apunta la cámara a una ventana de runnir que esté emitiendo.',
+    en: 'Point the camera at a runnir window that is sending.',
+  },
 
   langLabel: { es: 'Idioma', en: 'Language' },
 

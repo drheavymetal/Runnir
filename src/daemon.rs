@@ -389,7 +389,7 @@ impl Remote {
         wake: Box<dyn Fn() + Send>,
     ) -> Result<Remote, String> {
         let path = socket_path().ok_or("no XDG_RUNTIME_DIR, so there is nowhere safe for the player")?;
-        let stream = match UnixStream::connect(&path) {
+        let mut stream = match UnixStream::connect(&path) {
             Ok(s) => s,
             Err(_) => {
                 spawn_daemon()?;
@@ -397,18 +397,46 @@ impl Remote {
             }
         };
         let _ = cfg;
-        let state = Arc::new(Mutex::new(Snapshot::default()));
-        let reader = stream.try_clone().map_err(|e| e.to_string())?;
+        let mine = build_id();
+
+        // The build is checked HERE, before the handle is handed back, and not by the
+        // reader thread when the first snapshot happens to arrive.
+        //
+        // It used to be the latter, and the difference is one command: `connect`
+        // returned, the caller sent something immediately, and only afterwards did the
+        // snapshot land and mark the daemon stale. So the FIRST thing a window did
+        // after opening went to the out-of-date daemon anyway, and only the second was
+        // routed to a current one. Sharing is exactly the shape of command that gets
+        // pressed once — it went to a three-hour-old daemon that already had a tunnel
+        // of its own, and the panel sat on "opening" for ever.
+        let (mut reader, mut first) = hello(&stream)?;
+        if is_other_build(&first, &mine) {
+            retire_over(&mut stream);
+            drop(reader);
+            drop(stream);
+            // The old daemon takes a moment to let go of the socket and the lock. A
+            // new one started before then finds the lock held and exits immediately,
+            // which would leave the window with nothing at all.
+            wait_until_gone(&path);
+            spawn_daemon()?;
+            stream = wait_for_socket(&path)?;
+            let next = hello(&stream)?;
+            reader = next.0;
+            first = next.1;
+        }
+
+        // Seeded with what the daemon has already said, so a panel opened right now
+        // draws what is playing instead of an empty one for a frame.
+        let state = Arc::new(Mutex::new(first.unwrap_or_default()));
         let shared = state.clone();
         let alive = Arc::new(AtomicBool::new(true));
         let reader_alive = alive.clone();
         let stale = Arc::new(AtomicBool::new(false));
         let reader_stale = stale.clone();
-        let mine = build_id();
         std::thread::Builder::new()
             .name("runnir-player-client".into())
             .spawn(move || {
-                for line in BufReader::new(reader).lines() {
+                for line in reader.lines() {
                     let Ok(line) = line else { break };
                     let Ok(snapshot) = serde_json::from_str::<Snapshot>(&line) else { continue };
                     // A daemon from before the last install answers perfectly well and
@@ -528,6 +556,62 @@ fn spawn_daemon() -> Result<(), String> {
     Ok(())
 }
 
+/// How long to wait for the daemon's first snapshot, which is what carries its build.
+///
+/// The writer sends one the moment a client connects, so this is normally instant. The
+/// timeout exists so a daemon that is wedged costs a second rather than the window.
+const HELLO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Reads the first snapshot a daemon pushes, and hands back the reader positioned
+/// after it.
+///
+/// The SAME `BufReader` is returned rather than a fresh one: it may have buffered part
+/// of the next line already, and a second reader over the socket would start after
+/// those bytes — losing a snapshot, or half of one.
+fn hello(stream: &UnixStream) -> Result<(BufReader<UnixStream>, Option<Snapshot>), String> {
+    let read = stream.try_clone().map_err(|e| format!("cannot read from the player: {e}"))?;
+    let _ = read.set_read_timeout(Some(HELLO_TIMEOUT));
+    let mut reader = BufReader::new(read);
+    let mut line = String::new();
+    let first = match reader.read_line(&mut line) {
+        Ok(n) if n > 0 => serde_json::from_str::<Snapshot>(&line).ok(),
+        _ => None,
+    };
+    // Back to blocking for the reader thread, which is supposed to sit there for the
+    // life of the window: a timeout left on would end its loop after two idle seconds.
+    let _ = reader.get_ref().set_read_timeout(None);
+    Ok((reader, first))
+}
+
+/// Whether a snapshot came from a different build of runnir than this process.
+///
+/// An empty stamp on either side means "cannot tell", which counts as the same build:
+/// the point is to catch a daemon left over from before an install, never to refuse to
+/// talk to one on a system without `/proc`.
+fn is_other_build(snapshot: &Option<Snapshot>, mine: &str) -> bool {
+    let Some(snapshot) = snapshot else { return false };
+    !snapshot.build.is_empty() && !mine.is_empty() && snapshot.build != *mine
+}
+
+/// Tells a daemon to go, straight down the socket.
+fn retire_over(stream: &mut UnixStream) {
+    if let Ok(line) = serde_json::to_string(&Cmd::Quit) {
+        let _ = writeln!(stream, "{line}");
+        let _ = stream.flush();
+    }
+}
+
+/// Waits for a retired daemon to stop answering, so the next one can take the lock.
+fn wait_until_gone(path: &std::path::Path) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while std::time::Instant::now() < deadline {
+        if UnixStream::connect(path).is_err() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
 fn wait_for_socket(path: &std::path::Path) -> Result<UnixStream, String> {
     let deadline = std::time::Instant::now() + START_TIMEOUT;
     while std::time::Instant::now() < deadline {
@@ -542,6 +626,64 @@ fn wait_for_socket(path: &std::path::Path) -> Result<UnixStream, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_daemon_from_another_build_is_spotted_before_a_command_is_sent() {
+        let mine = "1234-99".to_string();
+        let snap = |build: &str| {
+            Some(Snapshot { build: build.to_string(), ..Default::default() })
+        };
+        // The case that cost a session: a daemon left over from before an install.
+        assert!(is_other_build(&snap("1200-1"), &mine));
+        assert!(!is_other_build(&snap("1234-99"), &mine));
+        // "Cannot tell" is not "different". A machine without /proc reports an empty
+        // stamp on both sides, and refusing to talk to its own player would be a worse
+        // failure than the one this guards against.
+        assert!(!is_other_build(&snap(""), &mine));
+        assert!(!is_other_build(&snap("1200-1"), ""));
+        // No snapshot at all: the daemon said nothing inside the timeout. Treated as
+        // the same build, because killing a player over silence would turn a slow
+        // machine into a broken one.
+        assert!(!is_other_build(&None, &mine));
+    }
+
+    #[test]
+    fn the_first_snapshot_is_read_before_the_handle_is_used() {
+        // `hello` has to hand back the SAME reader it read the first line with: a
+        // fresh one over the socket would start after whatever got buffered, which
+        // silently drops snapshots.
+        let (client, server) = UnixStream::pair().unwrap();
+        let mut writer = server;
+        // Two lines in one write, so the second is certainly sitting in the reader's
+        // buffer when the first has been parsed.
+        let first = serde_json::to_string(&Snapshot { build: "a-1".into(), ..Default::default() }).unwrap();
+        let second = serde_json::to_string(&Snapshot { build: "a-2".into(), ..Default::default() }).unwrap();
+        writeln!(writer, "{first}").unwrap();
+        writeln!(writer, "{second}").unwrap();
+        writer.flush().unwrap();
+
+        let (mut reader, got) = hello(&client).unwrap();
+        assert_eq!(got.expect("the first snapshot").build, "a-1");
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        let next: Snapshot = serde_json::from_str(&line).unwrap();
+        assert_eq!(next.build, "a-2", "the buffered second snapshot was lost");
+    }
+
+    #[test]
+    fn a_silent_daemon_costs_a_timeout_and_not_the_window() {
+        // Nothing is ever written to this pair. `hello` must come back rather than
+        // block the window until something happens on a socket that never speaks.
+        let (client, _server) = UnixStream::pair().unwrap();
+        let started = std::time::Instant::now();
+        let (_reader, got) = hello(&client).unwrap();
+        assert!(got.is_none());
+        assert!(
+            started.elapsed() >= HELLO_TIMEOUT && started.elapsed() < HELLO_TIMEOUT * 3,
+            "waited {:?}",
+            started.elapsed()
+        );
+    }
 
     #[test]
     fn the_socket_is_one_per_user_and_not_one_per_window() {

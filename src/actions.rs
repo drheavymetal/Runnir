@@ -79,6 +79,8 @@ pub enum Action {
     TidalShare,
     /// Zoom out: the session as a map of headlines.
     Map,
+    /// Send a file out through the screen as QR codes, for a phone camera.
+    OpticalTransfer,
     /// Arrange the window around a deploy: watches, and the deploy staged.
     WarRoom,
     /// Take the war room down, keeping any pane the user typed in.
@@ -185,6 +187,7 @@ impl Action {
             TidalStop => "tidal_stop",
             TidalShare => "tidal_share",
             Map => "map",
+            OpticalTransfer => "optical_transfer",
             WarRoom => "war_room",
             WarRoomClose => "war_room_close",
             SetImageWatchDir => "set_image_watch_dir",
@@ -282,6 +285,7 @@ impl Action {
             TidalStop => "Stop playing",
             TidalShare => "Share what is playing (link)",
             Map => "Map: the session zoomed out to one headline per pane",
+            OpticalTransfer => "Send a file to a phone by camera (QR stream)",
             WarRoom => "War room: arrange the window around a deploy",
             WarRoomClose => "War room: close it, keeping panes you typed in",
             SetImageWatchDir => "Auto-preview images: set / clear watched dir",
@@ -382,6 +386,7 @@ impl Action {
             "tidal_stop" => TidalStop,
             "tidal_share" => TidalShare,
             "map" => Map,
+            "optical_transfer" => OpticalTransfer,
             "war_room" => WarRoom,
             "war_room_close" => WarRoomClose,
             "set_image_watch_dir" => SetImageWatchDir,
@@ -492,6 +497,7 @@ impl Action {
             TidalStop,
             TidalShare,
             Map,
+            OpticalTransfer,
             WarRoom,
             WarRoomClose,
             SetImageWatchDir,
@@ -996,6 +1002,11 @@ fn default_leader_bindings() -> HashMap<Chord, LeaderNode> {
     leaf(&mut m, "u", CatchUp);
     // `m` for map: zoom out to see the whole session at once.
     leaf(&mut m, "m", Map);
+    // `q` for the QR stream, which is literally what fills the window. `t` for
+    // transfer is the better word and is not available: Tabs has had it since
+    // before this existed. `q` reads as quit to a newcomer, but quit lives at
+    // `s q` and `q` alone has never done anything, so nothing is being taken.
+    leaf(&mut m, "q", OpticalTransfer);
     // Font size, where every terminal already puts it — but +, - and = are not all
     // one keypress on every layout (on the Spanish one `=` is shift+0), so the
     // letters are the binding that always works and the symbols are the alias.

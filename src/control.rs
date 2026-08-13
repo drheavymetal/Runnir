@@ -106,6 +106,37 @@ pub enum ControlRequest {
         #[serde(default)]
         button: Option<String>,
     },
+    /// Send a file out through the screen as a QR stream, for a phone camera.
+    ///
+    /// A verb of its own rather than `action --id optical_transfer`, because that
+    /// one can only open the prompt: an action carries no argument, and the whole
+    /// point of driving this from outside is naming the file.
+    Transfer {
+        path: String,
+        /// Codes per second, overriding `[transfer] fps` for this stream only.
+        /// Here because the right number depends on the camera pointed at it,
+        /// and comparing two numbers should not mean editing a config file and
+        /// starting over.
+        #[serde(default)]
+        fps: Option<u32>,
+        /// Codes on screen at once, overriding `[transfer] tiles`. Same reason:
+        /// whether a mosaic pays is a question about a phone and a screen, and
+        /// it is answered by trying both.
+        #[serde(default)]
+        tiles: Option<usize>,
+        /// Payload bytes per code, which chooses the QR VERSION and therefore how
+        /// big a module is on screen. The default is the densest symbol that
+        /// exists; a smaller one carries less per code and is far easier to read,
+        /// and which of those wins is a property of the room, not of the format.
+        #[serde(default)]
+        bytes: Option<usize>,
+        /// Carry a second code in colour, overriding `[transfer] color`. Here
+        /// with the others because it is the same kind of question — whether it
+        /// helps depends on the phone at the other end — and answering it means
+        /// running the same file twice, once each way.
+        #[serde(default)]
+        color: Option<bool>,
+    },
     /// Turn the wheel at a cell. `lines` is signed the way a wheel is: positive is
     /// up, away from the user. The pointer goes to the cell first, because every
     /// wheel target here is chosen by what is UNDER the pointer.
@@ -226,6 +257,17 @@ pub fn parse_client_args(cmd: &str, flags: &[String]) -> Result<ControlRequest, 
             row: opt_usize(&m, "row")?.ok_or("wheel needs --row")?,
             lines: opt_f32(&m, "lines")?,
         },
+        "transfer" => ControlRequest::Transfer {
+            path: m
+                .get("path")
+                .or_else(|| m.get("file"))
+                .ok_or("transfer needs --path (e.g. --path ~/notes.md)")?
+                .clone(),
+            fps: opt_u32(&m, "fps")?,
+            tiles: opt_usize(&m, "tiles")?,
+            bytes: opt_usize(&m, "bytes")?,
+            color: opt_bool(&m, "color")?,
+        },
         "action" => ControlRequest::Action {
             id: m.get("id").ok_or("action needs --id (e.g. --id git_panel)")?.clone(),
         },
@@ -243,6 +285,9 @@ pub fn parse_client_args(cmd: &str, flags: &[String]) -> Result<ControlRequest, 
 
 /// Collects `--key value` / `--key=value` pairs into a map. Rejects a bare token
 /// (no `--`) or a trailing flag with no value, so a typo fails loudly.
+///
+/// The exception is [`BARE_FLAGS`], which are switches and may be written with no
+/// value at all.
 fn parse_flags(flags: &[String]) -> Result<HashMap<String, String>, String> {
     let mut map = HashMap::new();
     let mut i = 0;
@@ -252,14 +297,30 @@ fn parse_flags(flags: &[String]) -> Result<HashMap<String, String>, String> {
         if let Some((k, v)) = key.split_once('=') {
             map.insert(k.to_string(), v.to_string());
             i += 1;
-        } else {
-            let v = flags.get(i + 1).ok_or_else(|| format!("flag --{key} needs a value"))?;
-            map.insert(key.to_string(), v.clone());
-            i += 2;
+            continue;
         }
+        // A switch takes the next token only if it looks like a value. `--color
+        // --fps 25` and a trailing `--color` both mean on, which is how a switch
+        // is written everywhere else.
+        let next = flags.get(i + 1);
+        if BARE_FLAGS.contains(&key) && next.is_none_or(|v| v.starts_with("--")) {
+            map.insert(key.to_string(), "true".to_string());
+            i += 1;
+            continue;
+        }
+        let v = next.ok_or_else(|| format!("flag --{key} needs a value"))?;
+        map.insert(key.to_string(), v.clone());
+        i += 2;
     }
     Ok(map)
 }
+
+/// Flags that are switches, and so may appear without a value.
+///
+/// A whitelist rather than a rule about what follows, because the loud failure is
+/// worth keeping for everything else: `--path` with nothing after it has to be an
+/// error, not a transfer of a file called `--fps`.
+const BARE_FLAGS: &[&str] = &["color"];
 
 fn opt_u64(m: &HashMap<String, String>, key: &str) -> Result<Option<u64>, String> {
     m.get(key)
@@ -270,6 +331,24 @@ fn opt_u64(m: &HashMap<String, String>, key: &str) -> Result<Option<u64>, String
 fn opt_usize(m: &HashMap<String, String>, key: &str) -> Result<Option<usize>, String> {
     m.get(key)
         .map(|v| v.parse::<usize>().map_err(|_| format!("--{key} wants a number, got {v:?}")))
+        .transpose()
+}
+
+fn opt_u32(m: &HashMap<String, String>, key: &str) -> Result<Option<u32>, String> {
+    m.get(key)
+        .map(|v| v.parse::<u32>().map_err(|_| format!("--{key} wants a number, got {v:?}")))
+        .transpose()
+}
+
+/// A switch, in any of the spellings someone types at a shell. `--color` on its
+/// own counts as on: see [`BARE_FLAGS`].
+fn opt_bool(m: &HashMap<String, String>, key: &str) -> Result<Option<bool>, String> {
+    m.get(key)
+        .map(|v| match v.to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Ok(true),
+            "0" | "false" | "no" | "off" => Ok(false),
+            _ => Err(format!("--{key} wants on or off, got {v:?}")),
+        })
         .transpose()
 }
 
@@ -703,6 +782,30 @@ mod tests {
     #[test]
     fn unknown_command_is_an_error() {
         assert!(parse_client_args("teleport", &[]).is_err());
+    }
+
+    #[test]
+    fn a_switch_may_be_written_bare_and_everything_else_may_not() {
+        // `--color` on its own is how a switch is written everywhere else, and it
+        // is the form someone types when comparing two runs of the same file.
+        let bare = parse_client_args("transfer", &flags(&["--path", "a.md", "--color"])).unwrap();
+        let mid = parse_client_args("transfer", &flags(&["--color", "--path", "a.md"])).unwrap();
+        let spelt = parse_client_args("transfer", &flags(&["--path", "a.md", "--color", "on"])).unwrap();
+        let off = parse_client_args("transfer", &flags(&["--path", "a.md", "--color=0"])).unwrap();
+        for (req, want) in [(bare, Some(true)), (mid, Some(true)), (spelt, Some(true)), (off, Some(false))] {
+            match req {
+                ControlRequest::Transfer { color, path, .. } => {
+                    assert_eq!(color, want);
+                    // The switch must not have eaten the flag after it.
+                    assert_eq!(path, "a.md");
+                }
+                other => panic!("expected a transfer request, got {other:?}"),
+            }
+        }
+        // Not a switch: a missing value is still an error rather than a file
+        // named after the next flag.
+        assert!(parse_client_args("transfer", &flags(&["--path"])).is_err());
+        assert!(parse_client_args("transfer", &flags(&["--path", "a.md", "--color", "maybe"])).is_err());
     }
 
     #[test]

@@ -40,6 +40,9 @@ pub struct Config {
     /// subscription behind it.
     #[serde(default)]
     pub tidal: Tidal,
+    /// Sending a file out through the screen as QR codes.
+    #[serde(default)]
+    pub transfer: Transfer,
     /// Extra keybindings, merged over the built-in ones. `"ctrl+shift+t" = "new_tab"`.
     /// A `"leader+v"` key binds on the leader layer instead of as a plain chord.
     pub keys: HashMap<String, String>,
@@ -101,6 +104,7 @@ impl Default for Config {
             behaviour: Behaviour::default(),
             clipboard: ClipboardCfg::default(),
             tidal: Tidal::default(),
+            transfer: Transfer::default(),
             ai: Ai::default(),
             watch: Watch::default(),
             media: Media::default(),
@@ -469,6 +473,53 @@ impl Default for Explorer {
             width: 30,
             show_hidden: false,
             open_on_start: false,
+        }
+    }
+}
+
+// ---- optical transfer -----------------------------------------------------
+
+/// Sending a file out through the screen as QR codes (leader q).
+///
+/// Both settings trade against the same thing — whether the camera can read what
+/// is on the glass — and neither has a right answer that does not depend on the
+/// screen, the phone and the light in the room. They are here so the answer can
+/// be measured rather than argued about.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Transfer {
+    /// Codes per second, or 0 for automatic — the fastest this machine can
+    /// actually paint, up to 30.
+    ///
+    /// 30 rather than more because that is where the receiver saturates: it
+    /// reads about 9 codes a second, and 30 frames in colour already put 60 on
+    /// the glass. An explicit number is obeyed even when the painter cannot keep
+    /// up, and the panel says so — same rule as `tiles`.
+    pub fps: u32,
+    /// How many codes to show at once, or 0 to fit as many as the window takes
+    /// without shrinking the modules. A number above what fits at full size
+    /// trades sharpness for count — worth trying up close with a good camera,
+    /// and a loss at arm's length.
+    pub tiles: usize,
+    /// Carry a second code in the colour of the first: red and green hold the
+    /// ordinary black-and-white code, blue holds another frame of the same
+    /// stream. Twice the codes out of the same square of screen, at the cost of
+    /// a second scan per capture on the receiver.
+    ///
+    /// On, because it measured +73% against a real phone. The base code stays a
+    /// completely ordinary QR either way, so nothing that could read a runnir
+    /// stream before stops being able to. Turn it off for a phone whose metrics
+    /// line shows it dropping captures — there the second scan costs more than
+    /// the second code brings.
+    pub color: bool,
+}
+
+impl Default for Transfer {
+    fn default() -> Self {
+        Self {
+            fps: crate::transfer::DEFAULT_FPS,
+            tiles: crate::transfer::DEFAULT_TILES,
+            color: crate::transfer::DEFAULT_COLOR,
         }
     }
 }

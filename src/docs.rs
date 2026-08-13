@@ -724,6 +724,13 @@ The browser lands on a tidal.com page that looks broken. That is expected: the g
 code is in its address bar, and pasting the whole address finishes the sign-in. The code
 lasts about a minute.
 
+Signing in once is meant to be the last of it. An access token lasts an hour and every
+call that needs one renews it first, so a session on disk keeps working for as long as
+TIDAL honours its refresh token — days or weeks, without asking again. Only if TIDAL
+refuses that token does anything have to be done, and the panel says which command:
+sign-in is gated by what a client id is registered for, and an id lifted from the web
+player only accepts --import.
+
 # TIDAL — one player for every window
 
 The player runs in its own process, so the music belongs to the session and not to a
@@ -746,6 +753,64 @@ leaves it up. It dies when the sharing is stopped or when the last window closes
 
 Worth being plain about: this re-transmits audio you are licensed to listen to, to
 whoever holds the URL.
+
+# Optical transfer — a file to a phone, through the screen (leader q)
+
+leader q asks for a file and fills the window with QR codes that keep changing. Point a
+phone camera at it, with runnir's website open on the phone, and the file arrives. No
+network between the two, no pairing, no account, no app: the only channel is light.
+
+  leader q                 ask which file to send
+  runnir @ transfer --path FILE   the same thing from a script
+  space                    pause on the frame that is showing
+  esc or q                 close
+
+Per-stream settings, for comparing two runs without editing a config file:
+
+  runnir @ transfer --path FILE --fps 25      codes per second (0 = as fast as
+                                              this machine can paint, up to 30)
+  runnir @ transfer --path FILE --tiles 2     codes on screen at once
+  runnir @ transfer --path FILE --bytes 1273  payload per code (picks the QR version)
+  runnir @ transfer --path FILE --color       carry a second code in colour
+
+Why it works with no handshake: the codes are not the file in order. Each one is a
+fountain-coded mixture, and the phone rebuilds the file from ANY 115 or so frames out of
+every 100 it needs, in any order. So there is no frame you can miss, no beginning to
+catch, and nothing to retransmit. It also means there is no last frame and no progress
+bar that reaches the end — the panel counts passes instead.
+
+The panel shows a six-digit code, and the phone shows one when it finishes. They match
+when the phone holds the file that was on screen. Nothing depends on you checking: the
+receiver verifies the full SHA-256 by itself and refuses a file that does not match.
+
+How long it takes: about 22 KB a second at the defaults, measured against a real phone
+at arm's length rather than calculated. Text, configs, diffs and small images are
+seconds; half a megabyte is about twenty. The file is gzipped first when that helps, and
+the panel says so.
+
+The rate is automatic by default: runnir times its own painting and runs as fast as it
+can keep up with, to a ceiling of 30 codes a second. The ceiling is where the RECEIVER
+saturates — a phone reads about nine codes a second, and 30 frames in colour already put
+sixty on the glass. An explicit --fps is obeyed instead, and the panel warns rather than
+overruling it when the painter cannot keep up.
+
+Colour (--color, or [transfer] color) puts TWO codes in the same square. Red and green
+carry an ordinary black-and-white code; blue carries another frame of the same stream.
+Read as brightness — which is what any QR decoder does — the first one is a completely
+normal code, so nothing was added to the format and a receiver that knows nothing about
+colour still reads half the stream at full speed. runnir's own receiver finds the second
+layer by looking for it, and marks its metrics line with the word color when it has.
+
+Colour is on by default because it measured +73% against a real phone: 22.5 KB a second
+with it, against 13 at best without. That result also answers the doubt it was built to
+settle — a second scan per capture would have cancelled the second code if decoding were
+the constraint, so the constraint is how many codes each capture YIELDS. Turn it off
+(--color 0) for a phone whose metrics line shows captures being dropped: there the second
+scan costs more than the second code brings. It also costs a second QR encode per frame here: at 25 fps
+that fits comfortably, and past that the panel warns that the painter is behind rather
+than quietly sending fewer codes than asked for.
+
+It only goes one way. runnir has no camera, so a phone cannot send to it.
 
 # TIDAL — checking things without playing them
 

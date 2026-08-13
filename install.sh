@@ -16,6 +16,10 @@
 # Environment overrides:
 #   PREFIX      install prefix for the binary (default: $HOME/.local)
 #               the binary lands in $PREFIX/bin/runnir
+#   RUNNIR_REF  branch or tag to build (default: whatever this machine already
+#               tracks, else origin's default branch). Remembered, so that
+#               runnir-update keeps following it instead of silently pulling
+#               the machine back to main.
 #   XDG_DATA_HOME, XDG_CONFIG_HOME honoured as usual.
 
 set -eu
@@ -30,6 +34,7 @@ CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
 
 DATA_DIR="$DATA_HOME/runnir"          # our private data dir (cache + self copy)
 SRC_DIR="$DATA_DIR/src"               # the git checkout we build from
+REF_FILE="$DATA_DIR/ref"              # the branch/tag this machine tracks
 SELF_COPY="$DATA_DIR/install.sh"      # copy of this script the helpers re-exec
 
 # Record whether the caller set PREFIX *before* we default it, so the root
@@ -157,24 +162,58 @@ ensure_cargo() {
 
 # --- source management -------------------------------------------------------
 
+# The branch or tag this machine tracks.
+#
+# Remembered in $DATA_DIR/ref so that `runnir-update` keeps following whatever
+# was installed. It used to always reset to origin's default branch, which meant
+# an update silently UNINSTALLED a feature you were running from a branch — with
+# no error, and no hint beyond the feature being gone. RUNNIR_REF=<ref> on an
+# install switches it; RUNNIR_REF=main switches back.
+tracked_ref() {
+	if [ -n "${RUNNIR_REF:-}" ]; then
+		printf '%s' "$RUNNIR_REF"
+		return 0
+	fi
+	if [ -f "$REF_FILE" ]; then
+		cat "$REF_FILE"
+		return 0
+	fi
+	_branch=$(git -C "$SRC_DIR" remote show origin 2>/dev/null \
+		| sed -n 's/.*HEAD branch: //p')
+	[ -n "$_branch" ] || _branch="main"
+	printf '%s' "$_branch"
+}
+
 fetch_source() {
 	mkdir -p "$DATA_DIR"
 	if [ -d "$SRC_DIR/.git" ]; then
 		info "updating source in $SRC_DIR"
-		git -C "$SRC_DIR" fetch --depth 1 origin
-		# Default branch of origin (main, master, …).
-		_branch=$(git -C "$SRC_DIR" remote show origin 2>/dev/null \
-			| sed -n 's/.*HEAD branch: //p')
-		[ -n "$_branch" ] || _branch="main"
-		git -C "$SRC_DIR" checkout -q "$_branch" 2>/dev/null || true
-		git -C "$SRC_DIR" reset --hard "origin/$_branch"
+		_ref=$(tracked_ref)
+		# An explicit refspec, because the checkout is a --depth 1 clone and those
+		# are single-branch: `fetch origin <ref>` lands in FETCH_HEAD and creates
+		# no remote-tracking branch, so the reset below would fail on an unknown
+		# revision. This is what makes switching refs work at all.
+		git -C "$SRC_DIR" fetch --depth 1 origin \
+			"+refs/heads/$_ref:refs/remotes/origin/$_ref" 2>/dev/null \
+			|| die "no branch or tag named $_ref on $REPO_URL"
+		git -C "$SRC_DIR" checkout -q -B "$_ref" "origin/$_ref" 2>/dev/null || true
+		git -C "$SRC_DIR" reset --hard "origin/$_ref"
 	else
 		info "cloning $REPO_URL"
 		# Clean out a stale non-git dir if one is somehow there.
 		if [ -e "$SRC_DIR" ] && [ ! -d "$SRC_DIR/.git" ]; then
 			rm -rf "$SRC_DIR"
 		fi
-		git clone --depth 1 "$REPO_URL" "$SRC_DIR"
+		_ref=$(tracked_ref)
+		git clone --depth 1 --branch "$_ref" "$REPO_URL" "$SRC_DIR" 2>/dev/null \
+			|| git clone --depth 1 "$REPO_URL" "$SRC_DIR"
+	fi
+	_ref=$(tracked_ref)
+	printf '%s' "$_ref" > "$REF_FILE"
+	# Said out loud every time, because a machine quietly tracking a branch is
+	# exactly the state nobody remembers being in.
+	if [ "$_ref" != "main" ]; then
+		info "tracking branch $_ref (RUNNIR_REF=main to go back to the released one)"
 	fi
 }
 

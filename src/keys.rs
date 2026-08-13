@@ -348,10 +348,14 @@ fn named_key(key: NamedKey, mods: ModifiersState, mode: KeyMode) -> Option<Vec<u
         NamedKey::Enter => b("\r"),
         NamedKey::Backspace => {
             // Plain Backspace: DEL, not BS. Every Unix terminal has done this since
-            // the VT220, and erase=^? in termios depends on it. Ctrl+Backspace and
-            // Alt+Backspace both send ESC-DEL, which readline/fish/zsh treat as
-            // backward-kill-word — "delete the whole word".
-            if mods.control_key() || mods.alt_key() {
+            // the VT220, and erase=^? in termios depends on it. Alt+Backspace sends
+            // ESC-DEL, which readline/fish/zsh treat as backward-kill-word.
+            // Ctrl+Backspace sends Ctrl+W (\x17) instead: that is the termios `werase`
+            // char, so every line editor — including TUIs that don't understand
+            // ESC-DEL (Cursor CLI among them) — deletes the word to the left.
+            if mods.control_key() {
+                b("\x17")
+            } else if mods.alt_key() {
                 b("\x1b\x7f")
             } else {
                 b("\x7f")
