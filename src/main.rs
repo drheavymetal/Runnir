@@ -12,6 +12,7 @@ mod docker;
 mod explorer;
 mod font;
 mod git;
+mod gpu;
 mod graphics;
 mod grid;
 mod guardian;
@@ -1760,9 +1761,19 @@ impl App {
         // which is why the first launch after an idle stretch feels slow while the
         // next ones are instant. We ask for LowPower anyway, so hide the discrete ICD
         // from the loader and only put it back if that leaves us with no adapter.
+        // Which GPU the compositor itself renders on, when it says. Rendering
+        // anywhere else hands it a buffer from the other card, and a cross-GPU
+        // dmabuf import it cannot make sense of shows as a black window with no
+        // error on either side. See `gpu`.
+        let compositor_gpu = gpu::compositor_device(&window);
         let hide_discrete = cfg!(target_os = "linux")
             && std::env::var_os("VK_LOADER_DRIVERS_DISABLE").is_none()
-            && std::env::var_os("VK_LOADER_DRIVERS_SELECT").is_none();
+            && std::env::var_os("VK_LOADER_DRIVERS_SELECT").is_none()
+            // Hiding the discrete ICD is a battery optimisation. It is the wrong
+            // trade when the compositor is the one running on the discrete card:
+            // that GPU is already awake, and it is the only one whose buffers it
+            // reliably reads.
+            && !compositor_gpu.is_some_and(|gpu| gpu.is_nvidia());
         let native = if cfg!(target_os = "macos") {
             wgpu::Backends::METAL
         } else if cfg!(target_os = "windows") {
@@ -1787,6 +1798,21 @@ impl App {
                 ..wgpu::InstanceDescriptor::new_without_display_handle()
             });
             let surface = instance.create_surface(window.clone()).ok()?;
+            // The compositor's own GPU first, when this instance can see it:
+            // `LowPower` below would take the integrated one and paint into a
+            // buffer the compositor cannot read back.
+            if let Some(want) = compositor_gpu {
+                let same = pollster::block_on(instance.enumerate_adapters(backends))
+                    .into_iter()
+                    .find(|adapter| {
+                        let info = adapter.get_info();
+                        (info.vendor, info.device) == (want.vendor, want.device)
+                            && adapter.is_surface_supported(&surface)
+                    });
+                if let Some(adapter) = same {
+                    return Some((instance, surface, adapter));
+                }
+            }
             let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::LowPower,
                 compatible_surface: Some(&surface),
