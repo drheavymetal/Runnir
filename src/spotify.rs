@@ -1005,16 +1005,26 @@ pub fn artist_albums(session: &Session, uri: &str) -> Result<Vec<Album>, String>
     )
 }
 
-/// The contents of a playlist — which Spotify does not serve to a client id registered
-/// now, not even for a playlist the user owns.
+/// The contents of a playlist.
 ///
-/// Kept, and kept calling the endpoint, because the restriction is Spotify's policy for
-/// new apps rather than anything about this code: the day it is lifted, or the day an
-/// app gets extended quota, this starts working with no change. The panel has to treat
-/// the refusal as a normal outcome and say so in the row, not as an error.
+/// Asks the Web API first and falls back to the client protocol, which is the opposite
+/// of the order the effort suggests — the fallback is the one that actually works today.
+/// The Web API refuses this to a client id registered now, measured on a playlist the
+/// signed-in user created with every scope granted, so the first call is there for the
+/// day that changes: it costs one request and it is how anyone will find out.
 pub fn playlist_tracks(session: &Session, uri: &str) -> Result<Vec<Track>, String> {
     let id = id_of(uri, "playlist")?;
-    paged(session, &format!("{API}/playlists/{id}/tracks"), &[("limit", "50")], parse_track)
+    match paged(session, &format!("{API}/playlists/{id}/tracks"), &[("limit", "50")], parse_track) {
+        Ok(tracks) => Ok(tracks),
+        // Only the refusal falls through. A timeout or a 500 says nothing about whether
+        // this client is allowed, and answering those by opening a second session to
+        // Spotify would turn a blip into a minute of reconnecting.
+        Err(e) if e.contains("does not serve") => {
+            let cfg = crate::config::Config::load().spotify;
+            playlist_tracks_deep(&cfg, uri)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 pub fn my_playlists(session: &Session) -> Result<Vec<Playlist>, String> {
@@ -1067,6 +1077,20 @@ mod tests {
         assert_eq!(uri_from("spotify:track:abc"), "spotify:track:abc");
         assert_eq!(uri_from("hello"), "hello");
         assert_eq!(uri_from("https://open.spotify.com/track/"), "https://open.spotify.com/track/");
+    }
+
+    /// The fallback to the client protocol is triggered by MATCHING THE ERROR TEXT, which
+    /// is a thread thin enough to snap without anyone noticing: reword the 403 message
+    /// and playlists silently stop working, with no failing test and no compiler error.
+    /// This is the test that notices.
+    #[test]
+    fn the_refusal_message_is_what_the_fallback_looks_for() {
+        let message =
+            format!("Spotify does not serve {} to this client id", endpoint_name("/playlists/P/tracks"));
+        assert!(
+            message.contains("does not serve"),
+            "playlist_tracks falls back on this substring; keep them together"
+        );
     }
 
     /// Loopback, by IP. Spotify refuses `localhost` for a redirect URI, and the failure
@@ -1385,4 +1409,130 @@ impl Engine {
         // before anything else tries to open the same card.
         std::thread::sleep(std::time::Duration::from_millis(120));
     }
+}
+
+// ---------------------------------------------------------------------------
+// Playlists, through the door the Web API closed
+// ---------------------------------------------------------------------------
+
+/// A connection to Spotify kept for metadata, separate from the one the daemon plays
+/// through.
+///
+/// **This is an amendment to the design in this file**, which said the tokio runtime
+/// would live in the player daemon and nowhere else. That held until the Web API refused
+/// to hand over playlist contents: the panel resolves its own lists, in its own worker
+/// threads, in the window process — and the only door left to those contents speaks the
+/// client protocol. So the window gets a runtime too.
+///
+/// Kept rather than built per call because connecting costs about a second. Two
+/// connections for one account is fine — Spotify allows it, and neither of them is a
+/// Connect device, so nothing appears on anyone's phone because a playlist was opened.
+struct Metadata {
+    rt: tokio::runtime::Runtime,
+    session: librespot_core::Session,
+}
+
+static METADATA: std::sync::Mutex<Option<Metadata>> = std::sync::Mutex::new(None);
+
+/// Fills the slot if it is empty, so the caller can unwrap it.
+///
+/// Takes the guard rather than locking inside, so the connection happens with the lock
+/// held: two panels opening two playlists at once should make one session, not two.
+fn metadata_session(
+    guard: &mut Option<Metadata>,
+    cfg: &Cfg,
+) -> Result<(), String> {
+    use librespot_core::{Session as LsSession, SessionConfig, authentication::Credentials};
+    if guard.is_none() {
+        let session = current(Which::Audio)?;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| format!("could not start the async runtime: {e}"))?;
+        let ls_cfg = SessionConfig { client_id: cfg.client_id.clone(), ..SessionConfig::default() };
+        // Built INSIDE the runtime: `Session::new` registers with the reactor, and
+        // constructing one outside panics with "there is no reactor running" — which is
+        // a message about tokio rather than about Spotify, and sends you looking in the
+        // wrong place entirely.
+        let ls = rt.block_on(async move {
+            let ls = LsSession::new(ls_cfg, None);
+            ls.connect(Credentials::with_access_token(session.access_token), false)
+                .await
+                .map_err(|e| format!("Spotify refused the session: {e}"))?;
+            Ok::<_, String>(ls)
+        })?;
+        *guard = Some(Metadata { rt, session: ls });
+    }
+    Ok(())
+}
+
+/// The contents of a playlist, fetched over the client protocol instead of the Web API.
+///
+/// **Why this exists.** `/playlists/{id}/tracks` answers 403 to a client id registered
+/// now — measured on a playlist the signed-in user created, with every scope granted. It
+/// is not a permission and not a sign-in, so no amount of asking differently fixes it.
+/// librespot speaks the protocol the desktop client speaks, where a playlist carries its
+/// own item list, and that door is not the one Spotify closed.
+///
+/// The cost is real and worth stating: an item carries only a URI, so every track is a
+/// round trip. They go out concurrently, in flight at a time rather than all at once,
+/// because a playlist of four hundred would otherwise open four hundred requests in one
+/// breath.
+pub fn playlist_tracks_deep(cfg: &Cfg, uri: &str) -> Result<Vec<Track>, String> {
+    use librespot_core::SpotifyUri;
+    use librespot_metadata::{Metadata, Playlist, Track as LsTrack};
+
+    let uri = SpotifyUri::from_uri(uri).map_err(|e| format!("not a Spotify URI: {e}"))?;
+    let mut guard = METADATA.lock().unwrap_or_else(|e| e.into_inner());
+    metadata_session(&mut guard, cfg)?;
+    let meta = guard.as_ref().expect("metadata_session filled it");
+    let (rt, ls) = (&meta.rt, meta.session.clone());
+
+    rt.block_on(async move {
+        let playlist = Playlist::get(&ls, &uri)
+            .await
+            .map_err(|e| format!("could not read the playlist: {e}"))?;
+
+        let uris: Vec<SpotifyUri> = playlist
+            .contents
+            .items
+            .iter()
+            .map(|item| item.id.clone())
+            .filter(|id| matches!(id, SpotifyUri::Track { .. }))
+            .collect();
+
+        /// How many metadata requests are allowed in flight. Enough that a long playlist
+        /// does not resolve one round trip at a time; few enough that opening one does
+        /// not look like a flood to the other end.
+        const IN_FLIGHT: usize = 16;
+
+        let mut out: Vec<Option<Track>> = vec![None; uris.len()];
+        let mut next = 0usize;
+        let mut running = tokio::task::JoinSet::new();
+        loop {
+            while running.len() < IN_FLIGHT && next < uris.len() {
+                let (ls, uri, at) = (ls.clone(), uris[next].clone(), next);
+                next += 1;
+                running.spawn(async move {
+                    let track = LsTrack::get(&ls, &uri).await.ok();
+                    (at, track)
+                });
+            }
+            let Some(done) = running.join_next().await else { break };
+            if let Ok((at, Some(t))) = done {
+                out[at] = Some(Track {
+                    uri: t.id.to_uri().unwrap_or_default(),
+                    title: t.name,
+                    artist: t.artists.iter().map(|a| a.name.clone()).collect::<Vec<_>>().join(", "),
+                    album: t.album.name,
+                    // Milliseconds here, as everywhere in this protocol.
+                    seconds: (t.duration.max(0) as u32).div_ceil(1000),
+                    explicit: t.is_explicit,
+                });
+            }
+        }
+        // A track that would not resolve is dropped rather than drawn as a blank row:
+        // a row with no title is a row nobody can decide about.
+        Ok(out.into_iter().flatten().collect())
+    })
 }

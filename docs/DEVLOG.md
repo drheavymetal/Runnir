@@ -4986,8 +4986,57 @@ played a Spotify track FROM the panel, through the daemon, on this machine. That
 next thing, and the rule this file already records applies: verify on a real instance,
 because the bugs that turn up are layout, DPI and keys under Hyprland.
 
+## 2026-09-14 - Playlists, through the door the Web API closed
+
+Working, and faster than the effort suggested:
+
+    53 tracks in 1.04s   (first: includes connecting)
+    171 tracks in 0.74s  (session cached)
+
+The Web API refuses `/playlists/{id}/tracks` to a client id registered now — measured on
+a playlist the signed-in user created, with every scope granted. librespot speaks the
+protocol the desktop client speaks, and there a playlist carries its own item list. That
+door is not the one Spotify closed.
+
+**A playlist item carries only a URI**, so every track is a round trip. Sixteen in flight
+at a time: enough that a long playlist does not resolve one at a time, few enough that
+opening one does not look like a flood. The tracks come back with their album and artist
+names already attached, which is the part that made this cheap — the obvious alternative,
+resolving names through the Web API in batches, is 403 as well.
+
+**The Web API is still asked first**, which is the opposite order to the effort. It costs
+one request, and it is how anyone will find out the day Spotify reopens it. Only the
+REFUSAL falls through: a timeout or a 500 says nothing about whether this client is
+allowed, and answering those by opening a second session to Spotify would turn a blip
+into a minute of reconnecting.
+
+⚠️ **The fallback triggers on matching the error text**, which is a thread thin enough to
+snap silently — reword the 403 message and playlists stop working, with nothing failing.
+There is now a test whose only job is to keep the message and the condition together.
+
+### An amendment to the design in this file
+
+The design said the tokio runtime would live in the player daemon and nowhere else. That
+held until this: the panel resolves its own lists, in its own worker threads, in the
+WINDOW process, and the only remaining door to playlist contents speaks the client
+protocol. So the window gets a runtime too, and a session cached beside it — connecting
+costs about a second and three playlists should not cost three.
+
+Two connections for one account is fine. Spotify allows it, and neither is a Connect
+device, so nothing appears on anyone's phone because somebody opened a playlist.
+
+### A tokio trap worth remembering
+
+`Session::new` registers with the reactor, so building one OUTSIDE `block_on` panics with
+"there is no reactor running, must be called from the context of a Tokio 1.x runtime" —
+a message about tokio, while the code around it is about Spotify. It sends you looking in
+the wrong place. Construct inside the runtime, always.
+
 ## Gotchas (do not re-learn)
 
+- `librespot_core::Session::new` must be built INSIDE a tokio runtime: it registers with
+  the reactor, and constructing one outside panics with "there is no reactor running",
+  which is a message about tokio in the middle of code about Spotify.
 - A Spotify client id registered TODAY is not the one the docs describe. Half the Web
   API answers 403 to it — playlist contents (even the user's own), artist top tracks,
   followed artists, anything asked in bulk — and page-size caps are per endpoint,

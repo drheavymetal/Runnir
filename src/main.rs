@@ -228,6 +228,38 @@ fn main() {
         // first album and the first playlist. The same job `--tidal-browse` does, and the
         // reason is the same: a panel that draws six kinds of list is six ways to be
         // wrong about the JSON, and none of them are visible from a unit test.
+        // `runnir --spotify-playlist <uri>` — the contents of a playlist, over the
+        // client protocol, because the Web API refuses them to a client id registered
+        // now. Its own command because it is its own door, and the day Spotify reopens
+        // the Web API one this is how the two get compared.
+        Some("--spotify-playlist") => {
+            let what = args[2..].join(" ");
+            if what.is_empty() {
+                return eprintln!("usage: runnir --spotify-playlist <spotify:playlist:... | URL>");
+            }
+            let cfg = config::Config::load().spotify;
+            // More than one is allowed, and is the point: the session is cached, so the
+            // second is the one that says whether caching it worked.
+            for (n, what) in args[2..].iter().enumerate() {
+                let uri = spotify::uri_from(what);
+                let started = std::time::Instant::now();
+                match spotify::playlist_tracks_deep(&cfg, &uri) {
+                    Ok(tracks) => {
+                        println!(
+                            "{} tracks in {:.2}s{}",
+                            tracks.len(),
+                            started.elapsed().as_secs_f64(),
+                            if n == 0 { " (first: includes connecting)" } else { "" }
+                        );
+                        for t in tracks.iter().take(if n == 0 { 5 } else { 2 }) {
+                            println!("  {} — {} [{}:{:02}]", t.artist, t.title, t.seconds / 60, t.seconds % 60);
+                        }
+                    }
+                    Err(e) => eprintln!("runnir: {e}"),
+                }
+            }
+            return;
+        }
         Some("--spotify-browse") => {
             let what = args[2..].join(" ");
             if what.is_empty() {
