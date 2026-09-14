@@ -4777,8 +4777,44 @@ Sharing stays TIDAL-only: librespot hands back decoded samples, not a re-sendabl
 encrypted file the way `playbackinfopostpaywall` did. Lyrics have no Web API endpoint, so
 `L` will have to name the provider and say so. TIDAL is untouched and still works.
 
+## 2026-09-14 - The reservation gives the name back and NOT the card, if the card has UCM
+
+Found by accident, on the first run that used a card Pedro actually listens to. After
+playing one Spotify track on `hw:0,0` (a Focusrite Scarlett 2i2), the interface vanished
+from the desktop's sound settings. It was still there for ALSA and still a card for
+PipeWire — with `Active Profile: off` and no sink at all.
+
+**The release protocol worked.** wireplumber owned `ReserveDevice1.Audio0/1/2` again, so
+the name went back exactly as August's fix intended, and nothing of ours was holding the
+PCM. What did not come back is the PROFILE. WirePlumber hands a card over by switching it
+to `off`, and taking the name back is evidently not the same event as restoring what the
+card was doing before.
+
+**Worse, the profile it had could not be reassigned by hand.** The card listed only `off`
+and `pro-audio`; the UCM profile it was using — `HiFi`, the one behind
+`alsa_output...HiFi__Line__sink` — was not in the list at all, because the UCM had been
+unloaded with the handover. `systemctl --user restart wireplumber` brought both back, and
+then the default sink had to be pointed at it again (it had fallen to HDMI).
+
+**This is not a Spotify bug, and it is not new.** It is the same chain TIDAL has been
+using since August; the reservation code is untouched. It was never seen because the
+device it was developed against is a HiBy R4, which has no UCM profiles. A USB interface
+with UCM does, and that is the case that breaks.
+
+Open question, not yet answered: whether runnir should verify after releasing that the
+card came back with a profile, and ask for one if it did not — or whether reserving a
+UCM card is simply not safe and the chain should refuse to. What is certain is that the
+current behaviour costs the user their audio interface and gives no sign of why.
+
 ## Gotchas (do not re-learn)
 
+- Releasing a reserved card returns the NAME, not the card. WirePlumber hands a card
+  over by setting its profile to `off`, and taking the reservation name back does not
+  restore it: the device disappears from the desktop's sound settings with no error
+  anywhere. If the card has UCM profiles, the one it was using is not even offered for
+  reassignment until wireplumber is restarted, because the UCM went with the handover.
+  Never assume the card came back — read its profile afterwards, the way August's
+  lesson said to read the state instead of trusting a happy path.
 - Detecting a bad peer ASYNCHRONOUSLY means the first command still goes to it. The
   stale-daemon check rode in on the first snapshot, which lands after `connect` has
   returned, so exactly one command per window went to the wrong process — and the first
