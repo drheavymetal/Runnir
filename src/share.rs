@@ -244,7 +244,14 @@ fn stream_track(stream: &mut TcpStream, snapshot: &Snapshot) {
     // The tier the listener gets is the tier that is playing, because the badge on the
     // page says so and it must not be a different claim from what is sent.
     let quality = if track.quality.is_empty() { "LOSSLESS" } else { track.quality.as_str() };
-    let info = match tidal::stream_info(&session, track.id, quality) {
+    // Sharing re-fetches from the provider rather than tee-ing the decoded audio, so it
+    // is built on TIDAL's stream endpoint. Spotify hands back decoded samples and no
+    // re-sendable file, so there is nothing here to pass on.
+    let Some(tidal_id) = track.tidal_id() else {
+        respond(stream, "501 Not Implemented", "text/plain", b"sharing is TIDAL-only");
+        return;
+    };
+    let info = match tidal::stream_info(&session, tidal_id, quality) {
         Ok(i) => i,
         Err(e) => {
             // The reason goes to the terminal, not to the listener: an upstream error
@@ -514,7 +521,7 @@ mod tests {
         // authentication there is — so anything that could run script on this page is a
         // permanent grant of the stream to whoever collects it.
         let snapshot = Snapshot {
-            queue: vec![crate::tidal::Track {
+            queue: vec![crate::music::Track {
                 title: r#"<script>fetch('/'+location)</script>"#.into(),
                 artist: r#"a" onload="x"#.into(),
                 ..Default::default()
@@ -559,7 +566,7 @@ mod tests {
     #[test]
     fn the_page_says_what_is_playing_and_asks_for_the_stream_behind_the_token() {
         let snapshot = Snapshot {
-            queue: vec![crate::tidal::Track {
+            queue: vec![crate::music::Track {
                 title: "Dreams".into(),
                 artist: "Fleetwood Mac".into(),
                 quality: "HI_RES_LOSSLESS".into(),

@@ -21,6 +21,7 @@ mod keys;
 mod layout;
 mod media;
 mod mouse;
+mod music;
 mod mpris;
 mod optical;
 mod overlay;
@@ -492,8 +493,9 @@ fn demo_scene(path: &str) {
 /// The music panel, drawn over a plain terminal, with a library invented for it.
 fn tidal_scene(path_out: &str, state: &str) {
     use crate::render::Rect;
-    let track = |title: &str, artist: &str, secs: u32, quality: &str| tidal::Track {
-        id: title.len() as u64,
+    let track = |title: &str, artist: &str, secs: u32, quality: &str| music::Track {
+        source: music::Source::Tidal,
+        id: title.len().to_string(),
         title: title.into(),
         artist: artist.into(),
         album: String::new(),
@@ -1837,10 +1839,11 @@ fn notify(body: &str) {
 /// one type would mean each side checking whether the answer was meant for it.
 pub enum TidalAnswer {
     Found(tidal::Found),
-    /// The track the words are for, and the words. The id travels with them because
-    /// the answer can arrive after the song has changed, and words for the wrong song
-    /// are worse than none.
-    Lyrics(u64, tidal::Lyrics),
+    /// The track the words are for, and the words. The identity travels with them
+    /// because the answer can arrive after the song has changed, and words for the wrong
+    /// song are worse than none. It is `Track::key()` rather than a number: an id on its
+    /// own stopped being an identity the moment there were two providers.
+    Lyrics(String, tidal::Lyrics),
 }
 
 /// Turns a search result into the rows a list draws, headings and all.
@@ -1866,7 +1869,7 @@ fn rows_of(found: &tidal::Found) -> Vec<overlay::TidalRow> {
     };
     if !found.tracks.is_empty() {
         heading(&mut rows, "TRACKS");
-        rows.extend(found.tracks.iter().cloned().map(overlay::TidalRow::Track));
+        rows.extend(found.tracks.iter().cloned().map(|t| overlay::TidalRow::Track(t.into())));
     }
     if !found.albums.is_empty() {
         heading(&mut rows, "ALBUMS");

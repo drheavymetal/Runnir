@@ -81,13 +81,13 @@ pub fn publish(tx: std::sync::mpsc::Sender<Cmd>, state: Arc<Mutex<Snapshot>>) {
 async fn announce_changes(server: Server<Player>, state: Arc<Mutex<Snapshot>>) {
     let mut last_generation = u64::MAX;
     let mut last_status = PlaybackStatus::Stopped;
-    let mut last_track: Option<u64> = None;
+    let mut last_track: Option<String> = None;
     loop {
         let snapshot = state.lock().map(|s| s.clone()).unwrap_or_default();
         if snapshot.generation != last_generation {
             last_generation = snapshot.generation;
             let status = status_of(&snapshot);
-            let track = snapshot.now_playing().map(|t| t.id);
+            let track = snapshot.now_playing().map(|t| t.key());
 
             let mut changed: Vec<Property> = Vec::new();
             if status != last_status {
@@ -349,13 +349,14 @@ impl PlayerInterface for Player {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tidal::Track;
+    use crate::music::Track;
 
     fn snapshot(playing: bool, paused: bool, queue: usize, index: usize) -> Snapshot {
         Snapshot {
             queue: (0..queue)
                 .map(|i| Track {
-                    id: i as u64,
+                    source: crate::music::Source::Tidal,
+                    id: i.to_string(),
                     title: format!("track {i}"),
                     artist: "Opeth".into(),
                     album: "Blackwater Park".into(),

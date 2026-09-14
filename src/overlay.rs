@@ -2736,7 +2736,9 @@ pub struct TidalPanel {
     /// Which track the words belong to. Without this they outlive their song: the
     /// panel went on drawing one track's lyrics while highlighting a line by the NEXT
     /// track's position — confidently wrong words, presented as synced.
-    pub lyrics_for: Option<u64>,
+    /// Which track the words on screen belong to, as `Track::key()` — provider and all.
+    /// A bare number stopped being an identity the moment a second provider existed.
+    pub lyrics_for: Option<String>,
     pub show_lyrics: bool,
     /// The trail for a list that has been ASKED for but has not arrived.
     ///
@@ -2817,7 +2819,7 @@ pub enum PanelFocus {
 /// and pretending otherwise would mean four searches or three lost answers.
 #[derive(Clone, Debug)]
 pub enum TidalRow {
-    Track(crate::tidal::Track),
+    Track(crate::music::Track),
     Album(crate::tidal::Album),
     Artist(crate::tidal::Artist),
     Playlist(crate::tidal::Playlist),
@@ -2952,7 +2954,7 @@ impl TidalPanel {
     /// Playing a track from a list plays the WHOLE list from there, which is what a
     /// list of songs on screen implies. Headings and non-tracks are skipped, so playing
     /// the third track of a mixed search result does not start at the wrong song.
-    pub fn play_selection(&self) -> Option<(Vec<crate::tidal::Track>, usize)> {
+    pub fn play_selection(&self) -> Option<(Vec<crate::music::Track>, usize)> {
         let mut tracks = Vec::new();
         let mut at = None;
         for (i, row) in self.rows.iter().enumerate() {
@@ -2967,7 +2969,7 @@ impl TidalPanel {
         (!tracks.is_empty()).then_some((tracks, at))
     }
 
-    pub fn selected_track(&self) -> Option<crate::tidal::Track> {
+    pub fn selected_track(&self) -> Option<crate::music::Track> {
         match self.selected()? {
             TidalRow::Track(t) => Some(t.clone()),
             _ => None,
@@ -3193,7 +3195,7 @@ impl TidalPanel {
                 write(g, at, side + 2, tag, pen);
             }
             let playing = matches!(row, TidalRow::Track(t)
-                if self.snapshot.now_playing().is_some_and(|p| p.id == t.id));
+                if self.snapshot.now_playing().is_some_and(|p| p.key() == t.key()));
             let mark = if playing { "\u{25b8} " } else { "  " };
             let text = format!("{mark}{}", row_line(row));
             let pen = if sel {
@@ -3391,7 +3393,7 @@ fn short_tail(s: &str, max: usize) -> String {
     format!("{head}\u{2026}")
 }
 
-fn track_line(t: &crate::tidal::Track) -> String {
+fn track_line(t: &crate::music::Track) -> String {
     if t.artist.is_empty() { t.title.clone() } else { format!("{} \u{2014} {}", t.artist, t.title) }
 }
 
@@ -5855,9 +5857,10 @@ mod tests {
         assert!(p.selected().is_none());
     }
 
-fn a_track(title: &str) -> crate::tidal::Track {
-        crate::tidal::Track {
-            id: 1,
+fn a_track(title: &str) -> crate::music::Track {
+        crate::music::Track {
+            source: crate::music::Source::Tidal,
+            id: "1".into(),
             title: title.into(),
             artist: "Opeth".into(),
             album: "Blackwater Park".into(),

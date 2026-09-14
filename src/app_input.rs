@@ -7486,7 +7486,7 @@ impl Gpu {
             // crumb — the opened album or playlist — against the track title, so the
             // cache never hit, and on the one day those two strings matched it would
             // have shown the previous track's words.
-            if p.lyrics.is_some() && p.lyrics_for == Some(track.id) {
+            if p.lyrics.is_some() && p.lyrics_for.as_deref() == Some(track.key().as_str()) {
                 return;
             }
             // Not the ones we are about to fetch: showing the last track's words while
@@ -7503,11 +7503,19 @@ impl Gpu {
             p.pending_lyrics = Some(seq);
         }
         let proxy = self.proxy.clone();
-        let id = track.id;
+        let key = track.key();
+        // Only TIDAL has words. Spotify's Web API has no lyrics endpoint at all, so the
+        // panel says which provider cannot do it rather than drawing an empty pane and
+        // letting someone wonder whether it is still loading.
+        let Some(id) = track.tidal_id() else {
+            let answer = Err(format!("{} does not serve lyrics", track.source.label()));
+            let _ = proxy.send_event(UserEvent::Tidal(seq, answer));
+            return;
+        };
         std::thread::spawn(move || {
             let answer = crate::tidal::current()
                 .and_then(|session| crate::tidal::lyrics(&session, id))
-                .map(|l| TidalAnswer::Lyrics(id, l));
+                .map(|l| TidalAnswer::Lyrics(key, l));
             let _ = proxy.send_event(UserEvent::Tidal(seq, answer));
         });
     }
@@ -7608,8 +7616,8 @@ impl Gpu {
             // daemon — left the rows stale, and Enter on a stale row then replayed a
             // queue that no longer existed.
             let moved = p.snapshot.generation != snapshot.generation;
-            let playing = snapshot.now_playing().map(|t| t.id);
-            let was_playing = p.snapshot.now_playing().map(|t| t.id);
+            let playing = snapshot.now_playing().map(|t| t.key());
+            let was_playing = p.snapshot.now_playing().map(|t| t.key());
             p.snapshot = snapshot;
             if p.source == overlay::Source::Queue && moved {
                 p.reload_queue();

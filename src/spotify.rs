@@ -307,6 +307,12 @@ pub fn uri_from(input: &str) -> String {
 pub struct ChainSink {
     output: crate::player::Output,
     device: Option<crate::player::Sink>,
+    /// The loudness of the packet that just went to the device, one value per column.
+    ///
+    /// Measured here rather than guessed at elsewhere for the same reason the TIDAL path
+    /// measures it in its own write loop: what is drawn should be what is being heard.
+    /// RMS and not peak — a peak meter jumps on one sample and trembles.
+    pub levels: std::sync::Arc<std::sync::Mutex<Vec<f32>>>,
     /// Filled in as soon as the device opens, so the caller can report which rung it
     /// landed on without waiting for the track to end.
     pub signal: std::sync::Arc<std::sync::Mutex<crate::player::SignalPath>>,
@@ -321,7 +327,14 @@ impl ChainSink {
         channels: u32,
         signal: std::sync::Arc<std::sync::Mutex<crate::player::SignalPath>>,
     ) -> ChainSink {
-        ChainSink { output, device: None, signal, rate, channels }
+        ChainSink {
+            output,
+            device: None,
+            levels: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            signal,
+            rate,
+            channels,
+        }
     }
 
     fn device_for(&mut self) -> Result<&mut crate::player::Sink, String> {
@@ -341,7 +354,7 @@ impl ChainSink {
             // Set here rather than inside `open`, because the chain has no way of
             // knowing what it is carrying: the same device, the same rung and the same
             // numbers describe a FLAC from TIDAL and a Vorbis from Spotify.
-            sink.signal.lossy = true;
+            sink.signal.lossy = crate::music::Source::Spotify.is_lossy();
             if let Ok(mut s) = self.signal.lock() {
                 *s = sink.signal.clone();
             }
@@ -349,6 +362,31 @@ impl ChainSink {
         }
         Ok(self.device.as_mut().expect("just opened"))
     }
+}
+
+/// One value per column for a packet of interleaved samples, 0..=1.
+///
+/// The buffer is cut into as many slices as there are columns and each is measured on
+/// its own, so the columns rise and fall in place instead of marching leftwards. A shape
+/// that moves under the eye cannot be read — that was the lesson the TIDAL wave learned
+/// the long way, and there is no reason to learn it twice.
+fn levels_of(samples: &[f64], channels: usize) -> Vec<f32> {
+    const COLUMNS: usize = 24;
+    let frames = samples.len() / channels.max(1);
+    if frames == 0 {
+        return Vec::new();
+    }
+    let per = frames.div_ceil(COLUMNS);
+    let mut out = Vec::with_capacity(COLUMNS);
+    for chunk in samples.chunks(per * channels.max(1)) {
+        let sum: f64 = chunk.iter().map(|s| s * s).sum();
+        let rms = (sum / chunk.len().max(1) as f64).sqrt();
+        // The same 60 dB scale the TIDAL meter uses: linear amplitude spends nine
+        // tenths of its range on the top tenth of what music does.
+        let db = 20.0 * rms.max(1e-6).log10();
+        out.push(((db + 60.0) / 60.0).clamp(0.0, 1.0) as f32);
+    }
+    out
 }
 
 impl librespot_playback::audio_backend::Sink for ChainSink {
@@ -405,6 +443,9 @@ impl librespot_playback::audio_backend::Sink for ChainSink {
             let device = self.device_for().map_err(SinkError::ConnectionRefused)?;
             device.width()
         };
+        if let Ok(mut l) = self.levels.lock() {
+            *l = levels_of(samples, self.channels as usize);
+        }
         // The conversion is librespot's, not ours: it carries the ditherer, and
         // reimplementing a float-to-integer reduction by hand is how you get quiet
         // distortion that nobody can point at.
@@ -1151,5 +1192,197 @@ mod tests {
         assert!(!live.expired());
         let nearly = Session { access_token: "a".into(), refresh_token: "r".into(), expires_at: now() + REFRESH_MARGIN / 2 };
         assert!(nearly.expired(), "a token inside the margin must be refreshed, not used");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The engine: one session, one player, for as long as the daemon lives
+// ---------------------------------------------------------------------------
+
+/// A live Spotify player, owned by whoever is running the queue.
+///
+/// Built once and kept, for the same reason the TIDAL path keeps its ALSA device across
+/// tracks: connecting costs a second or two, and paying it per track would put a gap in
+/// every album. It also means librespot's own gapless handling gets to do its job, since
+/// the sink is not torn down between tracks either.
+///
+/// The tokio runtime lives here and nowhere else in this program. It is `current_thread`
+/// because it is driving one player's network IO, and a thread pool for that would be a
+/// pool sitting idle inside a terminal.
+pub struct Engine {
+    rt: tokio::runtime::Runtime,
+    player: std::sync::Arc<librespot_playback::player::Player>,
+    events: librespot_playback::player::PlayerEventChannel,
+    signal: std::sync::Arc<std::sync::Mutex<crate::player::SignalPath>>,
+    levels: std::sync::Arc<std::sync::Mutex<Vec<f32>>>,
+}
+
+impl Engine {
+    /// Connects. Blocking, and slow enough to be worth doing once.
+    pub fn new(cfg: &Cfg) -> Result<Engine, String> {
+        use librespot_core::{Session as LsSession, SessionConfig, authentication::Credentials};
+        use librespot_playback::config::{Bitrate, PlayerConfig};
+        use librespot_playback::mixer::NoOpVolume;
+        use librespot_playback::player::Player;
+
+        let session = current(Which::Audio)?;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| format!("could not start the async runtime: {e}"))?;
+
+        let signal = std::sync::Arc::new(std::sync::Mutex::new(crate::player::SignalPath::default()));
+        let levels = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let output = crate::player::Output {
+            device: cfg.output.clone(),
+            bit_perfect: cfg.bit_perfect,
+            release_device: cfg.release_device,
+        };
+
+        let player = rt.block_on(async {
+            let ls_cfg =
+                SessionConfig { client_id: cfg.client_id.clone(), ..SessionConfig::default() };
+            let ls = LsSession::new(ls_cfg, None);
+            ls.connect(Credentials::with_access_token(session.access_token), false)
+                .await
+                .map_err(|e| format!("Spotify refused the session: {e}"))?;
+
+            let player_cfg = PlayerConfig {
+                bitrate: Bitrate::Bitrate320,
+                // Without this there is no position to draw: the panel would show a
+                // progress bar frozen at zero for the length of every song.
+                position_update_interval: Some(std::time::Duration::from_millis(200)),
+                ..PlayerConfig::default()
+            };
+            let (sig, lev) = (signal.clone(), levels.clone());
+            Ok::<_, String>(Player::new(player_cfg, ls, Box::new(NoOpVolume), move || {
+                let mut sink = ChainSink::new(
+                    output,
+                    librespot_playback::SAMPLE_RATE,
+                    librespot_playback::NUM_CHANNELS as u32,
+                    sig,
+                );
+                sink.levels = lev;
+                Box::new(sink)
+            }))
+        })?;
+
+        let events = player.get_player_event_channel();
+        Ok(Engine { rt, player, events, signal, levels })
+    }
+
+    /// Plays one track to its end, or until the conductor says otherwise.
+    ///
+    /// Shaped like the TIDAL path on purpose: same `Flow`, same `Progress`, same
+    /// `Outcome`, so the queue above it does not have to know which provider it is
+    /// running. What differs is where the numbers come from — librespot reports the
+    /// position, and the sink reports how loud what it just wrote was.
+    pub fn play(
+        &mut self,
+        uri: &str,
+        conductor: &mut dyn FnMut(crate::player::Progress<'_>) -> crate::player::Flow,
+    ) -> crate::player::Outcome {
+        use crate::player::{Flow, Outcome};
+        use librespot_core::SpotifyUri;
+        use librespot_playback::player::PlayerEvent;
+
+        let uri = match SpotifyUri::from_uri(uri) {
+            Ok(u) => u,
+            Err(e) => return Outcome::Failed(format!("not a Spotify URI: {e}")),
+        };
+        // Left over from whatever played before: a wave that keeps its last shape while
+        // a new track is still resolving looks like the old track is still playing.
+        if let Ok(mut l) = self.levels.lock() {
+            l.clear();
+        }
+        self.player.load(uri, true, 0);
+
+        let mut position_ms: u32 = 0;
+        let mut paused = false;
+        let events = &mut self.events;
+        let (player, signal, levels) = (&self.player, &self.signal, &self.levels);
+
+        self.rt.block_on(async move {
+            loop {
+                // Never blocks for long: the conductor has to be asked often enough that
+                // a key press is answered promptly, and a signal has to be able to stop
+                // this loop before the process is exited out from under the device.
+                let tick = std::time::Duration::from_millis(100);
+                let event = match tokio::time::timeout(tick, events.recv()).await {
+                    Ok(Some(e)) => Some(e),
+                    Ok(None) => return Outcome::Ended,
+                    Err(_) => None,
+                };
+                match event {
+                    Some(PlayerEvent::PositionCorrection { position_ms: p, .. })
+                    | Some(PlayerEvent::Playing { position_ms: p, .. })
+                    | Some(PlayerEvent::Paused { position_ms: p, .. }) => position_ms = p,
+                    Some(PlayerEvent::EndOfTrack { .. }) => return Outcome::Ended,
+                    Some(PlayerEvent::Stopped { .. }) => return Outcome::Stopped,
+                    Some(PlayerEvent::Unavailable { .. }) => {
+                        return Outcome::Failed(
+                            "Spotify will not serve this track to this account".into(),
+                        );
+                    }
+                    _ => {}
+                }
+                if crate::reserve::shutting_down() {
+                    player.stop();
+                    return Outcome::Quit;
+                }
+
+                let sig = signal.lock().ok().map(|s| s.clone()).unwrap_or_default();
+                let rate = if sig.decoded_rate == 0 {
+                    librespot_playback::SAMPLE_RATE
+                } else {
+                    sig.decoded_rate
+                };
+                let flow = conductor(crate::player::Progress {
+                    // The queue counts in frames because that is what the TIDAL path
+                    // has; librespot counts in milliseconds. One multiplication keeps
+                    // the difference out of everything above here.
+                    frames: position_ms as u64 * rate as u64 / 1000,
+                    rate,
+                    signal: Some(&sig),
+                    levels: if paused {
+                        // Bars standing still next to a paused track read as "still
+                        // playing". Flat is the honest shape.
+                        Vec::new()
+                    } else {
+                        levels.lock().map(|l| l.clone()).unwrap_or_default()
+                    },
+                });
+                match flow {
+                    Flow::Continue => {
+                        if paused {
+                            paused = false;
+                            player.play();
+                        }
+                    }
+                    Flow::Pause => {
+                        if !paused {
+                            paused = true;
+                            player.pause();
+                        }
+                    }
+                    Flow::Skip => {
+                        player.stop();
+                        return Outcome::Ended;
+                    }
+                    Flow::Stop => {
+                        player.stop();
+                        return Outcome::Stopped;
+                    }
+                }
+            }
+        })
+    }
+
+    /// Stops and lets go of the device, which is what makes room for the other provider.
+    pub fn release(&mut self) {
+        self.player.stop();
+        // The sink closes on the player's own thread; give it the moment ALSA needs
+        // before anything else tries to open the same card.
+        std::thread::sleep(std::time::Duration::from_millis(120));
     }
 }
