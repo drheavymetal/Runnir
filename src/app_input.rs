@@ -863,6 +863,7 @@ impl Gpu {
             Action::CatchUp => self.show_catch_up(),
             Action::RepoVerbs => self.show_repo_verbs(config),
             Action::TidalPanel => self.show_tidal_panel(config),
+            Action::MusicProvider => self.music_switch_provider(config),
             Action::TidalToggle => self.tidal_send(crate::player::Cmd::Toggle, config),
             Action::TidalNext => self.tidal_send(crate::player::Cmd::Next, config),
             Action::TidalPrev => self.tidal_send(crate::player::Cmd::Prev, config),
@@ -4138,6 +4139,7 @@ impl Gpu {
             Action::CatchUp => self.show_catch_up(),
             Action::RepoVerbs => self.show_repo_verbs(config),
             Action::TidalPanel => self.show_tidal_panel(config),
+            Action::MusicProvider => self.music_switch_provider(config),
             Action::TidalToggle => self.tidal_send(crate::player::Cmd::Toggle, config),
             Action::TidalNext => self.tidal_send(crate::player::Cmd::Next, config),
             Action::TidalPrev => self.tidal_send(crate::player::Cmd::Prev, config),
@@ -7496,6 +7498,39 @@ impl Gpu {
             };
             let _ = proxy.send_event(UserEvent::Tidal(seq, answer.map(TidalAnswer::Found)));
         });
+    }
+
+    /// Switches which shop the panel's lists come from, opening the panel first if it is
+    /// not already open.
+    ///
+    /// Opening it is the point: "switch to Spotify" from a bare terminal should land
+    /// somewhere, not change a setting invisibly and leave the screen as it was.
+    fn music_switch_provider(&mut self, config: &crate::config::Config) {
+        if !matches!(self.overlay, Some(Overlay::Tidal(_))) {
+            self.show_tidal_panel(config);
+        }
+        let mut reload = None;
+        if let Some(Overlay::Tidal(p)) = &mut self.overlay {
+            p.provider = match p.provider {
+                crate::music::Source::Tidal => crate::music::Source::Spotify,
+                crate::music::Source::Spotify => crate::music::Source::Tidal,
+            };
+            // Rows from the shop you just left, sitting under the name of the one you
+            // are now in, is the same class of lie as a crumb that outlives its list.
+            p.rows.clear();
+            p.crumb = None;
+            p.message = None;
+            p.pending = None;
+            // The queue belongs to the player rather than to a shop, so that one source
+            // is left alone. Everything else has to be asked for again, somewhere else.
+            if p.source != crate::overlay::Source::Queue {
+                reload = Some(p.source);
+            }
+        }
+        if let Some(source) = reload {
+            self.tidal_load(source);
+        }
+        self.window.request_redraw();
     }
 
     /// Opens a container row: an album, an artist or a playlist becomes a list of its
