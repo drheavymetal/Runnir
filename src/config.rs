@@ -601,6 +601,21 @@ pub struct Spotify {
     pub bit_perfect: bool,
     /// Ask PipeWire to release the card before opening it exclusively.
     pub release_device: bool,
+    /// A `client_id` of your own, from developer.spotify.com, for the CATALOGUE.
+    ///
+    /// Empty means the catalogue uses `client_id` too, which works and then stops
+    /// working: the desktop id is shared by every librespot program on earth and the Web
+    /// API rate-limits it as a single client — measured at `429 Retry-After: 40` on the
+    /// third request of a fresh session, hours apart, with no requests of our own in
+    /// between. Playback is unaffected, because playback never touches the Web API.
+    ///
+    /// Registering one takes five minutes and costs nothing. If it turns out your own id
+    /// also opens a playback session, put it in `client_id` instead and leave this empty:
+    /// then there is one id and one sign-in.
+    pub api_client_id: String,
+    /// Callback port for the catalogue sign-in. Free to choose, unlike the other one,
+    /// because the redirect is registered by whoever owns the client id — you.
+    pub api_callback_port: u16,
     /// Announce the terminal on the LAN as a Spotify Connect device.
     ///
     /// Off by default. The advert only lives as long as the player daemon, which dies
@@ -616,6 +631,8 @@ impl Default for Spotify {
         Self {
             client_id: DESKTOP_CLIENT_ID.to_string(),
             callback_port: 8898,
+            api_client_id: String::new(),
+            api_callback_port: 8899,
             output: "auto".to_string(),
             bit_perfect: true,
             release_device: true,

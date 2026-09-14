@@ -4844,8 +4844,96 @@ Three deliberate restrictions:
 Verified after the fix: SIGTERM and SIGINT both leave `Active Profile: HiFi` with its
 sink, exit 130, and take 135 ms to do it.
 
+## 2026-09-14 - Phase 1: the catalogue, and how much of it Spotify will actually hand over
+
+The catalogue layer works against the real account: search of four types in one request,
+the user's own shelves paginated to the end (39 playlists, 4073 saved tracks, 396 saved
+albums), an album's tracks, an artist's albums. `runnir --spotify-browse <words>` walks
+all of it, the way `--tidal-browse` does, because six kinds of list is six ways to be
+wrong about JSON and none of them are visible from a unit test.
+
+Getting there cost three findings, and all three are about the same thing: a client id
+registered today is not the client id the documentation describes.
+
+### One sign-in was not enough, and the reason is a quota
+
+The desktop client id is rate-limited on the Web API as a single client, because every
+librespot program on earth shares it: `429 Retry-After: 40` on the third request of a
+fresh session, still 429 hours later with nothing of ours in between. It never recovers,
+so it cannot even be a fallback.
+
+So there are two ids and, for now, two sign-ins: `client_id` for playback (the desktop
+one, which is the one known to open a session) and `api_client_id` for the catalogue.
+Leave the second empty and both collapse to the first — which is what should happen the
+day somebody proves their own id can also open a playback session. Registered in five
+minutes at developer.spotify.com, which is exactly the door TIDAL never had: there, no
+first-party client would take a loopback redirect and the login ended up being a URL
+pasted by hand.
+
+### Half the Web API is closed to a new app, and 403 is not about permissions
+
+Measured on this account, every scope granted, against the user's own data:
+
+    OK   profile, search, saved tracks, saved albums, your playlists,
+         your top tracks, Connect devices, one track, one album,
+         an album's tracks, one artist, an artist's albums, a playlist object
+    403  the contents of a playlist  ← even one the user owns
+    403  an artist's top tracks
+    403  followed artists
+    403  anything asked for in bulk (?ids=)
+
+`/me/playlists` answers and `/playlists/{id}` answers; `/playlists/{id}/tracks` is 403
+for a playlist the signed-in user created. That is not a scope and not a sign-in, so the
+error says which endpoint is closed rather than "Forbidden" — being told "forbidden"
+sends someone to check permissions that are already correct.
+
+Two consequences. An artist's top tracks are replaced with an artist's ALBUMS, which is a
+slightly different question that gets a reliable answer, and the top-tracks call is still
+made in `--spotify-browse` purely as the record of whether the restriction still stands.
+And playlist CONTENTS have no Web API path at all — see below.
+
+Also: the playlist object no longer carries `tracks.total`, so every playlist reports 0
+tracks. The parser treats a missing count as unknown rather than as zero-and-therefore-
+empty, and the panel will have to not draw a number it does not have.
+
+### The page size is capped per endpoint, the caps disagree, and they are not documented
+
+    /me/tracks               50  ok
+    /artists/{id}/albums     20  ->  400 Invalid limit      10 ok
+    /search                  50  ->  400 Invalid limit
+
+`400`, not a truncated page: a fixed number that is right today is an EMPTY LIST the day
+Spotify moves it. So the number is discovered — ask for what we want, halve on `Invalid
+limit`, remember what worked, keyed by endpoint with the ids stripped out. Using the
+smallest cap everywhere instead would turn 4073 saved tracks from 82 requests into 408.
+
+### Pagination, written first rather than found again
+
+Every listing follows `next` to the end. The TIDAL audit caught the other version of this
+— playlists, albums and favourites each read one page and stopped, so a playlist of 444
+tracks played as one of 100 — and a library that silently ends at fifty looks exactly like
+a small library. Capped at 100 pages, because a `next` that never ends would hang a panel
+with nothing to show for it.
+
+### What is left, and where it belongs
+
+Playlist contents are the one real hole, and there are 39 of them on this account. The
+remaining path is not the Web API at all: librespot's own metadata layer talks the client
+protocol, where `Playlist` carries its contents, and that is a door the Web API
+restrictions do not close. It needs a live librespot session, which is a thing phase 2
+builds anyway for the daemon — so it is written down here and built there, rather than
+standing up a throwaway session for a diagnostic command.
+
 ## Gotchas (do not re-learn)
 
+- A Spotify client id registered TODAY is not the one the docs describe. Half the Web
+  API answers 403 to it — playlist contents (even the user's own), artist top tracks,
+  followed artists, anything asked in bulk — and page-size caps are per endpoint,
+  undocumented, and enforced with `400 Invalid limit` rather than a short page. Discover
+  the cap and remember it; never hard-code one.
+- The desktop client id every librespot program shares is permanently rate-limited on the
+  Web API: 429 on the third request of a fresh session, and it does not recover. It is
+  fine for playback, which never touches the Web API, and useless as a catalogue fallback.
 - Releasing a reserved card returns the NAME, not the card. WirePlumber hands a card
   over by setting its profile to `off`, and taking the reservation name back does not
   restore it: the device disappears from the desktop's sound settings with no error

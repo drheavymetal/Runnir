@@ -215,10 +215,25 @@ fn main() {
         // `runnir --spotify-login` — browser, loopback listener, code exchange. Unlike
         // TIDAL this is the ordinary path rather than the one that does not work:
         // Spotify accepts a loopback redirect, so nothing has to be pasted by hand.
-        Some("--spotify-login") => return spotify_login(),
+        Some("--spotify-login") if args.get(2).map(String::as_str) == Some("--api") => {
+            return spotify_login(spotify::Which::Api);
+        }
+        Some("--spotify-login") => return spotify_login(spotify::Which::Audio),
         // `runnir --spotify-play <uri|url>` — play one track and report the rung it
         // came out on. The same job `--tidal-play` does, and for the same reason:
         // whether the DAC took the stream is not something a test can answer.
+        // `runnir --spotify-browse <words>` — walks the whole catalogue layer in one go:
+        // the four search types, then the user's own shelves, then the tracks behind the
+        // first album and the first playlist. The same job `--tidal-browse` does, and the
+        // reason is the same: a panel that draws six kinds of list is six ways to be
+        // wrong about the JSON, and none of them are visible from a unit test.
+        Some("--spotify-browse") => {
+            let what = args[2..].join(" ");
+            if what.is_empty() {
+                return eprintln!("usage: runnir --spotify-browse <search words>");
+            }
+            return spotify_browse(&what);
+        }
         Some("--spotify-play") => {
             // `--seconds N` stops through the drops rather than waiting for the track to
             // end, so a diagnostic run gives the card back the way a real one does.
@@ -775,10 +790,24 @@ fn tidal_creds() -> Result<(config::Tidal, tidal::Creds), String> {
 /// this one prints the URL, and the same command with the pasted URL finishes it.
 /// Signs in to Spotify. The browser opens, the loopback listener catches the code, and
 /// the session lands on disk — no pasting, which is the one thing TIDAL never allowed.
-fn spotify_login() {
+fn spotify_login(which: spotify::Which) {
     let cfg = config::Config::load().spotify;
-    match spotify::login(&cfg) {
-        Ok(_) => println!("signed in to Spotify"),
+    if which == spotify::Which::Api && cfg.api_client_id.is_empty() {
+        eprintln!(
+            "runnir: no api_client_id in [spotify]. Register an app at \
+             developer.spotify.com (five minutes, free), give it the redirect \
+             http://127.0.0.1:{}/login, and put its client id there. Without one the \
+             catalogue shares the desktop id, which the Web API rate-limits across every \
+             librespot program there is.",
+            cfg.api_callback_port
+        );
+        return;
+    }
+    match spotify::login(which, &cfg) {
+        Ok(_) => println!("signed in to Spotify for {}", match which {
+            spotify::Which::Audio => "playback",
+            spotify::Which::Api => "the catalogue",
+        }),
         Err(e) => eprintln!("runnir: {e}"),
     }
 }
@@ -803,6 +832,76 @@ fn spotify_play(what: &str, limit: Option<std::time::Duration>) {
     if let Some(sig) = reserve::signalled() {
         std::process::exit(128 + sig);
     }
+}
+
+/// Walks the catalogue and prints what came back, so the shapes can be checked against
+/// a real account before a panel is built on top of them.
+fn spotify_browse(words: &str) {
+    let session = match spotify::current(spotify::Which::Api) {
+        Ok(s) => s,
+        Err(e) => return eprintln!("runnir: {e}"),
+    };
+
+    let found = match spotify::search(&session, words, 5) {
+        Ok(f) => f,
+        Err(e) => return eprintln!("runnir: {e}"),
+    };
+    println!("search \"{words}\"");
+    for t in &found.tracks {
+        println!("  track    {}  {} — {} [{}] {}", t.uri, t.artist, t.title, mmss(t.seconds), if t.explicit { "E" } else { "" });
+    }
+    for a in &found.albums {
+        println!("  album    {}  {} — {} ({}, {} tracks)", a.uri, a.artist, a.title, a.year, a.tracks);
+    }
+    for a in &found.artists {
+        println!("  artist   {}  {}", a.uri, a.name);
+    }
+    for p in &found.playlists {
+        println!("  playlist {}  {} by {} ({} tracks)", p.uri, p.title, p.owner, p.tracks);
+    }
+
+    // The shelves. Each one is a paginated listing, which is the part that has been
+    // wrong before: a library that quietly ends at fifty looks exactly like a small one.
+    match spotify::my_playlists(&session) {
+        Ok(p) => println!("\nyour playlists: {} (all pages)", p.len()),
+        Err(e) => println!("\nyour playlists: {e}"),
+    }
+    match spotify::saved_tracks(&session) {
+        Ok(t) => println!("saved tracks:   {} (all pages)", t.len()),
+        Err(e) => println!("saved tracks:   {e}"),
+    }
+    match spotify::saved_albums(&session) {
+        Ok(a) => println!("saved albums:   {} (all pages)", a.len()),
+        Err(e) => println!("saved albums:   {e}"),
+    }
+
+    if let Some(album) = found.albums.first() {
+        match spotify::album_tracks(&session, &album.uri) {
+            Ok(t) => println!("\n{} — {}: {} tracks, first is {:?}", album.artist, album.title, t.len(), t.first().map(|t| t.title.clone())),
+            Err(e) => println!("\nalbum tracks: {e}"),
+        }
+    }
+    if let Some(artist) = found.artists.first() {
+        match spotify::artist_albums(&session, &artist.uri) {
+            Ok(a) => println!("{} albums: {} (first: {:?})", artist.name, a.len(), a.first().map(|a| a.title.clone())),
+            Err(e) => println!("artist albums: {e}"),
+        }
+        // Asked on purpose even though it is known to be refused: this line is the
+        // record of whether the restriction still stands.
+        if let Err(e) = spotify::artist_top_tracks(&session, &artist.uri) {
+            println!("  (top tracks: {e})");
+        }
+    }
+    if let Some(pl) = found.playlists.first() {
+        match spotify::playlist_tracks(&session, &pl.uri) {
+            Ok(t) => println!("playlist {:?}: {} tracks (claimed {})", pl.title, t.len(), pl.tracks),
+            Err(e) => println!("playlist tracks: {e}"),
+        }
+    }
+}
+
+fn mmss(seconds: u32) -> String {
+    format!("{}:{:02}", seconds / 60, seconds % 60)
 }
 
 fn tidal_login(pasted: Option<&str>) {
