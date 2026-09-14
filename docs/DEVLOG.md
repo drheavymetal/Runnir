@@ -4553,6 +4553,129 @@ green, no warnings.
 **Not changed**: `player.rs` keeps its own `ensure_fresh` with the credentials the daemon was
 started with. It was already correct, and it is the hot path for playback.
 
+## DESIGN, NOT YET BUILT — Spotify beside TIDAL, and the terminal as a Connect device (2026-09-14)
+
+**Why.** Pedro cancelled TIDAL and moved to Spotify. The player, the panel, the daemon,
+MPRIS and the whole output chain stay exactly as useful as they were; what has to change
+is where the bytes come from. TIDAL is NOT removed — it is left alone, in place and
+working, so that a migration and a new backend do not land as one commit nobody can
+bisect.
+
+**What Spotify cannot do, said first.** There is no endpoint anywhere in the official
+Web API that returns audio. That is not an oversight to route around: the Web API is
+metadata and remote control of Connect, and the only first-party way to hear a track
+outside their own apps is the Web Playback SDK, which is a browser with Widevine. So
+playback means `librespot` — MIT, Rust, and a reimplementation of the client rather than
+a wrapper over one.
+
+**And bit-perfect is over.** Spotify's Lossless tier is served only to their own apps,
+which ask for and decrypt FLAC through a proprietary pipeline. Every Connect endpoint —
+every third-party streamer, librespot included — still receives Ogg Vorbis 320. There is
+no DRM barrier in the way; the Connect backend simply does not hand FLAC to outside
+devices, and librespot's decoder is already prepared for the day it does. The honest
+ceiling is therefore *exclusive, not resampled*, at 44.1/16, and the badge has to say so
+(see below). Everything the chain learned — the reservation protocol, the rungs, the
+refusals, keeping the device open across tracks — still pays for itself; it is the claim
+at the top that shrinks, not the machinery underneath.
+
+**The licence question is already settled.** librespot is MIT and runnir is GPL-3.0-only.
+MIT goes into GPL-3 without argument, which is the same direction that let `optical.rs`
+vendor decimen's format.
+
+### The one login that opens both halves
+
+`librespot-oauth` runs authorization code + PKCE against a local callback server, and the
+token it returns is good **both** for the Web API and for opening a session with
+`librespot-core`. That is precisely what TIDAL refused: no first-party client there would
+redirect to loopback (`error 11102` with both redirects proved it was the client, not the
+redirect), and the login ended up being a URL pasted by hand. `tidal.rs::wait_for_callback`
+was built, tested, and then unreachable for six weeks. It finally has a caller.
+
+⚠️ **Unverified, and phase 0 answers it**: whether a `client_id` registered at
+developer.spotify.com also opens a librespot session, or whether the audio half needs the
+desktop client id librespot ships. If they differ, the config carries two ids and says why.
+The default is librespot's, because it needs no registration at all.
+
+### Stack, and the tokio it drags in
+
+The TIDAL design said "no GStreamer, no tokio" and that was right for TIDAL. librespot is
+async and brings tokio ^1, so the sentence needs amending rather than defending:
+
+**The runtime lives in the daemon process only**, `current_thread`, started only when the
+provider is Spotify. No window ever builds one, `app_input.rs` never awaits anything, and
+the UI thread's relationship with the player is the socket it already has. The daemon was
+built in August so that exactly one process owns the ALSA device; it now also owns the one
+async runtime. Binary size and compile time are the cost and both get measured in phase 0,
+not estimated here.
+
+### Where the seam is
+
+librespot fetches, decrypts and DECODES. It hands samples to its own `Sink` trait —
+`write(AudioPacket, &mut Converter)`, plus `start`/`stop`. So the seam is one type:
+
+    librespot player → our Sink impl → player::Sink (ALSA) → the DAC
+
+Everything downstream of that arrow is untouched: `plan()`, `Attempt`, `Rung`, the
+PipeWire reservation, the refusal list, the device kept open between tracks. The only
+change inside `player.rs` is that `Sink::write` must also accept a plain interleaved
+sample buffer, because today it accepts a symphonia `GenericAudioBufferRef` and nothing
+else. symphonia stays exactly where it is, for TIDAL.
+
+**The badge stops promising what it cannot deliver.** Quality reads `OGG 320`, the rung
+stays as true as it ever was, and the accent colour that means "nothing touched the
+samples" is reserved for the case where nothing did — which for Spotify means no resample
+after the decoder, never bit-perfect. This is the fourth time this file records the same
+rule: report what arrived, not what was asked for.
+
+### The catalogue is ordinary, with two holes
+
+Web API over `ureq` on worker threads, like TIDAL: search of four types, playlists,
+saved tracks and albums, artist top tracks. Paginated from the first commit, because the
+audit already taught this feature that a playlist of 444 tracks reads as one of 100 when a
+caller takes the first page and stops.
+
+Two things the panel has that Spotify will not give it:
+
+- **No lyrics.** The Web API has no lyrics endpoint. `L` names the provider and says so,
+  rather than drawing an empty pane.
+- **Sharing stays TIDAL-only** for now. librespot does not hand back a re-sendable
+  encrypted file the way `playbackinfopostpaywall` did, and rebroadcasting this is harder
+  to defend besides. Decide it when the panel is provider-agnostic, not before.
+
+Ids are URIs (`spotify:track:...`), not `u64`. That is the one shape change the panel's
+row types have to absorb.
+
+### Announcing the terminal as a Connect device
+
+`librespot-discovery` publishes over zeroconf; `librespot-connect` brings the Spirc state
+machine. From the phone, the music goes to the terminal.
+
+**This collides with a rule set in August and the rule wins.** The daemon dies with the
+last window: nothing plays without runnir on screen. A zeroconf advert that outlives the
+UI would make the terminal a speaker that answers when nobody has opened it. So the advert
+lives and dies with the daemon — coherent with the existing policy, and nearly free
+because that lifetime already exists.
+
+### Keys: the room was already made
+
+The leader group is called **Music**, not TIDAL — deliberately, in July. So:
+
+- transport (`space`, `f`, `b`, `s`) acts on whatever is PLAYING, whichever provider it
+  came from. Two providers never sound at once; there is one device and one daemon.
+- `leader n n` opens the panel for the active provider (`music.provider` in config).
+- The provider is a heading in the panel's own source column, not another leader letter.
+  Letters are the scarce thing; the column already scrolls.
+
+### Phases, risky half first
+
+0. **No UI.** `runnir --spotify-login` and `--spotify-play <uri>`: authenticate, resolve,
+   and get sound out through the existing chain. Answers the three unknowns — whether the
+   OAuth token opens a session, whether the Sink seam holds, what tokio costs.
+1. Catalogue over the Web API, paginated, with the row types widened to URI ids.
+2. Panel, daemon, MPRIS and status bar made provider-agnostic.
+3. Connect device over zeroconf, with the daemon's lifetime.
+4. Audit rounds (Fable finds, Opus fixes), then `docs-site` and the F1 manual.
+
 ## Gotchas (do not re-learn)
 
 - Detecting a bad peer ASYNCHRONOUSLY means the first command still goes to it. The
