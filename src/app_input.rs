@@ -7221,7 +7221,9 @@ impl Gpu {
             self.jukebox = None;
         }
         if self.jukebox.is_none() {
-            if !config.tidal.configured() {
+            // The daemon starts for EITHER provider. Refusing without TIDAL credentials
+            // put the whole player — Spotify included — behind a TIDAL door.
+            if !music_ready(config) {
                 return None;
             }
             let proxy = self.proxy.clone();
@@ -7264,7 +7266,7 @@ impl Gpu {
                     }
                 }
                 None => {
-                    if attempt == 0 && config.tidal.configured() {
+                    if attempt == 0 && music_ready(config) {
                         continue; // connecting failed; try once more
                     }
                     return self.toast_no_tidal();
@@ -7275,21 +7277,33 @@ impl Gpu {
 
     fn toast_no_tidal(&mut self) {
         self.toast(
-            "No TIDAL credentials — add [tidal] client_id and client_secret to the config",
-            6,
+            "No music provider signed in — run: runnir --spotify-login, or add [tidal] credentials",
+            7,
         );
     }
 
     /// Opens the panel onto whatever the player is already doing.
     fn show_tidal_panel(&mut self, config: &Config) {
-        if !config.tidal.configured() {
+        // The door used to be TIDAL's, like everything else about this panel. Asking for
+        // TIDAL credentials before opening a panel somebody wants to use for Spotify is
+        // the same mistake one layer up from the ones already fixed inside it.
+        let (tidal_ready, spotify_ready) = (tidal_ready(config), spotify_ready(config));
+        if !tidal_ready && !spotify_ready {
+            // Names both doors, because the one that is missing is not always the one
+            // the person was reaching for.
             return self.toast_no_tidal();
         }
-        if crate::tidal::Session::load().is_none() {
-            return self.toast("Not signed in to TIDAL — run: runnir --tidal-login", 6);
-        }
         let snapshot = self.player(config).map(|j| j.snapshot()).unwrap_or_default();
-        self.overlay = Some(Overlay::Tidal(overlay::TidalPanel::new(snapshot)));
+        let mut panel = overlay::TidalPanel::new(snapshot);
+        // Open on a shop that can actually answer. The configured preference wins only
+        // when it is usable: a panel that opens on an error message is worse than one
+        // that opens somewhere else and says so in its title.
+        if panel.provider == crate::music::Source::Tidal && !tidal_ready {
+            panel.provider = crate::music::Source::Spotify;
+        } else if panel.provider == crate::music::Source::Spotify && !spotify_ready {
+            panel.provider = crate::music::Source::Tidal;
+        }
+        self.overlay = Some(Overlay::Tidal(panel));
         self.window.request_redraw();
     }
 
@@ -8457,4 +8471,28 @@ fn human_away(d: Duration) -> String {
         90..=3599 => format!("{} min", secs / 60),
         _ => format!("{}h{:02}m", secs / 3600, (secs % 3600) / 60),
     }
+}
+
+
+/// Whether TIDAL can answer: configured AND signed in. Configuration alone was the old
+/// test, and it let the panel open onto a wall.
+fn tidal_ready(config: &Config) -> bool {
+    config.tidal.configured() && crate::tidal::Session::load().is_some()
+}
+
+/// Whether Spotify can answer. The AUDIO session is the one asked about, because that is
+/// what playback needs; a missing catalogue session shows up as an error in one list,
+/// which is recoverable, rather than as silence.
+fn spotify_ready(config: &Config) -> bool {
+    config.spotify.configured()
+        && crate::spotify::Session::load(crate::spotify::Which::Audio, &config.spotify).is_some()
+}
+
+/// Whether there is any music to be had at all.
+///
+/// One question, asked in one place. It used to be `config.tidal.configured()` in three,
+/// which is how the player stayed behind a TIDAL door long after it stopped being a
+/// TIDAL player.
+fn music_ready(config: &Config) -> bool {
+    tidal_ready(config) || spotify_ready(config)
 }
