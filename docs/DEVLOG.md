@@ -4801,10 +4801,48 @@ using since August; the reservation code is untouched. It was never seen because
 device it was developed against is a HiBy R4, which has no UCM profiles. A USB interface
 with UCM does, and that is the case that breaks.
 
-Open question, not yet answered: whether runnir should verify after releasing that the
-card came back with a profile, and ask for one if it did not — or whether reserving a
-UCM card is simply not safe and the chain should refuse to. What is certain is that the
-current behaviour costs the user their audio interface and gives no sign of why.
+### Answered the same day, and it was neither of the guesses
+
+The question looked like "should we verify the card came back, or refuse to reserve UCM
+cards at all". It was the wrong question, because the failure is not about UCM and not
+about verification. Measured both ways on the same card, same track, same device:
+
+    clean exit (through the drops)   Active Profile: HiFi   1 sink
+    SIGTERM                          Active Profile: off    0 sinks
+
+**A signalled process runs no destructors.** The ordering that makes a clean exit work is
+already right — in `Sink`, `pcm` is declared before `_reservation`, so the handle closes
+before the name goes — but a signal does not use that ordering at all. The kernel
+releases the file descriptor and the bus name in the same instant, PipeWire sees the name
+freed and goes to take back a card that ALSA has not finished letting go of, fails, and
+leaves it at `off`. The UCM part is why it *looked* unfixable afterwards: the profile the
+card had been using is unloaded with the handover, so it is not even offered for
+reassignment until wireplumber restarts.
+
+It was never a Spotify bug and it was never new. `kill` is how a daemon usually ends, and
+the player daemon holds a card — so every time the last window closed with exclusive
+playback running, the sound card went with it.
+
+**The fix is a guard installed by `take`, and nowhere else.** A handler that writes one
+byte to a pipe (about all that is safe inside a signal handler), a thread that reads it
+and then: sets a flag, waits for the open device count to reach zero, waits out ALSA's
+own release, and exits. The playback loops check the flag between packets — and, the case
+that is easy to miss, *inside the pause loop*, because a pause deliberately holds the
+device open while writing nothing, so the packet-loop check never runs.
+
+Three deliberate restrictions:
+
+- **Installed lazily, from `take`.** A runnir that never reserves a card handles signals
+  exactly as it always did.
+- **The signal mask is untouched.** It is inherited across fork and exec, and a blocked
+  SIGTERM would silently break the `PR_SET_PDEATHSIG` that keeps a daemon's children from
+  outliving it — trading this bug for the `cloudflared` one already in the Gotchas.
+- **The exit code still says 130.** The fix works well enough that the loop notices the
+  signal and returns *normally*, which made the process exit 0 — so an interrupted run
+  became indistinguishable from a finished one. `reserve::signalled()` puts that back.
+
+Verified after the fix: SIGTERM and SIGINT both leave `Active Profile: HiFi` with its
+sink, exit 130, and take 135 ms to do it.
 
 ## Gotchas (do not re-learn)
 

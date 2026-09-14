@@ -18,7 +18,138 @@
 //! Nothing here is required for playback: without a reservation the chain still works,
 //! it just lands a rung lower and says so.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
+
+/// Set when a signal has arrived and the card has to be given back before exiting.
+///
+/// Read by whatever is feeding a device, which is the only thing that can close it.
+static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+/// How many ALSA devices are open right now. The signal thread waits on this: it is the
+/// difference between exiting with the card still held and exiting after it is free.
+static OPEN_DEVICES: AtomicUsize = AtomicUsize::new(0);
+
+/// Which signal arrived, so a command that stopped because of one can exit saying so.
+static SIGNAL: AtomicI32 = AtomicI32::new(0);
+
+/// The signal that stopped this process, if one did.
+///
+/// Needed because the fix works TOO well: the playback loop now notices the signal and
+/// returns normally, so the process exits 0 and a caller cannot tell an interrupted run
+/// from a finished one. Before the fix it died of the signal and reported 130.
+pub fn signalled() -> Option<i32> {
+    match SIGNAL.load(Ordering::Relaxed) {
+        0 => None,
+        n => Some(n),
+    }
+}
+
+/// True once a signal has asked this process to stop. A playback loop that keeps going
+/// after this is a playback loop that will be killed mid-buffer, taking the card with it.
+pub fn shutting_down() -> bool {
+    SHUTDOWN.load(Ordering::Relaxed)
+}
+
+pub fn device_opened() {
+    OPEN_DEVICES.fetch_add(1, Ordering::SeqCst);
+}
+
+pub fn device_closed() {
+    OPEN_DEVICES.fetch_sub(1, Ordering::SeqCst);
+}
+
+/// Catches the signals that would otherwise kill this process with a card still in it.
+///
+/// **Why this exists.** A signalled process runs no destructors. The PCM handle and the
+/// D-Bus name are then released by the kernel at the same instant — and PipeWire, seeing
+/// the name freed, goes to take a card back that ALSA has not finished letting go of.
+/// It fails, and leaves the card at `Active Profile: off`: gone from the desktop's sound
+/// settings, with the profile it was using no longer even offered, until wireplumber is
+/// restarted. Measured, both ways, on a Focusrite Scarlett 2i2:
+///
+///     clean exit (through the drops)   Active Profile: HiFi   1 sink
+///     SIGTERM                          Active Profile: off    0 sinks
+///
+/// The handler itself only writes a byte to a pipe, which is one of the few things that
+/// is safe inside one. A thread reads that byte and does the work: ask the playback loop
+/// to stop, wait for the device to actually close, wait out ALSA's own release, and only
+/// then exit — which is what finally drops the name.
+///
+/// Installed lazily, from `take`, so that a runnir which never reserves a card never
+/// changes how it handles signals. The mask is untouched for the same reason: it is
+/// inherited across fork and exec, and a blocked SIGTERM would quietly break the
+/// `PR_SET_PDEATHSIG` that stops a daemon's children outliving it.
+#[cfg(unix)]
+fn install_guard_once() {
+    use std::os::fd::RawFd;
+    static INSTALLED: AtomicBool = AtomicBool::new(false);
+    if INSTALLED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    static mut WRITE_FD: RawFd = -1;
+
+    extern "C" fn on_signal(sig: libc::c_int) {
+        // Async-signal-safe: one `write` of one byte, and nothing else. No allocation,
+        // no locks, no formatting.
+        let byte = sig as u8;
+        unsafe {
+            let fd = std::ptr::addr_of!(WRITE_FD).read_volatile();
+            if fd >= 0 {
+                libc::write(fd, std::ptr::addr_of!(byte).cast(), 1);
+            }
+        }
+    }
+
+    let mut fds = [0 as libc::c_int; 2];
+    // SAFETY: `fds` is a two-element array, which is what pipe2 writes into.
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        eprintln!("runnir: could not arm the device-release guard; a kill will leave the card off");
+        return;
+    }
+    let (read_fd, write_fd) = (fds[0], fds[1]);
+    // SAFETY: single-threaded initialisation, before any handler can run.
+    unsafe { std::ptr::addr_of_mut!(WRITE_FD).write_volatile(write_fd) };
+
+    for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+        // SAFETY: `action` is zeroed and then filled as sigaction expects.
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = on_signal as *const () as usize;
+            action.sa_flags = libc::SA_RESTART;
+            libc::sigemptyset(&mut action.sa_mask);
+            libc::sigaction(sig, &action, std::ptr::null_mut());
+        }
+    }
+
+    std::thread::Builder::new()
+        .name("runnir-release".to_string())
+        .spawn(move || {
+            let mut byte = 0u8;
+            // SAFETY: reading one byte into a byte.
+            let n = unsafe { libc::read(read_fd, std::ptr::addr_of_mut!(byte).cast(), 1) };
+            if n != 1 {
+                return;
+            }
+            SIGNAL.store(byte as i32, Ordering::SeqCst);
+            SHUTDOWN.store(true, Ordering::SeqCst);
+
+            // Give the loop feeding the device a chance to close it. Two seconds is far
+            // more than a loop that checks between packets needs, and a loop that is
+            // wedged is not going to be helped by waiting longer.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while OPEN_DEVICES.load(Ordering::SeqCst) > 0 && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            // ALSA frees a card an instant AFTER the handle is closed, and the whole
+            // point of this thread is not to release the name inside that instant.
+            std::thread::sleep(RELEASE_GRACE);
+            std::process::exit(128 + byte as i32);
+        })
+        .ok();
+}
+
+#[cfg(not(unix))]
+fn install_guard_once() {}
 
 /// A held reservation. The card is ours until this is dropped.
 pub struct Reservation {
@@ -115,6 +246,11 @@ pub fn take(card: u32) -> Result<Option<Reservation>, String> {
         | RequestNameFlags::DoNotQueue;
     match connection.request_name_with_flags(well_known, flags.into()) {
         Ok(_) => {
+            // From here on, dying without running destructors costs the user their sound
+            // card until they restart wireplumber. Armed now rather than at startup, so
+            // that a runnir which never reserves anything never changes how it handles
+            // signals.
+            install_guard_once();
             // PipeWire closes the device when it loses the name, but it does that on
             // its own thread and not instantly. Without this pause the open that
             // follows still finds the card busy, which is the bug this exists to fix.

@@ -220,11 +220,24 @@ fn main() {
         // came out on. The same job `--tidal-play` does, and for the same reason:
         // whether the DAC took the stream is not something a test can answer.
         Some("--spotify-play") => {
-            let what = args[2..].join(" ");
-            if what.is_empty() {
-                return eprintln!("usage: runnir --spotify-play <spotify:track:... | https://open.spotify.com/track/...>");
+            // `--seconds N` stops through the drops rather than waiting for the track to
+            // end, so a diagnostic run gives the card back the way a real one does.
+            let mut rest: Vec<&str> = args[2..].iter().map(String::as_str).collect();
+            let mut limit = None;
+            if let Some(i) = rest.iter().position(|a| *a == "--seconds") {
+                match rest.get(i + 1).and_then(|v| v.parse::<u64>().ok()) {
+                    Some(n) => {
+                        limit = Some(std::time::Duration::from_secs(n));
+                        rest.drain(i..=i + 1);
+                    }
+                    None => return eprintln!("usage: --seconds <whole number of seconds>"),
+                }
             }
-            return spotify_play(&what);
+            let what = rest.join(" ");
+            if what.is_empty() {
+                return eprintln!("usage: runnir --spotify-play [--seconds N] <spotify:track:... | https://open.spotify.com/track/...>");
+            }
+            return spotify_play(&what, limit);
         }
         // `runnir --tidal-play <track-id|search words>` — fetch, decode and play one
         // track, then report the signal path it came out on. This is how the audio
@@ -771,7 +784,7 @@ fn spotify_login() {
 }
 
 /// Plays one track and says where the audio went.
-fn spotify_play(what: &str) {
+fn spotify_play(what: &str, limit: Option<std::time::Duration>) {
     let cfg = config::Config::load().spotify;
     let uri = spotify::uri_from(what);
     let mut announce = |p: &spotify::Playing| {
@@ -780,9 +793,15 @@ fn spotify_play(what: &str) {
         }
         println!("  {}", p.badge);
     };
-    match spotify::play_uri(&cfg, &uri, &mut announce) {
+    match spotify::play_uri(&cfg, &uri, limit, &mut announce) {
         Ok(()) => {}
         Err(e) => eprintln!("runnir: {e}"),
+    }
+    // Stopping cleanly because of a signal is still stopping because of a signal, and a
+    // shell that sees 0 will think the track finished. The same applies to
+    // `--tidal-play`, which has never been signalled in anger.
+    if let Some(sig) = reserve::signalled() {
+        std::process::exit(128 + sig);
     }
 }
 

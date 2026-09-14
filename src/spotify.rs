@@ -373,6 +373,7 @@ pub struct Playing {
 pub fn play_uri(
     cfg: &Cfg,
     uri: &str,
+    limit: Option<std::time::Duration>,
     announce: &mut dyn FnMut(&Playing),
 ) -> Result<(), String> {
     use librespot_core::{Session as LsSession, SessionConfig, SpotifyUri, authentication::Credentials};
@@ -420,8 +421,43 @@ pub fn play_uri(
         let mut events = player.get_player_event_channel();
         player.load(uri, true, 0);
 
+        // A deadline exists so that a diagnostic run can end the way a queue ends,
+        // through the drops, instead of being killed from outside. The difference is not
+        // cosmetic: a signalled process runs no destructors, so the PCM handle and the
+        // reservation are released by the kernel at the same instant — and PipeWire then
+        // tries to take a card back that ALSA has not finished letting go of.
+        let deadline = limit.map(|d| std::time::Instant::now() + d);
         let mut announced = false;
-        while let Some(event) = events.recv().await {
+        loop {
+            // Never waits longer than a tick without looking up, because a signal has
+            // to be answered by closing the device and this loop owns it. The deadline,
+            // when there is one, only shortens the tick further.
+            const TICK: std::time::Duration = std::time::Duration::from_millis(100);
+            let wait = match deadline {
+                Some(end) => {
+                    let left = end.saturating_duration_since(std::time::Instant::now());
+                    if left.is_zero() {
+                        break;
+                    }
+                    left.min(TICK)
+                }
+                None => TICK,
+            };
+            let event = match tokio::time::timeout(wait, events.recv()).await {
+                Ok(Some(e)) => e,
+                Ok(None) => break,
+                // Nothing happened in this tick. Check why we might want to stop, and
+                // otherwise go round again.
+                Err(_) => {
+                    if crate::reserve::shutting_down() {
+                        break;
+                    }
+                    continue;
+                }
+            };
+            if crate::reserve::shutting_down() {
+                break;
+            }
             match event {
                 // Announced when the device opens rather than when the track ends:
                 // "which rung did it land on" is the question, and waiting four minutes

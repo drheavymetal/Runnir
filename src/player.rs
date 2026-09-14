@@ -637,6 +637,12 @@ pub fn play_parts(
         // Asked AFTER the write, so the answer is about audio that has already been
         // handed over: a pause here stops the next packet, not the one being heard.
         let levels = levels_of(&decoded);
+        // A signal is a reason to stop like any other, and the only one where carrying
+        // on costs the user their sound card: the process is about to be exited by the
+        // release thread, and the device has to be closed before that happens.
+        if crate::reserve::shutting_down() {
+            break;
+        }
         let mut flow = conductor(Progress {
             frames: played.frames,
             rate: played.signal.decoded_rate,
@@ -646,6 +652,14 @@ pub fn play_parts(
         while flow == Flow::Pause {
             if let Some(sink) = sink.as_mut() {
                 sink.set_paused(true);
+            }
+            // A pause holds the device open on purpose — closing it between tracks is
+            // what cost a second and a half of silence in August — so a signal arriving
+            // during one finds the card held by a loop that is not writing anything.
+            // This is the case the packet loop's check cannot cover.
+            if crate::reserve::shutting_down() {
+                flow = Flow::Stop;
+                break;
             }
             std::thread::sleep(PAUSE_POLL);
             // A paused player is silent, and a wave that keeps its last shape while
@@ -956,6 +970,15 @@ mod linux {
         }
     }
 
+    impl Drop for Sink {
+        fn drop(&mut self) {
+            // The PCM handle goes with this struct; the reservation goes with the field
+            // declared after it. What this records is only that the device is no longer
+            // open, so a signal waiting to exit knows it may.
+            crate::reserve::device_closed();
+        }
+    }
+
     /// Writes until the whole buffer is gone, recovering from underruns.
     ///
     /// A short write is normal — the device took what fitted — so the loop advances by
@@ -1074,6 +1097,10 @@ mod linux {
             Rung::BitPerfect
         };
 
+        // Counted from here to the drop below. A signal arriving in between has to wait
+        // for this to reach zero before the process exits, or the card is released while
+        // ALSA still has it and PipeWire cannot take it back.
+        crate::reserve::device_opened();
         Ok(Sink {
             format,
             channels: want.channels,
