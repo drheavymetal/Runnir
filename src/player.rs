@@ -83,8 +83,17 @@ pub struct SignalPath {
     /// in a 32-bit container".
     pub padded: Option<(u32, u32)>,
     pub resampled: Option<(u32, u32)>,
-    /// TIDAL's word for what it served, which is not always what was asked for.
+    /// The provider's word for what it served, which is not always what was asked for.
     pub quality: String,
+    /// The SOURCE was lossy, whatever the device did with it afterwards.
+    ///
+    /// The rungs describe the path from the decoder to the DAC, and that path can be
+    /// flawless while the thing travelling down it has already thrown away half the
+    /// music: Spotify serves every Connect endpoint Ogg Vorbis 320. Without this, a
+    /// Spotify track landing on an exclusive device would be labelled BIT-PERFECT, in
+    /// the accent colour that means "nothing touched the samples" — which would be the
+    /// fourth lie this badge has told, and the previous three were all this shape.
+    pub lossy: bool,
     /// Every device that was tried and would not take it, with what it said.
     ///
     /// Without this, landing on the laptop speakers instead of the DAC is indis-
@@ -102,16 +111,20 @@ impl SignalPath {
             return String::new();
         }
         match self.rung {
+            Some(rung) if self.lossy && rung.is_bit_exact() => {
+                format!("{}/{} exclusive", self.decoded_bits, fmt_khz(self.decoded_rate))
+            }
             Some(rung) => format!("{}/{} {}", self.decoded_bits, fmt_khz(self.decoded_rate), rung.label()),
             None => format!("{}/{}", self.decoded_bits, fmt_khz(self.decoded_rate)),
         }
     }
 
-    /// True when the path changed no sample value. The status bar colours by this:
-    /// bit-exact reads as accent, anything else as ordinary text, so "am I getting
-    /// what I pay for" is answered without reading a word.
+    /// True when the path changed no sample value AND there were real samples to keep.
+    /// The status bar colours by this: bit-exact reads as accent, anything else as
+    /// ordinary text, so "am I getting what I pay for" is answered without reading a
+    /// word. A lossy source can never earn it, however good the device is.
     pub fn is_bit_exact(&self) -> bool {
-        self.rung.is_some_and(|r| r.is_bit_exact())
+        !self.lossy && self.rung.is_some_and(|r| r.is_bit_exact())
     }
 
     /// The status-bar line. Deliberately assembled here rather than in the drawing code
@@ -131,7 +144,12 @@ impl SignalPath {
             s.push_str(&format!(" · resampled {} → {}", fmt_khz(from), fmt_khz(to)));
         }
         if let Some(rung) = self.rung {
-            s.push_str(&format!(" · {}", rung.label()));
+            // A bit-exact rung under a lossy source is still worth saying — an exclusive
+            // device that does not resample is the best this source can have — but it is
+            // not the claim BIT-PERFECT makes, and borrowing the word would be a lie
+            // about the music rather than about the wire.
+            let label = if self.lossy && rung.is_bit_exact() { "exclusive (lossy source)" } else { rung.label() };
+            s.push_str(&format!(" · {label}"));
         }
         s
     }
@@ -142,6 +160,37 @@ fn fmt_khz(rate: u32) -> String {
         format!("{} kHz", rate / 1000)
     } else {
         format!("{:.1} kHz", rate as f64 / 1000.0)
+    }
+}
+
+/// The sample shape a device was opened with. Providers that hand over floats (Spotify
+/// through librespot) need to know what to convert to; symphonia's path never asks,
+/// because it converts into whatever buffer `write` allocates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Width {
+    S16,
+    /// Packed 24: three bytes per sample, no typed ALSA IO.
+    S24Packed,
+    /// 24 bits justified into the low three bytes of a 32-bit word.
+    S24In32,
+    S32,
+}
+
+/// What the output chain needs to know, with no opinion about where the music came
+/// from. TIDAL and Spotify drive the same DAC through the same rungs; making the chain
+/// take a `Tidal` was only ever true because TIDAL was the only provider there was.
+#[derive(Clone, Debug, Default)]
+pub struct Output {
+    /// `"auto"`, a device name like `"hw:2,0"`, or `"default"` for PipeWire.
+    pub device: String,
+    pub bit_perfect: bool,
+    /// Ask PipeWire to hand the card over before opening it exclusively.
+    pub release_device: bool,
+}
+
+impl From<&TidalCfg> for Output {
+    fn from(c: &TidalCfg) -> Self {
+        Output { device: c.output.clone(), bit_perfect: c.bit_perfect, release_device: c.release_device }
     }
 }
 
@@ -472,7 +521,7 @@ pub fn play_parts(
     parts: Vec<Part>,
     hint_ext: &str,
     quality: &str,
-    cfg: &TidalCfg,
+    cfg: &Output,
     output: bool,
     sink: &mut Option<Sink>,
     conductor: &mut dyn FnMut(Progress<'_>) -> Flow,
@@ -702,8 +751,7 @@ pub fn hw_devices_public() -> Vec<Device> {
 
 #[cfg(target_os = "linux")]
 mod linux {
-    use super::{Attempt, Rung, SignalPath, Want, plan};
-    use crate::config::Tidal as TidalCfg;
+    use super::{Attempt, Output, Rung, SignalPath, Want, plan};
     use alsa::pcm::{Access, Format, HwParams, PCM, State};
     use alsa::{Direction, ValueOr};
     use symphonia::core::audio::sample::i24;
@@ -724,9 +772,9 @@ mod linux {
 
     impl Sink {
         /// Walks the chain until something opens, and records which rung that was.
-        pub fn open(cfg: &TidalCfg, want: &Want, quality: &str) -> Result<Sink, String> {
+        pub fn open(cfg: &Output, want: &Want, quality: &str) -> Result<Sink, String> {
             let devices = hw_devices();
-            let attempts = plan(&cfg.output, cfg.bit_perfect, &devices);
+            let attempts = plan(&cfg.device, cfg.bit_perfect, &devices);
             // Taken ONCE, for the card the chain would rather use, and held for the
             // whole walk down it. Asking per attempt meant releasing it again between
             // rungs — PipeWire took the card back in the gap, and the next attempt
@@ -775,6 +823,16 @@ mod linux {
 
         /// Writes one decoded buffer. Returns the number of underruns recovered from,
         /// because a run that stuttered is not a run that worked.
+        /// What this device took, so a provider holding floats knows what to make.
+        pub fn width(&self) -> super::Width {
+            match self.format {
+                Format::S16LE => super::Width::S16,
+                Format::S243LE => super::Width::S24Packed,
+                Format::S24LE => super::Width::S24In32,
+                _ => super::Width::S32,
+            }
+        }
+
         pub fn write(
             &mut self,
             decoded: &symphonia::core::audio::GenericAudioBufferRef<'_>,
@@ -826,23 +884,23 @@ mod linux {
             }
         }
 
-        fn write_i16(&mut self, buf: &[i16]) -> Result<u32, String> {
+        pub fn write_i16(&mut self, buf: &[i16]) -> Result<u32, String> {
             let io = self.pcm.io_i16().map_err(|e| e.to_string())?;
             write_all(&self.pcm, buf, self.channels as usize, |b| io.writei(b))
         }
 
-        fn write_i32(&mut self, buf: &[i32]) -> Result<u32, String> {
+        pub fn write_i32(&mut self, buf: &[i32]) -> Result<u32, String> {
             let io = self.pcm.io_i32().map_err(|e| e.to_string())?;
             write_all(&self.pcm, buf, self.channels as usize, |b| io.writei(b))
         }
 
         /// 24-in-32. ALSA has its own accessor for this and refuses the plain one.
-        fn write_i32_s24(&mut self, buf: &[i32]) -> Result<u32, String> {
+        pub fn write_i32_s24(&mut self, buf: &[i32]) -> Result<u32, String> {
             let io = self.pcm.io_i32_s24().map_err(|e| e.to_string())?;
             write_all(&self.pcm, buf, self.channels as usize, |b| io.writei(b))
         }
 
-        fn write_packed24(&mut self, bytes: &[u8]) -> Result<u32, String> {
+        pub fn write_packed24(&mut self, bytes: &[u8]) -> Result<u32, String> {
             let io = self.pcm.io_bytes();
             // Three bytes per sample times the channels: what ALSA counts as one frame,
             // and what a short write has to be advanced by.
@@ -1034,6 +1092,9 @@ mod linux {
                 padded,
                 resampled,
                 quality: String::new(),
+                // The chain cannot know: the same device, rung and numbers describe a
+                // FLAC and a Vorbis. Whoever opened it says so.
+                lossy: false,
                 refused: Vec::new(),
             },
             pcm,
@@ -1235,8 +1296,7 @@ pub fn devices_under(root: &std::path::Path) -> Vec<Device> {
 
 #[cfg(not(target_os = "linux"))]
 mod other {
-    use super::{SignalPath, Want};
-    use crate::config::Tidal as TidalCfg;
+    use super::{Output, SignalPath, Want};
 
     /// No output backend outside Linux yet. Browsing and the catalogue work; playback
     /// says so plainly instead of failing somewhere deeper with a stranger message.
@@ -1245,13 +1305,28 @@ mod other {
     }
 
     impl Sink {
-        pub fn open(_: &TidalCfg, _: &Want, _: &str) -> Result<Sink, String> {
+        pub fn open(_: &Output, _: &Want, _: &str) -> Result<Sink, String> {
             Err("audio output on this platform is not implemented (ALSA is Linux-only)".into())
         }
         pub fn write(
             &mut self,
             _: &symphonia::core::audio::GenericAudioBufferRef<'_>,
         ) -> Result<u32, String> {
+            Err("no audio output".into())
+        }
+        pub fn width(&self) -> super::Width {
+            super::Width::S16
+        }
+        pub fn write_i16(&mut self, _: &[i16]) -> Result<u32, String> {
+            Err("no audio output".into())
+        }
+        pub fn write_i32(&mut self, _: &[i32]) -> Result<u32, String> {
+            Err("no audio output".into())
+        }
+        pub fn write_i32_s24(&mut self, _: &[i32]) -> Result<u32, String> {
+            Err("no audio output".into())
+        }
+        pub fn write_packed24(&mut self, _: &[u8]) -> Result<u32, String> {
             Err("no audio output".into())
         }
         pub fn drain(&mut self) {}
@@ -1634,7 +1709,7 @@ fn play_one(
         parts,
         hint_for(&info),
         &info.quality,
-        &playing_cfg,
+        &(&playing_cfg).into(),
         true,
         sink,
         &mut |progress| {

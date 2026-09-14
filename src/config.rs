@@ -40,6 +40,10 @@ pub struct Config {
     /// subscription behind it.
     #[serde(default)]
     pub tidal: Tidal,
+    /// Spotify: the same panel, a different shop. Kept beside `tidal` rather than
+    /// replacing it, so that a change of subscription is not also a rewrite.
+    #[serde(default)]
+    pub spotify: Spotify,
     /// Sending a file out through the screen as QR codes.
     #[serde(default)]
     pub transfer: Transfer,
@@ -104,6 +108,7 @@ impl Default for Config {
             behaviour: Behaviour::default(),
             clipboard: ClipboardCfg::default(),
             tidal: Tidal::default(),
+            spotify: Spotify::default(),
             transfer: Transfer::default(),
             ai: Ai::default(),
             watch: Watch::default(),
@@ -564,6 +569,73 @@ pub struct Tidal {
     /// through the Device Reservation protocol it implements for exactly this, not
     /// taken — and it gets the card back when playback stops.
     pub release_device: bool,
+}
+
+/// Spotify.
+///
+/// There is no secret here and there is no `quality`, and both absences are the shape of
+/// what Spotify gives a third party. Authentication is PKCE, which exists precisely so a
+/// client that cannot keep a secret does not have to have one. And quality is not a
+/// request: Connect endpoints are served Ogg Vorbis 320 and only the first-party apps are
+/// given FLAC, so a field asking for a tier would be a field that does nothing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Spotify {
+    /// Defaults to the desktop client id librespot ships, which needs no registration.
+    /// A client id of your own from developer.spotify.com goes here.
+    pub client_id: String,
+    /// Port the sign-in callback listens on. Spotify accepts a loopback redirect, which
+    /// is the thing TIDAL would never do — there, no first-party client would, and the
+    /// login ended up being a URL pasted by hand.
+    ///
+    /// **Not a free choice with the default client id.** Spotify checks the redirect
+    /// against the ones registered for the client, and the desktop client has
+    /// `http://127.0.0.1:8898/login` — which is why every librespot-based program uses
+    /// that number. Changing it without also setting a `client_id` of your own gets the
+    /// sign-in refused as `INVALID_CLIENT`, which does not mention the port at all.
+    pub callback_port: u16,
+    /// `"auto"`, a device name like `"hw:2,0"`, or `"default"` for PipeWire. Same chain
+    /// as TIDAL: bit-perfect is not reachable from a lossy source, but an exclusive
+    /// device that does not resample still is.
+    pub output: String,
+    pub bit_perfect: bool,
+    /// Ask PipeWire to release the card before opening it exclusively.
+    pub release_device: bool,
+    /// Announce the terminal on the LAN as a Spotify Connect device.
+    ///
+    /// Off by default. The advert only lives as long as the player daemon, which dies
+    /// with the last window — nothing plays without runnir on screen, and a speaker that
+    /// answers when nobody has opened the terminal would break that rule quietly.
+    pub connect_device: bool,
+    /// The name the phone sees.
+    pub device_name: String,
+}
+
+impl Default for Spotify {
+    fn default() -> Self {
+        Self {
+            client_id: DESKTOP_CLIENT_ID.to_string(),
+            callback_port: 8898,
+            output: "auto".to_string(),
+            bit_perfect: true,
+            release_device: true,
+            connect_device: false,
+            device_name: "runnir".to_string(),
+        }
+    }
+}
+
+/// Spotify's own desktop client id. Public, in every librespot install, and the only id
+/// known to open a session against the access point — an id registered at
+/// developer.spotify.com is good for the Web API and unproven for playback.
+pub const DESKTOP_CLIENT_ID: &str = "65b708073fc0480ea92a077233ca87bd";
+
+impl Spotify {
+    /// Whether the panel exists at all. Unlike TIDAL there is nothing to configure, so
+    /// this is true out of the box: the sign-in is what gates it.
+    pub fn configured(&self) -> bool {
+        !self.client_id.is_empty()
+    }
 }
 
 impl Default for Tidal {

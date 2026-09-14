@@ -36,6 +36,7 @@ mod share;
 mod session;
 mod settings;
 mod shell_integration;
+mod spotify;
 mod tab;
 mod themes;
 mod tidal;
@@ -211,6 +212,20 @@ fn main() {
             return tidal_login_paste(&creds);
         }
         Some("--tidal-login") => return tidal_login(args.get(2).map(String::as_str)),
+        // `runnir --spotify-login` — browser, loopback listener, code exchange. Unlike
+        // TIDAL this is the ordinary path rather than the one that does not work:
+        // Spotify accepts a loopback redirect, so nothing has to be pasted by hand.
+        Some("--spotify-login") => return spotify_login(),
+        // `runnir --spotify-play <uri|url>` — play one track and report the rung it
+        // came out on. The same job `--tidal-play` does, and for the same reason:
+        // whether the DAC took the stream is not something a test can answer.
+        Some("--spotify-play") => {
+            let what = args[2..].join(" ");
+            if what.is_empty() {
+                return eprintln!("usage: runnir --spotify-play <spotify:track:... | https://open.spotify.com/track/...>");
+            }
+            return spotify_play(&what);
+        }
         // `runnir --tidal-play <track-id|search words>` — fetch, decode and play one
         // track, then report the signal path it came out on. This is how the audio
         // chain gets verified: whether the DAC really took the stream untouched is not
@@ -745,6 +760,32 @@ fn tidal_creds() -> Result<(config::Tidal, tidal::Creds), String> {
 ///
 /// PKCE needs the code the browser was redirected with, so it runs in two commands:
 /// this one prints the URL, and the same command with the pasted URL finishes it.
+/// Signs in to Spotify. The browser opens, the loopback listener catches the code, and
+/// the session lands on disk — no pasting, which is the one thing TIDAL never allowed.
+fn spotify_login() {
+    let cfg = config::Config::load().spotify;
+    match spotify::login(&cfg) {
+        Ok(_) => println!("signed in to Spotify"),
+        Err(e) => eprintln!("runnir: {e}"),
+    }
+}
+
+/// Plays one track and says where the audio went.
+fn spotify_play(what: &str) {
+    let cfg = config::Config::load().spotify;
+    let uri = spotify::uri_from(what);
+    let mut announce = |p: &spotify::Playing| {
+        if !p.title.is_empty() {
+            println!("  {} — {}", p.artist, p.title);
+        }
+        println!("  {}", p.badge);
+    };
+    match spotify::play_uri(&cfg, &uri, &mut announce) {
+        Ok(()) => {}
+        Err(e) => eprintln!("runnir: {e}"),
+    }
+}
+
 fn tidal_login(pasted: Option<&str>) {
     let (_, creds) = match tidal_creds() {
         Ok(v) => v,
@@ -1115,7 +1156,7 @@ fn tidal_play(what: &str) {
         },
         player::hint_for(&info),
         &info.quality,
-        &cfg,
+        &(&cfg).into(),
         true,
         &mut None,
         &mut |progress| {
@@ -1165,7 +1206,7 @@ fn tidal_decode(files: &[&str], play: bool) {
         .unwrap_or("flac");
     let ext = if matches!(ext, "m4s" | "m4a" | "mp4") { "mp4" } else { ext };
 
-    match player::play_parts(parts, ext, "", &cfg, play, &mut None, &mut |_| player::Flow::Continue) {
+    match player::play_parts(parts, ext, "", &(&cfg).into(), play, &mut None, &mut |_| player::Flow::Continue) {
         Ok(played) => {
             let seconds = played.frames as f64 / played.signal.decoded_rate.max(1) as f64;
             println!("  {}", played.signal.badge());
