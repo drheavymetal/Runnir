@@ -542,33 +542,44 @@ fn tidal_scene(path_out: &str, state: &str) {
         overlay::TidalRow::Track(track("Rollin' Stone", "Muddy Waters", 189, "LOSSLESS")),
         overlay::TidalRow::Track(track("Got My Mojo Working", "Muddy Waters", 168, "HIGH")),
         overlay::TidalRow::Heading("ALBUMS".into()),
-        overlay::TidalRow::Album(tidal::Album {
-            id: 1,
+        overlay::TidalRow::Album(music::Album {
+            source: music::Source::Tidal,
+            id: "1".into(),
             title: "Folk Singer".into(),
             artist: "Muddy Waters".into(),
             tracks: 9,
-            year: Some(1964),
+            year: "1964".into(),
             quality: "HI_RES_LOSSLESS".into(),
         }),
-        overlay::TidalRow::Album(tidal::Album {
-            id: 2,
+        overlay::TidalRow::Album(music::Album {
+            source: music::Source::Tidal,
+            id: "2".into(),
             title: "The Best Of Muddy Waters".into(),
             artist: "Muddy Waters".into(),
             tracks: 12,
-            year: Some(1958),
+            year: "1958".into(),
             quality: "LOSSLESS".into(),
         }),
         overlay::TidalRow::Heading("ARTISTS".into()),
-        overlay::TidalRow::Artist(tidal::Artist { id: 3, name: "Muddy Waters".into() }),
+        overlay::TidalRow::Artist(music::Artist {
+            source: music::Source::Tidal,
+            id: "3".into(),
+            name: "Muddy Waters".into(),
+        }),
         overlay::TidalRow::Heading("PLAYLISTS".into()),
-        overlay::TidalRow::Playlist(tidal::Playlist {
-            uuid: "x".into(),
+        overlay::TidalRow::Playlist(music::Playlist {
+            source: music::Source::Tidal,
+            id: "x".into(),
             title: "Blues Essentials".into(),
             tracks: 40,
             owner: "TIDAL".into(),
             mine: false,
         }),
     ];
+    // The invented library is TIDAL's, so the panel has to be too — otherwise the
+    // screenshot claims one shop while showing another's rows, which is exactly the
+    // kind of quiet lie these scenes exist to catch.
+    panel.provider = music::Source::Tidal;
     panel.cursor = 1;
     if state == "queue" {
         panel.source = overlay::Source::Queue;
@@ -1838,7 +1849,7 @@ fn notify(body: &str) {
 /// set of lyrics are drawn by different halves of the panel, and collapsing them into
 /// one type would mean each side checking whether the answer was meant for it.
 pub enum TidalAnswer {
-    Found(tidal::Found),
+    Found(music::Found),
     /// The track the words are for, and the words. The identity travels with them
     /// because the answer can arrive after the song has changed, and words for the wrong
     /// song are worse than none. It is `Track::key()` rather than a number: an id on its
@@ -1851,7 +1862,7 @@ pub enum TidalAnswer {
 /// The order is deliberate: tracks first because they are what a search is usually
 /// for, then albums, artists and playlists. Headings only appear when there is more
 /// than one kind, since a single-kind list needs no label.
-fn rows_of(found: &tidal::Found) -> Vec<overlay::TidalRow> {
+fn rows_of(found: &music::Found) -> Vec<overlay::TidalRow> {
     let kinds = [
         !found.tracks.is_empty(),
         !found.albums.is_empty(),
@@ -1873,15 +1884,15 @@ fn rows_of(found: &tidal::Found) -> Vec<overlay::TidalRow> {
     }
     if !found.albums.is_empty() {
         heading(&mut rows, "ALBUMS");
-        rows.extend(found.albums.iter().cloned().map(overlay::TidalRow::Album));
+        rows.extend(found.albums.iter().cloned().map(|x| overlay::TidalRow::Album(x.into())));
     }
     if !found.artists.is_empty() {
         heading(&mut rows, "ARTISTS");
-        rows.extend(found.artists.iter().cloned().map(overlay::TidalRow::Artist));
+        rows.extend(found.artists.iter().cloned().map(|x| overlay::TidalRow::Artist(x.into())));
     }
     if !found.playlists.is_empty() {
         heading(&mut rows, "PLAYLISTS");
-        rows.extend(found.playlists.iter().cloned().map(overlay::TidalRow::Playlist));
+        rows.extend(found.playlists.iter().cloned().map(|x| overlay::TidalRow::Playlist(x.into())));
     }
     rows
 }

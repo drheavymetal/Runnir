@@ -40,6 +40,13 @@ pub struct Config {
     /// subscription behind it.
     #[serde(default)]
     pub tidal: Tidal,
+    /// Which provider the music panel opens on: `"tidal"` or `"spotify"`.
+    ///
+    /// A string rather than an enum in the file, so that an unknown value degrades to
+    /// the default instead of refusing to load the whole config — a typo here should
+    /// not cost somebody their keybindings.
+    #[serde(default)]
+    pub music_provider: String,
     /// Spotify: the same panel, a different shop. Kept beside `tidal` rather than
     /// replacing it, so that a change of subscription is not also a rewrite.
     #[serde(default)]
@@ -108,6 +115,7 @@ impl Default for Config {
             behaviour: Behaviour::default(),
             clipboard: ClipboardCfg::default(),
             tidal: Tidal::default(),
+            music_provider: String::new(),
             spotify: Spotify::default(),
             transfer: Transfer::default(),
             ai: Ai::default(),
@@ -1050,6 +1058,23 @@ impl Config {
     /// Loads and validates the config, or `None` if the file is missing or invalid.
     /// Prefers the JSON file (settings panel) over the TOML one. Hot-reload uses this
     /// to keep the running config on a parse error rather than snapping to defaults.
+    /// The provider the panel opens on. Empty or unknown means: whichever one is signed
+    /// in, preferring Spotify when both are — because a provider that cannot answer is a
+    /// panel that opens on an error message.
+    pub fn music_provider(&self) -> crate::music::Source {
+        match self.music_provider.to_ascii_lowercase().as_str() {
+            "spotify" => crate::music::Source::Spotify,
+            "tidal" => crate::music::Source::Tidal,
+            _ => {
+                if crate::spotify::Session::load(crate::spotify::Which::Api, &self.spotify).is_some() {
+                    crate::music::Source::Spotify
+                } else {
+                    crate::music::Source::Tidal
+                }
+            }
+        }
+    }
+
     pub fn try_load() -> Option<Self> {
         let json = Self::json_path();
         if json.exists() {

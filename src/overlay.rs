@@ -2739,6 +2739,12 @@ pub struct TidalPanel {
     /// Which track the words on screen belong to, as `Track::key()` — provider and all.
     /// A bare number stopped being an identity the moment a second provider existed.
     pub lyrics_for: Option<String>,
+    /// Which shop the lists are coming from.
+    ///
+    /// A panel-level setting rather than a per-row one, because a search has to go
+    /// somewhere before there are any rows to ask. The rows themselves still carry their
+    /// own provider, which is what lets a queue hold tracks from both at once.
+    pub provider: crate::music::Source,
     pub show_lyrics: bool,
     /// The trail for a list that has been ASKED for but has not arrived.
     ///
@@ -2820,9 +2826,9 @@ pub enum PanelFocus {
 #[derive(Clone, Debug)]
 pub enum TidalRow {
     Track(crate::music::Track),
-    Album(crate::tidal::Album),
-    Artist(crate::tidal::Artist),
-    Playlist(crate::tidal::Playlist),
+    Album(crate::music::Album),
+    Artist(crate::music::Artist),
+    Playlist(crate::music::Playlist),
     /// A heading inside a mixed list. Never selectable.
     Heading(String),
 }
@@ -2899,6 +2905,7 @@ impl TidalPanel {
             message: None,
             lyrics: None,
             lyrics_for: None,
+            provider: crate::config::Config::load().music_provider(),
             show_lyrics: false,
             crumb_pending: None,
             snapshot,
@@ -3047,9 +3054,14 @@ impl TidalPanel {
         let (w, h, side, list_rows) = (l.w, l.h, l.side, l.list_rows);
         let mut g = panel_grid(w, h, theme);
 
+        // The title names the shop, because it was never decoration: a list of songs
+        // looks the same whoever is selling them, and the queue can hold both at once.
+        // `\u{b7}p` is the key that switches, said where the name is rather than in a
+        // help screen nobody opens while looking at a list.
+        let shop = self.provider.label();
         let title = match &self.crumb {
-            Some(c) => format!("TIDAL  \u{b7}  {c}"),
-            None => "TIDAL".to_string(),
+            Some(c) => format!("{shop}  \u{b7}  {c}"),
+            None => format!("{shop}  \u{b7}p"),
         };
         write(&mut g, 0, 2, &title, accent());
 
@@ -3368,7 +3380,9 @@ fn row_line(row: &TidalRow) -> String {
     match row {
         TidalRow::Track(t) => track_line(t),
         TidalRow::Album(a) => {
-            let year = a.year.map(|y| format!(" ({y})")).unwrap_or_default();
+            // Empty means the provider did not say, which is a thing that happens and
+            // must not be drawn as "( )".
+            let year = if a.year.is_empty() { String::new() } else { format!(" ({})", a.year) };
             format!("{} \u{2014} {}{year}", a.artist, a.title)
         }
         TidalRow::Artist(a) => a.name.clone(),
@@ -5899,7 +5913,7 @@ fn a_track(title: &str) -> crate::music::Track {
             TidalRow::Track(a_track("one")),
             TidalRow::Track(a_track("two")),
             TidalRow::Heading("ALBUMS".into()),
-            TidalRow::Album(crate::tidal::Album::default()),
+            TidalRow::Album(crate::music::Album::default()),
         ];
         p.cursor = 2; // the second track
         let (tracks, at) = p.play_selection().expect("a selection");
@@ -5916,7 +5930,7 @@ fn a_track(title: &str) -> crate::music::Track {
             TidalRow::Heading("TRACKS".into()),
             TidalRow::Track(a_track("one")),
             TidalRow::Heading("ALBUMS".into()),
-            TidalRow::Album(crate::tidal::Album::default()),
+            TidalRow::Album(crate::music::Album::default()),
         ];
         p.settle_cursor();
         assert_eq!(p.cursor, 1, "the first selectable row, not the heading above it");
@@ -6026,17 +6040,64 @@ fn a_track(title: &str) -> crate::music::Track {
         assert_eq!(quality_tag(""), "   ");
     }
 
+    /// Rows from the shop you just left, sitting under the name of the one you are now
+    /// in, is the same class of lie as a crumb that outlives its list.
+    #[test]
+    fn changing_provider_empties_the_list_it_came_from() {
+        let mut p = TidalPanel::new(crate::player::Snapshot::default());
+        p.provider = crate::music::Source::Tidal;
+        p.rows = vec![TidalRow::Track(a_track("Bleak"))];
+        p.crumb = Some("Blackwater Park".into());
+
+        // What the `p` key does, in the order it does it.
+        p.provider = crate::music::Source::Spotify;
+        p.rows.clear();
+        p.crumb = None;
+
+        assert!(p.rows.is_empty());
+        assert_eq!(p.crumb, None);
+        assert_eq!(p.provider, crate::music::Source::Spotify);
+    }
+
+    /// The queue is the player's, not the shop's: it can hold both at once, and
+    /// switching provider must not throw away what is playing.
+    #[test]
+    fn a_queue_can_hold_both_providers_at_once() {
+        let mut mixed = crate::player::Snapshot::default();
+        mixed.queue = vec![
+            crate::music::Track {
+                source: crate::music::Source::Tidal,
+                id: "7".into(),
+                title: "Bleak".into(),
+                ..Default::default()
+            },
+            crate::music::Track {
+                source: crate::music::Source::Spotify,
+                id: "spotify:track:ABC".into(),
+                title: "My Home Is In The Delta".into(),
+                ..Default::default()
+            },
+        ];
+        mixed.index = 1;
+        let p = TidalPanel::new(mixed);
+        assert_eq!(p.snapshot.queue.len(), 2);
+        assert_eq!(p.snapshot.now_playing().map(|t| t.source), Some(crate::music::Source::Spotify));
+        // And the two are still told apart, which is what MPRIS and the lyrics cache
+        // key on.
+        assert_ne!(p.snapshot.queue[0].key(), p.snapshot.queue[1].key());
+    }
+
     #[test]
     fn a_row_says_what_kind_of_thing_it_is() {
-        let album = TidalRow::Album(crate::tidal::Album {
+        let album = TidalRow::Album(crate::music::Album {
             title: "Rumours".into(),
             artist: "Fleetwood Mac".into(),
-            year: Some(1977),
+            year: "1977".into(),
             ..Default::default()
         });
         assert_eq!(row_line(&album), "Fleetwood Mac \u{2014} Rumours (1977)");
 
-        let mine = TidalRow::Playlist(crate::tidal::Playlist {
+        let mine = TidalRow::Playlist(crate::music::Playlist {
             title: "Dormir".into(),
             tracks: 11,
             owner: "Pedro".into(),

@@ -4924,6 +4924,68 @@ restrictions do not close. It needs a live librespot session, which is a thing p
 builds anyway for the daemon — so it is written down here and built there, rather than
 standing up a throwaway session for a diagnostic command.
 
+## 2026-09-14 - Phase 2: the panel stops being TIDAL's
+
+The player, the queue, the panel, MPRIS, the status bar and the share page were written
+in terms of `tidal::Track`, `tidal::Album`, `tidal::Playlist`. That was honest while
+there was one shop. `music::` is the same five fields without the shop attached, plus the
+one field that decides a path — and the fork lives in `play_one`, which is the only place
+that has to care.
+
+**`id` becomes a string and identity becomes `key()`.** A Spotify id is not a number, and
+two providers can spell an id the same way and mean different songs. MPRIS hands that out
+as a track id and the lyrics cache keys on it, so an unqualified id was a collision
+waiting for the day both were signed in.
+
+**The conductor came out of `play_one` as a type.** There are two audio loops now.
+Duplicating it would have meant two copies of "previous restarts the track after three
+seconds", two copies of the pacing rules, and a guarantee that a fix to one would miss
+the other. The loops differ in where the samples come from; what they do about a key
+press does not.
+
+**The Spotify engine is built once and kept**, like the ALSA device is kept across
+tracks: connecting costs a second or two, and paying that per track puts a gap in every
+album. Switching providers releases the other one first — two engines cannot both hold an
+exclusive device, which is the daemon's "exactly one process owns the card" rule applied
+one level down.
+
+**The wave is measured in the sink**, where the TIDAL one is measured, so what is drawn
+is what is being heard rather than a second guess at it. RMS over a 60 dB scale, cut into
+as many slices as there are columns so the bars rise and fall in place.
+
+### What the panel says now
+
+The title names the shop, with `·p` beside it — the key that switches. It was never
+decoration: a list of songs looks identical whoever is selling them.
+
+That came out of the headless scene rather than out of reading the code. The first
+version added a provider label under the title and the screenshot showed it sitting
+beside the hard-coded word TIDAL, contradicting it — a demo drawing a TIDAL library while
+announcing Spotify, because the panel reads its default provider from the config and this
+machine is signed in to both. Two fixes, and the second one matters more: the scene now
+pins its provider, because a screenshot that claims one shop while showing another's rows
+is exactly the quiet lie these scenes exist to catch. That is the third time
+`--demo <file> tidal` has found something reading the code did not.
+
+Switching provider clears the list, the crumb and the pending request. Rows from the shop
+you just left, sitting under the name of the one you are now in, is the same class of lie
+as a crumb that outlives its list. The QUEUE is not cleared: it belongs to the player, not
+to a shop, and it can hold both at once.
+
+### Left standing, deliberately
+
+Playlist CONTENTS from Spotify. The Web API refuses them to a client id registered now,
+even for a playlist the user owns, and librespot's metadata layer is the remaining door —
+it talks the client protocol, where `Playlist` carries its contents. The engine already
+holds a live librespot session, so the door is now behind a wall that has been built; the
+work is fetching the item list and resolving the tracks without doing it one round trip at
+a time.
+
+And the whole of this is verified by tests and one headless screenshot. Nobody has yet
+played a Spotify track FROM the panel, through the daemon, on this machine. That is the
+next thing, and the rule this file already records applies: verify on a real instance,
+because the bugs that turn up are layout, DPI and keys under Hyprland.
+
 ## Gotchas (do not re-learn)
 
 - A Spotify client id registered TODAY is not the one the docs describe. Half the Web

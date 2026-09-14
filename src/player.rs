@@ -1601,6 +1601,10 @@ fn play_queue(
     // Held across the whole queue rather than per track. See `play_parts`: reopening
     // between tracks cost a gap and a busy-wait on the device's own release.
     let mut sink: Option<Sink> = None;
+    // The same reasoning, one provider over: connecting to Spotify costs a second or
+    // two, so the engine outlives the track. Built on first use, because a queue that
+    // never plays a Spotify track should never open a Spotify session.
+    let mut spotify: Option<crate::spotify::Engine> = None;
     loop {
         let (track, index) = {
             let Ok(s) = state.lock() else { return false };
@@ -1610,7 +1614,7 @@ fn play_queue(
             }
         };
 
-        let outcome = play_one(&track, rx, state, wake, cfg, creds, &mut sink);
+        let outcome = play_one(&track, rx, state, wake, cfg, creds, &mut sink, &mut spotify);
         match outcome {
             Outcome::Quit => return true,
             Outcome::Stopped => {
@@ -1684,12 +1688,23 @@ fn play_one(
     cfg: &mut TidalCfg,
     creds: &tidal::Creds,
     sink: &mut Option<Sink>,
+    spotify: &mut Option<crate::spotify::Engine>,
 ) -> Outcome {
     set(state, wake, |s| {
         s.buffering = true;
         s.playing = true;
         s.position_secs = 0.0;
     });
+    if track.source == crate::music::Source::Spotify {
+        return play_one_spotify(track, rx, state, wake, spotify);
+    }
+    // Back on TIDAL, so whatever Spotify is holding has to go. Two engines cannot both
+    // have an exclusive device, and the one that is not playing should not be the one
+    // keeping the card — this is the same "exactly one process owns the ALSA device"
+    // rule the daemon exists for, applied one level down.
+    if let Some(engine) = spotify.as_mut() {
+        engine.release();
+    }
     let Some(session) = tidal::Session::load() else {
         return Outcome::Failed("not signed in".into());
     };
@@ -1758,6 +1773,52 @@ fn play_one(
         }
         Ok(Err(e)) => Outcome::Failed(e),
         Ok(Ok(_)) => conductor.verdict,
+    }
+}
+
+/// The Spotify half of `play_one`.
+///
+/// Short, because everything that makes it a queue rather than a stream — the commands,
+/// the position, the wave, the pacing — is the shared `Conductor`, and everything that
+/// makes it audio is the engine. What is left here is the part that is genuinely
+/// different: the session is built on first use rather than per track, and a failure to
+/// build it is a failure of this track rather than of the queue.
+fn play_one_spotify(
+    track: &crate::music::Track,
+    rx: &std::sync::mpsc::Receiver<Cmd>,
+    state: &std::sync::Arc<std::sync::Mutex<Snapshot>>,
+    wake: &dyn Fn(),
+    spotify: &mut Option<crate::spotify::Engine>,
+) -> Outcome {
+    set(state, wake, |s| {
+        s.playing = true;
+        s.paused = false;
+        s.buffering = true;
+        s.position_secs = 0.0;
+        s.error = None;
+        // The wave belongs to the track being heard, not to the player.
+        s.wave.clear();
+    });
+
+    if spotify.is_none() {
+        let cfg = crate::config::Config::load().spotify;
+        match crate::spotify::Engine::new(&cfg) {
+            Ok(e) => *spotify = Some(e),
+            Err(e) => return Outcome::Failed(e),
+        }
+    }
+    let Some(engine) = spotify.as_mut() else {
+        return Outcome::Failed("no Spotify engine".into());
+    };
+
+    let mut conductor = Conductor::new(rx, state, wake);
+    let outcome = engine.play(&track.id, &mut |progress| conductor.tick(progress));
+    // A verdict the conductor reached — "next", "previous", "the queue was replaced" —
+    // outranks the engine simply reporting that the track stopped, because the engine
+    // stopped it BECAUSE of that verdict.
+    match outcome {
+        Outcome::Ended | Outcome::Stopped => conductor.verdict,
+        other => other,
     }
 }
 
