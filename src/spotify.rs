@@ -426,9 +426,28 @@ pub fn play_uri(
                 // Announced when the device opens rather than when the track ends:
                 // "which rung did it land on" is the question, and waiting four minutes
                 // for the answer makes the command useless for checking it.
+                // `Playing` is emitted when playback STARTS, which is before the first
+                // packet has reached the sink — and the device is opened by that first
+                // packet, because only then is the real shape known. Reporting here
+                // reads the signal path before anything has filled it in: `PCM 0/0 kHz`
+                // and an empty device. So wait for the device, briefly.
                 PlayerEvent::Playing { .. } if !announced => {
                     announced = true;
-                    let badge = signal.lock().map(|s| s.badge()).unwrap_or_default();
+                    let mut badge = String::new();
+                    for _ in 0..100 {
+                        if let Ok(s) = signal.lock() {
+                            if s.decoded_rate != 0 {
+                                badge = s.badge();
+                                break;
+                            }
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                    // Five seconds is long enough for a device to open and short enough
+                    // that a chain which never opens one says so instead of hanging.
+                    if badge.is_empty() {
+                        badge = "no device opened — nothing was written to a sink".to_string();
+                    }
                     announce(&Playing {
                         title: title.0.clone(),
                         artist: title.1.clone(),

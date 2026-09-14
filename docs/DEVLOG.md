@@ -4596,6 +4596,25 @@ developer.spotify.com also opens a librespot session, or whether the audio half 
 desktop client id librespot ships. If they differ, the config carries two ids and says why.
 The default is librespot's, because it needs no registration at all.
 
+**Answered, 2026-09-14, and not the way the question was asked.** The token does work
+against the Web API — the scopes are honoured and the call is authenticated. What it runs
+into is a `429` with `Retry-After: 40` on the THIRD request of a fresh session, which is
+not a quota anyone here has spent: the desktop client id is shared by every
+librespot-based program on earth and the Web API rate-limits it as one client. Playback is
+unaffected, because playback never touches the Web API.
+
+So the two ids are needed after all, for a reason the design did not anticipate:
+
+- **audio** — the desktop client id, which is the one known to open a session.
+- **catalogue** — a `client_id` of its own from developer.spotify.com, not for
+  permission but for a rate limit that belongs to this machine. Its redirect is its own
+  too, which is what makes `callback_port` a real setting rather than a fixed 8898.
+
+Phase 1 therefore starts by splitting the field, and the panel is unusable in practice
+without a registered id. Worth saying plainly in whatever the user reads: this is a
+five-minute registration, and it is the difference between a catalogue that answers and
+one that returns 429 to the third keystroke.
+
 ### Stack, and the tokio it drags in
 
 The TIDAL design said "no GStreamer, no tokio" and that was right for TIDAL. librespot is
@@ -4675,6 +4694,88 @@ The leader group is called **Music**, not TIDAL — deliberately, in July. So:
 2. Panel, daemon, MPRIS and status bar made provider-agnostic.
 3. Connect device over zeroconf, with the daemon's lifetime.
 4. Audit rounds (Fable finds, Opus fixes), then `docs-site` and the F1 manual.
+
+## 2026-09-14 - Phase 0: Spotify plays, and the badge does not lie about it
+
+It works. Signed in, resolved, and out through the chain the DAC is already on:
+
+    Muddy Waters - My Home Is In The Delta
+    OGG 320 16/44.1 kHz · hw:0,0 · 16→32 zero-pad · exclusive (lossy source)
+
+Heard, not inferred: Pedro asked whether the music was mine while the second run was
+playing. The first run landed on `hw:2,0` — the board's analogue jack — which is a
+working path to a socket nobody is listening to, so it proved the chain and not the
+sound. Forcing `hw:0,0` (the Scarlett) is what made it audible.
+
+### The three unknowns the phase existed for
+
+**Does an OAuth token open a librespot session?** Yes, and one token does both halves:
+the same access token authenticates the session and is accepted by the Web API. The
+sign-in is a browser and a loopback listener, with nothing pasted by hand — which is
+worth pausing on, because `tidal.rs::wait_for_callback` was written in August, tested,
+and then unreachable, since no first-party TIDAL client would redirect to loopback
+(`error 11102` refused the app redirect and the loopback one alike, which is what proved
+the client was the problem and not the redirect). Six weeks later it has a caller.
+
+**Does the sink seam hold?** Yes, and nothing downstream of it changed. `plan()`, the
+rungs, the reservation, the refusal list, the device held open across tracks — all of it
+is the August machinery, reached through one `impl Sink`. What it took was making the
+chain provider-blind: it takes an `Output` instead of a `Tidal`, and it reports the
+`Width` it opened with, because a provider holding floats has to know what to convert to.
+
+**What does the runtime cost?** 500 → 651 packages, and the release binary 46.1 → 56.8 MB
+(+11.2 MB, +23%). A full release build is ~105 s on this machine. The runtime itself is
+`current_thread` and is built at one call site; no window holds one.
+
+### A fourth answer, to a question nobody asked
+
+The token works against the Web API and then gets `429 Retry-After: 40` on the **third**
+request of a fresh session. That is not a quota anyone here has spent: the desktop client
+id is shared by every librespot program on earth and Spotify rate-limits it as one
+client. Playback never touches the Web API, so playback does not care — but the
+catalogue is the Web API, so phase 1 starts by splitting the setting in two: the desktop
+id for the session, a registered id of one's own for the catalogue. That also makes
+`callback_port` a real setting instead of a fixed number.
+
+### Two things read out of librespot rather than found by running it
+
+**librespot stops the sink on every pause** (`handle_pause` → `ensure_sink_stopped(false)`),
+not only at the end of a queue. A sink that closes the device there gives the card back
+and has to take it again on resume — landing on the `EBUSY` of its own release, which is
+the gap this program already diagnosed once, between tracks, in August. So `stop` pauses
+the PCM and keeps the device, and `start` is its exact inverse (`set_paused(false)`, not
+`resume()`, because only the first undoes a hardware pause). Holding an exclusive device
+through a pause is not selfish: the reservation answers `RequestRelease` with yes.
+
+**The badge would have said BIT-PERFECT over Ogg Vorbis 320.** The rungs describe the
+path from decoder to DAC, and that path can be flawless while what travels down it has
+already thrown half the music away. `SignalPath` carries `lossy`, `is_bit_exact` never
+grants it to a lossy source, and a bit-exact rung under one reads `exclusive (lossy
+source)` — a real thing to be, and not the other one. That makes four badge lies caught
+in this file; all four were the same shape, and this is the first caught before it shipped.
+
+### And one found by running it
+
+The first run printed `PCM 0/0 kHz ·` with an empty device. `PlayerEvent::Playing` is
+emitted when playback starts, which is *before* the first packet reaches the sink — and
+the device is opened BY that first packet, because only then is the shape known. The
+announcement was reading the signal path before anything had filled it in. It now waits
+for the device, up to five seconds, and says "no device opened" rather than printing
+zeros if none ever does.
+
+### Cost of entry, for the record
+
+`librespot-core`'s build script would not compile at all: `vergen-gitcl` depends on
+`vergen 9.0.6` *and* `vergen-lib 0.1.6`, while `vergen 9.1.0` — which the resolver
+prefers — moved to `vergen-lib 9.1.0`. Two crates of the same name by semver, one trait
+each, and an error inside a dependency's build script that says nothing about versions.
+Pinned with `cargo update -p vergen --precise 9.0.6`.
+
+### Not done, deliberately
+
+Sharing stays TIDAL-only: librespot hands back decoded samples, not a re-sendable
+encrypted file the way `playbackinfopostpaywall` did. Lyrics have no Web API endpoint, so
+`L` will have to name the provider and say so. TIDAL is untouched and still works.
 
 ## Gotchas (do not re-learn)
 
