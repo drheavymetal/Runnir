@@ -87,6 +87,8 @@ pub enum Action {
     Map,
     /// Send a file out through the screen as QR codes, for a phone camera.
     OpticalTransfer,
+    /// Put this window on a phone, and show the QR and PIN that let one in.
+    Pocket,
     /// Arrange the window around a deploy: watches, and the deploy staged.
     WarRoom,
     /// Take the war room down, keeping any pane the user typed in.
@@ -195,6 +197,7 @@ impl Action {
             TidalShare => "tidal_share",
             Map => "map",
             OpticalTransfer => "optical_transfer",
+            Pocket => "pocket",
             WarRoom => "war_room",
             WarRoomClose => "war_room_close",
             SetImageWatchDir => "set_image_watch_dir",
@@ -294,6 +297,7 @@ impl Action {
             TidalShare => "Share what is playing (link)",
             Map => "Map: the session zoomed out to one headline per pane",
             OpticalTransfer => "Send a file to a phone by camera (QR stream)",
+            Pocket => "Put this window on a phone (share the screen)",
             WarRoom => "War room: arrange the window around a deploy",
             WarRoomClose => "War room: close it, keeping panes you typed in",
             SetImageWatchDir => "Auto-preview images: set / clear watched dir",
@@ -396,6 +400,7 @@ impl Action {
             "tidal_share" => TidalShare,
             "map" => Map,
             "optical_transfer" => OpticalTransfer,
+            "pocket" => Pocket,
             "war_room" => WarRoom,
             "war_room_close" => WarRoomClose,
             "set_image_watch_dir" => SetImageWatchDir,
@@ -508,6 +513,7 @@ impl Action {
             TidalShare,
             Map,
             OpticalTransfer,
+            Pocket,
             WarRoom,
             WarRoomClose,
             SetImageWatchDir,
@@ -1093,6 +1099,11 @@ fn default_leader_bindings() -> HashMap<Chord, LeaderNode> {
     // is not negotiable — the letter that is free wins over the nicer mnemonic.
     group(&mut m, "r", "Run & launch", |g| {
         leaf(g, "c", LaunchClaude);
+        // `p` for phone, in the group for reaching something that is not here, beside
+        // `s` for QuickConnect. Shifted for the reason `n shift+s` is: publishing to
+        // the internet does not get to sit one unshifted letter from something
+        // ordinary, and this one publishes a shell rather than a song.
+        leaf(g, "shift+p", Pocket);
         leaf(g, "w", Whisper);
         leaf(g, "s", QuickConnect);
         leaf(g, "m", NowPlaying);

@@ -4104,6 +4104,7 @@ dependencies = [
  "qrcode",
  "serde",
  "serde_json",
+ "sha1",
  "sha2",
  "swash",
  "symphonia 0.6.0",

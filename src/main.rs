@@ -27,6 +27,8 @@ mod optical;
 mod overlay;
 mod pane;
 mod platform;
+mod pocket;
+mod pocket_server;
 mod player;
 mod project_session;
 mod pty;
@@ -1672,6 +1674,10 @@ struct Gpu {
     /// offered by the Super+V picker for re-paste. Never persisted (privacy).
     clip_history: clipboard::ClipHistory,
     broadcast: bool,
+    /// The window on a phone, when somebody asked for it. `None` costs nothing: the
+    /// frame checks this before composing anything, so a window nobody is mirroring
+    /// does no extra work at all.
+    pocket: Option<crate::pocket_server::Session>,
     /// Fractional scroll carry-over, so slow touchpad swipes (sub-line pixel deltas)
     /// accumulate into smooth motion instead of being truncated to zero (D9).
     scroll_accum: f32,
@@ -2124,6 +2130,7 @@ impl App {
                 self.config.clipboard.enabled,
             ),
             broadcast: false,
+            pocket: None,
             scroll_accum: 0.0,
             hover_url: None,
             copy_mode: None,

@@ -91,6 +91,26 @@ export const FEATURES = [
     },
   },
   {
+    key: 'pocket', section: 'distinctive', status: 'dev',
+    title: { es: 'Esta ventana en el móvil', en: 'This window on a phone' },
+    natural: {
+      es: 'Leader R Shift+P pone la ventana ENTERA en el navegador de un móvil: los paneles, la barra de pestañas y el panel que tengas abierto, con sus colores y el cursor donde está. El panel enseña un QR y seis dígitos; escaneas, tecleas el PIN y estás mirando la máquina que dejaste atrás. Desde el móvil se escribe, se toca y se hace scroll: un toque es un clic en esa celda, así que tocar una pestaña cambia de pestaña — y como es la misma ventana, cambia también en el escritorio. Dos dedos mueven el scrollback. El PIN no viaja nunca en el enlace, porque una URL de túnel es una URL pública y acaba en capturas y portapapeles; cinco intentos fallidos cierran la sesión entera en vez de fallar uno. Echar a alguien termina su sesión pero no le prohíbe volver: para eso está rotar el PIN, que no afecta a quien ya está dentro. Mientras haya alguien mirando, la barra de estado lo dice, permanentemente.',
+      en: 'Leader R Shift+P puts the WHOLE window in a phone\u2019s browser: the panes, the tab bar and whatever panel is open, in their real colours with the cursor where it is. The panel shows a QR and six digits; scan, type the PIN, and you are looking at the machine you left behind. From the phone you type, tap and scroll: a tap is a click on that cell, so tapping a tab switches tab \u2014 and because it is the same window, it switches on the desk too. Two fingers move the scrollback. The PIN never travels in the link, because a tunnel URL is a public URL and ends up in screenshots and clipboards; five wrong tries stop the whole session rather than failing one attempt. Dropping a viewer ends their session but does not ban them \u2014 rotating the PIN is what does that, and it leaves anyone already connected alone. While anybody is watching, the status bar says so, permanently.',
+    },
+    keys: [
+      'Leader R Shift+P',
+      { es: 'Q o Esc · cerrar el panel, seguir compartiendo', en: 'Q or Esc · close the panel, keep sharing' },
+      { es: 'Shift+Q · dejar de compartir', en: 'Shift+Q · stop sharing' },
+      { es: 'X · echar al espectador seleccionado', en: 'X · drop the selected viewer' },
+      { es: 'Shift+R · PIN nuevo', en: 'Shift+R · new PIN' },
+    ],
+    example: 'runnir @ pocket',
+    note: {
+      es: 'Lo que no es una celda no viaja: las imágenes inline, el QR de la transferencia óptica y la onda del reproductor son texturas, y en el móvil salen como huecos. El móvil tampoco redimensiona nada — la geometría es del escritorio, y un reflow porque alguien desbloquea un teléfono le reordenaría la pantalla a quien está sentado al teclado; el botón de ajuste alterna entre caber a lo ancho (letra diminuta, ventana entera) y a lo alto (llena la pantalla, scroll lateral). Enter viaja siempre como tecla y el servidor rechaza saltos de línea dentro del texto pegado, así que un comando peligroso sigue levantando el mismo «¿Ejecuto esto?» que levantaría desde el teclado; pegar deja el texto en el campo en vez de ejecutarlo, por lo mismo. Una sola ventana puede compartir a la vez. Y un móvil que se duerme pierde la conexión —eso no se puede evitar desde una página web— pero vuelve en cuanto lo miras, redibujando la pantalla entera.',
+      en: 'Anything that is not a cell does not travel: inline images, the optical-transfer QR and the player\u2019s waveform are textures, and on the phone they are blank rectangles. The phone does not resize anything either \u2014 the geometry belongs to the desk, and a reflow because somebody unlocked a phone would rearrange the screen of whoever is at the keyboard; the fit button swaps between fitting the width (tiny text, whole window) and the height (fills the screen, scrolls sideways). Enter always travels as a key and the server refuses newlines inside pasted text, so a dangerous command still raises the same \u201cRun this?\u201d it would from the keyboard; paste leaves the text in the field rather than running it, for the same reason. One window can share at a time. And a phone that falls asleep loses the connection \u2014 no web page can prevent that \u2014 but comes back the moment you look at it, redrawing the whole screen.',
+    },
+  },
+  {
     key: 'tidal-share', section: 'distinctive', status: 'dev',
     title: { es: 'Compartir lo que suena', en: 'Share what is playing' },
     natural: {

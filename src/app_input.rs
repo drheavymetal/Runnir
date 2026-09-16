@@ -874,6 +874,7 @@ impl Gpu {
             Action::WarRoomClose => self.close_war_room(config),
             Action::SetImageWatchDir => self.set_image_watch_dir(),
             Action::OpticalTransfer => self.open_optical_prompt(),
+            Action::Pocket => self.open_pocket(config),
             Action::SaveProjectSession => self.save_project_session_cmd(),
             Action::RestoreProjectSession => self.restore_project_session_cmd(config),
             Action::NowPlaying => self.open_now_playing(),
@@ -2295,6 +2296,83 @@ impl Gpu {
     }
 
     /// Keys while the docker panel has the keyboard.
+    /// Keys for the sharing panel.
+    ///
+    /// `q` closes the panel and leaves the session running — the status bar keeps
+    /// saying so — while `shift+q` tears the sharing down. The reflex key after
+    /// reading a PIN off the screen is `q`, and it must not be the one that cuts off
+    /// somebody in the kitchen mid-command.
+    /// Opens the sharing panel, starting a session and asking for a public link the
+    /// first time.
+    ///
+    /// The tunnel is opened here rather than waiting to be asked: somebody pressing
+    /// this wants a phone to reach the window, and the alternative is a panel with a
+    /// button whose only job is to start the thing they already asked for. It runs in
+    /// the background, so the panel opens now and the QR appears when the link really
+    /// answers.
+    fn open_pocket(&mut self, config: &Config) {
+        if self.pocket.is_none() {
+            match crate::pocket_server::Session::start(config.theme.clone(), self.proxy.clone()) {
+                Ok(session) => self.pocket = Some(session),
+                Err(e) => {
+                    self.status = Some(format!("cannot share: {e}"));
+                    self.window.request_redraw();
+                    return;
+                }
+            }
+        }
+        let Some(session) = self.pocket.as_ref() else { return };
+        // Outside the branch above, because a session may already exist from
+        // `runnir @ pocket`, which is loopback only. Opening the panel is how a person
+        // asks for a phone to reach this, so it asks for the link whatever started the
+        // session — and the call is a no-op once one is opening or live.
+        session.open_tunnel();
+        self.overlay = Some(Overlay::Pocket(overlay::PocketPanel {
+            local_url: session.url(),
+            tunnel: session.tunnel(),
+            pin: session.pin(),
+            viewers: session.viewers(),
+            selected: 0,
+        }));
+        self.window.request_redraw();
+    }
+
+    fn pocket_panel_key(&mut self, key: &Key) {
+        let Some(Overlay::Pocket(panel)) = self.overlay.as_mut() else { return };
+        match key {
+            Key::Named(NamedKey::Escape) => self.overlay = None,
+            Key::Character(c) => match c.as_str() {
+                "q" => self.overlay = None,
+                "Q" => {
+                    // Dropping the session is the teardown: the port closes, the
+                    // tunnel process is killed and every phone is disconnected.
+                    self.pocket = None;
+                    self.overlay = None;
+                }
+                "R" => {
+                    if let Some(session) = &self.pocket {
+                        session.rotate_pin();
+                    }
+                }
+                "x" => {
+                    let target = panel.viewers.get(panel.selected).map(|v| v.id);
+                    if let (Some(id), Some(session)) = (target, self.pocket.as_ref()) {
+                        session.drop_viewer(id);
+                    }
+                }
+                "j" => panel.selected = (panel.selected + 1).min(panel.viewers.len().saturating_sub(1)),
+                "k" => panel.selected = panel.selected.saturating_sub(1),
+                _ => {}
+            },
+            Key::Named(NamedKey::ArrowDown) => {
+                panel.selected = (panel.selected + 1).min(panel.viewers.len().saturating_sub(1))
+            }
+            Key::Named(NamedKey::ArrowUp) => panel.selected = panel.selected.saturating_sub(1),
+            _ => {}
+        }
+        self.window.request_redraw();
+    }
+
     fn docker_panel_key(&mut self, key: &Key, config: &Config) {
         let (cols, rows) = self.screen_cells();
         // A window narrowed since the last keypress may have dropped the column the
@@ -3162,6 +3240,7 @@ impl Gpu {
             Some(Overlay::Tidal(_)) => "tidal",
             Some(Overlay::Map(_)) => "map",
             Some(Overlay::Transfer(_)) => "transfer",
+            Some(Overlay::Pocket(_)) => "pocket",
             Some(_) => "other",
         };
         let mut out = json!({
@@ -3423,6 +3502,7 @@ impl Gpu {
             // Almost nothing to drive: the stream runs itself, and a key that did
             // something clever would mostly be a key pressed by accident while
             // holding a phone in the other hand.
+            Overlay::Pocket(_) => self.pocket_panel_key(key),
             Overlay::Transfer(p) => match key {
                 Key::Named(NamedKey::Escape) => {
                     self.overlay = None;
@@ -4150,6 +4230,7 @@ impl Gpu {
             Action::WarRoomClose => self.close_war_room(config),
             Action::SetImageWatchDir => self.set_image_watch_dir(),
             Action::OpticalTransfer => self.open_optical_prompt(),
+            Action::Pocket => self.open_pocket(config),
             Action::SaveProjectSession => self.save_project_session_cmd(),
             Action::RestoreProjectSession => self.restore_project_session_cmd(config),
             Action::NowPlaying => self.open_now_playing(),
@@ -7966,6 +8047,50 @@ impl Gpu {
                 // The panel carries its own failure, so the response is ok either
                 // way; `ui_state` says which overlay is actually up.
                 ControlResponse::ok(self.ui_state())
+            }
+            ControlRequest::Pocket { stop } => {
+                if stop {
+                    // Dropping the session is what stops it: the Drop impl closes the
+                    // port and clears the viewers, so there is one teardown path and
+                    // it also runs when the window goes.
+                    match self.pocket.take() {
+                        Some(_) => ControlResponse::ok(json!({ "sharing": false })),
+                        None => ControlResponse::error("not sharing"),
+                    }
+                } else if let Some(session) = &self.pocket {
+                    // Asking twice shows the link again rather than starting a second
+                    // server on a port that is already bound.
+                    //
+                    // The PIN is in the answer because this socket is already full
+                    // control of the terminal — it is 0600 in a 0700 runtime dir, and
+                    // anything that can ask can already type. Withholding it here
+                    // would protect nothing and would make the feature untestable.
+                    ControlResponse::ok(json!({
+                        "url": session.url(),
+                        "pin": session.pin(),
+                        "tunnel": match session.tunnel() {
+                            crate::pocket_server::Tunnel::Off => serde_json::Value::Null,
+                            crate::pocket_server::Tunnel::Opening => json!("opening"),
+                            crate::pocket_server::Tunnel::Live(u) => json!(u),
+                            crate::pocket_server::Tunnel::Failed(e) => json!({ "error": e }),
+                        },
+                        "viewers": session.viewers().len(),
+                    }))
+                } else {
+                    match crate::pocket_server::Session::start(config.theme.clone(), self.proxy.clone()) {
+                        Ok(session) => {
+                            let url = session.url();
+                            let pin = session.pin();
+                            self.pocket = Some(session);
+                            // Nothing has been composed yet - the snapshot is taken in
+                            // the frame - so ask for one now, or the first viewer waits
+                            // for whatever happens to redraw next.
+                            self.window.request_redraw();
+                            ControlResponse::ok(json!({ "url": url, "pin": pin }))
+                        }
+                        Err(e) => ControlResponse::error(e),
+                    }
+                }
             }
             ControlRequest::Action { id } => {
                 let Some(action) = Action::parse(&id) else {

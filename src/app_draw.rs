@@ -27,6 +27,27 @@ impl Gpu {
         // never lands on a pane the zoom hides.
         self.sync_zoom();
 
+        // The sharing panel reads its contents from the session every frame instead of
+        // keeping a copy: a cached PIN is shown for one frame after rotating, which is
+        // exactly the moment somebody is reading it off the screen. The same refresh
+        // retires a session that stopped itself after too many wrong PINs.
+        if self.pocket.as_ref().is_some_and(|s| s.is_dead()) {
+            self.pocket = None;
+        }
+        if let Some(Overlay::Pocket(panel)) = self.overlay.as_mut() {
+            match &self.pocket {
+                Some(session) => {
+                    panel.tunnel = session.tunnel();
+                    panel.pin = session.pin();
+                    panel.viewers = session.viewers();
+                    panel.selected = panel.selected.min(panel.viewers.len().saturating_sub(1));
+                }
+                // The session went away underneath the panel: close it rather than
+                // leaving a PIN on screen that opens nothing.
+                None => self.overlay = None,
+            }
+        }
+
         // Lock every pane's grid up front; the render borrows them read-only.
         let area = self.active_area();
         let cell = self.renderer.cell_size();
@@ -411,6 +432,18 @@ impl Gpu {
             }
         }
 
+        // The window on a phone, composed from the very layers about to be drawn. This
+        // is the one instant where the whole window exists as cells: the chrome and the
+        // overlays are built per frame and live nowhere else, which is why the snapshot
+        // is taken here rather than read from outside.
+        if let Some(session) = &self.pocket {
+            let (cw, ch) = cell;
+            let cols = (screen.0 / cw).floor().max(1.0) as usize;
+            let rows = (screen.1 / ch).floor().max(1.0) as usize;
+            let layers = crate::pocket::layers_from(&panes, overlay.as_ref(), cell);
+            session.publish(crate::pocket::compose(&layers, cols, rows), &title);
+        }
+
         let flash = self.bell_alpha();
         self.renderer.render(
             &self.device,
@@ -570,6 +603,29 @@ impl Gpu {
             bar.write_str(0, x, &s, accent);
             x += s.chars().count() + 2;
         }
+        // Sharing, immediately after the repo: a remote control nobody can see is a
+        // door nobody remembers leaving open, so this is permanent while it lasts
+        // rather than a toast that has gone by the time it matters. It takes the
+        // accent because it is a claim about the machine, not a detail about it.
+        if let Some(session) = &self.pocket {
+            let viewers = session.viewers();
+            let label = match viewers.len() {
+                0 => "sharing".to_string(),
+                // The name is what the visitor typed about themselves at the door, so
+                // it is a courtesy, not an identity — anyone through it can type
+                // anything. It reads like a sentence; the count is the honest
+                // fallback when nobody introduced themselves.
+                1 => match &viewers[0].name {
+                    Some(name) => format!("sharing with {name}"),
+                    None => "sharing with 1 person".to_string(),
+                },
+                n => format!("sharing with {n} people"),
+            };
+            let s = format!("\u{f0674} {label}"); // 󰙴 broadcast glyph
+            bar.write_str(0, x, &s, accent);
+            x += s.chars().count() + 2;
+        }
+
         // Right: clock, and the music just before it.
         let mut right_edge = cols;
         if !self.clock.is_empty() {

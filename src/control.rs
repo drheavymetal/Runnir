@@ -137,6 +137,17 @@ pub enum ControlRequest {
         #[serde(default)]
         color: Option<bool>,
     },
+    /// Mirror this window to a browser — the whole window, not a pane: panes, tab
+    /// bar and any open panel, composed from the same layers the renderer draws.
+    ///
+    /// A verb of its own rather than `action --id`, for the reason `transfer` is one:
+    /// an action carries no argument and this one takes `--stop`.
+    Pocket {
+        /// Stop an existing session instead of starting one. Every connected viewer
+        /// is dropped.
+        #[serde(default)]
+        stop: bool,
+    },
     /// Turn the wheel at a cell. `lines` is signed the way a wheel is: positive is
     /// up, away from the user. The pointer goes to the cell first, because every
     /// wheel target here is chosen by what is UNDER the pointer.
@@ -268,6 +279,9 @@ pub fn parse_client_args(cmd: &str, flags: &[String]) -> Result<ControlRequest, 
             bytes: opt_usize(&m, "bytes")?,
             color: opt_bool(&m, "color")?,
         },
+        "pocket" => ControlRequest::Pocket {
+            stop: opt_bool(&m, "stop")?.unwrap_or(false),
+        },
         "action" => ControlRequest::Action {
             id: m.get("id").ok_or("action needs --id (e.g. --id git_panel)")?.clone(),
         },
@@ -320,7 +334,7 @@ fn parse_flags(flags: &[String]) -> Result<HashMap<String, String>, String> {
 /// A whitelist rather than a rule about what follows, because the loud failure is
 /// worth keeping for everything else: `--path` with nothing after it has to be an
 /// error, not a transfer of a file called `--fps`.
-const BARE_FLAGS: &[&str] = &["color"];
+const BARE_FLAGS: &[&str] = &["color", "stop"];
 
 fn opt_u64(m: &HashMap<String, String>, key: &str) -> Result<Option<u64>, String> {
     m.get(key)
@@ -539,7 +553,7 @@ fn handle_conn(stream: UnixStream, proxy: EventLoopProxy<UserEvent>) {
 
 /// Hands a request to the UI thread and waits for its response. Bounded so a hung or
 /// gone UI can never block the socket thread forever.
-fn bridge(req: ControlRequest, proxy: &EventLoopProxy<UserEvent>) -> ControlResponse {
+pub(crate) fn bridge(req: ControlRequest, proxy: &EventLoopProxy<UserEvent>) -> ControlResponse {
     let (tx, rx) = mpsc::channel();
     if proxy.send_event(UserEvent::Control(req, tx)).is_err() {
         return ControlResponse::error("terminal is shutting down");

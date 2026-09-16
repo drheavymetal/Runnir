@@ -5032,8 +5032,672 @@ device, so nothing appears on anyone's phone because somebody opened a playlist.
 a message about tokio, while the code around it is about Spotify. It sends you looking in
 the wrong place. Construct inside the runtime, always.
 
+## DESIGN, NOT YET BUILT — the window in a phone's hand (2026-09-16)
+
+**Why.** Claude Code has a `/remote-control` that puts a running session on your phone.
+Same idea here: type one thing in a window and that window is on the phone — the output
+live, the keyboard driving it — while the machine stays where it is. Walk to the kitchen
+while a build runs, answer the prompt it stops at, kill it when it goes wrong.
+
+**Scope: the whole window, and why that is not the expensive answer.** This was first
+scoped to the focused pane only, on the reasoning that panels assume a mouse and a metre
+of glass. Pedro changed his mind after seeing the prototype, and looking at what it would
+actually cost showed the narrow scope was not buying much:
+
+Everything runnir draws is **already a grid of cells with an origin**. `build_chrome()`
+returns `Vec<(Grid, f32, f32)>` — the tab bar is a `Grid`. `PaneDraw` is `{ grid: &Grid,
+origin: (f32, f32), … }`. The overlays — git, Docker, explorer, which-key — are drawn
+through `pane_instances(panel)`, so they are `PaneDraw` too. At the moment of painting,
+the window IS a list of `(Grid, origin)` that the renderer flattens into instances.
+
+So mirroring the window is a loop over that list, dividing origins by the cell size and
+composing into one window-sized grid in the same stacking order the painter's algorithm
+already uses. Mechanical work, not a new system.
+
+**What does not survive, and that is accepted.** Anything that is not a cell is not in
+that list: inline images (kitty graphics), the optical-transfer QR, the player's
+waveform. They are textures. On the phone they are holes. Fine for the 95% of the screen
+that is glyphs; open the image viewer and you get an empty rectangle.
+
+**What this is, plainly.** It publishes a shell to the internet for as long as it is
+running. `share.rs` publishes what song is playing; this publishes a prompt that can
+`rm -rf`. Everything below that looks like paranoia is sized against that sentence.
+
+### Where it lives: the window, not the daemon
+
+`share.rs` is owned by the player daemon, because a link to music that dies when you
+close the terminal that made it is not a link you would give anybody. This is the exact
+opposite case. A remote control that outlives the window it controls **controls nothing**,
+and dying with the window is the cheapest security property available: closing it is a
+gesture everybody already has.
+
+So: a server per window, started on demand, stopped when the window goes.
+
+### One window, one state — including which tab is active
+
+The phone is a **mirror, not a second seat**. There is one window, one focus, one active
+tab, and the phone sees exactly what the screen shows.
+
+That has a consequence worth stating rather than discovering: **changing tab from the
+phone changes it on the desk too.** The tab bar travels in the snapshot like everything
+else, so tapping a tab is `click --col --row` on a chrome cell and needs no new code —
+and the person at the keyboard watches their window switch. That is the correct behaviour
+for a remote control and the wrong behaviour for a viewer, and this is a remote control.
+
+The alternative — per-viewer focus, per-viewer active tab — means rendering a window
+state that nobody is looking at, and two of everything the app keeps one of. It is not a
+harder version of this feature; it is a different one.
+
+### Where the snapshot is taken: in the frame, not from outside
+
+The pane-only design could read from any thread, because `Pane.grid` is an
+`Arc<Mutex<Grid>>`. The chrome and the overlays are not like that: they are **built fresh
+every frame inside the drawing path** and do not exist anywhere else. Widening the scope
+to the window therefore moves the read.
+
+The snapshot is composed in `app_draw`, at the point where `build_chrome`,
+`build_status`, `build_whichkey`, `build_explorer` and the `PaneDraw` list have all been
+assembled and the renderer is about to flatten them — that is the one instant in the
+program where the whole window exists as cells. It is written into a buffer the server
+thread reads, and it is composed **only when somebody is watching**, so a window with no
+viewer pays nothing.
+
+Input still needs no snapshot and keeps the cheap path: a keystroke is `key --chord` and
+a tap is `click --col --row`, both of which `control.rs` already executes over the proxy
+bridge. Widening the scope made the input half *simpler*, not harder — the phone can drive
+the git panel because the git panel is on the phone.
+
+### `Grid::revision` is no longer needed, and here is why it was
+
+The pane-only design called for a monotonic `revision: u64` on `Grid`, because
+`Grid.dirty` is a **bool the renderer consumes** — it draws and clears it — so a second
+reader watching `dirty` would either steal frames from the renderer or miss its own. That
+observation is still true and still worth knowing (`app_draw.rs` does
+`pane.grid.lock().unwrap().dirty = false` on every frame).
+
+It is no longer needed here. Composing per frame means the frame IS the trigger, and not
+sending the same thing twice is handled by the row diff that was going to exist anyway.
+The counter was the right answer to a question the new scope stopped asking.
+
+The general rule survives the feature that prompted it: **a shared bool has one consumer;
+the moment there are two, it has to be a counter.** `command_seq` and `bell_count` are the
+other two instances.
+
+### The wire: WebSocket — and SSE, which phase 0 killed
+
+**This section was written the other way round, and the measurement reversed it.** It is
+left in that order because the reasoning was sound and the answer was still no.
+
+The plan was SSE plus `POST`, on the grounds that a WebSocket handshake needs SHA-1 while
+the tree carries `sha2` — a different algorithm — so WebSocket meant a new dependency or
+SHA-1 by hand, for a channel whose real traffic is one keystroke from a thumb. It also
+reused the hand-rolled HTTP server `share.rs` already proves works through a quick tunnel.
+
+**A Cloudflare quick tunnel buffers SSE completely.** Not partially, not until a buffer
+fills: every event arrives at once when the stream ends. Measured against six variations —
+close-delimited and `Transfer-Encoding: chunked`, with and without `X-Accel-Buffering: no`,
+HTTP/1.1 and HTTP/2 to the edge, 40-byte events and 8 KB-padded ones, QUIC and `--protocol
+http2` from cloudflared — all six identical:
+
+```
+SSE  @ 0.5 s spacing    delay median 3514 ms   arrival gaps 0 ms    11/11 bunched
+WS   @ 0.5 s spacing    delay median   13 ms   arrival gaps 500 ms   0/11 bunched
+```
+
+Both controls are clean, and they are what makes the result trustworthy: the same server
+and the same client over **plain localhost** deliver at 0 ms with 500 ms gaps, and over
+**TLS localhost** likewise. So it is neither curl, nor TLS, nor the instrument. It is the
+tunnel.
+
+So the wire is a WebSocket:
+
+    GET /r/<token>/           the page
+    GET /r/<token>/ws         upgrade; frames out, keystrokes back on the same socket
+
+And it is better than what it replaces, beyond merely working: input stops being one HTTP
+request per keypress and rides the socket that is already open.
+
+**The SHA-1 cost is real and small.** `sha1` from RustCrypto is the same family as the
+`sha2` already in the tree and shares the `digest` it already compiles. The handshake is
+twenty lines; server-to-client frames need no mask, client-to-server frames need a 4-byte
+XOR unmask. It is a well-specified wire format with published vectors — unlike
+`optical.rs`, nothing here has to be bit-identical with a peer nobody can talk to.
+
+### What a frame carries
+
+Not the whole grid per pulse, and not plain text either — plain text throws away the
+colour, which is most of what makes output readable.
+
+    {"rev": 8412, "rows": {"3": [["  M ", 3, 0, 0], ["src/pty.rs", 7, 0, 1]], ...},
+     "cursor": [12, 34], "cols": 120, "rows_total": 40}
+
+One entry per row **that changed since the client's `rev`**, each row a list of runs
+(`text, fg, bg, attrs`). A client that just connected sends `rev=0` and gets everything.
+A client that dropped a frame asks again with the rev it has and is made whole — no
+resync path of its own, because the general case already is the resync.
+
+### Who is watching, on the screen that is being watched
+
+While anybody is connected the window says so, in the status bar, permanently — not a
+toast that appears once and is gone by the time it matters. A remote control nobody can
+see is a door nobody remembers leaving open.
+
+    sharing with Pedro          one viewer who gave a name
+    sharing with 2 people       two viewers, or one who did not
+
+The name is **asked for on the pairing screen, next to the PIN, and is optional**. There
+is no account system here and there never will be, so it is worth being precise about
+what that name is: **a label the visitor typed about themselves, not an identity.**
+Anyone holding the link and the PIN can type any name at all. The security property is
+the PIN; the name is a courtesy so the bar reads like a sentence instead of a counter.
+
+Which is also why the count is the fallback and not an error state — "2 people" is the
+honest thing to say when the second one did not introduce themselves.
+
+### The phone does not get to resize the window
+
+Tempting and wrong. Reflowing to a phone's width reflows the window a person is sitting in
+front of, and the person at the keyboard did not ask for their build output to be
+rewrapped to 45 columns because somebody unlocked a phone. With the whole window mirrored
+it would be worse than a reflow: panel layouts and column widths would move under them.
+
+The geometry belongs to the desk. The phone scrolls, or shrinks its font. The prototype
+settled that this is liveable — 170 columns on a phone got "se ve de locos" — so this is
+measured, not assumed.
+
+### runnir serves the page, not `docs-site`
+
+The optical receiver lives on the website because in that feature **there is no
+connection** between the two ends — the only channel is light. Here there is a connection,
+and putting Cloudflare Pages in the middle of it would buy CORS, a deployment coupled to a
+terminal feature, and a link that stops working when the website does.
+
+So the page is HTML+JS embedded in the binary with `include_str!`, served through the
+tunnel by the same server. It is authored as its own source file, not a string literal in
+the middle of Rust.
+
+### The door: a token in the link and a PIN that never travels in it
+
+1. The path carries a random token, like `share.rs`. Everything is behind it.
+2. The window shows a **six-digit PIN that the link does not contain**. The phone must
+   type it, and it is exchanged once for a session cookie.
+3. Wrong PINs are counted, and a handful of them **stop the whole server**, not just that
+   attempt. There is one person expected here and they can read six digits off a screen.
+4. While a session is live the window shows it — a persistent marker, not a toast. A
+   remote control nobody can see is a door nobody remembers leaving open.
+
+The PIN is what the token alone cannot do. A quick tunnel URL is a public URL, and URLs
+end up in screenshots, history and clipboards; the extra factor is the thing that is only
+ever on a screen in the room.
+
+The QR for the link is painted with `qrcode`, already in the tree for optical transfer.
+
+### Starting and stopping from the window, with hands
+
+The panel is where this lives, and `r shift+p` opens it whether or not a session is
+running. It shows three things: the **QR** for the link, the **PIN**, and who is watching.
+
+- **Not running** — opening it starts the tunnel and shows the QR once the name resolves
+  from outside (never before; see the DNS gotcha, which is the difference between a code
+  that scans and one that scans to nothing).
+- **Running** — opening it shows the same QR and PIN again, for a second phone or a phone
+  that lost the tab.
+
+Inside the panel, `q` and Escape **close the panel, not the session** — the session keeps
+running and the status bar keeps saying so. **`shift+q` stops the sharing**: the tunnel
+dies, the token stops answering, and every connected phone is dropped.
+
+Shifted on the same reasoning as everywhere else in this file: the unshifted key is the
+one a hand reaches for by reflex, and `q` after reading a PIN off the screen should put
+the panel away, not tear down what somebody in the kitchen is using. The destructive one
+is one modifier further.
+
+The panel lists who is connected, so it can also drop **one** of them: select the row,
+`x`, and that viewer's socket closes.
+
+**And dropping one is worthless on its own**, which is the part worth writing down before
+somebody builds the button and believes it. A dropped viewer still holds the link, the
+PIN and — unless it is invalidated — the session cookie that already passed the PIN. So
+`x` invalidates that session's cookie, and the panel offers **rotating the PIN** (`shift+r`)
+right next to it, because that is the action that actually means "you are not coming back
+in". The QR changes with it, and phones still connected are unaffected: they already
+passed the door.
+
+The honest framing for the panel's own text: `x` ends a session, rotating the PIN ends
+*access*. A person who is bothering you needs the second one.
+
+`runnir @ pocket --stop` does the same thing from a script, and stopping is also implied
+by closing the window, which is the property the whole design is built on.
+
+### The guardian is on this path from the first commit
+
+`guardian.rs` guards dangerous commands, and this file already records the day it was
+found **missing from the scripted-key path** (`press_key`) — runnir's only safety feature
+was the one the remote control could not exercise and no test covered. This is a brand
+new text-input path into a shell. It goes through the guardian in the commit that
+introduces it, not in an audit round afterwards.
+
+### Names and keys
+
+**`src/pocket.rs`.** Not `remote.rs`: `control.rs` opens with "Remote-control API" and two
+modules called remote is a grep that returns the wrong one for the rest of the project's
+life.
+
+    runnir @ pocket                  # start; answers {url, pin}
+    runnir @ pocket --stop
+    runnir @ pocket --pane <id>      # a pane other than the focused one
+
+A verb of its own for the same reason `transfer` is one: `action --id` carries no
+argument, and `--pane` is an argument.
+
+Leader: **`r shift+p`**, in the *Run & launch* group where `QuickConnect` (`r s`) already
+lives — the group for reaching something that is not here. Shifted on the precedent this
+file already set for `TidalShare` (`n shift+s`): publishing to the internet does not get
+to sit one unshifted letter away from something ordinary.
+
+### Phases
+
+0. **The risky half, and nothing else.** ✅ **Done 2026-09-16, and it changed the
+   design**: SSE is buffered end-to-end by a quick tunnel, WebSocket is delivered in 13 ms.
+   See the entry below for the measurements and the two controls that make them mean
+   something.
+1. **The mirror, read-only.** The window snapshot composed in `app_draw`, `src/pocket.rs`
+   with the WebSocket server and the row diff, the page, the tunnel, the token. The phone
+   watches the whole window — panes, tab bar, panels; it cannot type.
+2. **The door.** PIN, the optional name, cookie exchange, counted attempts, the
+   `sharing with …` marker in the status bar, and the QR.
+3. **Writing.** Keys and taps over the open socket (`key --chord`, `click --col --row`),
+   the key bar a phone does not have (Esc, Tab, Ctrl, arrows), and the guardian on the
+   path.
+4. **What a phone needs that a keyboard does not.** Scrollback by touch, paste from the
+   phone's clipboard, and the active tab's title in the header.
+
+### Open questions, not decided here
+
+- **Does the session survive the phone locking?** An SSE stream through a tunnel and a
+  backgrounded Safari tab is a reconnect story, and the row-diff protocol already handles
+  it — but how long a token stays valid after the last byte is a decision nobody has made.
+- **More than one phone.** Refusing the second is a line of code; allowing it needs an
+  answer for two thumbs typing into one shell. Refuse, until somebody wants otherwise.
+
+## 2026-09-16 - Phase 0 of the pocket design: SSE does not survive a quick tunnel
+
+The design above proposed SSE and argued its way past WebSocket on the cost of SHA-1.
+Phase 0 existed to check the one assumption underneath that: that a Cloudflare quick
+tunnel forwards an event stream as it arrives. It does not.
+
+### What was measured
+
+A hand-rolled socket server — the same shape `share.rs` is and `pocket.rs` would be —
+emitting one event every 500 ms with the send time inside it, read through a real quick
+tunnel, timestamping each arrival.
+
+```
+                                    delay median   arrival gaps   bunched <50 ms
+SSE, close-delimited, HTTP/2           5515 ms          0 ms         19/19
+SSE, chunked, HTTP/2                   5515 ms          0 ms         19/19
+SSE, chunked + X-Accel-Buffering       5516 ms          0 ms         19/19
+SSE, chunked, HTTP/1.1                 5515 ms          0 ms         19/19
+SSE, 8 KB padding per event            3545 ms          5 ms         11/11
+SSE, one 8 KB priming comment          3521 ms          0 ms         11/11
+SSE, cloudflared --protocol http2      3514 ms          0 ms         11/11
+WebSocket, same tunnel                   13 ms        500 ms          0/11
+```
+
+Every SSE row is the same shape: nothing arrives until the stream ends, and then all of
+it does at once. The delivery delay of the FIRST event equals the duration of the whole
+stream. Padding does not help, so it is not a byte threshold waiting to fill; the hint
+header does not help; neither transport to the edge helps.
+
+### The two controls, which are the reason this is believable
+
+An identical measurement over **plain localhost** and over **TLS localhost**, same server
+and same client, no tunnel: 0 ms delay, 500 ms gaps, zero bunching, both times. So it is
+not curl, not `--no-buffer`, not TLS, and not the harness.
+
+That mattered because the harness lied once already: `for line in proc.stdout` in Python
+read-aheads 8 KB, and the entire test stream fits in 8 KB, so the first four runs came
+back identical **to the millisecond** with everything arriving at EOF. Fixing it to a
+binary pipe and `readline()` changed nothing at all — the tunnel's buffering was hiding
+behind the instrument's, and both had the same signature. **Two buffers in series look
+exactly like one.** The only thing that separates them is a control with the network path
+removed, and that should have been the first measurement, not the fifth.
+
+### What it costs to be wrong here
+
+The design's whole argument for SSE was that WebSocket needs SHA-1 and the tree has
+`sha2`. That was true and it did not matter: `sha1` is the same RustCrypto family sharing
+a `digest` already compiled in, the handshake is twenty lines, and the wire format is
+published with vectors. Meanwhile WebSocket removes the other half of the SSE design —
+input stops being an HTTP request per keystroke.
+
+Cost of finding out: an afternoon of measurement and no Rust. Cost of not finding out: the
+mirror built, the page built, the PIN built, and a phone showing output in ten-second
+lumps, against a protocol chosen so firmly that the first instinct would have been to look
+for the bug in `pocket.rs`.
+
+### Two things learned about this machine, both worth keeping
+
+**`cloudflared` was not installed.** Not in PATH, not in `~/.local/bin`, not in
+`~/.cargo/bin`, not in pacman's database. `share.rs` shells out to it by name, so
+`leader n shift+s` on this machine fails at `open_tunnel` — the TIDAL share has been
+unavailable here since whenever it went missing, with no symptom until somebody presses
+the key. Installed 2026-09-16 to `~/.local/bin/cloudflared` (2026.9.1, official static
+build).
+
+**A quick tunnel's DNS record does not exist when cloudflared prints its URL, and
+asking too early poisons the asker's cache.** This was first written up here as "the
+Control D resolver blocks `*.trycloudflare.com`", which was wrong and is corrected in
+place because the wrong version had a plausible story behind it — quick tunnels are a
+category DNS filters do block, the apex resolved, the subdomain did not, and 1.1.1.1
+answered for the same name.
+
+What actually happens: there is **no wildcard** under `trycloudflare.com` — an invented
+name is NXDOMAIN at 1.1.1.1 too — so the record is created per tunnel and takes about ten
+seconds to appear. The test asked the local resolver the moment the URL was printed, got a
+legitimate NXDOMAIN, and that negative sat in the cache for its whole TTL while the test
+retried every two seconds for a minute against a cached no.
+
+The clean experiment: open a tunnel, poll **only** 1.1.1.1 until it answers, and only then
+ask the local resolver, for the first time, about a name it has never heard of. It answers
+immediately and correctly. Nothing is blocked.
+
+**This is a requirement, not a footnote.** `share.rs` already waits for the edge to route
+before handing out a URL, because cloudflared announces it several seconds early. DNS is
+the same trap one layer down and it is worse, because the damage is not a failed request:
+**a phone that resolves the name too early caches the NXDOMAIN and cannot reach the tunnel
+even after it comes up, until that cache expires.** So the window must not show the QR or
+the link until the name resolves from outside. A code that scans to nothing, and keeps
+scanning to nothing while the terminal insists it is serving, is exactly the failure a
+person reads as "this feature is broken".
+
+The measurements above resolved over DoH and handed the address to curl with `--resolve`,
+which sidestepped all of this — and by sidestepping it, hid it.
+
+## 2026-09-16 - A throwaway prototype answered the questions no test could
+
+Before writing any Rust, the pocket design was put in front of a phone as a Python
+prototype: poll `get-text` over the existing control socket, push it down a WebSocket
+through a quick tunnel, draw it in a page. Roughly a hundred lines, attached only to a
+window opened for the purpose.
+
+It is worth recording what that bought, because none of it was reachable from a test.
+
+**It reads well in a hand.** Pedro's verdict on a 170-column pane on a phone was "se ve
+de locos". That was the open question the design could not answer and the reason the
+phone does not get to resize the pane: if 170 columns had been unreadable, the whole
+scope would have needed rethinking. It did not.
+
+**The phone has no Nerd Font, and a modern prompt is mostly Nerd Font.** Powerline
+separators, the distro glyph, every icon: all in Unicode's Private Use Area, all missing
+on a phone, all drawn as nothing. The fix is the one the project already paid for -
+`font.rs` embeds JetBrains Mono Nerd with `include_bytes!`, so the server hands the phone
+**the same bytes the renderer draws with**. No Google Fonts, no CDN, no version skew
+between what is on the screen and what is in the hand, and no size cost: the bytes are
+already in the process. 2.47 MB over the tunnel in 0.23 s, cached for a day.
+
+**`get-text` cannot carry colour, and that settles the design rather than annoying it.**
+The prototype shows plain text, so the path is not blue and `git status` is not green.
+There is no control verb that could fix it: `control.rs` speaks text and keys, not cells.
+Colour is only reachable by reading `Grid` from inside the process, which is exactly what
+phase 1 does - `Cell { ch, pen }`, runs per row. The row diff is not an optimisation over
+a simpler text protocol; the simpler text protocol does not exist at the quality needed.
+
+**`get-text` also rejects `{"cmd":"get-text"}`** with *missing field `args`*, although
+every field it has is optional. The CLI fills it in, so `runnir @ get-text` works and
+nothing ever noticed; any other client speaking the socket hits it immediately, and it
+fails as a bad request rather than as anything a caller can act on. Worth fixing with
+`#[serde(default)]` on the content, since the wire format is already public API.
+
+**And the DNS trap from this morning was walked into within the hour**, by the prototype,
+after being written into the Gotchas. It asked the local resolver the instant the URL
+appeared, cached the NXDOMAIN, and then sat retrying against its own cached no for 62
+seconds. The fix is to poll 1.1.1.1 over DoH - which cannot poison a local cache - and
+only touch the system resolver once the record is known to exist. That a freshly written
+warning did not prevent it is the argument for the window enforcing it in code rather than
+documenting it: **the QR does not appear until the name resolves from outside.**
+
+## 2026-09-16 - Pocket phases 1 and 2: the window on a phone, behind a PIN
+
+`runnir @ pocket` or `leader r shift+p` puts the whole window in a browser: panes, tab
+bar, and any panel that is open, with their colours and the cursor. The panel shows a QR
+and six digits; the phone types them and watches.
+
+Verified end to end against a real window driven over the control socket — 170x63,
+17 foreground colours, the command palette composed over the shell beneath it, and the
+same thing again through a public tunnel with the pairing in front of it.
+
+### What the scope change bought, and what it cost
+
+The design started at "the focused pane only" and Pedro changed it to the whole window
+after seeing a prototype. That turned out to be nearly free, because everything runnir
+draws is already a `Grid` with an origin — `build_chrome` returns them, `PaneDraw` is
+one, the overlays go through `pane_instances` — and `app_draw` stacks them all into one
+`Vec<PaneDraw>` in painter's order. Composing is a loop over that vector.
+
+It cost one thing: the snapshot must be taken **inside the frame**. A pane could have
+been read from any thread through its `Arc<Mutex<Grid>>`; the chrome and the overlays
+are built per frame and exist nowhere else. And it removed `Grid::revision` from the
+plan entirely — with the frame as the trigger, the row diff already answers "did
+anything change".
+
+### Three traps, each of which cost real time
+
+**`PR_SET_PDEATHSIG` fires on the parent THREAD, not the parent process.** The tunnel
+was spawned from a worker that returned as soon as it had a URL, so the kernel killed
+cloudflared moments after it started working. The symptom was a link that answered once
+and then `530`, with a `<defunct>` child nobody had reaped — and it looked exactly like
+Cloudflare rate-limiting a free tunnel. `share.rs` never hit it because its spawn
+happens on a thread that does not end. The draining loop now lives on the spawning
+thread, which gives it a lifetime tied to the child's.
+
+**The DNS trap, for the third time in one day, now in shipped code.** `wait_until_reachable`
+asked the system resolver immediately, cached the NXDOMAIN, and then spent ninety seconds
+re-reading its own no before giving up. It now probes 1.1.1.1 over DoH — addressed by IP
+literal, so asking needs no lookup and cannot poison any cache — and touches the local
+resolver only once the record is known to exist. Opening went from failing at 100 s to
+succeeding at 12 s. Writing the gotcha down three entries ago did not prevent it; only
+the code does.
+
+**A heredoc ate the escapes and the compiler did not care.** `"...\r\n..."` written
+through a shell heredoc became real newlines in the Rust literal, producing an HTTP
+response whose headers were mangled — `Set-Cookie` silently absent, the browser simply
+never paired. It compiles, it runs, and only a raw `curl -i` shows it. Anything that
+generates code through a shell has to be re-read as bytes afterwards, not trusted
+because `cargo build` was happy.
+
+### Decisions worth not re-litigating
+
+- **The phone is a mirror, not a second seat.** One window, one focus, one active tab.
+  Tapping a tab on the phone changes it on the desk, because the tab bar is in the
+  snapshot like everything else. That is right for a remote control and wrong for a
+  viewer; this is a remote control.
+- **The phone does not resize anything.** The geometry belongs to the desk. 170 columns
+  on a phone was measured as readable before this was decided.
+- **Colours resolve in Rust**, not on the page: a phone with its own palette would show
+  different output from the screen. Reverse video and the unfocused-pane dim too.
+- **`q` closes the panel, `shift+q` stops the sharing.** The reflex key after reading a
+  PIN off the screen must not be the one that cuts off somebody mid-command.
+- **The page is served by runnir**, not by `docs-site`. The optical receiver lives on the
+  website because there is no connection between its two ends; here there is one, and
+  putting Pages in the middle would buy CORS, a coupled deployment, and a link that dies
+  when the website does.
+- **The font is served from the binary.** A phone has no Nerd Font, and a modern prompt
+  is mostly Nerd Font. Same bytes `font.rs` draws with, so there is no version skew
+  between the hand and the screen.
+- **The control socket answers with the PIN.** It is 0600 in a 0700 runtime dir and
+  anything that can ask can already type into the terminal, so withholding it would
+  protect nothing and make the feature untestable.
+
+### Still to do
+
+- **Phase 3, writing.** Keys and taps over the open socket (`key --chord`,
+  `click --col --row`, both of which `control.rs` already executes), the key bar a phone
+  does not have, and the guardian on that path from the first commit.
+- Nobody has held a phone to phases 1 and 2 yet. The whole flow is verified, but by a
+  script rather than a thumb.
+- `x` drops a viewer and `shift+r` rotates the PIN; neither has been exercised against a
+  second real client.
+
+## 2026-09-16 - Pocket phase 3: the phone types, and a phone keyboard is not a keyboard
+
+`leader r shift+p` now hands over a window that can be driven, not only watched. Keys,
+taps and a row of the keys a phone does not have. Tested by Pedro on his own phone
+through a real tunnel, which is the only test that was ever going to find any of this.
+
+### Characters go as keys, and that is a correctness fix
+
+The first version sent typed characters as `send-text`, which writes straight to the
+child. It works for a shell and **fails for everything else runnir is**: an overlay
+reads keys, so with the QR panel open every `q` went to the shell underneath while the
+panel sat there, unclosable from the phone.
+
+So a character is a key now, spelled the way the config spells it (`shift+a` for `A`),
+and it takes the route a real keypress takes: overlay, leader layer, then the child.
+Only what has no chord spelling — accents, emoji — still travels as text.
+
+**Enter is always a key, and the server refuses newlines inside text.** That is not
+tidiness: Enter is where `guardian` asks "run this?", and text carrying a newline would
+reach the child without passing it. A phone must not be able to step around the one
+safety feature this terminal has. There is a test whose only job is to fail if that
+filter is removed.
+
+### What a phone keyboard does, none of which a desktop browser does
+
+Each of these arrived looking like a bug in this feature, and each was an assumption
+about browsers that does not survive contact with a phone:
+
+- **A `<button>` takes focus when pressed, and losing focus closes the keyboard.** So
+  the sticky `ctrl` button dismissed the keyboard, leaving nothing to modify. Every
+  button in the dock now cancels `pointerdown`.
+- **No `keydown` fires for an ordinary letter.** Only `input`. A sticky modifier
+  checked in `keydown` alone therefore applied to nothing at all, and `ctrl` then `c`
+  sent a bare `c`. The flag has to be read where the characters actually arrive.
+- **The send arrow fires `beforeinput` with `insertLineBreak`**, not a `keydown`, on
+  several Android keyboards. Both paths have to end in the same place.
+- **Intercepting Backspace with `preventDefault` means the field never shortens**, so
+  nothing can be deleted. It is an ordinary edit; the handler that compares lengths
+  turns a shorter value into backspaces for the terminal.
+
+### Two layout lessons
+
+**An absolutely positioned child is laid out against the padding box.** `#screen` had
+`position: absolute; top: 0` inside a wrapper whose `padding-top` reserved room for the
+top bar — and the padding was ignored, so the first three rows, including the prompt,
+were drawn underneath the bar. They were there the whole time. Put it in the flow.
+
+**Do not size around a phone keyboard by hand.** The first attempt computed everything
+from `visualViewport`, and the field still ended up covered, because the keyboard's
+**suggestion strip is not part of the reported height**. `interactive-widget=resizes-content`
+asks the browser to shrink the content itself, which is what makes `bottom: 0` mean
+"above the keyboard". The hand calculation survives only as a fallback.
+
+And the cursor has to be kept in view: with the keyboard up the visible area is about
+half a screen, and the row being typed into is at the bottom of a 63-row window.
+
+### Honest about the connection
+
+A sleeping phone drops the socket and nothing in a web page can prevent that. Claiming
+otherwise would ship a page that looks connected and is not. What it does instead is
+come back immediately — `visibilitychange` reconnects without waiting out the backoff —
+and a reconnect costs nothing visually, because a new viewer is sent the whole screen.
+Traffic every twenty seconds keeps an idle socket from being reaped in between.
+
+### Known limits
+
+- **One window at a time.** The port is fixed, so a second window answers "another
+  window is already sharing - stop that one first" rather than an `EADDRINUSE`.
+- Nothing that is not a cell is mirrored: inline images, the transfer QR, the waveform.
+- `x` (drop a viewer) and `shift+r` (rotate the PIN) are built and tested by unit, but
+  have never been exercised against two real phones at once.
+
+## 2026-09-16 - Pocket phase 4: the title, the scrollback and pasting
+
+The last of the planned phases, and the smallest.
+
+**The window's title travels with every frame**, so the page can say which machine is in
+the hand and the browser tab is not called "runnir" four times over.
+
+**Two fingers scroll the scrollback**, one finger moves the view over a screen that does
+not fit. Split by finger count rather than by whether the view happens to overflow: a
+gesture that changes meaning depending on the zoom is a gesture nobody trusts. Sub-row
+movement is carried rather than truncated, so a slow drag accumulates instead of
+rounding to nothing — the same fix the touchpad needed in July. `wheel` joins the
+whitelist of what a phone may send; `⇞` and `⇟` are in the key row for the same job.
+
+**Paste puts the text in the FIELD, not in the terminal.** You see what you are about to
+run, and Enter is still pressed by you — which is where the guardian asks about it. A
+paste that executed itself would be the one way around that question. Newlines become
+spaces, because each one would otherwise be a separate command.
+
+### Two small things worth keeping
+
+`src/docs.rs` is a Rust string literal, so a double quote inside the manual text ends it
+and the error arrives as `prefix 'in' is unknown` — a message about Rust tokens, in the
+middle of prose. Single quotes in manual text.
+
+And `git commit -m` in fish ate two words of the phase 3 message: backticks are
+substituted even inside double quotes, exactly as this file's own Gotchas say. `-F` with
+a file avoids the whole class.
+
+### Where the feature stands
+
+Phases 0 to 3 are done and phase 4 with them. Verified on Pedro's own phone through a
+real tunnel: reading, typing, panels, ctrl+c, the keyboard, pasting and the scrollback.
+
+Left open:
+- `x` (drop a viewer) and `shift+r` (rotate the PIN) are unit-tested but have never been
+  exercised against two phones at once.
+- `docs-site` has the feature and the binding written, but this checkout has no
+  `node_modules`, so `npm run build` was not run.
+- One window can share at a time, by construction: the port is fixed.
+
 ## Gotchas (do not re-learn)
 
+- **`src/docs.rs` is a Rust string literal.** A double quote in manual prose ends it, and
+  the compiler complains about unknown token prefixes rather than about the text. Use
+  single quotes there.
+- **A phone keyboard fires no `keydown` for ordinary letters** — only `input` — and its
+  send arrow fires `beforeinput`/`insertLineBreak`. Anything that reads modifiers or
+  Enter from `keydown` alone silently does nothing on a phone.
+- **A `<button>` takes focus when pressed, which closes a phone keyboard.** Cancel
+  `pointerdown` on any control that must not dismiss it.
+- **`interactive-widget=resizes-content` beats computing around the keyboard.** The
+  suggestion strip is not part of `visualViewport.height`, so hand-sized layouts still
+  end up underneath it.
+- **An absolutely positioned child ignores its container's padding** (it is laid out
+  against the padding box), so padding reserved for a fixed bar does not push it down.
+- **`PR_SET_PDEATHSIG` fires when the parent THREAD exits, not the parent process.** A
+  child spawned from a short-lived worker dies as soon as that worker returns. Keep the
+  spawning thread alive for the child's lifetime (draining its output is a good reason
+  to) or do not use the flag.
+- **Generating Rust through a shell heredoc silently eats `\r\n` and `\"`.** The result
+  compiles and runs with mangled HTTP headers or broken JSON. Re-read what was written
+  before trusting a green build.
+- **A phone has no Nerd Font.** Anything runnir shows a browser has to ship the font with
+  it, and `font.rs` already embeds the right one - serve those bytes, never a CDN.
+- **`get-text` requires an `args` field** even though all of its fields are optional;
+  `{"cmd":"get-text"}` is rejected as a bad request. Any client that is not the CLI trips
+  on this.
+- **A Cloudflare quick tunnel buffers Server-Sent Events completely**: nothing arrives
+  until the stream closes, and then all of it does. Measured against chunked and
+  close-delimited framing, `X-Accel-Buffering: no`, HTTP/1.1 and HTTP/2, 8 KB padding,
+  and both cloudflared edge protocols - all identical. WebSocket through the same tunnel
+  is prompt (13 ms). Do not design a push channel over a tunnel on SSE.
+- **Two buffers in series look exactly like one.** `for line in proc.stdout` in Python
+  read-aheads 8 KB; a test stream smaller than that arrives entirely at EOF, which is the
+  same signature as a proxy holding the body. Any latency measurement needs a control
+  with the network path removed BEFORE it accuses the network.
+- **A quick tunnel's DNS record appears ~10 s AFTER cloudflared prints the URL**, and
+  there is no wildcard under `trycloudflare.com`. Resolving at announce time returns a
+  legitimate NXDOMAIN that the resolver then caches for its negative TTL, so retrying
+  cannot fix it — the asker is stuck on a cached no while the tunnel is up and healthy.
+  Never publish the link or the QR before the name resolves from outside. (This was
+  misdiagnosed once as a Control D block; it is not, and the wrong diagnosis sent someone
+  to a DNS dashboard to fix nothing.)
+- **`cloudflared` is a runtime dependency nothing checks for.** `share.rs` spawns it by
+  name; when it is absent the only symptom is a share that fails when pressed. It went
+  missing from this machine at some point with nobody noticing.
 - `librespot_core::Session::new` must be built INSIDE a tokio runtime: it registers with
   the reactor, and constructing one outside panics with "there is no reactor running",
   which is a message about tokio in the middle of code about Spotify.

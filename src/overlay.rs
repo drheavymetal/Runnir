@@ -41,6 +41,8 @@ pub enum Overlay {
     Tidal(TidalPanel),
     /// A file leaving through the screen as QR codes, for a phone camera.
     Transfer(TransferPanel),
+    /// This window on a phone: the link as a QR, the PIN, and who is watching.
+    Pocket(PocketPanel),
 }
 
 impl Overlay {
@@ -49,6 +51,7 @@ impl Overlay {
     pub fn render(&self, cols: usize, rows: usize, theme: &Theme) -> Vec<Panel> {
         match self {
             Overlay::Palette(p) => p.render(cols, rows, theme),
+            Overlay::Pocket(p) => p.render(cols, rows, theme),
             Overlay::Docs(d) => d.render(cols, rows, theme),
             Overlay::Prompt(p) => p.render(cols, rows, theme),
             Overlay::Ai(a) => a.render(cols, rows, theme),
@@ -7450,4 +7453,166 @@ impl DockerPanel {
             }
         }
     }
+}
+
+// ---- pocket: this window on a phone ----------------------------------------
+
+/// The sharing panel: a QR to scan, the PIN to type, and the list of who is watching.
+///
+/// It is rebuilt from the session on every frame rather than holding its own copy of
+/// the state. A panel that caches a PIN shows the old one for a frame after rotating,
+/// which is exactly the moment somebody is reading it off the screen.
+pub struct PocketPanel {
+    pub local_url: String,
+    pub tunnel: crate::pocket_server::Tunnel,
+    pub pin: String,
+    pub viewers: Vec<crate::pocket_server::Viewer>,
+    pub selected: usize,
+}
+
+impl PocketPanel {
+    /// The link a phone should use: the public one when there is one, else loopback.
+    pub fn link(&self) -> Option<&str> {
+        match &self.tunnel {
+            crate::pocket_server::Tunnel::Live(url) => Some(url),
+            _ => None,
+        }
+    }
+
+    fn render(&self, cols: usize, rows: usize, theme: &Theme) -> Vec<Panel> {
+        let qr = self.link().and_then(qr_half_blocks);
+        let qr_w = qr.as_ref().map(|q| q.first().map(|r| r.chars().count()).unwrap_or(0)).unwrap_or(0);
+        let qr_h = qr.as_ref().map(|q| q.len()).unwrap_or(0);
+
+        let w = (qr_w + 6).max(46).min(cols.saturating_sub(2));
+        let h = (qr_h + 12 + self.viewers.len()).max(14).min(rows.saturating_sub(2));
+        let mut g = panel_grid(w, h, theme);
+
+        write(&mut g, 0, 2, "Pocket · this window on a phone", accent());
+
+        let mut y = 2;
+        match &self.tunnel {
+            crate::pocket_server::Tunnel::Off => {
+                write(&mut g, y, 2, "Local only:", dim());
+                write(&mut g, y + 1, 2, &self.local_url, normal());
+                y += 3;
+            }
+            crate::pocket_server::Tunnel::Opening => {
+                // Said plainly, because opening one genuinely takes most of a minute
+                // and a panel that shows nothing looks broken rather than busy.
+                write(&mut g, y, 2, "Opening a public link…", accent());
+                write(&mut g, y + 1, 2, "The QR appears when it really answers.", dim());
+                y += 3;
+            }
+            crate::pocket_server::Tunnel::Failed(why) => {
+                write(&mut g, y, 2, "No public link:", dim());
+                for (i, chunk) in wrap(why, w.saturating_sub(4)).into_iter().take(2).enumerate() {
+                    write(&mut g, y + 1 + i, 2, &chunk, normal());
+                }
+                y += 4;
+            }
+            crate::pocket_server::Tunnel::Live(url) => {
+                if let Some(rows_of_qr) = &qr {
+                    // Black on white regardless of theme: a camera reads contrast, and
+                    // a QR in somebody's pastel palette is a QR that does not scan.
+                    let pen = Pen {
+                        fg: Color::Rgb(0, 0, 0),
+                        bg: Color::Rgb(0xff, 0xff, 0xff),
+                        ..Pen::default()
+                    };
+                    let left = (w.saturating_sub(qr_w)) / 2;
+                    for (i, line) in rows_of_qr.iter().enumerate() {
+                        write(&mut g, y + i, left, line, pen);
+                    }
+                    y += rows_of_qr.len() + 1;
+                }
+                for (i, chunk) in wrap(url, w.saturating_sub(4)).into_iter().take(2).enumerate() {
+                    write(&mut g, y + i, 2, &chunk, dim());
+                }
+                y += 2;
+            }
+        }
+
+        // The PIN, which is the whole point of the panel being on screen at all: it is
+        // the one thing that never travels in the link.
+        write(&mut g, y, 2, "PIN", dim());
+        write(&mut g, y, 6, &spaced(&self.pin), accent());
+        y += 2;
+
+        if self.viewers.is_empty() {
+            write(&mut g, y, 2, "nobody watching", dim());
+        } else {
+            write(&mut g, y, 2, "watching", dim());
+            y += 1;
+            for (i, viewer) in self.viewers.iter().enumerate() {
+                let row = y + i;
+                if row >= h - 2 {
+                    break;
+                }
+                let label = viewer.name.clone().unwrap_or_else(|| "someone".into());
+                let pen = if i == self.selected { selected() } else { normal() };
+                write(&mut g, row, 2, &format!("  {label}"), pen);
+            }
+        }
+
+        let help = "q close · shift+q stop · x drop · shift+r new pin";
+        write(&mut g, h - 1, 2, help, dim());
+
+        vec![Panel {
+            grid: g,
+            col: (cols.saturating_sub(w)) / 2,
+            row: (rows.saturating_sub(h)) / 2,
+        }]
+    }
+}
+
+/// Digits with room to breathe, because this is read aloud and typed on a phone.
+fn spaced(pin: &str) -> String {
+    pin.chars().flat_map(|c| [c, ' ']).collect::<String>().trim_end().to_string()
+}
+
+/// A QR as half-block rows, two module rows per text row.
+///
+/// Cells are about twice as tall as they are wide, so one module per cell would draw a
+/// rectangle that a phone reads badly or not at all. Half blocks make the modules
+/// square, which is what a decoder expects.
+fn qr_half_blocks(data: &str) -> Option<Vec<String>> {
+    use qrcode::QrCode;
+    let code = QrCode::new(data.as_bytes()).ok()?;
+    let width = code.width();
+    let dark: Vec<bool> = code
+        .to_colors()
+        .iter()
+        .map(|c| *c == qrcode::Color::Dark)
+        .collect();
+
+    // Four modules of quiet zone on every side. Without it a decoder never finds the
+    // finder patterns, and the failure looks like "my phone does not read this one".
+    const QUIET: usize = 4;
+    let side = width + QUIET * 2;
+    let at = |x: usize, y: usize| -> bool {
+        if x < QUIET || y < QUIET || x >= QUIET + width || y >= QUIET + width {
+            return false;
+        }
+        dark[(y - QUIET) * width + (x - QUIET)]
+    };
+
+    let mut out = Vec::new();
+    let mut y = 0;
+    while y < side {
+        let mut line = String::with_capacity(side);
+        for x in 0..side {
+            let top = at(x, y);
+            let bottom = y + 1 < side && at(x, y + 1);
+            line.push(match (top, bottom) {
+                (true, true) => '\u{2588}',
+                (true, false) => '\u{2580}',
+                (false, true) => '\u{2584}',
+                (false, false) => ' ',
+            });
+        }
+        out.push(line);
+        y += 2;
+    }
+    Some(out)
 }
