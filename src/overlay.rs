@@ -2721,6 +2721,11 @@ pub struct TidalPanel {
     pub focus: PanelFocus,
     pub rows: Vec<TidalRow>,
     pub cursor: usize,
+    /// The first row on screen. Its own state, on purpose: derived from the cursor it
+    /// re-framed the list every time something was selected, which slid the rows out
+    /// from under the pointer between the two halves of a double click — you clicked a
+    /// song and the one below it started.
+    pub first: usize,
     /// Where the current list came from, when it is not simply a source: the album,
     /// artist or playlist that was opened. Shown as a trail so it is never a mystery
     /// which list you are looking at.
@@ -2903,6 +2908,7 @@ impl TidalPanel {
             focus: PanelFocus::List,
             rows: Vec::new(),
             cursor,
+            first: 0,
             crumb: None,
             query: String::new(),
             editing: source == Source::Search,
@@ -2956,6 +2962,31 @@ impl TidalPanel {
     /// The first selectable row, for when a list has just arrived.
     pub fn settle_cursor(&mut self) {
         self.cursor = self.rows.iter().position(TidalRow::selectable).unwrap_or(0);
+        self.first = 0;
+    }
+
+    /// The first visible row: the remembered scroll, nudged only as far as it takes to
+    /// keep the cursor on screen. A cursor already in view moves nothing, so the list
+    /// stays still under the pointer.
+    fn scroll_for(&self, list_rows: usize) -> usize {
+        if list_rows == 0 {
+            return 0;
+        }
+        let first = self.first.min(self.rows.len().saturating_sub(list_rows));
+        if self.cursor < first {
+            self.cursor
+        } else if self.cursor >= first + list_rows {
+            self.cursor + 1 - list_rows
+        } else {
+            first
+        }
+    }
+
+    /// Commits the nudge above, so scrolling accumulates instead of springing back to
+    /// wherever the list last sat. Called by whatever moved the cursor, which is the
+    /// only place that knows how tall the list is drawn.
+    pub fn follow_cursor(&mut self, cols: usize, rows: usize) {
+        self.first = self.scroll_for(self.layout(cols, rows).list_rows);
     }
 
     pub fn selected(&self) -> Option<&TidalRow> {
@@ -3011,7 +3042,7 @@ impl TidalPanel {
             h,
             side: 14,
             list_rows,
-            first: self.cursor.saturating_sub(list_rows.saturating_sub(2)),
+            first: self.scroll_for(list_rows),
         }
     }
 
@@ -3192,7 +3223,7 @@ impl TidalPanel {
 
         // Keep the cursor on screen without moving the list under it every keystroke.
         // The same sum the hit-testing uses, through `layout`.
-        let first = self.cursor.saturating_sub(list_rows.saturating_sub(2));
+        let first = self.scroll_for(list_rows);
         for (i, row) in self.rows.iter().skip(first).take(list_rows).enumerate() {
             let index = first + i;
             let at = 3 + i;
@@ -6016,6 +6047,58 @@ fn a_track(title: &str) -> crate::music::Track {
         let l = p.layout(cols, rows);
         assert!(l.first > 0, "a cursor at 50 must have scrolled the window");
         assert_eq!(p.hit(cols, rows, l.col + l.side + 4, l.row + 3), Some(TidalHit::Row(l.first)));
+    }
+
+    #[test]
+    fn selecting_a_row_does_not_slide_the_list_under_the_pointer() {
+        // The reported bug: "I click one and the one below it plays". Selecting used to
+        // re-frame the list so the cursor sat on a fixed line, so the first half of a
+        // double click scrolled the rows and the second half landed one further down —
+        // and the panel walked down the list instead of playing anything.
+        let mut p = TidalPanel::new(crate::player::Snapshot::default());
+        p.rows = (0..60).map(|i| TidalRow::Track(a_track(&format!("t{i}")))).collect();
+        let (cols, rows) = (120, 40);
+
+        for line in 0..p.layout(cols, rows).list_rows {
+            p.first = 7; // scrolled: the case where re-framing did the damage
+            p.cursor = 10; // and the cursor somewhere in view, as a real one always is
+            let y = p.layout(cols, rows).row + 3 + line;
+            let x = p.layout(cols, rows).col + p.layout(cols, rows).side + 4;
+
+            let Some(TidalHit::Row(first_click)) = p.hit(cols, rows, x, y) else {
+                panic!("line {line} is not a row");
+            };
+            p.cursor = first_click; // what the click handler does, and nothing else
+            assert_eq!(
+                p.hit(cols, rows, x, y),
+                Some(TidalHit::Row(first_click)),
+                "clicking line {line} twice must mean the same row both times"
+            );
+            assert_eq!(p.play_selection().map(|(t, at)| t[at].title.clone()), Some(format!("t{first_click}")));
+        }
+    }
+
+    #[test]
+    fn the_list_scrolls_only_far_enough_to_keep_the_cursor_in_view() {
+        let mut p = TidalPanel::new(crate::player::Snapshot::default());
+        p.rows = (0..60).map(|i| TidalRow::Track(a_track(&format!("t{i}")))).collect();
+        let (cols, rows) = (120, 40);
+        let list_rows = p.layout(cols, rows).list_rows;
+
+        // Walking down: the window holds still until the cursor reaches its bottom edge.
+        for _ in 0..list_rows - 1 {
+            p.down();
+            p.follow_cursor(cols, rows);
+            assert_eq!(p.layout(cols, rows).first, 0, "nothing off screen yet");
+        }
+        p.down();
+        p.follow_cursor(cols, rows);
+        assert_eq!(p.layout(cols, rows).first, 1, "one row, not a whole re-frame");
+
+        // And back up, one row at a time rather than springing to the top.
+        p.up();
+        p.follow_cursor(cols, rows);
+        assert_eq!(p.layout(cols, rows).first, 1, "still in view, so still still");
     }
 
     #[test]

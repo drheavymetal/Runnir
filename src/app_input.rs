@@ -7461,6 +7461,9 @@ impl Gpu {
                     p.show_lyrics = false;
                     if p.rows.get(i).is_some_and(|r| !matches!(r, crate::overlay::TidalRow::Heading(_))) {
                         p.cursor = i;
+                        // Deliberately NOT following the cursor here: the row clicked is
+                        // on screen by definition, so the list must not move at all
+                        // between the two halves of a double click.
                     }
                     if same {
                         match p.selected().cloned() {
@@ -7518,6 +7521,7 @@ impl Gpu {
     /// once, and having one pair of keys mean "move" everywhere is worth more than
     /// having a separate pair nobody remembers.
     fn tidal_move(&mut self, by: i32) {
+        let (cols, rows) = self.screen_cells();
         let mut load: Option<crate::overlay::Source> = None;
         if let Some(Overlay::Tidal(p)) = &mut self.overlay {
             match p.focus {
@@ -7539,6 +7543,7 @@ impl Gpu {
                     } else {
                         p.down()
                     }
+                    p.follow_cursor(cols, rows);
                 }
             }
         }
