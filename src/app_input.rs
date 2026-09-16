@@ -7786,6 +7786,37 @@ impl Gpu {
                 // way; `ui_state` says which overlay is actually up.
                 ControlResponse::ok(self.ui_state())
             }
+            ControlRequest::Pocket { stop } => {
+                if stop {
+                    // Dropping the session is what stops it: the Drop impl closes the
+                    // port and clears the viewers, so there is one teardown path and
+                    // it also runs when the window goes.
+                    match self.pocket.take() {
+                        Some(_) => ControlResponse::ok(json!({ "sharing": false })),
+                        None => ControlResponse::error("not sharing"),
+                    }
+                } else if let Some(session) = &self.pocket {
+                    // Asking twice shows the link again rather than starting a second
+                    // server on a port that is already bound.
+                    ControlResponse::ok(json!({
+                        "url": session.url(),
+                        "viewers": session.viewers().len(),
+                    }))
+                } else {
+                    match crate::pocket_server::Session::start(config.theme.clone()) {
+                        Ok(session) => {
+                            let url = session.url();
+                            self.pocket = Some(session);
+                            // Nothing has been composed yet - the snapshot is taken in
+                            // the frame - so ask for one now, or the first viewer waits
+                            // for whatever happens to redraw next.
+                            self.window.request_redraw();
+                            ControlResponse::ok(json!({ "url": url }))
+                        }
+                        Err(e) => ControlResponse::error(e),
+                    }
+                }
+            }
             ControlRequest::Action { id } => {
                 let Some(action) = Action::parse(&id) else {
                     return ControlResponse::error(format!("unknown action {id:?}"));

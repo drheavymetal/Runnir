@@ -411,6 +411,18 @@ impl Gpu {
             }
         }
 
+        // The window on a phone, composed from the very layers about to be drawn. This
+        // is the one instant where the whole window exists as cells: the chrome and the
+        // overlays are built per frame and live nowhere else, which is why the snapshot
+        // is taken here rather than read from outside.
+        if let Some(session) = &self.pocket {
+            let (cw, ch) = cell;
+            let cols = (screen.0 / cw).floor().max(1.0) as usize;
+            let rows = (screen.1 / ch).floor().max(1.0) as usize;
+            let layers = crate::pocket::layers_from(&panes, overlay.as_ref(), cell);
+            session.publish(crate::pocket::compose(&layers, cols, rows));
+        }
+
         let flash = self.bell_alpha();
         self.renderer.render(
             &self.device,

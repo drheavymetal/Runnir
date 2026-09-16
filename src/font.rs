@@ -407,6 +407,12 @@ impl FontAtlas {
 /// designed to look, rather than the way its distro's default monospace looks. Licence
 /// notes — these are multi-licence, the outlines and the patched-in icons differing —
 /// are in `assets/fonts/NOTICE.md`.
+/// The regular face on its own, for anything that has to hand the font to something
+/// that is not this renderer — the pocket server serves it to a phone, which otherwise
+/// draws every powerline separator and prompt icon as a missing glyph.
+pub(crate) const EMBEDDED_NERD_REGULAR: &[u8] =
+    include_bytes!("../assets/fonts/JetBrainsMonoNerdFontMono-Regular.ttf");
+
 const EMBEDDED_FAMILY: &[&[u8]] = &[
     include_bytes!("../assets/fonts/JetBrainsMonoNerdFontMono-Regular.ttf"),
     include_bytes!("../assets/fonts/JetBrainsMonoNerdFontMono-Bold.ttf"),

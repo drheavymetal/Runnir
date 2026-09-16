@@ -162,6 +162,75 @@ fn write_fold(out: &mut Snapshot, row: usize, col: usize, width: usize, lines: u
     }
 }
 
+/// Turns what the renderer is about to draw into layers this module can flatten.
+///
+/// This is the seam, and it is deliberately thin: the caller hands over the very same
+/// `panes` vector and overlay it passes to `render`, so the snapshot cannot drift from
+/// the screen by being built from a second source of truth.
+///
+/// Pixel origins become cells here. Every grid in that list was positioned on a cell
+/// boundary by whoever built it, so rounding is exact rather than approximate — but it
+/// is rounding, not truncation, because a `f32` that came from a multiplication can sit
+/// a hair below the integer it means.
+pub fn layers_from<'a>(
+    panes: &'a [crate::render::PaneDraw<'a>],
+    overlay: Option<&'a crate::render::Overlay<'a>>,
+    cell: (f32, f32),
+) -> Vec<Layer<'a>> {
+    let to_cells = |px: f32, size: f32| -> usize {
+        if size <= 0.0 {
+            return 0;
+        }
+        (px / size).round().max(0.0) as usize
+    };
+
+    // An overlay dims everything behind it, so the phone has to dim it too or a modal
+    // panel looks like it is merely sitting next to live content.
+    let behind_overlay = overlay.is_some();
+
+    let mut layers: Vec<Layer<'a>> = panes
+        .iter()
+        .map(|p| Layer {
+            grid: p.grid,
+            col: to_cells(p.origin.0, cell.0),
+            row: to_cells(p.origin.1, cell.1),
+            transparent: p.transparent,
+            cursor: p.cursor.and_then(|_| cursor_screen_pos(p.grid)),
+            dim: behind_overlay || !p.focused,
+        })
+        .collect();
+
+    if let Some(ov) = overlay {
+        layers.extend(ov.panels.iter().map(|p| Layer {
+            grid: p.grid,
+            col: to_cells(p.origin.0, cell.0),
+            row: to_cells(p.origin.1, cell.1),
+            transparent: p.transparent,
+            cursor: None,
+            dim: false,
+        }));
+    }
+
+    layers
+}
+
+/// Where the cursor sits on screen, in the grid's own rows.
+///
+/// The cursor lives on the screen, which sits after the scrollback, and a fold above it
+/// shifts it up — the same arithmetic `pane_instances` does. `None` when it is hidden
+/// inside a fold, which only happens to finished output and is therefore rare.
+fn cursor_screen_pos(grid: &Grid) -> Option<(usize, usize)> {
+    let (row, col) = grid.cursor();
+    if !grid.has_folds() {
+        return Some((row, col));
+    }
+    let abs = grid.total_rows() - grid.rows() + row;
+    grid.display_plan()
+        .iter()
+        .position(|p| matches!(p, PlanRow::Real(a) if *a == abs))
+        .map(|screen_row| (screen_row, col))
+}
+
 /// A stretch of one row sharing every visual attribute, which is how a row is sent.
 #[derive(Clone, Debug, PartialEq, serde::Serialize)]
 pub struct Run {
