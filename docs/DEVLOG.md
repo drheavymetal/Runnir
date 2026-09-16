@@ -5060,7 +5060,90 @@ because `cargo build` was happy.
 - `x` drops a viewer and `shift+r` rotates the PIN; neither has been exercised against a
   second real client.
 
+## 2026-09-16 - Pocket phase 3: the phone types, and a phone keyboard is not a keyboard
+
+`leader r shift+p` now hands over a window that can be driven, not only watched. Keys,
+taps and a row of the keys a phone does not have. Tested by Pedro on his own phone
+through a real tunnel, which is the only test that was ever going to find any of this.
+
+### Characters go as keys, and that is a correctness fix
+
+The first version sent typed characters as `send-text`, which writes straight to the
+child. It works for a shell and **fails for everything else runnir is**: an overlay
+reads keys, so with the QR panel open every `q` went to the shell underneath while the
+panel sat there, unclosable from the phone.
+
+So a character is a key now, spelled the way the config spells it (`shift+a` for `A`),
+and it takes the route a real keypress takes: overlay, leader layer, then the child.
+Only what has no chord spelling — accents, emoji — still travels as text.
+
+**Enter is always a key, and the server refuses newlines inside text.** That is not
+tidiness: Enter is where `guardian` asks "run this?", and text carrying a newline would
+reach the child without passing it. A phone must not be able to step around the one
+safety feature this terminal has. There is a test whose only job is to fail if that
+filter is removed.
+
+### What a phone keyboard does, none of which a desktop browser does
+
+Each of these arrived looking like a bug in this feature, and each was an assumption
+about browsers that does not survive contact with a phone:
+
+- **A `<button>` takes focus when pressed, and losing focus closes the keyboard.** So
+  the sticky `ctrl` button dismissed the keyboard, leaving nothing to modify. Every
+  button in the dock now cancels `pointerdown`.
+- **No `keydown` fires for an ordinary letter.** Only `input`. A sticky modifier
+  checked in `keydown` alone therefore applied to nothing at all, and `ctrl` then `c`
+  sent a bare `c`. The flag has to be read where the characters actually arrive.
+- **The send arrow fires `beforeinput` with `insertLineBreak`**, not a `keydown`, on
+  several Android keyboards. Both paths have to end in the same place.
+- **Intercepting Backspace with `preventDefault` means the field never shortens**, so
+  nothing can be deleted. It is an ordinary edit; the handler that compares lengths
+  turns a shorter value into backspaces for the terminal.
+
+### Two layout lessons
+
+**An absolutely positioned child is laid out against the padding box.** `#screen` had
+`position: absolute; top: 0` inside a wrapper whose `padding-top` reserved room for the
+top bar — and the padding was ignored, so the first three rows, including the prompt,
+were drawn underneath the bar. They were there the whole time. Put it in the flow.
+
+**Do not size around a phone keyboard by hand.** The first attempt computed everything
+from `visualViewport`, and the field still ended up covered, because the keyboard's
+**suggestion strip is not part of the reported height**. `interactive-widget=resizes-content`
+asks the browser to shrink the content itself, which is what makes `bottom: 0` mean
+"above the keyboard". The hand calculation survives only as a fallback.
+
+And the cursor has to be kept in view: with the keyboard up the visible area is about
+half a screen, and the row being typed into is at the bottom of a 63-row window.
+
+### Honest about the connection
+
+A sleeping phone drops the socket and nothing in a web page can prevent that. Claiming
+otherwise would ship a page that looks connected and is not. What it does instead is
+come back immediately — `visibilitychange` reconnects without waiting out the backoff —
+and a reconnect costs nothing visually, because a new viewer is sent the whole screen.
+Traffic every twenty seconds keeps an idle socket from being reaped in between.
+
+### Known limits
+
+- **One window at a time.** The port is fixed, so a second window answers "another
+  window is already sharing - stop that one first" rather than an `EADDRINUSE`.
+- Nothing that is not a cell is mirrored: inline images, the transfer QR, the waveform.
+- `x` (drop a viewer) and `shift+r` (rotate the PIN) are built and tested by unit, but
+  have never been exercised against two real phones at once.
+
 ## Gotchas (do not re-learn)
+
+- **A phone keyboard fires no `keydown` for ordinary letters** — only `input` — and its
+  send arrow fires `beforeinput`/`insertLineBreak`. Anything that reads modifiers or
+  Enter from `keydown` alone silently does nothing on a phone.
+- **A `<button>` takes focus when pressed, which closes a phone keyboard.** Cancel
+  `pointerdown` on any control that must not dismiss it.
+- **`interactive-widget=resizes-content` beats computing around the keyboard.** The
+  suggestion strip is not part of `visualViewport.height`, so hand-sized layouts still
+  end up underneath it.
+- **An absolutely positioned child ignores its container's padding** (it is laid out
+  against the padding box), so padding reserved for a fixed bar does not push it down.
 
 - **`PR_SET_PDEATHSIG` fires when the parent THREAD exits, not the parent process.** A
   child spawned from a short-lived worker dies as soon as that worker returns. Keep the
