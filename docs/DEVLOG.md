@@ -4753,6 +4753,29 @@ ever on a screen in the room.
 
 The QR for the link is painted with `qrcode`, already in the tree for optical transfer.
 
+### Starting and stopping from the window, with hands
+
+The panel is where this lives, and `r shift+p` opens it whether or not a session is
+running. It shows three things: the **QR** for the link, the **PIN**, and who is watching.
+
+- **Not running** — opening it starts the tunnel and shows the QR once the name resolves
+  from outside (never before; see the DNS gotcha, which is the difference between a code
+  that scans and one that scans to nothing).
+- **Running** — opening it shows the same QR and PIN again, for a second phone or a phone
+  that lost the tab.
+
+Inside the panel, `q` and Escape **close the panel, not the session** — the session keeps
+running and the status bar keeps saying so. **`shift+q` stops the sharing**: the tunnel
+dies, the token stops answering, and every connected phone is dropped.
+
+Shifted on the same reasoning as everywhere else in this file: the unshifted key is the
+one a hand reaches for by reflex, and `q` after reading a PIN off the screen should put
+the panel away, not tear down what somebody in the kitchen is using. The destructive one
+is one modifier further.
+
+`runnir @ pocket --stop` does the same thing from a script, and stopping is also implied
+by closing the window, which is the property the whole design is built on.
+
 ### The guardian is on this path from the first commit
 
 `guardian.rs` guards dangerous commands, and this file already records the day it was
