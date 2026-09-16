@@ -5833,6 +5833,12 @@ much as to the window it draws.
 
 ## Gotchas (do not re-learn)
 
+- **Deploying the website needs `CLOUDFLARE_ACCOUNT_ID`.** Two accounts are visible from
+  this machine's login and wrangler refuses to guess; `runnir-docs` lives in
+  `e5480c9d…` (Dev@drheavymetal.com), not in the other one. It is pinned in the `deploy`
+  script now. An account id is an identifier, not a credential - unlike the API token
+  that shadowed this same deploy back in August by belonging to the wrong account.
+
 - **Render the page and look at it.** `helium-browser --headless=new --screenshot`, plus
   CDP to seed the PIN into sessionStorage, shows a layout bug in one shot. Reasoning
   about CSS from source got it wrong three times in a row first.

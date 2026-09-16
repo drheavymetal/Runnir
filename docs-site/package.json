@@ -11,7 +11,7 @@
     "check:optical": "node --import tsx tools/optical-cross-check.mjs",
     "check:painted": "node --import tsx tools/optical-painted-check.mjs",
     "check:scene": "node --import tsx tools/optical-scene-check.mjs",
-    "deploy": "vite build && wrangler pages deploy dist --project-name runnir-docs --branch main --commit-dirty=true"
+    "deploy": "vite build && CLOUDFLARE_ACCOUNT_ID=e5480c9d315cbdfae6689af5561c36f1 wrangler pages deploy dist --project-name runnir-docs --branch main --commit-dirty=true"
   },
   "dependencies": {
     "react": "^18.3.1",
