@@ -624,11 +624,15 @@ pub struct Spotify {
     /// Callback port for the catalogue sign-in. Free to choose, unlike the other one,
     /// because the redirect is registered by whoever owns the client id — you.
     pub api_callback_port: u16,
-    /// Announce the terminal on the LAN as a Spotify Connect device.
+    /// Announce the terminal to Spotify as a Connect device.
     ///
-    /// Off by default. The advert only lives as long as the player daemon, which dies
-    /// with the last window — nothing plays without runnir on screen, and a speaker that
-    /// answers when nobody has opened the terminal would break that rule quietly.
+    /// On, because without it the phone has no idea the terminal exists: music plays out
+    /// of the speakers and Spotify goes on showing nothing at all. With it the terminal
+    /// appears in the device list and the phone says what is playing.
+    ///
+    /// The device only lives as long as the player daemon, which goes away with the last
+    /// window. That is a property, not a shortcoming: nothing plays without runnir on
+    /// screen, and a speaker answering for a terminal nobody has opened would break that.
     pub connect_device: bool,
     /// The name the phone sees.
     pub device_name: String,
@@ -644,7 +648,7 @@ impl Default for Spotify {
             output: "auto".to_string(),
             bit_perfect: true,
             release_device: true,
-            connect_device: false,
+            connect_device: true,
             device_name: "runnir".to_string(),
         }
     }

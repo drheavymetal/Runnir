@@ -112,8 +112,47 @@ const KEEPALIVE: std::time::Duration = std::time::Duration::from_secs(10);
 
 // ---- the daemon ------------------------------------------------------------
 
+/// Somewhere for librespot to talk.
+///
+/// librespot reports everything — a refused session, a track the account may not have,
+/// Connect declining to start — through the `log` crate, and nothing in this program was
+/// listening. So the daemon's log file, which exists for precisely those moments, was
+/// empty during every one of them. Warnings and errors by default, because at `info`
+/// librespot narrates every track; `RUST_LOG=debug` opens it up when that is what is
+/// wanted.
+struct DaemonLog(log::LevelFilter);
+
+impl log::Log for DaemonLog {
+    fn enabled(&self, meta: &log::Metadata) -> bool {
+        meta.level() <= self.0
+    }
+
+    fn log(&self, record: &log::Record) {
+        if self.enabled(record.metadata()) {
+            // stderr, which the spawning window has already pointed at the log file.
+            eprintln!("{} {}: {}", record.level(), record.target(), record.args());
+        }
+    }
+
+    fn flush(&self) {}
+}
+
+fn start_logging() {
+    let level = match std::env::var("RUST_LOG").ok().as_deref() {
+        Some("trace") => log::LevelFilter::Trace,
+        Some("debug") => log::LevelFilter::Debug,
+        Some("info") => log::LevelFilter::Info,
+        Some("off") => log::LevelFilter::Off,
+        _ => log::LevelFilter::Warn,
+    };
+    if log::set_boxed_logger(Box::new(DaemonLog(level))).is_ok() {
+        log::set_max_level(level);
+    }
+}
+
 /// Runs the player until the last window goes away. Never returns in the normal case.
 pub fn main(cfg: TidalCfg, creds: Option<tidal::Creds>) {
+    start_logging();
     let Some(path) = socket_path() else {
         return eprintln!("runnir: no XDG_RUNTIME_DIR, so there is nowhere safe for the player");
     };

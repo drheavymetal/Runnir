@@ -1230,15 +1230,48 @@ mod tests {
 /// every album. It also means librespot's own gapless handling gets to do its job, since
 /// the sink is not torn down between tracks either.
 ///
-/// The tokio runtime lives here and nowhere else in this program. It is `current_thread`
-/// because it is driving one player's network IO, and a thread pool for that would be a
-/// pool sitting idle inside a terminal.
+/// The tokio runtime lives here and nowhere else in this program. One worker thread, not
+/// a pool: it drives one player's network IO. It is not `current_thread`, though it was,
+/// because a `current_thread` runtime only runs what is spawned on it while somebody is
+/// blocked on it — and the Connect device has to keep answering Spotify between tracks
+/// and while nothing is playing at all, which is most of the time.
 pub struct Engine {
     rt: tokio::runtime::Runtime,
     player: std::sync::Arc<librespot_playback::player::Player>,
     events: librespot_playback::player::PlayerEventChannel,
     signal: std::sync::Arc<std::sync::Mutex<crate::player::SignalPath>>,
     levels: std::sync::Arc<std::sync::Mutex<Vec<f32>>>,
+    /// The Spotify Connect device, when the terminal is announcing itself as one.
+    ///
+    /// When it is there it is the only thing that may touch the player: loading the
+    /// player behind Spirc's back leaves the phone saying nothing is playing while the
+    /// terminal plays, which is the whole complaint this answers.
+    connect: Option<librespot_connect::Spirc>,
+}
+
+/// A mixer that remembers a number and touches nothing.
+///
+/// Spotify Connect insists on one; this output chain must not have one. The point of the
+/// device path is that the samples reach the card as they left the decoder, and the only
+/// way a volume slider can reach them is by multiplying them. So the number is kept, and
+/// reported back so a remote slider does not snap about, and never applied: the default
+/// `get_soft_volume` is librespot's no-op, which is unity gain. The device also asks
+/// Spotify not to offer the slider at all — see `disable_volume` below.
+#[derive(Default)]
+struct FixedMixer(std::sync::atomic::AtomicU16);
+
+impl librespot_playback::mixer::Mixer for FixedMixer {
+    fn open(_: librespot_playback::mixer::MixerConfig) -> Result<Self, librespot_core::Error> {
+        Ok(Self::default())
+    }
+
+    fn volume(&self) -> u16 {
+        self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn set_volume(&self, volume: u16) {
+        self.0.store(volume, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 impl Engine {
@@ -1250,7 +1283,8 @@ impl Engine {
         use librespot_playback::player::Player;
 
         let session = current(Which::Audio)?;
-        let rt = tokio::runtime::Builder::new_current_thread()
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
             .enable_all()
             .build()
             .map_err(|e| format!("could not start the async runtime: {e}"))?;
@@ -1263,13 +1297,11 @@ impl Engine {
             release_device: cfg.release_device,
         };
 
-        let player = rt.block_on(async {
+        let (player, connect) = rt.block_on(async {
             let ls_cfg =
                 SessionConfig { client_id: cfg.client_id.clone(), ..SessionConfig::default() };
             let ls = LsSession::new(ls_cfg, None);
-            ls.connect(Credentials::with_access_token(session.access_token), false)
-                .await
-                .map_err(|e| format!("Spotify refused the session: {e}"))?;
+            let creds = Credentials::with_access_token(session.access_token);
 
             let player_cfg = PlayerConfig {
                 bitrate: Bitrate::Bitrate320,
@@ -1279,7 +1311,10 @@ impl Engine {
                 ..PlayerConfig::default()
             };
             let (sig, lev) = (signal.clone(), levels.clone());
-            Ok::<_, String>(Player::new(player_cfg, ls, Box::new(NoOpVolume), move || {
+            // Built before the session is connected, which is librespot's own order: the
+            // player works on a thread of its own and only needs the session once there
+            // is a track to fetch. Connect wants to do the connecting itself.
+            let player = Player::new(player_cfg, ls.clone(), Box::new(NoOpVolume), move || {
                 let mut sink = ChainSink::new(
                     output,
                     librespot_playback::SAMPLE_RATE,
@@ -1288,11 +1323,57 @@ impl Engine {
                 );
                 sink.levels = lev;
                 Box::new(sink)
-            }))
+            });
+
+            let connect = if cfg.connect_device {
+                let connect_cfg = librespot_connect::ConnectConfig {
+                    name: cfg.device_name.clone(),
+                    // A terminal is a computer, and saying so is what puts the right icon
+                    // beside the name in the phone's list of devices.
+                    device_type: librespot_core::config::DeviceType::Computer,
+                    // The one control this device must not offer. Everything below here is
+                    // exclusive and unresampled, and a remote volume slider can only reach
+                    // those samples by multiplying them — so the phone is told there is no
+                    // slider, rather than given one that quietly lies about what it does.
+                    disable_volume: true,
+                    ..Default::default()
+                };
+                // `Spirc::new` connects the session itself, so this is also the sign-in.
+                match librespot_connect::Spirc::new(
+                    connect_cfg,
+                    ls.clone(),
+                    creds.clone(),
+                    player.clone(),
+                    std::sync::Arc::new(FixedMixer::default()),
+                )
+                .await
+                {
+                    Ok((spirc, task)) => {
+                        tokio::spawn(task);
+                        Some(spirc)
+                    }
+                    // Being visible is not worth losing playback over: if Connect will not
+                    // start, the terminal still plays — just silently, as far as the rest
+                    // of Spotify is concerned.
+                    Err(e) => {
+                        eprintln!("runnir: Spotify Connect did not start ({e}); playing anyway");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
+            if connect.is_none() {
+                ls.connect(creds, false)
+                    .await
+                    .map_err(|e| format!("Spotify refused the session: {e}"))?;
+            }
+            Ok::<_, String>((player, connect))
         })?;
 
         let events = player.get_player_event_channel();
-        Ok(Engine { rt, player, events, signal, levels })
+        Ok(Engine { rt, player, events, signal, levels, connect })
     }
 
     /// Plays one track to its end, or until the conductor says otherwise.
@@ -1310,6 +1391,7 @@ impl Engine {
         use librespot_core::SpotifyUri;
         use librespot_playback::player::PlayerEvent;
 
+        let raw_uri = uri;
         let uri = match SpotifyUri::from_uri(uri) {
             Ok(u) => u,
             Err(e) => return Outcome::Failed(format!("not a Spotify URI: {e}")),
@@ -1319,12 +1401,36 @@ impl Engine {
         if let Ok(mut l) = self.levels.lock() {
             l.clear();
         }
-        self.player.load(uri, true, 0);
+        if let Some(spirc) = self.connect.as_ref() {
+            // Through the device, never around it. Spirc drops every command that reaches
+            // it while it is only advertising, so activating is not optional — and a load
+            // that goes straight to the player leaves Spotify showing an idle device
+            // while the terminal plays, which is the whole point of having one.
+            if let Err(e) = spirc.activate() {
+                return Outcome::Failed(format!("Spotify Connect would not take over: {e}"));
+            }
+            // One track, not the queue. The queue above here owns what plays next, and a
+            // context holding the rest of it would have Spirc advancing as well — two
+            // things moving one queue, each skipping the other's track.
+            let load = librespot_connect::LoadRequest::from_tracks(
+                vec![raw_uri.to_string()],
+                librespot_connect::LoadRequestOptions {
+                    start_playing: true,
+                    ..Default::default()
+                },
+            );
+            if let Err(e) = spirc.load(load) {
+                return Outcome::Failed(format!("Spotify Connect refused the track: {e}"));
+            }
+        } else {
+            self.player.load(uri, true, 0);
+        }
 
         let mut position_ms: u32 = 0;
         let mut paused = false;
         let events = &mut self.events;
         let (player, signal, levels) = (&self.player, &self.signal, &self.levels);
+        let connect = self.connect.as_ref();
 
         self.rt.block_on(async move {
             loop {
@@ -1338,7 +1444,14 @@ impl Engine {
                     Err(_) => None,
                 };
                 match event {
-                    Some(PlayerEvent::PositionCorrection { position_ms: p, .. })
+                    // `PositionChanged` is the one that arrives on a timer, and the
+                    // timer is `position_update_interval` above. Without it in here the
+                    // only position ever seen was the zero that came with `Playing`, so
+                    // the progress bar sat at the start of the song for the whole song.
+                    // `PositionCorrection` is not a substitute: it fires when the clock
+                    // was WRONG, which on a track that plays normally is never.
+                    Some(PlayerEvent::PositionChanged { position_ms: p, .. })
+                    | Some(PlayerEvent::PositionCorrection { position_ms: p, .. })
                     | Some(PlayerEvent::Playing { position_ms: p, .. })
                     | Some(PlayerEvent::Paused { position_ms: p, .. }) => position_ms = p,
                     Some(PlayerEvent::EndOfTrack { .. }) => return Outcome::Ended,
@@ -1380,13 +1493,22 @@ impl Engine {
                     Flow::Continue => {
                         if paused {
                             paused = false;
-                            player.play();
+                            match connect {
+                                Some(spirc) => drop(spirc.play()),
+                                None => player.play(),
+                            }
                         }
                     }
                     Flow::Pause => {
                         if !paused {
                             paused = true;
-                            player.pause();
+                            // Pausing the player directly would leave the phone showing a
+                            // song still running. Spirc sees the same player events either
+                            // way, but only a command it issued itself updates its state.
+                            match connect {
+                                Some(spirc) => drop(spirc.pause()),
+                                None => player.pause(),
+                            }
                         }
                     }
                     Flow::Skip => {
@@ -1404,6 +1526,12 @@ impl Engine {
 
     /// Stops and lets go of the device, which is what makes room for the other provider.
     pub fn release(&mut self) {
+        // And lets go of the Connect device as well. A terminal that goes on claiming to
+        // be Spotify's active speaker while it is playing TIDAL is lying to every phone
+        // on the account — and the next thing sent to it would go nowhere.
+        if let Some(spirc) = self.connect.as_ref() {
+            let _ = spirc.disconnect(true);
+        }
         self.player.stop();
         // The sink closes on the player's own thread; give it the moment ALSA needs
         // before anything else tries to open the same card.

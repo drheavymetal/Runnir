@@ -52,6 +52,8 @@ vte = "0.15.0"
 wgpu = "30.0.0"
 winit = "0.30.13"
 zbus = { version = "5", default-features = false, features = ["blocking-api", "async-io"] }
+librespot-connect = { version = "0.8", default-features = false, features = ["rustls-tls-native-roots"] }
+log = { version = "0.4", features = ["std"] }
 
 # Unix process/fs bits (O_NOFOLLOW, sysctl on macOS).
 [target.'cfg(unix)'.dependencies]

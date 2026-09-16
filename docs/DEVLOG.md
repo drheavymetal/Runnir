@@ -5831,7 +5831,85 @@ It is the same rule this file already has for the terminal itself — verify in 
 instance, not by reading the code — and it applies to the web page runnir serves just as
 much as to the window it draws.
 
+## 2026-09-16 - The phone says "Playing on runnir", because the terminal is a device now
+
+Pedro: *"el spotify del movil no me indica que se esta reproduciendo musica en la
+terminal"*. It could not. runnir used `librespot-core`, `-metadata`, `-oauth` and
+`-playback` — everything except the one crate that makes a client visible. Without
+`librespot-connect` the terminal is a private client: it plays, and as far as the rest of
+Spotify is concerned nothing is happening anywhere.
+
+**Not zeroconf, which is what the September design assumed.** `librespot-connect` 0.8
+registers through Spotify's dealer websocket, so the device appears on the ACCOUNT rather
+than on the LAN. That is strictly better for the thing asked for — the phone sees it from
+anywhere, not only from the sofa — and the August rule survives untouched, because the
+Spirc task lives inside the player daemon and the daemon still dies with the last window.
+
+**Spirc must own the player, or the phone is told a lie.** Loading the player directly
+while a Connect device exists leaves Spotify showing an idle speaker while the terminal
+plays. So with a device present every command goes through it: `activate()`, then
+`load()`, and `play()`/`pause()` in the conductor instead of `player.play()`/`pause()`.
+Spirc sees the same player events either way — but only a command it ISSUED updates the
+state it publishes.
+
+**One track per load, not the queue.** `LoadRequest::from_tracks` will take the whole
+queue and Spirc will then advance through it at end of track. So would the queue above it:
+two things moving one queue, each skipping the other's song. A one-track context ends in
+`handle_stop()` — checked in `handle_next`, which says so in as many words — and the queue
+stays the only thing that decides what plays next. It costs nothing: `load_context_from_tracks`
+is not `async`, so there is no round trip between songs.
+
+**The device must not offer a volume slider.** `disable_volume: true`. Everything below
+here is exclusive and unresampled, and the only way a remote slider reaches those samples
+is by multiplying them. The `Mixer` trait Connect insists on is implemented by storing the
+number and applying nothing.
+
+Verified against Spotify itself rather than by reading the code — `GET /v1/me/player`
+while the daemon played:
+
+```
+t+ 5s | runnir pos=  3.5s | spotify: device=runnir is_playing=True progress=3.5s
+t+20s | runnir pos= 19.0s | spotify: device=runnir is_playing=True progress=19.3s
+Toggle   | runnir paused=True  | spotify is_playing=False
+Toggle   | runnir paused=False | spotify is_playing=True
+```
+
+**Two lines of noise that are librespot's, not ours.** A track list has no real context,
+so Spirc invents `spotify:web-api` for it and then logs `couldn't load context info` and a
+`400 Bad Request` when it tries to fetch metadata for something that does not exist.
+Playback and the state the phone sees are both unaffected. Do not "fix" it by giving the
+load a real context URI: the queue is arbitrary, and a context that claims to be an album
+would be a worse lie than the warning.
+
+## 2026-09-16 - The progress bar was frozen at zero for every Spotify track ever played
+
+Found while verifying the above, and OLDER than it — it reproduces with the Connect device
+turned off. `PlayerConfig::position_update_interval` was set, correctly, to 200 ms. The
+event it produces is `PositionChanged`. The match arm listened for `PositionCorrection`,
+which fires when the clock was WRONG — on a track that plays normally, never. So the only
+position the panel ever saw was the zero that arrives with `Playing`.
+
+This is why the daemon looked wedged in every diagnostic today: `playing=true`, position
+`0.0`, for ever. It was playing the whole time.
+
 ## Gotchas (do not re-learn)
+- **Nothing was listening to the `log` crate.** librespot reports a refused session, an
+  unavailable track and Connect declining to start through `log`, and runnir installed no
+  logger — so `runnir-player.log` was empty in precisely the situations it exists for.
+  There is a tiny one in `daemon.rs` now (warn by default, `RUST_LOG=debug` for more).
+  Before debugging the player blind again, read that file.
+- **`PositionCorrection` is not the position.** `PositionChanged` is the one
+  `position_update_interval` emits; the other fires only on a correction. Getting this
+  wrong does not fail, it just freezes the progress bar at zero and looks like a hung
+  player.
+- **The player daemon exits five seconds after starting if no window connects**
+  (`START_TIMEOUT`). Driving it from a script means connecting inside that window and
+  HOLDING the connection — the daemon goes away with the last client, and the Connect
+  device goes with it.
+- **`runnir-player.log` is truncated by the WINDOW that spawns the daemon**, not by the
+  daemon. Start one by hand and the file still holds the last window-spawned run — which
+  reads as a fresh error message about something that happened an hour ago.
+
 
 - **Deploying the website needs `CLOUDFLARE_ACCOUNT_ID`.** Two accounts are visible from
   this machine's login and wrangler refuses to guess; `runnir-docs` lives in
