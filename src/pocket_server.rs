@@ -782,6 +782,7 @@ fn header(headers: &[String], name: &str) -> Option<String> {
 /// * `click` — a cell. The whole window is on the phone, so tapping a tab or a row of
 ///   the git panel means the same thing it means with a mouse.
 /// * `wheel` — the scrollback, which keys alone cannot move without losing your place.
+/// * `action` — a named action by its config id, for the phone's menu.
 ///
 /// Anything else is ignored rather than guessed at: this is input arriving from the
 /// internet, and the list of what it may do belongs here, in one place.
@@ -807,6 +808,14 @@ fn request_from(payload: &[u8]) -> Option<ControlRequest> {
             col: msg.get("col")?.as_u64()? as usize,
             row: msg.get("row")?.as_u64()? as usize,
             button: None,
+        }),
+        // Named actions, for the phone's own menu. This is what lets a phone switch
+        // pane or open a panel WITHOUT arming the leader layer — which would put a
+        // which-key menu on the desk's screen and then wait for a letter the phone
+        // cannot comfortably type. It adds no reach: everything here is already
+        // typeable by whoever is through the door.
+        "action" => Some(ControlRequest::Action {
+            id: msg.get("id")?.as_str()?.chars().take(64).collect(),
         }),
         "wheel" => Some(ControlRequest::Wheel {
             col: msg.get("col")?.as_u64()? as usize,

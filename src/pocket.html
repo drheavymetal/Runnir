@@ -124,6 +124,43 @@
   }
   #pairerr { color: #e06c6c; font-size: 12px; min-height: 1.2em; }
 
+  /* The phone's own menu. It fires named actions directly, so nothing is armed on the
+     desk's screen and nothing has to be typed blind afterwards. */
+  #menu {
+    position: fixed;
+    left: 0; right: 0;
+    background: #14161c;
+    border-top: 1px solid #2c2f37;
+    padding: 10px;
+    padding-bottom: 12px;
+    display: none;
+    z-index: 3;
+  }
+  #menu.show { display: block; }
+  #menu .group { margin-bottom: 10px; }
+  #menu .group:last-child { margin-bottom: 0; }
+  #menu h3 {
+    margin: 0 0 6px;
+    font-size: 11px;
+    font-weight: 600;
+    color: #7f8593;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+  }
+  #menu .row { display: flex; flex-wrap: wrap; gap: 6px; }
+  #menu button {
+    background: #1e212a;
+    color: #d0d4dd;
+    border: 1px solid #32363f;
+    border-radius: 8px;
+    font: inherit;
+    font-size: 14px;
+    min-height: 46px;
+    padding: 0 14px;
+    flex: 1 1 auto;
+    min-width: 62px;
+  }
+
   /* The keys a phone keyboard does not have, and the terminal cannot do without. */
   #dock {
     position: fixed;
@@ -173,7 +210,7 @@
   /* The leader is the way into tabs, panes and every panel, so it is first, wider and
      the only coloured key. Everything else on this row is a single keystroke; this one
      opens the layer the whole application lives behind. */
-  #leader {
+  #menu-btn {
     background: #2a3d63;
     color: #cfe0ff;
     border-color: #3d5a8f;
@@ -224,6 +261,37 @@
 </div>
 <div id="wrap"><div id="screen"><div id="cursor" hidden></div></div></div>
 
+<div id="menu">
+  <div class="group">
+    <h3>pane</h3>
+    <div class="row">
+      <button data-action="focus_left">&larr;</button>
+      <button data-action="focus_down">&darr;</button>
+      <button data-action="focus_up">&uarr;</button>
+      <button data-action="focus_right">&rarr;</button>
+      <button data-action="toggle_zoom">zoom</button>
+    </div>
+  </div>
+  <div class="group">
+    <h3>tab</h3>
+    <div class="row">
+      <button data-action="prev_tab">&lsaquo; prev</button>
+      <button data-action="next_tab">next &rsaquo;</button>
+      <button data-action="new_tab">new</button>
+    </div>
+  </div>
+  <div class="group">
+    <h3>panels</h3>
+    <div class="row">
+      <button data-action="git_panel">git</button>
+      <button data-action="docker_panel">docker</button>
+      <button data-action="toggle_explorer">files</button>
+      <button data-action="tidal_panel">music</button>
+      <button data-action="command_palette">palette</button>
+    </div>
+  </div>
+</div>
+
 <div id="dock">
   <div id="keys">
     <button data-chord="escape">esc</button>
@@ -235,7 +303,7 @@
     <button data-chord="right">&rarr;</button>
     <button data-chord="backspace">&#9003;</button>
     <button data-chord="ctrl+c">^C</button>
-    <button id="leader">leader</button>
+    <button id="menu-btn">menu</button>
     <button data-chord="pageup">&#8670;</button>
     <button data-chord="pagedown">&#8671;</button>
     <button id="paste">paste</button>
@@ -338,12 +406,7 @@ function apply(msg) {
     if (moved && viewMode === 'focus' && !manual) fit();
     else if (moved) scrollToFocus();
   }
-  if (msg.leader !== undefined && msg.leader !== leaderChord) {
-    leaderChord = msg.leader;
-    // An empty leader means the layer is turned off in the config; hide the button
-    // rather than offering one that does nothing.
-    document.getElementById('leader').hidden = !leaderChord;
-  }
+  if (msg.leader !== undefined) leaderChord = msg.leader;
   if (msg.title !== undefined && msg.title !== shownTitle) {
     shownTitle = msg.title;
     document.getElementById('title').textContent = msg.title;
@@ -475,6 +538,7 @@ function toggleFit() {
 /// is the only thing that reports the truth here.
 function layout() {
   const dock = document.getElementById('dock');
+  const menu = document.getElementById('menu');
   const vv = window.visualViewport;
   // `interactive-widget=resizes-content` makes the browser shrink the page for the
   // keyboard, which is what `bottom: 0` then means. Where that is not honoured, the
@@ -483,9 +547,12 @@ function layout() {
   // which is not part of the reported height, kept covering the field anyway.
   const covered = vv ? Math.max(0, window.innerHeight - vv.height - vv.offsetTop) : 0;
   dock.style.bottom = covered + 'px';
+  const menuOpen = menu.classList.contains('show');
+  menu.style.bottom = (covered + dock.offsetHeight) + 'px';
   wrapEl.style.top = '30px';
   wrapEl.style.height =
-    ((vv ? vv.height : window.innerHeight) - 30 - dock.offsetHeight) + 'px';
+    ((vv ? vv.height : window.innerHeight) - 30 - dock.offsetHeight
+      - (menuOpen ? menu.offsetHeight : 0)) + 'px';
   revealCursor();
 }
 
@@ -715,14 +782,33 @@ for (const btn of document.querySelectorAll('#keys button[data-chord]')) {
 }
 ctrlBtn.addEventListener('click', () => setCtrl(!ctrlArmed));
 
-// The leader layer is how everything in runnir is reached - tabs with 1..9, panes with
-// h/j/k/l, every panel with a letter - and none of it is typeable on a phone keyboard,
-// which has no Alt and no way to hold Shift and Space together. So it gets a button,
-// and the which-key panel that follows is on the phone too, being part of the window.
-document.getElementById('leader').addEventListener('click', () => {
-  if (leaderChord) key(leaderChord);
-  kbdEl.focus();
-});
+// The phone gets its OWN menu rather than a button that arms the leader layer.
+//
+// Arming it was the obvious move and the wrong one: the which-key panel appears on the
+// DESK's screen, which is somebody else's screen, and the phone is then expected to
+// type a letter blind. These buttons fire named actions straight through the control
+// bridge, so nothing is armed anywhere and nothing has to be typed afterwards.
+const menuEl = document.getElementById('menu');
+const menuBtn = document.getElementById('menu-btn');
+
+function toggleMenu(show) {
+  const on = show === undefined ? !menuEl.classList.contains('show') : show;
+  menuEl.classList.toggle('show', on);
+  menuBtn.classList.toggle('on', on);
+  layout();
+}
+
+menuBtn.addEventListener('click', () => toggleMenu());
+
+for (const btn of menuEl.querySelectorAll('button[data-action]')) {
+  btn.addEventListener('pointerdown', (e) => e.preventDefault());
+  btn.addEventListener('click', () => {
+    send({ t: 'action', id: btn.dataset.action });
+    // Closing after a tap is what makes it a menu rather than a permanent panel eating
+    // half the screen - and the thing you just asked for is on the screen behind it.
+    toggleMenu(false);
+  });
+}
 document.getElementById('enter').addEventListener('click', () => {
   submitLine();
   kbdEl.focus();

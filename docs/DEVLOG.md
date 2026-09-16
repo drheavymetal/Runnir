@@ -5766,7 +5766,34 @@ a four-pane split, a cell-sized click target, a chord with three modifiers — h
 re-offered rather than scaled down.** The mirror stays faithful; what changes is which
 part of it fills the screen and how you reach the rest.
 
+## 2026-09-16 - The phone gets its own menu, not a button that arms the desk's
+
+The leader button lasted one round of real use. Pedro's objection, and he is right:
+pressing it armed the leader layer on the **desk's** screen — which is somebody else's
+screen — and then expected the phone to type a letter blind. A remote control that makes
+the room it is not in flash a menu is not a remote control.
+
+So the phone has its **own** menu: a sheet of buttons that fire named actions straight
+through the control bridge. `focus_left`, `next_tab`, `git_panel` and the rest are
+already ids the config and the palette use, so nothing new was invented and nothing is
+armed anywhere. Verified: tapping through it moved the focused rectangle
+(col 128 → 86 → 1) with `leader_armed` false on the desktop throughout.
+
+`action` joins the whitelist of what a phone may send. It adds no reach — everything in
+that menu is typeable by whoever is already through the door — and it removes the need to
+go through a modal layer to get at any of it.
+
+**The general shape of the mistake is worth keeping.** Mirroring a window makes it
+tempting to mirror its *input model* too, and that is where it breaks: the leader layer
+is excellent at a keyboard and unusable through glass, and worse, driving it remotely has
+a visible effect on the machine being driven. What travels well is the SCREEN; what has
+to be re-offered is every way of reaching things.
+
 ## Gotchas (do not re-learn)
+
+- **Driving a modal layer remotely changes the screen being driven.** Arming the leader
+  from a phone puts a which-key menu on the desk. Remote input should reach actions
+  directly (`action --id`) rather than through anything the local screen reacts to.
 
 - **A phone cannot type a leader chord.** No Alt, no Shift+Space, and `f13` is worse. Any
   feature reached through a modifier layer needs a button when it goes to a phone.
