@@ -83,6 +83,8 @@ pub enum Action {
     TidalStop,
     /// Publish a link to what is playing, or take it down.
     TidalShare,
+    /// Open a Spotify Jam on this terminal, or end it.
+    MusicJam,
     /// Zoom out: the session as a map of headlines.
     Map,
     /// Send a file out through the screen as QR codes, for a phone camera.
@@ -197,6 +199,7 @@ impl Action {
             TidalPrev => "tidal_prev",
             TidalStop => "tidal_stop",
             TidalShare => "tidal_share",
+            MusicJam => "music_jam",
             Map => "map",
             OpticalTransfer => "optical_transfer",
             Pocket => "pocket",
@@ -298,6 +301,7 @@ impl Action {
             TidalPrev => "Previous track",
             TidalStop => "Stop playing",
             TidalShare => "Share what is playing (link)",
+            MusicJam => "Jam: let other people listen along on Spotify",
             Map => "Map: the session zoomed out to one headline per pane",
             OpticalTransfer => "Send a file to a phone by camera (QR stream)",
             Pocket => "Put this window on a phone (share the screen)",
@@ -402,6 +406,7 @@ impl Action {
             "tidal_prev" => TidalPrev,
             "tidal_stop" => TidalStop,
             "tidal_share" => TidalShare,
+            "music_jam" => MusicJam,
             "map" => Map,
             "optical_transfer" => OpticalTransfer,
             "pocket" => Pocket,
@@ -516,6 +521,7 @@ impl Action {
             TidalPrev,
             TidalStop,
             TidalShare,
+            MusicJam,
             Map,
             OpticalTransfer,
             Pocket,
@@ -1144,6 +1150,9 @@ fn default_leader_bindings() -> HashMap<Chord, LeaderNode> {
         // Shift, because publishing a link to the internet should not be one letter
         // away from "stop".
         leaf(g, "shift+s", TidalShare);
+        // `j` for Jam. Not shifted, unlike the share: a Jam reaches the people you hand
+        // the link to and nobody else, and it ends when you say so.
+        leaf(g, "j", MusicJam);
     });
     group(&mut m, "s", "Session", |g| {
         leaf(g, "s", SaveProjectSession);

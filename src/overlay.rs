@@ -3158,6 +3158,31 @@ impl TidalPanel {
         // The link takes the footer while there is one: it is the only thing on this
         // panel somebody needs to READ rather than glance at, and the terminal's hint
         // layer can only make it clickable if it is on screen in full.
+        // The Jam goes first when there is one. Both this and the share are "a link that
+        // lets other people in", and only one fits on the line — but a Jam is the one
+        // somebody is standing next to you waiting to scan.
+        if let Some(jam) = self.snapshot.jam.as_ref() {
+            // The host counts as a member, so "two" is one other person. Saying "2
+            // listening" when one friend has joined reads as two friends.
+            let who = match jam.members {
+                0 | 1 => "jam \u{b7} nobody yet".to_string(),
+                2 => "jam \u{b7} 1 other".to_string(),
+                n => format!("jam \u{b7} {} others", n - 1),
+            };
+            let line = match jam.error.as_deref() {
+                Some(why) => format!("jam failed: {why}"),
+                None if jam.session_id.is_empty() => String::new(),
+                None => {
+                    return_share_footer(&mut g, bar + 1, w, &jam.join_url, &who);
+                    String::new()
+                }
+            };
+            let pen = if jam.error.is_some() { accent() } else { dim() };
+            let under =
+                if line.is_empty() { self.snapshot.signal.badge() } else { line };
+            write(&mut g, bar + 2, 2, &short_tail(&under, w.saturating_sub(4)), pen);
+            return vec![Panel { grid: g, col: l.col, row: l.row }];
+        }
         let foot = match self.snapshot.share.as_ref() {
             Some(share) if !share.url.is_empty() => {
                 let who = match share.listeners {

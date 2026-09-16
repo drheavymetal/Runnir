@@ -241,6 +241,20 @@ pub fn main(cfg: TidalCfg, creds: Option<tidal::Creds>) {
                         share.stop();
                     }
                 }
+                // And the Jam with it, for the same reason and one service over: a
+                // listening session on somebody's account, hosted by a terminal that
+                // closed an hour ago, is the same surprise wearing Spotify's clothes.
+                // Before `Cmd::Quit`, because quitting takes the session it needs. Only
+                // when there IS one: asking otherwise reaches a Spotify session that a
+                // TIDAL user never opened, and prints a failure about it on every exit.
+                let hosting = jukebox
+                    .shared()
+                    .lock()
+                    .ok()
+                    .is_some_and(|s| s.jam.as_ref().is_some_and(|j| !j.session_id.is_empty()));
+                if hosting {
+                    set_jam(&jukebox, false);
+                }
                 jukebox.send(Cmd::Quit);
                 // Give the player a moment to close the device rather than having it
                 // yanked: a card released cleanly is one the next application does not
@@ -284,6 +298,38 @@ pub fn main(cfg: TidalCfg, creds: Option<tidal::Creds>) {
 }
 
 /// Starts or stops the public link, and records the result where every window sees it.
+/// Opens or closes the Jam, and says in the snapshot what happened.
+///
+/// Which Jam to end is read from the snapshot rather than kept here: one memory of "the
+/// Jam that is open" is one chance to end the wrong one, and two would be two.
+fn set_jam(jukebox: &Jukebox, on: bool) {
+    let publish = |jam: Option<crate::spotify::Jam>| {
+        if let Ok(mut s) = jukebox.shared().lock() {
+            s.jam = jam;
+            s.generation += 1;
+        }
+    };
+    let open = jukebox
+        .shared()
+        .lock()
+        .ok()
+        .and_then(|s| s.jam.as_ref().map(|j| j.session_id.clone()))
+        .unwrap_or_default();
+    if on && !open.is_empty() {
+        return; // already hosting one; asking twice is not an error
+    }
+    match crate::spotify::jam_set(on, &open) {
+        Ok(jam) => publish(jam),
+        // A failure to START is worth saying; a failure to END must still clear it, or
+        // the panel goes on offering a link to a session that may well be gone.
+        Err(e) if on => publish(Some(crate::spotify::Jam { error: Some(e), ..Default::default() })),
+        Err(e) => {
+            eprintln!("runnir: could not end the Jam cleanly: {e}");
+            publish(None);
+        }
+    }
+}
+
 fn set_share(jukebox: &Jukebox, share: &Mutex<Option<crate::share::Share>>, on: bool) {
     let Ok(mut held) = share.lock() else { return };
     let publish = |state: Option<crate::share::State>| {
@@ -380,6 +426,13 @@ fn serve(
                 let jukebox = jukebox.clone();
                 let share = share.clone();
                 std::thread::spawn(move || set_share(&jukebox, &share, on));
+            }
+            // The Jam is the daemon's for the same reasons as the share: it outlives the
+            // window that asked, and asking Spotify costs a round trip that must not
+            // happen on the thread reading this window's commands.
+            Ok(Cmd::Jam(on)) => {
+                let jukebox = jukebox.clone();
+                std::thread::spawn(move || set_jam(&jukebox, on));
             }
             Ok(cmd) => jukebox.send(cmd),
             // A command this daemon does not understand comes from a newer window than

@@ -870,6 +870,7 @@ impl Gpu {
             Action::TidalPrev => self.tidal_send(crate::player::Cmd::Prev, config),
             Action::TidalStop => self.tidal_send(crate::player::Cmd::Stop, config),
             Action::TidalShare => self.tidal_share(config),
+            Action::MusicJam => self.music_jam(config),
             Action::Map => self.show_map(),
             Action::WarRoom => self.open_war_room(config),
             Action::WarRoomClose => self.close_war_room(config),
@@ -3440,6 +3441,10 @@ impl Gpu {
                 "share": p.snapshot.share.as_ref().map(|s| serde_json::json!({
                     "url": s.url, "listeners": s.listeners, "error": s.error,
                 })),
+                "jam": p.snapshot.jam.as_ref().map(|j| serde_json::json!({
+                    "session_id": j.session_id, "url": j.join_url,
+                    "members": j.members, "error": j.error,
+                })),
                 "error": p.snapshot.error,
             });
         }
@@ -3799,6 +3804,7 @@ impl Gpu {
             // The TIDAL panel. Typing goes to the query box while it is armed, so the
             // transport letters only mean transport when they cannot mean a search.
             Overlay::Tidal(p) => {
+                let mut jam = false;
                 let mut search_for: Option<String> = None;
                 let mut command: Option<crate::player::Cmd> = None;
                 let mut open: Option<crate::overlay::TidalRow> = None;
@@ -3886,6 +3892,8 @@ impl Gpu {
                         // The words, for the track PLAYING — not the one under the
                         // cursor. Lyrics follow the music, not the browsing.
                         "L" | "y" => want_lyrics = true,
+                        // Shifted, because `j` is "down" and always will be.
+                        "J" => jam = true,
                         "f" => command = Some(crate::player::Cmd::Next),
                         "b" => command = Some(crate::player::Cmd::Prev),
                         "s" => command = Some(crate::player::Cmd::Stop),
@@ -3925,6 +3933,9 @@ impl Gpu {
                 }
                 if want_lyrics {
                     self.tidal_lyrics();
+                }
+                if jam {
+                    self.music_jam(config);
                 }
                 if let Some(cmd) = command {
                     self.tidal_send(cmd, config);
@@ -4263,6 +4274,7 @@ impl Gpu {
             Action::TidalPrev => self.tidal_send(crate::player::Cmd::Prev, config),
             Action::TidalStop => self.tidal_send(crate::player::Cmd::Stop, config),
             Action::TidalShare => self.tidal_share(config),
+            Action::MusicJam => self.music_jam(config),
             Action::Map => self.show_map(),
             Action::WarRoom => self.open_war_room(config),
             Action::WarRoomClose => self.close_war_room(config),
@@ -7513,6 +7525,23 @@ impl Gpu {
             self.toast("Opening a tunnel — this takes a few seconds", 6);
         }
         self.tidal_send(crate::player::Cmd::Share(!sharing), config);
+    }
+
+    /// Opens a Jam, or ends the one that is open.
+    ///
+    /// One key for both, like the share above and for the same reason: the panel always
+    /// says which state it is in, so a second key would be a second thing to remember.
+    fn music_jam(&mut self, config: &Config) {
+        let open = self
+            .jukebox
+            .as_ref()
+            .is_some_and(|j| j.snapshot().jam.as_ref().is_some_and(|m| !m.session_id.is_empty()));
+        if !open {
+            // The session has to exist before it can host anything, and it is built on
+            // the first track. Saying so beats a bare "not connected".
+            self.toast("Opening a Jam\u{2026}", 4);
+        }
+        self.tidal_send(crate::player::Cmd::Jam(!open), config);
     }
 
     /// Moves the cursor, in whichever half has the keyboard.

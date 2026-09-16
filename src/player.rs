@@ -1395,6 +1395,12 @@ pub enum Cmd {
     /// "previous" should be cheap to undo.
     Prev,
     Stop,
+    /// Open a Jam on this terminal, or end the one that is open.
+    ///
+    /// Handled by the daemon, beside `Share`, and for the same reasons: it outlives the
+    /// track, and asking costs a network round trip that must not happen between two
+    /// audio packets.
+    Jam(bool),
     /// The config changed: the output device or bit-perfect setting may be different.
     /// Takes effect on the next track, since the current one is already on a device.
     Reconfigure(Box<TidalCfg>),
@@ -1427,6 +1433,8 @@ pub struct Snapshot {
     pub wave: Vec<f32>,
     /// The public link, when there is one.
     pub share: Option<crate::share::State>,
+    /// The Jam this terminal is hosting, when it is hosting one.
+    pub jam: Option<crate::spotify::Jam>,
     /// Which build of runnir this daemon is. Empty in a window's own copy; filled by
     /// the daemon so a window can tell whether it is talking to its own version.
     pub build: String,
@@ -1564,6 +1572,10 @@ fn run(
         }
         wake();
     };
+    // Built on first use, because a session that never plays a Spotify track should never
+    // open a Spotify session — and then kept for the life of the player, because it is
+    // also the Connect device the phone sees and the seat the Jam is hosted from.
+    let mut spotify: Option<crate::spotify::Engine> = None;
 
     while let Ok(cmd) = rx.recv() {
         match cmd {
@@ -1572,6 +1584,9 @@ fn run(
             // Handled by the daemon, which owns the tunnel. Reaching the player means
             // there is no daemon — a single-window build — and there is nothing to do.
             Cmd::Share(_) => {}
+            // The same, for the Jam: the daemon asks Spotify, on a thread that is not
+            // this one, because this one is the only thing reading commands.
+            Cmd::Jam(_) => {}
             Cmd::Play { tracks, at } => {
                 if tracks.is_empty() {
                     continue;
@@ -1581,7 +1596,7 @@ fn run(
                     s.index = at.min(tracks.len() - 1);
                     s.error = None;
                 });
-                if play_queue(&rx, &state, &wake, &mut cfg, &creds) {
+                if play_queue(&rx, &state, &wake, &mut cfg, &creds, &mut spotify) {
                     return; // quit arrived mid-track
                 }
             }
@@ -1590,7 +1605,7 @@ fn run(
             // skip — except that a Toggle with a queue means "start it again".
             Cmd::Toggle => {
                 let has_queue = state.lock().map(|s| !s.queue.is_empty()).unwrap_or(false);
-                if has_queue && play_queue(&rx, &state, &wake, &mut cfg, &creds) {
+                if has_queue && play_queue(&rx, &state, &wake, &mut cfg, &creds, &mut spotify) {
                     return;
                 }
             }
@@ -1607,14 +1622,15 @@ fn play_queue(
     wake: &dyn Fn(),
     cfg: &mut TidalCfg,
     creds: &Option<tidal::Creds>,
+    // Outlives the queue, not just the track. Connecting to Spotify costs a second or
+    // two either way, but the reason it is held this far out is that the session is also
+    // the Connect device and the Jam's seat: both have to survive a silence, or the
+    // terminal would vanish from the phone the moment an album ended.
+    spotify: &mut Option<crate::spotify::Engine>,
 ) -> bool {
     // Held across the whole queue rather than per track. See `play_parts`: reopening
     // between tracks cost a gap and a busy-wait on the device's own release.
     let mut sink: Option<Sink> = None;
-    // The same reasoning, one provider over: connecting to Spotify costs a second or
-    // two, so the engine outlives the track. Built on first use, because a queue that
-    // never plays a Spotify track should never open a Spotify session.
-    let mut spotify: Option<crate::spotify::Engine> = None;
     loop {
         let (track, index) = {
             let Ok(s) = state.lock() else { return false };
@@ -1624,7 +1640,7 @@ fn play_queue(
             }
         };
 
-        let outcome = play_one(&track, rx, state, wake, cfg, creds, &mut sink, &mut spotify);
+        let outcome = play_one(&track, rx, state, wake, cfg, creds, &mut sink, spotify);
         match outcome {
             Outcome::Quit => return true,
             Outcome::Stopped => {
@@ -1923,7 +1939,7 @@ impl<'a> Conductor<'a> {
                 }
                 Cmd::Enqueue(t) => set(self.state, self.wake, |s| s.queue.push(t.clone())),
                 Cmd::Reconfigure(next) => self.pending_cfg = Some(*next),
-                Cmd::Share(_) => {}
+                Cmd::Share(_) | Cmd::Jam(_) => {}
             }
         }
 

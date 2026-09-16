@@ -1040,6 +1040,75 @@ pub fn saved_albums(session: &Session) -> Result<Vec<Album>, String> {
 }
 
 #[cfg(test)]
+mod jam_tests {
+    use super::*;
+
+    /// Recorded from the real service on 2026-09-16, trimmed to the fields that are
+    /// read. Here as a golden vector for the same reason `optical.rs` has them: this is
+    /// an UNDOCUMENTED endpoint, so the only thing standing between a shape change and a
+    /// panel handing out a dead link is a test that knows what the shape was.
+    const REAL_ANSWER: &str = r#"{
+        "active_device_id": "…",
+        "is_session_owner": true,
+        "join_session_token": "4QLt94WQxVijhbQLvcs4mq",
+        "join_session_uri": "spotify:socialsession:4QLt94WQxVijhbQLvcs4mq",
+        "join_session_url": "hm://social-connect/v2/sessions/join/4QLt94WQxVijhbQLvcs4mq",
+        "maxMemberCount": 32,
+        "session_id": "9f63fa63dcd32177b6e6133581c1543e",
+        "session_members": [
+            {"display_name": "drheavymetal", "is_current_user": true},
+            {"display_name": "somebody else", "is_current_user": false}
+        ],
+        "session_owner_id": "3a90cbb26be234047fd0d7e552117b9c"
+    }"#;
+
+    #[test]
+    fn the_join_link_is_one_a_phone_can_actually_open() {
+        let jam = jam_from(&serde_json::from_str(REAL_ANSWER).expect("valid JSON"));
+        // The service's own `join_session_url` is an `hm://` address — Spotify's internal
+        // scheme. Handing that to somebody is handing them nothing, and it LOOKS like a
+        // link, which is worse than an empty footer.
+        assert_eq!(
+            jam.join_url,
+            "https://open.spotify.com/socialsession/4QLt94WQxVijhbQLvcs4mq"
+        );
+        assert_eq!(jam.session_id, "9f63fa63dcd32177b6e6133581c1543e");
+        assert_eq!(jam.members, 2, "the host counts");
+        assert!(jam.error.is_none());
+    }
+
+    #[test]
+    fn a_real_https_link_would_be_preferred_to_one_we_built() {
+        let v = serde_json::json!({
+            "session_id": "abc",
+            "join_session_token": "tok",
+            "join_session_url": "https://open.spotify.com/socialsession/tok?si=1",
+        });
+        assert_eq!(jam_from(&v).join_url, "https://open.spotify.com/socialsession/tok?si=1");
+    }
+
+    #[test]
+    fn an_answer_with_no_session_is_not_read_as_one() {
+        // What an endpoint that refused looks like. `jam_start` turns this into an error
+        // rather than a Jam with an empty id, which the panel would draw as a live one.
+        let jam = jam_from(&serde_json::json!({}));
+        assert!(jam.session_id.is_empty());
+        assert_eq!(jam.members, 0);
+    }
+
+    #[test]
+    fn the_token_can_be_recovered_from_the_url_alone() {
+        // Defence for the day `join_session_token` stops being sent: the token is the
+        // last segment of the address either way.
+        let v = serde_json::json!({
+            "session_id": "abc",
+            "join_session_url": "hm://social-connect/v2/sessions/join/tok123",
+        });
+        assert_eq!(jam_from(&v).join_url, "https://open.spotify.com/socialsession/tok123");
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1247,6 +1316,146 @@ pub struct Engine {
     /// player behind Spirc's back leaves the phone saying nothing is playing while the
     /// terminal plays, which is the whole complaint this answers.
     connect: Option<librespot_connect::Spirc>,
+    /// Kept for the endpoints that are not playback: a Jam is hosted by a DEVICE, and
+    /// this session is what makes the terminal one.
+    session: librespot_core::Session,
+}
+
+/// A Jam hosted by this terminal: a listening session other people can join.
+///
+/// Shaped like `share::State` on purpose. They are the same idea twice — a link that
+/// lets other people in on what is happening here — and the panel draws them the same
+/// way, so they had better report themselves the same way too.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Jam {
+    /// Spotify's id for the session. Needed to end it.
+    pub session_id: String,
+    /// The link to hand out — the same one the official apps put behind their QR code.
+    pub join_url: String,
+    /// How many people are in it, the host included.
+    pub members: usize,
+    /// Set when starting failed, so the panel can say why rather than showing nothing.
+    pub error: Option<String>,
+}
+
+/// The live session, reachable from outside the thread that is busy making sound.
+///
+/// A Jam is not playback. It is asked for by a window, it outlives the track, and the
+/// answer takes a network round trip that must not happen between two audio packets. So
+/// the session — cheap to clone, safe to use from anywhere — is left here when the engine
+/// is built and taken back when it goes, and the daemon does the asking on a thread of
+/// its own. Exactly the shape the share already has, one service over.
+static JAM: std::sync::Mutex<Option<JamSeat>> = std::sync::Mutex::new(None);
+
+struct JamSeat {
+    session: librespot_core::Session,
+    rt: tokio::runtime::Handle,
+}
+
+/// Starts or ends the Jam. BLOCKS on the network; call it on a thread of its own.
+///
+/// `session_id` is the one being ended and is ignored when starting. It comes from the
+/// snapshot rather than from here because the daemon is what remembers, and a second
+/// copy of "which Jam is open" is a second chance to end the wrong one.
+pub fn jam_set(on: bool, session_id: &str) -> Result<Option<Jam>, String> {
+    let (session, rt) = {
+        let held = JAM.lock().map_err(|_| "the Spotify session is wedged".to_string())?;
+        let seat = held
+            .as_ref()
+            .ok_or("Spotify is not connected yet — play something first")?;
+        (seat.session.clone(), seat.rt.clone())
+    };
+    let engine = JamClient { session, rt };
+    if on {
+        engine.start().map(Some)
+    } else {
+        engine.stop(session_id).map(|()| None)
+    }
+}
+
+/// The Jam endpoints, off the engine so they can be used while it plays.
+struct JamClient {
+    session: librespot_core::Session,
+    rt: tokio::runtime::Handle,
+}
+
+impl JamClient {
+    fn ask(&self, method: http::Method, path: &str) -> Result<serde_json::Value, String> {
+        let client = self.session.spclient();
+        let bytes = self
+            .rt
+            .block_on(async { client.request_as_json(&method, path, None, None).await })
+            .map_err(|e| format!("Spotify refused the request: {e}"))?;
+        if bytes.is_empty() {
+            return Ok(serde_json::Value::Null);
+        }
+        serde_json::from_slice(&bytes).map_err(|e| {
+            format!(
+                "Spotify answered something that is not JSON ({e}): {}",
+                String::from_utf8_lossy(&bytes)
+            )
+        })
+    }
+
+    fn start(&self) -> Result<Jam, String> {
+        let path = format!(
+            "/social-connect/v2/sessions/current_or_new?local_device_id={}",
+            self.session.device_id()
+        );
+        let answer = self.ask(http::Method::GET, &path)?;
+        let jam = jam_from(&answer);
+        if jam.session_id.is_empty() {
+            return Err(format!("Spotify started no Jam: {answer}"));
+        }
+        Ok(jam)
+    }
+
+    fn stop(&self, session_id: &str) -> Result<(), String> {
+        if session_id.is_empty() {
+            return Ok(());
+        }
+        self.ask(http::Method::DELETE, &format!("/social-connect/v2/sessions/{session_id}"))?;
+        Ok(())
+    }
+}
+
+/// Reads whatever a session endpoint answered into the shape the panel wants.
+fn jam_from(v: &serde_json::Value) -> Jam {
+    // `join_session_url` comes back as an `hm://` address — Spotify's own internal
+    // scheme, which no phone can open. The token is the part that is actually the
+    // invitation, so the link is built from it, and the service's own url is used only
+    // if it ever starts being a real one.
+    let token = v["join_session_token"]
+        .as_str()
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            v["join_session_url"]
+                .as_str()
+                .or_else(|| v["join_session_uri"].as_str())
+                .and_then(|u| u.rsplit('/').next())
+                .unwrap_or_default()
+                .to_string()
+        });
+    let join_url = match v["join_session_url"].as_str() {
+        Some(url) if url.starts_with("https://") => url.to_string(),
+        _ => format!("https://open.spotify.com/socialsession/{token}"),
+    };
+    Jam {
+        session_id: v["session_id"].as_str().unwrap_or_default().to_string(),
+        join_url,
+        members: v["session_members"].as_array().map(Vec::len).unwrap_or(0),
+        error: None,
+    }
+}
+
+impl Drop for Engine {
+    /// Takes the Jam's seat back. The handle in it belongs to this engine's runtime, and
+    /// a handle outliving its runtime is a panic waiting for whoever asks next.
+    fn drop(&mut self) {
+        if let Ok(mut seat) = JAM.lock() {
+            *seat = None;
+        }
+    }
 }
 
 /// A mixer that remembers a number and touches nothing.
@@ -1297,7 +1506,7 @@ impl Engine {
             release_device: cfg.release_device,
         };
 
-        let (player, connect) = rt.block_on(async {
+        let (player, connect, ls) = rt.block_on(async {
             let ls_cfg =
                 SessionConfig { client_id: cfg.client_id.clone(), ..SessionConfig::default() };
             let ls = LsSession::new(ls_cfg, None);
@@ -1369,11 +1578,33 @@ impl Engine {
                     .await
                     .map_err(|e| format!("Spotify refused the session: {e}"))?;
             }
-            Ok::<_, String>((player, connect))
+            Ok::<_, String>((player, connect, ls))
         })?;
 
+        // The Jam's seat. Left here rather than handed out, because the thing that wants
+        // it — a window asking for a Jam — has no way to reach an engine that is inside
+        // the player thread's queue loop.
+        if let Ok(mut seat) = JAM.lock() {
+            *seat = Some(JamSeat { session: ls.clone(), rt: rt.handle().clone() });
+        }
+
         let events = player.get_player_event_channel();
-        Ok(Engine { rt, player, events, signal, levels, connect })
+        Ok(Engine { rt, player, events, signal, levels, connect, session: ls })
+    }
+
+    /// Everything Spotify says about this terminal's session, unread. For the diagnostic.
+    pub fn jam_raw(&self) -> Result<serde_json::Value, String> {
+        let client = self.session.spclient();
+        let path = format!(
+            "/social-connect/v2/sessions/current_or_new?local_device_id={}",
+            self.session.device_id()
+        );
+        let bytes = self
+            .rt
+            .block_on(async { client.request_as_json(&http::Method::GET, &path, None, None).await })
+            .map_err(|e| format!("Spotify refused the request: {e}"))?;
+        serde_json::from_slice(&bytes)
+            .map_err(|e| format!("not JSON ({e}): {}", String::from_utf8_lossy(&bytes)))
     }
 
     /// Plays one track to its end, or until the conductor says otherwise.

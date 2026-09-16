@@ -303,6 +303,13 @@ fn main() {
         // `runnir --tidal-devices` — what the output chain would try, in order, for the
         // current config. Answers "why is it not bit-perfect" without playing anything.
         Some("--tidal-devices") => return tidal_devices(),
+        // `runnir --spotify-jam` — opens a Jam, prints the link, and ends it again.
+        //
+        // Here for the same reason as `--tidal-browse`: the unit tests cover the parsing,
+        // and only this covers the SHAPE the service really answers with. Jams live behind
+        // `spclient`, which has no published API at all, so "it still works" is something
+        // to be asked rather than assumed.
+        Some("--spotify-jam") => return spotify_jam(),
         // The player process itself. Started by a window that finds no daemon running,
         // never by a person — which is why it is not in --help.
         Some("--player-daemon") => {
@@ -1389,6 +1396,57 @@ fn tidal_decode(files: &[&str], play: bool) {
 }
 
 /// Prints the output chain for the current config, without playing anything.
+/// Opens a Jam on this terminal, says who is in it, and closes it again.
+///
+/// Prints the raw answer beside the reading of it, because the reading is a guess about
+/// an undocumented service and the raw answer is the evidence. When Spotify changes the
+/// shape, this is where it shows — not in a panel that quietly hands out a dead link.
+fn spotify_jam() {
+    let cfg = Config::load().spotify;
+    if !cfg.connect_device {
+        return eprintln!("runnir: connect_device is off, and a Jam is hosted by a device");
+    }
+    let engine = match spotify::Engine::new(&cfg) {
+        Ok(e) => e,
+        Err(e) => return eprintln!("runnir: {e}"),
+    };
+    match engine.jam_raw() {
+        Ok(raw) => println!("raw:\n{}\n", serde_json::to_string_pretty(&raw).unwrap_or_default()),
+        Err(e) => println!("raw:      {e}\n"),
+    }
+    match spotify::jam_set(true, "").map(Option::unwrap_or_default) {
+        Ok(jam) => {
+            println!("jam:      {}", jam.session_id);
+            println!("join:     {}", jam.join_url);
+            println!("members:  {}", jam.members);
+            match spotify::jam_set(false, &jam.session_id).map(|_| ()) {
+                Ok(()) => println!("ended:    yes"),
+                Err(e) => println!("ended:    no ({e})"),
+            }
+            // Asking again is the only honest proof that the last one is gone: a new id
+            // back means it ended, the same id means it did not. And the one that proves
+            // it is a real Jam too, so it gets ended as well rather than left open on
+            // somebody's account by a diagnostic.
+            match spotify::jam_set(true, "").map(Option::unwrap_or_default) {
+                Ok(after) => {
+                    println!(
+                        "re-asked: {} ({})",
+                        after.session_id,
+                        if after.session_id == jam.session_id {
+                            "SAME — it did not end"
+                        } else {
+                            "a new one, so the old one is gone"
+                        }
+                    );
+                    let _ = spotify::jam_set(false, &after.session_id);
+                }
+                Err(e) => println!("re-asked: {e}"),
+            }
+        }
+        Err(e) => eprintln!("runnir: {e}"),
+    }
+}
+
 fn tidal_devices() {
     let cfg = Config::load().tidal;
     let devices = player::hw_devices_public();

@@ -4165,6 +4165,7 @@ dependencies = [
  "flate2",
  "fontdb",
  "futures-lite",
+ "http",
  "image",
  "libc",
  "libproc",

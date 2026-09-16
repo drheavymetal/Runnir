@@ -5892,7 +5892,74 @@ position the panel ever saw was the zero that arrives with `Playing`.
 This is why the daemon looked wedged in every diagnostic today: `playing=true`, position
 `0.0`, for ever. It was playing the whole time.
 
+## 2026-09-16 - A Jam from the terminal, which only became possible this morning
+
+Pedro asked for two things in one sentence: the phone should say the terminal is playing,
+and it should be possible to hold a Jam from it. They turned out to be the same piece of
+work in the right order — **a Jam is hosted by a DEVICE**, and until the Connect entry
+above landed, runnir was not one. With the device registered, the Jam is a few endpoints.
+
+**librespot does not do this, and was never going to.** `librespot-connect` LISTENS to
+`social-connect/v2/session_update` and tracks the session id — its own comment says "this
+seems to be used for jams" — but it cannot create or join one. So this talks to the
+service directly through `SpClient::request_as_json`, which is public and generic and
+already carries the client token and the access token.
+
+**Undocumented, so it was mapped rather than assumed.** `runnir --spotify-jam` is here
+for the same reason `--tidal-browse` is: the unit tests cover the reading, and only a real
+call covers the SHAPE. What it found:
+
+  - `GET /social-connect/v2/sessions/current_or_new?local_device_id=<device>` opens one,
+    or returns the one already open. `current_or_new` and not `new`, because asking twice
+    for a new one is how you end up hosting two and handing out the wrong link.
+  - `join_session_url` is an `hm://` address — Spotify's internal scheme, which no phone
+    can open. The shareable link is built from `join_session_token`:
+    `https://open.spotify.com/socialsession/<token>`. A test pins this, because an
+    `hm://` URL in the footer would LOOK like a link, which is worse than an empty one.
+  - Ending it took three wrong guesses. `.../sessions/leave` answers 405 to `POST` and
+    404 to `DELETE`, which together say that `leave` was being read as a session id the
+    whole time. The real one is `DELETE /social-connect/v2/sessions/<session_id>`.
+  - `session_members` counts the host, so "2 members" is one other person.
+
+**The Jam is the daemon's, beside the share.** Same reasons, written out once already:
+it outlives the window that asked for it, and asking costs a network round trip that must
+not happen between two audio packets. So `Cmd::Jam` is intercepted in `daemon.rs` exactly
+where `Cmd::Share` is, and answered on a thread of its own.
+
+**Which meant the engine had to move.** It lived inside `play_queue` and died when the
+queue ran out. That was invisible while it was only a player; it is not invisible when the
+same session is the Connect device and the Jam's seat. Hoisted to `run`, so the terminal
+stays a device the phone can see through a silence instead of vanishing when an album ends.
+
+**And the seat is a static**, next to the one `metadata_session` already uses. The thing
+that wants it — a window asking for a Jam — has no way to reach an engine sitting inside
+the player thread's queue loop, and the session behind it is cheap to clone and safe from
+anywhere. `Drop for Engine` takes it back: the runtime handle in it belongs to that
+engine's runtime, and a handle outliving its runtime is a panic waiting for the next
+caller.
+
+**It ends when the terminal does.** The same rule the share has, and the same sentence
+justifies it: a listening session on somebody's account, hosted by a terminal that closed
+an hour ago, is the same surprise wearing Spotify's clothes. Verified by killing the
+daemon mid-Jam and then asking for a new one — a different id came back.
+
+`leader n j`, or `J` in the music panel. Shifted there because `j` is "down" and always
+will be.
+
 ## Gotchas (do not re-learn)
+- **A Jam is hosted by a DEVICE.** Nothing in the social-connect API works until the
+  terminal is a registered Connect device, so `connect_device` is not an optional extra
+  for it — it is the prerequisite. The error says so rather than reporting a bare refusal.
+- **`.../sessions/leave` is a trap.** It is not an endpoint; `leave` is being parsed as a
+  session id. 405 on `POST` with 404 on `DELETE` for the same path is what that looks
+  like, and it means "you have the noun wrong", not "the method is wrong".
+- **`join_session_url` is not a URL anyone can open.** Build the link from
+  `join_session_token`. There is a golden-vector test for this recorded from the live
+  service; if it fails, the service changed and the footer is about to hand out rubbish.
+- **The chord for a shifted letter is `shift+j`, not `J`.** `Chord::parse` lowercases,
+  so sending `J` over the control socket delivers plain `j` — which in the music panel is
+  "move down", so the test passes for the wrong reason and the binding looks broken.
+
 - **Nothing was listening to the `log` crate.** librespot reports a refused session, an
   unavailable track and Connect declining to start through `log`, and runnir installed no
   logger — so `runnir-player.log` was empty in precisely the situations it exists for.
