@@ -441,7 +441,34 @@ impl Gpu {
             let cols = (screen.0 / cw).floor().max(1.0) as usize;
             let rows = (screen.1 / ch).floor().max(1.0) as usize;
             let layers = crate::pocket::layers_from(&panes, overlay.as_ref(), cell);
-            session.publish(crate::pocket::compose(&layers, cols, rows), &title, &config.leader);
+
+            // What the phone should fill itself with. A panel on top owns the screen
+            // while it is open; otherwise it is the focused pane. Everything else stays
+            // in the snapshot around it, so nothing is lost - it simply stops taking
+            // width away from the one thing being read.
+            let in_cells = |r: &Rect| crate::pocket::Focus {
+                col: (r.x / cw).round().max(0.0) as usize,
+                row: (r.y / ch).round().max(0.0) as usize,
+                cols: (r.w / cw).round().max(1.0) as usize,
+                rows: (r.h / ch).round().max(1.0) as usize,
+            };
+            let focus_rect = overlay
+                .as_ref()
+                .and_then(|ov| ov.panels.first())
+                .map(|p| crate::pocket::Focus {
+                    col: (p.origin.0 / cw).round().max(0.0) as usize,
+                    row: (p.origin.1 / ch).round().max(0.0) as usize,
+                    cols: p.grid.cols(),
+                    rows: p.grid.rows(),
+                })
+                .or_else(|| rects.iter().find(|(id, _)| *id == focus).map(|(_, r)| in_cells(r)));
+
+            session.publish(
+                crate::pocket::compose(&layers, cols, rows),
+                &title,
+                &config.leader,
+                focus_rect,
+            );
         }
 
         let flash = self.bell_alpha();

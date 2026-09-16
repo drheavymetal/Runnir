@@ -97,6 +97,8 @@ struct Shared {
     /// the layer that everything in runnir is behind, and it is a setting, so it cannot
     /// be assumed to be the default.
     leader: String,
+    /// The rectangle a phone should scale to fill; see `pocket::Focus`.
+    focus: Option<crate::pocket::Focus>,
     /// What the window is called right now, sent with every frame and with the
     /// snapshot a new viewer gets, so a phone always knows which machine it is holding.
     title: String,
@@ -159,6 +161,7 @@ impl Session {
             theme,
             title: String::new(),
             leader: String::new(),
+            focus: None,
             pin: random_pin()?,
             cipher: Aes256Gcm::new_from_slice(&key_bytes)
                 .map_err(|e| format!("cannot build the cipher: {e}"))?,
@@ -324,12 +327,19 @@ impl Session {
 
     /// Sends what changed since the last call. Called from the frame: never blocks,
     /// never writes to a socket, and does nothing at all when nobody is connected.
-    pub fn publish(&self, snapshot: Snapshot, title: &str, leader: &str) {
+    pub fn publish(
+        &self,
+        snapshot: Snapshot,
+        title: &str,
+        leader: &str,
+        focus: Option<crate::pocket::Focus>,
+    ) {
         let Ok(mut shared) = self.shared.lock() else { return };
         shared.title = title.to_string();
         if shared.leader != leader {
             shared.leader = leader.to_string();
         }
+        shared.focus = focus;
         if shared.clients.is_empty() {
             // Keep the baseline anyway: the next viewer gets a full snapshot on
             // arrival, so a stale `last` would only make the FIRST diff after that
@@ -350,6 +360,7 @@ impl Session {
             "cursor": snapshot.cursor,
             "title": title,
             "leader": shared.leader,
+            "focus": shared.focus,
             "updates": rows,
         });
         let frame = match serde_json::to_vec(&payload) {

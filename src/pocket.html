@@ -53,6 +53,7 @@
     white-space: nowrap;
     max-width: 38%;
   }
+  #bar button.on { background: #2a3d63; color: #cfe0ff; border-color: #3d5a8f; }
   #bar button {
     background: #1b1d23;
     color: #b9bdc6;
@@ -218,6 +219,7 @@
   <span id="size"></span>
   <button id="zoomout">A&minus;</button>
   <button id="zoomin">A+</button>
+  <button id="view" class="on">focus</button>
   <button id="fit">fit &harr;</button>
 </div>
 <div id="wrap"><div id="screen"><div id="cursor" hidden></div></div></div>
@@ -326,6 +328,16 @@ function apply(msg) {
   }
   placeCursor(msg.cursor);
   revealCursor();
+  if (msg.focus) {
+    const f = msg.focus;
+    const moved = !focusRect || f.col !== focusRect.col || f.row !== focusRect.row
+      || f.cols !== focusRect.cols || f.rows !== focusRect.rows;
+    focusRect = f;
+    // Switching pane or opening a panel changes the rectangle, and the phone should
+    // follow it the way your eye would.
+    if (moved && viewMode === 'focus' && !manual) fit();
+    else if (moved) scrollToFocus();
+  }
   if (msg.leader !== undefined && msg.leader !== leaderChord) {
     leaderChord = msg.leader;
     // An empty leader means the layer is turned off in the config; hide the button
@@ -339,6 +351,12 @@ function apply(msg) {
   }
 }
 let shownTitle = null;
+// The rectangle the terminal says is worth filling the screen with: the focused pane,
+// or a panel while one is open.
+let focusRect = null;
+// 'focus' scales that rectangle to the screen; 'full' shows the whole window, which is
+// how you see the other panes - they are still there, just not stealing width.
+let viewMode = 'focus';
 // The chord this window arms its leader layer with, told to us by the terminal because
 // it is a setting and the default cannot be assumed.
 let leaderChord = null;
@@ -350,6 +368,12 @@ let leaderChord = null;
 /// sits behind the keyboard while you type into it.
 function revealCursor() {
   if (!lastCursor) return;
+  // In focus mode the rectangle is already positioned and the cursor lives inside it;
+  // scrolling again here would fight that and jitter on every frame.
+  if (viewMode === 'focus' && focusRect) {
+    const r = focusRect;
+    if (lastCursor[0] >= r.row && lastCursor[0] < r.row + r.rows) return;
+  }
   const m = cellSize();
   const y = 4 + lastCursor[0] * m.h;
   const top = wrapEl.scrollTop;
@@ -405,13 +429,36 @@ let fitMode = 'width';
 function fit() {
   if (!cols) return;
   manual = false;
+  // In focus mode the target is the focused rectangle, not the window: four panes on a
+  // desktop are four readable columns, and on a phone they are four unreadable ones
+  // with three of them taking width from the one being read.
+  const target = (viewMode === 'focus' && focusRect)
+    ? focusRect
+    : { col: 0, row: 0, cols: cols, rows: rows };
   // Measure at a known size and scale linearly: the face is monospaced, so the ratio
   // of advance to font-size is constant.
   fontSize = 12; cached = null;
   const m = cellSize();
-  const byWidth = (wrapEl.clientWidth - 10) / cols / (m.w / 12);
-  const byHeight = (wrapEl.clientHeight - 10) / rows / 1.2;
+  const byWidth = (wrapEl.clientWidth - 10) / target.cols / (m.w / 12);
+  const byHeight = (wrapEl.clientHeight - 10) / target.rows / 1.2;
   setFont(Math.floor((fitMode === 'width' ? byWidth : byHeight) * 100) / 100);
+  scrollToFocus();
+}
+
+/// Put the focused rectangle at the top-left of the view. The rest of the window is
+/// still there, above and to the sides - scroll, or switch to full, to see it.
+function scrollToFocus() {
+  if (viewMode !== 'focus' || !focusRect) return;
+  const m = cellSize();
+  wrapEl.scrollLeft = Math.max(0, 4 + focusRect.col * m.w - 2);
+  wrapEl.scrollTop = Math.max(0, 4 + focusRect.row * m.h - 2);
+}
+
+function toggleView() {
+  viewMode = viewMode === 'focus' ? 'full' : 'focus';
+  document.getElementById('view').textContent = viewMode;
+  document.getElementById('view').classList.toggle('on', viewMode === 'focus');
+  fit();
 }
 
 function toggleFit() {
@@ -460,6 +507,7 @@ if (document.fonts && document.fonts.ready) {
 document.getElementById('zoomin').onclick = () => { manual = true; setFont(fontSize + 1); };
 document.getElementById('zoomout').onclick = () => { manual = true; setFont(fontSize - 1); };
 document.getElementById('fit').onclick = toggleFit;
+document.getElementById('view').onclick = toggleView;
 window.addEventListener('resize', () => { if (!manual) fit(); });
 
 const pairEl = document.getElementById('pair');

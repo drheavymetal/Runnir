@@ -231,6 +231,22 @@ fn cursor_screen_pos(grid: &Grid) -> Option<(usize, usize)> {
         .map(|screen_row| (screen_row, col))
 }
 
+/// The part of the window worth filling a phone with: the focused pane, or the panel
+/// on top when there is one.
+///
+/// A phone shows one thing at a time whether we plan for it or not. Four panes on a
+/// desktop are four readable columns; on a phone they are four unreadable ones, and
+/// three of them are stealing width from the one being looked at. So the terminal says
+/// which rectangle matters and the page scales THAT to the screen — the rest stays
+/// around it, reachable by scrolling, rather than being cropped away.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize)]
+pub struct Focus {
+    pub col: usize,
+    pub row: usize,
+    pub cols: usize,
+    pub rows: usize,
+}
+
 /// A stretch of one row sharing every visual attribute, which is how a row is sent.
 #[derive(Clone, Debug, PartialEq, serde::Serialize)]
 pub struct Run {

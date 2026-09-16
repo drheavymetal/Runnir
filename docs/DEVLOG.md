@@ -5732,6 +5732,40 @@ target measured in cells is a target measured in single-digit pixels once a desk
 window is fitted to a phone.** Anything that has to be hit from a phone belongs on a
 button, not on the grid. The grid is for reading and for typing into.
 
+## 2026-09-16 - The phone fills itself with the focused pane, not the window
+
+Second thing Pedro's real use found: with four panes, three of them are taking width away
+from the one being read. Measured on his own layout, the focused pane was **12% of the
+window's width** — on a desktop that is a readable column, on a phone it is nothing.
+
+So the terminal now sends the **rectangle worth filling the screen with**: the focused
+pane, or the panel on top while one is open. The page scales that to the screen instead
+of the whole window.
+
+What it deliberately does NOT do is crop. The rest of the window is still in the
+snapshot, above and around, reachable by scrolling — and a `focus`/`full` button swaps
+between the two views. Cropping would have meant deciding for the person that the other
+panes do not exist, and the whole point of mirroring the window was that they do.
+
+**Moving focus moves the frame.** `leader h/j/k/l` from the phone changes the rectangle
+and the page follows it, so panes are navigated one full screen at a time. Verified:
+
+```
+focused pane  col=86  42x61  -> 25% of the width
+leader + l
+focused pane  col=128 21x61  -> 12% of the width
+```
+
+An overlay takes precedence while it is open, because a modal panel owns the screen on a
+desktop too and it is the thing being looked at.
+
+### The rule underneath both phone findings today
+
+A desktop window on a phone is not a small desktop window. **Anything sized for a desk —
+a four-pane split, a cell-sized click target, a chord with three modifiers — has to be
+re-offered rather than scaled down.** The mirror stays faithful; what changes is which
+part of it fills the screen and how you reach the rest.
+
 ## Gotchas (do not re-learn)
 
 - **A phone cannot type a leader chord.** No Alt, no Shift+Space, and `f13` is worse. Any
