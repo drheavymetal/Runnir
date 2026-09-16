@@ -26,6 +26,7 @@ mod optical;
 mod overlay;
 mod pane;
 mod platform;
+mod pocket;
 mod player;
 mod project_session;
 mod pty;
