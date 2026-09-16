@@ -4553,21 +4553,32 @@ green, no warnings.
 **Not changed**: `player.rs` keeps its own `ensure_fresh` with the credentials the daemon was
 started with. It was already correct, and it is the hot path for playback.
 
-## DESIGN, NOT YET BUILT — the pane in a phone's hand (2026-09-16)
+## DESIGN, NOT YET BUILT — the window in a phone's hand (2026-09-16)
 
 **Why.** Claude Code has a `/remote-control` that puts a running session on your phone.
-The equivalent here is narrower and more useful: type one thing in a window and that
-window's **pane** is on the phone — the output live, the keyboard driving it — while the
-machine stays where it is. Walk to the kitchen while a build runs, answer the prompt it
-stops at, kill it when it goes wrong.
+Same idea here: type one thing in a window and that window is on the phone — the output
+live, the keyboard driving it — while the machine stays where it is. Walk to the kitchen
+while a build runs, answer the prompt it stops at, kill it when it goes wrong.
 
-**Scope, said first: the pane, not the window.** What the phone shows is the focused
-pane's grid — text, colours, cursor, scrollback. The git panel, Docker, the explorer and
-the which-key layer are **not** on the phone. They are the thing that makes runnir worth
-using at a desk, and they are also the thing that does not survive a 390-pixel-wide
-screen held in one hand: three columns with draggable separators is a design that assumes
-a mouse and a metre of glass. Pedro chose this scope deliberately. If the panels ever go
-to the phone it is a second design, not an extension of this one.
+**Scope: the whole window, and why that is not the expensive answer.** This was first
+scoped to the focused pane only, on the reasoning that panels assume a mouse and a metre
+of glass. Pedro changed his mind after seeing the prototype, and looking at what it would
+actually cost showed the narrow scope was not buying much:
+
+Everything runnir draws is **already a grid of cells with an origin**. `build_chrome()`
+returns `Vec<(Grid, f32, f32)>` — the tab bar is a `Grid`. `PaneDraw` is `{ grid: &Grid,
+origin: (f32, f32), … }`. The overlays — git, Docker, explorer, which-key — are drawn
+through `pane_instances(panel)`, so they are `PaneDraw` too. At the moment of painting,
+the window IS a list of `(Grid, origin)` that the renderer flattens into instances.
+
+So mirroring the window is a loop over that list, dividing origins by the cell size and
+composing into one window-sized grid in the same stacking order the painter's algorithm
+already uses. Mechanical work, not a new system.
+
+**What does not survive, and that is accepted.** Anything that is not a cell is not in
+that list: inline images (kitty graphics), the optical-transfer QR, the player's
+waveform. They are textures. On the phone they are holes. Fine for the 95% of the screen
+that is glyphs; open the image viewer and you get an empty rectangle.
 
 **What this is, plainly.** It publishes a shell to the internet for as long as it is
 running. `share.rs` publishes what song is playing; this publishes a prompt that can
@@ -4581,28 +4592,57 @@ opposite case. A remote control that outlives the window it controls **controls 
 and dying with the window is the cheapest security property available: closing it is a
 gesture everybody already has.
 
-So: a server per window, started on demand, stopped when the window goes. The pane it is
-bound to is chosen when it starts and does not follow the focus — a remote that retargets
-because somebody at the desk clicked elsewhere is a remote that types into the wrong
-shell.
+So: a server per window, started on demand, stopped when the window goes.
 
-### Reading without waking the UI thread
+### One window, one state — including which tab is active
 
-`Pane.grid` is an `Arc<Mutex<Grid>>` and `Pty::write` queues onto an mpsc channel to a
-dedicated writer thread. Both halves are therefore reachable from an ordinary thread with
-no `EventLoopProxy` in sight:
+The phone is a **mirror, not a second seat**. There is one window, one focus, one active
+tab, and the phone sees exactly what the screen shows.
 
-- **Out**: the server clones the pane's `Arc<Mutex<Grid>>` and reads cells itself.
-- **In**: the server holds a clone of the PTY's `writer_tx` and sends bytes. Sends never
-  block, so a phone on a bad connection can never wedge the terminal.
+That has a consequence worth stating rather than discovering: **changing tab from the
+phone changes it on the desk too.** The tab bar travels in the snapshot like everything
+else, so tapping a tab is `click --col --row` on a chrome cell and needs no new code —
+and the person at the keyboard watches their window switch. That is the correct behaviour
+for a remote control and the wrong behaviour for a viewer, and this is a remote control.
 
-This is the difference between this feature and `control.rs`, which has to cross the
-proxy bridge because it drives *runnir* — overlays, the leader layer, bound actions.
-Nothing here touches the UI thread except `request_redraw` after input, and that is one
-call after a keystroke a human made.
+The alternative — per-viewer focus, per-viewer active tab — means rendering a window
+state that nobody is looking at, and two of everything the app keeps one of. It is not a
+harder version of this feature; it is a different one.
 
-`pty.rs` needs one small addition: a cloneable `PtyWriter` handle, because today the
-`writer_tx` is private and writing needs `&mut Pane`.
+### Where the snapshot is taken: in the frame, not from outside
+
+The pane-only design could read from any thread, because `Pane.grid` is an
+`Arc<Mutex<Grid>>`. The chrome and the overlays are not like that: they are **built fresh
+every frame inside the drawing path** and do not exist anywhere else. Widening the scope
+to the window therefore moves the read.
+
+The snapshot is composed in `app_draw`, at the point where `build_chrome`,
+`build_status`, `build_whichkey`, `build_explorer` and the `PaneDraw` list have all been
+assembled and the renderer is about to flatten them — that is the one instant in the
+program where the whole window exists as cells. It is written into a buffer the server
+thread reads, and it is composed **only when somebody is watching**, so a window with no
+viewer pays nothing.
+
+Input still needs no snapshot and keeps the cheap path: a keystroke is `key --chord` and
+a tap is `click --col --row`, both of which `control.rs` already executes over the proxy
+bridge. Widening the scope made the input half *simpler*, not harder — the phone can drive
+the git panel because the git panel is on the phone.
+
+### `Grid::revision` is no longer needed, and here is why it was
+
+The pane-only design called for a monotonic `revision: u64` on `Grid`, because
+`Grid.dirty` is a **bool the renderer consumes** — it draws and clears it — so a second
+reader watching `dirty` would either steal frames from the renderer or miss its own. That
+observation is still true and still worth knowing (`app_draw.rs` does
+`pane.grid.lock().unwrap().dirty = false` on every frame).
+
+It is no longer needed here. Composing per frame means the frame IS the trigger, and not
+sending the same thing twice is handled by the row diff that was going to exist anyway.
+The counter was the right answer to a question the new scope stopped asking.
+
+The general rule survives the feature that prompted it: **a shared bool has one consumer;
+the moment there are two, it has to be a counter.** `command_seq` and `bell_count` are the
+other two instances.
 
 ### The wire: WebSocket — and SSE, which phase 0 killed
 
@@ -4657,32 +4697,34 @@ One entry per row **that changed since the client's `rev`**, each row a list of 
 A client that dropped a frame asks again with the rev it has and is made whole — no
 resync path of its own, because the general case already is the resync.
 
-### The gotcha that would otherwise cost a day
+### Who is watching, on the screen that is being watched
 
-`Grid.dirty` is a **bool the renderer consumes**: it draws and clears it. A second reader
-that watches `dirty` either steals frames from the renderer or misses its own, and the
-symptom is a phone that goes stale for seconds at a time under load — intermittent,
-load-dependent, and invisible in any test.
+While anybody is connected the window says so, in the status bar, permanently — not a
+toast that appears once and is gone by the time it matters. A remote control nobody can
+see is a door nobody remembers leaving open.
 
-So `Grid` grows a `revision: u64`, monotonic, cleared by nobody, bumped everywhere
-`dirty = true` is set today. Every consumer keeps the last one it saw. This is the third
-counter of its shape in this file — `command_seq` and `bell_count` exist for exactly the
-same reason — and the rule behind all three is worth stating once: **a shared bool has
-one consumer; the moment there are two, it has to be a counter.**
+    sharing with Pedro          one viewer who gave a name
+    sharing with 2 people       two viewers, or one who did not
 
-The SSE thread polls that counter (~16 ms) rather than hooking the PTY's `on_output`.
-Polling is the right call twice over: it is a lock and a `u64` compare, it only exists
-while somebody is actually watching, and it **coalesces** — two hundred grid mutations in
-one interval are one frame on the phone instead of two hundred.
+The name is **asked for on the pairing screen, next to the PIN, and is optional**. There
+is no account system here and there never will be, so it is worth being precise about
+what that name is: **a label the visitor typed about themselves, not an identity.**
+Anyone holding the link and the PIN can type any name at all. The security property is
+the PIN; the name is a courtesy so the bar reads like a sentence instead of a counter.
 
-### The phone does not get to resize the pane
+Which is also why the count is the fallback and not an error state — "2 people" is the
+honest thing to say when the second one did not introduce themselves.
 
-Tempting and wrong. Reflowing the pane to a phone's width reflows the window a person is
-sitting in front of, and the person at the keyboard did not ask for their build output to
-be rewrapped to 45 columns because somebody unlocked a phone.
+### The phone does not get to resize the window
 
-The grid's geometry belongs to the desk. The phone scrolls horizontally, or shrinks its
-font until 80 columns fit — in landscape on a modern phone they do.
+Tempting and wrong. Reflowing to a phone's width reflows the window a person is sitting in
+front of, and the person at the keyboard did not ask for their build output to be
+rewrapped to 45 columns because somebody unlocked a phone. With the whole window mirrored
+it would be worse than a reflow: panel layouts and column widths would move under them.
+
+The geometry belongs to the desk. The phone scrolls, or shrinks its font. The prototype
+settled that this is liveable — 170 columns on a phone got "se ve de locos" — so this is
+measured, not assumed.
 
 ### runnir serves the page, not `docs-site`
 
@@ -4743,14 +4785,16 @@ to sit one unshifted letter away from something ordinary.
    design**: SSE is buffered end-to-end by a quick tunnel, WebSocket is delivered in 13 ms.
    See the entry below for the measurements and the two controls that make them mean
    something.
-1. **The mirror, read-only.** `Grid::revision`, `src/pocket.rs`, the row diff, the page,
-   the tunnel, the token. The phone watches; it cannot type.
-2. **The door.** PIN, cookie exchange, counted attempts, the persistent marker in the
-   window, the QR.
-3. **Writing.** `POST /in`, the cloneable `PtyWriter`, the key bar a phone does not have
-   (Esc, Tab, Ctrl, arrows), and the guardian on the path.
+1. **The mirror, read-only.** The window snapshot composed in `app_draw`, `src/pocket.rs`
+   with the WebSocket server and the row diff, the page, the tunnel, the token. The phone
+   watches the whole window — panes, tab bar, panels; it cannot type.
+2. **The door.** PIN, the optional name, cookie exchange, counted attempts, the
+   `sharing with …` marker in the status bar, and the QR.
+3. **Writing.** Keys and taps over the open socket (`key --chord`, `click --col --row`),
+   the key bar a phone does not have (Esc, Tab, Ctrl, arrows), and the guardian on the
+   path.
 4. **What a phone needs that a keyboard does not.** Scrollback by touch, paste from the
-   phone's clipboard, and the pane's title in the header so you know what you are holding.
+   phone's clipboard, and the active tab's title in the header.
 
 ### Open questions, not decided here
 
