@@ -3244,6 +3244,7 @@ impl Gpu {
             Some(Overlay::Map(_)) => "map",
             Some(Overlay::Transfer(_)) => "transfer",
             Some(Overlay::Pocket(_)) => "pocket",
+            Some(Overlay::MusicProvider(_)) => "music_provider",
             Some(_) => "other",
         };
         let mut out = json!({
@@ -3259,6 +3260,12 @@ impl Gpu {
             // a test cannot tell "it refused and said why" from "nothing happened".
             "status": self.status.clone(),
         });
+        // Which music service the panel is shopping in. Reported because it is a
+        // setting that survives the window, and without it neither a script nor a test
+        // can tell whether a remembered choice was honoured on the next start.
+        if let Some(Overlay::Tidal(p)) = &self.overlay {
+            out["music_provider"] = json!(p.provider.label());
+        }
         if let Some(Overlay::Props(p)) = &self.overlay {
             out["props"] = json!({
                 "path": p.props.path.display().to_string(),
@@ -3506,6 +3513,23 @@ impl Gpu {
             // something clever would mostly be a key pressed by accident while
             // holding a phone in the other hand.
             Overlay::Pocket(_) => self.pocket_panel_key(key),
+            Overlay::MusicProvider(p) => match key {
+                Key::Named(NamedKey::Escape) => self.overlay = None,
+                Key::Named(NamedKey::ArrowUp) => p.up(),
+                Key::Named(NamedKey::ArrowDown) => p.down(),
+                Key::Named(NamedKey::Enter) => {
+                    let picked = p.selected();
+                    self.overlay = None;
+                    self.keep_music_provider(picked, config);
+                }
+                Key::Character(c) => match c.as_str() {
+                    "k" => p.up(),
+                    "j" => p.down(),
+                    "q" => self.overlay = None,
+                    _ => {}
+                },
+                _ => {}
+            },
             Overlay::Transfer(p) => match key {
                 Key::Named(NamedKey::Escape) => {
                     self.overlay = None;
@@ -7603,16 +7627,48 @@ impl Gpu {
     ///
     /// Opening it is the point: "switch to Spotify" from a bare terminal should land
     /// somewhere, not change a setting invisibly and leave the screen as it was.
+    /// Opens the list of music services.
+    ///
+    /// It used to flip between the two without asking and without saying which way it
+    /// had gone — and with the panel closed, nothing on screen changed at all, so the
+    /// key looked broken. Two options is still a list: it shows where you are before
+    /// you move, which a toggle cannot.
     fn music_switch_provider(&mut self, config: &crate::config::Config) {
+        let current = match &self.overlay {
+            Some(Overlay::Tidal(p)) => p.provider,
+            _ => config.music_provider(),
+        };
+        self.overlay = Some(Overlay::MusicProvider(overlay::ProviderPicker::new(current)));
+        self.window.request_redraw();
+    }
+
+    /// Applies a chosen service and REMEMBERS it, so the next window opens on it.
+    ///
+    /// The setting already existed and the panel already read it at startup; nothing
+    /// ever wrote it, so every choice died with the window that made it.
+    fn keep_music_provider(&mut self, picked: crate::music::Source, config: &Config) {
+        let mut cfg = config.clone();
+        cfg.music_provider = match picked {
+            crate::music::Source::Tidal => "tidal".into(),
+            crate::music::Source::Spotify => "spotify".into(),
+        };
+        self.status = Some(match cfg.save_json() {
+            Ok(()) => format!("music: {}", picked.label()),
+            Err(e) => format!("music: {} (save failed: {e})", picked.label()),
+        });
+        self.status_expiry = Some(Instant::now() + Duration::from_secs(2));
+        self.pending_config = Some(cfg);
+
         if !matches!(self.overlay, Some(Overlay::Tidal(_))) {
             self.show_tidal_panel(config);
         }
         let mut reload = None;
         if let Some(Overlay::Tidal(p)) = &mut self.overlay {
-            p.provider = match p.provider {
-                crate::music::Source::Tidal => crate::music::Source::Spotify,
-                crate::music::Source::Spotify => crate::music::Source::Tidal,
-            };
+            if p.provider == picked {
+                self.window.request_redraw();
+                return;
+            }
+            p.provider = picked;
             // Rows from the shop you just left, sitting under the name of the one you
             // are now in, is the same class of lie as a crumb that outlives its list.
             p.rows.clear();

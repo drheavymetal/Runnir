@@ -1188,6 +1188,32 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_chosen_music_provider_survives_a_save_and_reload() {
+        // The setting existed and the panel read it from the first day; nothing ever
+        // wrote it, so every choice died with the window that made it. This is the
+        // round trip that was missing.
+        let mut cfg = Config::default();
+
+        cfg.music_provider = "spotify".into();
+        let text = serde_json::to_string(&cfg).unwrap();
+        let back: Config = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.music_provider(), crate::music::Source::Spotify);
+
+        cfg.music_provider = "tidal".into();
+        let text = serde_json::to_string(&cfg).unwrap();
+        let back: Config = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.music_provider(), crate::music::Source::Tidal);
+
+        // What an EMPTY or unknown value falls back to is deliberately not asserted:
+        // it asks the disk whether a Spotify session exists, so pinning it down here
+        // would test the machine the suite runs on rather than the code — an error this
+        // project has already made once. Only what is written explicitly is asserted,
+        // which is the part a person's choice controls.
+        cfg.music_provider = "spotifty".into();
+        let _ = cfg.music_provider();
+    }
+
     use super::*;
 
     /// The palette is DERIVED, so the theme is the only place a colour is chosen.
