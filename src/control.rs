@@ -553,7 +553,7 @@ fn handle_conn(stream: UnixStream, proxy: EventLoopProxy<UserEvent>) {
 
 /// Hands a request to the UI thread and waits for its response. Bounded so a hung or
 /// gone UI can never block the socket thread forever.
-fn bridge(req: ControlRequest, proxy: &EventLoopProxy<UserEvent>) -> ControlResponse {
+pub(crate) fn bridge(req: ControlRequest, proxy: &EventLoopProxy<UserEvent>) -> ControlResponse {
     let (tx, rx) = mpsc::channel();
     if proxy.send_event(UserEvent::Control(req, tx)).is_err() {
         return ControlResponse::error("terminal is shutting down");

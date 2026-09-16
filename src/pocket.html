@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
 <meta name="color-scheme" content="dark">
 <title>runnir</title>
 <style>
@@ -55,12 +55,14 @@
 
   /* The screen is absolutely positioned rows of spans. Rows are replaced wholesale
      when they change, which is exactly the shape the diff arrives in. */
+  /* In the flow, NOT absolutely positioned. An absolute child is laid out against the
+     padding box, so `top: 0` ignored the padding that reserves room for the bar and the
+     first rows were drawn underneath it - the prompt was there all along, just hidden. */
   #screen {
-    position: absolute;
-    top: 0; left: 0;
-    transform-origin: 0 0;
+    position: relative;
     white-space: pre;
     padding: 4px;
+    width: max-content;
   }
   .row { height: 1.2em; }
 
@@ -111,10 +113,62 @@
   }
   #pairerr { color: #e06c6c; font-size: 12px; min-height: 1.2em; }
 
+  /* The keys a phone keyboard does not have, and the terminal cannot do without. */
+  #dock {
+    position: fixed;
+    left: 0; right: 0;
+    bottom: 0;
+    background: rgba(13, 13, 15, 0.96);
+    border-top: 1px solid #23252b;
+    z-index: 2;
+  }
+  #keys {
+    display: flex;
+    gap: 5px;
+    padding: 6px;
+    overflow-x: auto;
+  }
+  #typeline {
+    display: flex;
+    gap: 6px;
+    padding: 0 6px 6px;
+    padding-bottom: max(6px, env(safe-area-inset-bottom));
+  }
+  #keys button {
+    background: #1b1d23;
+    color: #c3c7d0;
+    border: 1px solid #2c2f37;
+    border-radius: 6px;
+    padding: 9px 12px;
+    font: inherit;
+    font-size: 12px;
+    flex: none;
+    min-width: 42px;
+  }
+  #keys button.on { background: #3d7eff; color: #fff; border-color: #3d7eff; }
+
+  /* Visible, because you have to see what you are typing. It was off-screen at first
+     purely to raise the phone's keyboard, and that made the one thing a person looks at
+     while typing invisible. */
+  #kbd {
+    flex: 1;
+    min-width: 0;
+    background: #16181e;
+    border: 1px solid #2c2f37;
+    border-radius: 6px;
+    color: #d7dae0;
+    font: inherit;
+    font-size: 15px;
+    padding: 9px 11px;
+  }
+
+  /* Height is set from visualViewport in JS: a phone keyboard shrinks the visual
+     viewport without changing the layout viewport, so `100%` keeps the page the size of
+     the whole screen and everything the keyboard covers simply becomes unreachable. */
   #wrap {
     position: absolute;
-    inset: 0;
-    padding-top: 30px;
+    top: 30px;
+    left: 0; right: 0;
     overflow: auto;
     -webkit-overflow-scrolling: touch;
   }
@@ -128,9 +182,28 @@
   <span id="size"></span>
   <button id="zoomout">A&minus;</button>
   <button id="zoomin">A+</button>
-  <button id="fit">fit</button>
+  <button id="fit">fit &harr;</button>
 </div>
-<div id="wrap"><div id="screen"></div><div id="cursor" hidden></div></div>
+<div id="wrap"><div id="screen"><div id="cursor" hidden></div></div></div>
+
+<div id="dock">
+  <div id="keys">
+    <button data-chord="escape">esc</button>
+    <button data-chord="tab">tab</button>
+    <button id="ctrl">ctrl</button>
+    <button data-chord="up">&uarr;</button>
+    <button data-chord="down">&darr;</button>
+    <button data-chord="left">&larr;</button>
+    <button data-chord="right">&rarr;</button>
+    <button data-chord="backspace">&#9003;</button>
+    <button data-chord="ctrl+c">^C</button>
+  </div>
+  <div id="typeline">
+    <input id="kbd" autocomplete="off" autocapitalize="off" autocorrect="off"
+           spellcheck="false" enterkeyhint="send" placeholder="type here…">
+    <button id="enter">&crarr;</button>
+  </div>
+</div>
 
 <div id="pair">
   <h1>runnir</h1>
@@ -191,12 +264,12 @@ function ensureShape(newCols, newRows) {
   if (newCols === cols && newRows === rows) return;
   cols = newCols;
   rows = newRows;
-  screenEl.textContent = '';
+  for (const el of rowEls) el.remove();
   rowEls = [];
   for (let i = 0; i < rows; i++) {
     const el = document.createElement('div');
     el.className = 'row';
-    screenEl.appendChild(el);
+    screenEl.insertBefore(el, cursorEl);
     rowEls.push(el);
   }
   sizeEl.textContent = cols + '×' + rows;
@@ -212,6 +285,23 @@ function apply(msg) {
     el.appendChild(buildRow(update.runs));
   }
   placeCursor(msg.cursor);
+  revealCursor();
+}
+
+/// Keep the cursor in view.
+///
+/// With the keyboard up, the visible area is roughly half a screen, and the prompt -
+/// the one row being typed into - is at the bottom of a 63-row window. Without this it
+/// sits behind the keyboard while you type into it.
+function revealCursor() {
+  if (!lastCursor) return;
+  const m = cellSize();
+  const y = 4 + lastCursor[0] * m.h;
+  const top = wrapEl.scrollTop;
+  const bottom = top + wrapEl.clientHeight;
+  if (y < top + m.h || y + 2 * m.h > bottom) {
+    wrapEl.scrollTop = Math.max(0, y - wrapEl.clientHeight + 3 * m.h);
+  }
 }
 
 function placeCursor(pos) {
@@ -230,7 +320,7 @@ function cellSize() {
   const probe = document.createElement('span');
   probe.style.cssText = 'position:absolute;visibility:hidden;white-space:pre;font-size:' + fontSize + 'px';
   probe.textContent = 'M'.repeat(100);
-  screenEl.appendChild(probe);
+  document.body.appendChild(probe);
   const w = probe.getBoundingClientRect().width / 100;
   probe.remove();
   cached = { size: fontSize, w: w, h: fontSize * 1.2 };
@@ -249,23 +339,66 @@ function setFont(px) {
 let lastCursor = null;
 function placeCursorFromLast() { placeCursor(lastCursor); }
 
-/// Pick the size that makes the whole width fit, which on a phone in landscape is
-/// usually readable and in portrait is usually not - but the choice belongs to whoever
-/// is holding it, so `fit` is a button and not a policy.
+/// Fit the width, or fit the height, and let the person holding it choose.
+///
+/// A terminal window is about 2.7 times wider than it is tall and a phone held upright
+/// is the opposite, so no single size can fill both: fitting the width leaves most of
+/// the screen empty and makes the text tiny, fitting the height fills the screen and
+/// asks for a sideways scroll. Landscape makes fitting the width the obvious one. This
+/// is why it is a button rather than a rule.
+let fitMode = 'width';
 function fit() {
   if (!cols) return;
   manual = false;
-  const avail = wrapEl.clientWidth - 8;
   // Measure at a known size and scale linearly: the face is monospaced, so the ratio
   // of advance to font-size is constant.
   fontSize = 12; cached = null;
-  const unit = cellSize().w / 12;
-  setFont(Math.floor(avail / cols / unit * 100) / 100);
+  const m = cellSize();
+  const byWidth = (wrapEl.clientWidth - 10) / cols / (m.w / 12);
+  const byHeight = (wrapEl.clientHeight - 10) / rows / 1.2;
+  setFont(Math.floor((fitMode === 'width' ? byWidth : byHeight) * 100) / 100);
 }
+
+function toggleFit() {
+  fitMode = fitMode === 'width' ? 'height' : 'width';
+  document.getElementById('fit').textContent = fitMode === 'width' ? 'fit ↔' : 'fit ↕';
+  fit();
+}
+
+/// Size the scrollable area to what is actually VISIBLE.
+///
+/// A phone keyboard shrinks the visual viewport and leaves the layout viewport alone,
+/// so anything sized in `vh` or `100%` keeps the height of the whole screen and the
+/// bottom of the page ends up underneath the keyboard, unreachable. `visualViewport`
+/// is the only thing that reports the truth here.
+function layout() {
+  const dock = document.getElementById('dock');
+  const vv = window.visualViewport;
+  // `interactive-widget=resizes-content` makes the browser shrink the page for the
+  // keyboard, which is what `bottom: 0` then means. Where that is not honoured, the
+  // visual viewport still reports the truth and the difference is made up by hand -
+  // the first attempt did all of this by hand and the keyboard's suggestion strip,
+  // which is not part of the reported height, kept covering the field anyway.
+  const covered = vv ? Math.max(0, window.innerHeight - vv.height - vv.offsetTop) : 0;
+  dock.style.bottom = covered + 'px';
+  wrapEl.style.top = '30px';
+  wrapEl.style.height =
+    ((vv ? vv.height : window.innerHeight) - 30 - dock.offsetHeight) + 'px';
+  revealCursor();
+}
+
+if (window.visualViewport) {
+  // Re-fitting on keyboard open matters in height mode: the visible area halves, and a
+  // screen sized for the old one leaves the prompt behind the keyboard.
+  window.visualViewport.addEventListener('resize', () => { layout(); if (!manual) fit(); });
+  window.visualViewport.addEventListener('scroll', layout);
+}
+window.addEventListener('resize', () => { layout(); if (!manual) fit(); });
+layout();
 
 document.getElementById('zoomin').onclick = () => { manual = true; setFont(fontSize + 1); };
 document.getElementById('zoomout').onclick = () => { manual = true; setFont(fontSize - 1); };
-document.getElementById('fit').onclick = fit;
+document.getElementById('fit').onclick = toggleFit;
 window.addEventListener('resize', () => { if (!manual) fit(); });
 
 const pairEl = document.getElementById('pair');
@@ -347,11 +480,180 @@ function connect() {
     barEl.classList.remove('live');
     // Backing off matters: a terminal that closed is not coming back, and a page left
     // open on a phone would otherwise hammer a dead port until the battery notices.
+    // The visibility handler below short-circuits it the moment somebody looks again.
     setTimeout(connect, reconnectDelay);
     reconnectDelay = Math.min(reconnectDelay * 2, 10000);
   };
   ws.onerror = () => { try { ws.close(); } catch (_) {} };
 }
+
+// A phone that sleeps drops the socket - that cannot be prevented from in here, and
+// pretending otherwise would just mean a page that looks connected and is not. What
+// CAN be done is come back instantly instead of waiting out a backoff, and a reconnect
+// costs nothing to the eye because a new viewer is sent the whole screen anyway.
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState !== 'visible') return;
+  reconnectDelay = 500;
+  if (!ws || ws.readyState > 1) connect();
+  layout();
+});
+
+// Traffic every twenty seconds, so an idle socket is not reaped by anything in the
+// middle. The server ignores what it does not recognise, which is exactly what this is.
+setInterval(() => {
+  if (ws && ws.readyState === 1) ws.send('{"t":"ping"}');
+}, 20000);
+
+// ---- input -----------------------------------------------------------------
+// Everything below goes out on the socket that is already open and arrives through
+// the same bridge `runnir @` uses, so a phone drives the terminal through exactly the
+// machinery a script does - leader layer, overlays and the guardian included.
+
+function send(obj) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj)); }
+function key(chord) { send({ t: 'key', chord: chord }); }
+
+const kbdEl = document.getElementById('kbd');
+const ctrlBtn = document.getElementById('ctrl');
+let ctrlArmed = false;
+
+function setCtrl(on) {
+  ctrlArmed = on;
+  ctrlBtn.classList.toggle('on', on);
+}
+
+// Every button in the dock: keep the keyboard up. A `<button>` takes focus when it is
+// pressed, which closes a phone keyboard - so pressing `ctrl` dismissed the keyboard
+// and there was nothing left to modify.
+for (const btn of document.querySelectorAll('#dock button')) {
+  btn.addEventListener('pointerdown', (e) => e.preventDefault());
+  btn.addEventListener('mousedown', (e) => e.preventDefault());
+}
+
+for (const btn of document.querySelectorAll('#keys button[data-chord]')) {
+  btn.addEventListener('click', () => {
+    const chord = btn.dataset.chord;
+    key(ctrlArmed && !chord.startsWith('ctrl+') ? 'ctrl+' + chord : chord);
+    setCtrl(false);
+    // Backspace here must also shorten the field, or the next typed character is sent
+    // as though nothing had been deleted.
+    if (chord === 'backspace') {
+      kbdEl.value = kbdEl.value.slice(0, -1);
+      sentUpTo = kbdEl.value.length;
+    }
+    kbdEl.focus();
+  });
+}
+ctrlBtn.addEventListener('click', () => setCtrl(!ctrlArmed));
+document.getElementById('enter').addEventListener('click', () => {
+  submitLine();
+  kbdEl.focus();
+});
+
+// Special keys are chords; ordinary characters ride the `input` event below, because a
+// phone keyboard does not produce usable keydowns for them.
+// Backspace and Delete are deliberately ABSENT: intercepting them called
+// preventDefault, so the field never shortened and nothing could be deleted. They are
+// ordinary edits, and the `input` handler below turns a shorter value into backspaces.
+const NAMED = {
+  Enter: 'enter', Tab: 'tab', Escape: 'escape',
+  ArrowUp: 'up', ArrowDown: 'down', ArrowLeft: 'left',
+  ArrowRight: 'right', Home: 'home', End: 'end', PageUp: 'pageup', PageDown: 'pagedown'
+};
+
+/// The chord for one typed character.
+///
+/// Characters go as KEYS, not as text, and that is the fix for panels: an overlay reads
+/// keys, so typing `q` as text sent it to the shell underneath while the QR panel sat
+/// there unclosable. A key takes the same route a real one does — overlay first, then
+/// the leader layer, then the child.
+function charChord(ch) {
+  // With shift held a keyboard delivers the uppercase character, and the bindings match
+  // on it, so this is the spelling the config uses.
+  if (ch >= 'A' && ch <= 'Z') return 'shift+' + ch.toLowerCase();
+  // Anything outside ASCII (accents, emoji) has no chord spelling; those still go as
+  // text, which is fine because no panel is driven by them.
+  return (ch.charCodeAt(0) > 32 && ch.charCodeAt(0) < 127) ? ch : null;
+}
+
+function submitLine() {
+  key('enter');
+  kbdEl.value = '';
+  sentUpTo = 0;
+}
+
+kbdEl.addEventListener('keydown', (e) => {
+  const named = NAMED[e.key];
+  if (named) {
+    e.preventDefault();
+    if (named === 'enter' && !e.ctrlKey && !ctrlArmed && !e.altKey) {
+      submitLine();
+      return;
+    }
+    const mods = (e.ctrlKey || ctrlArmed ? 'ctrl+' : '') + (e.altKey ? 'alt+' : '');
+    key(mods + named);
+    setCtrl(false);
+    return;
+  }
+  // A real ctrl held on a hardware keyboard, or the sticky button above.
+  if ((e.ctrlKey || ctrlArmed) && e.key.length === 1) {
+    e.preventDefault();
+    key('ctrl+' + e.key.toLowerCase());
+    setCtrl(false);
+  }
+});
+
+// The value is never kept: it is read, sent and cleared, so the field cannot drift out
+// of step with a terminal that is echoing somewhere else entirely.
+// Characters go out as they are typed, so the shell echoes them and the terminal on
+// the desk stays in step. The field keeps them too, because on a phone the thing you
+// are looking at while typing is the field.
+let sentUpTo = 0;
+kbdEl.addEventListener('input', () => {
+  const value = kbdEl.value;
+  if (value.length > sentUpTo) {
+    const added = value.slice(sentUpTo);
+    // A sticky ctrl has to apply to what the PHONE keyboard produces, and a phone
+    // keyboard never fires keydown for an ordinary letter - it fires this. Checking
+    // the flag only in keydown is why pressing ctrl and then `c` sent a plain `c`.
+    if (ctrlArmed && added.length === 1) {
+      const chord = charChord(added);
+      if (chord) key('ctrl+' + chord.replace('shift+', ''));
+      setCtrl(false);
+      // The character itself is consumed by the chord, so the field must not keep it.
+      kbdEl.value = value.slice(0, sentUpTo);
+      return;
+    }
+    for (const ch of added) {
+      const chord = charChord(ch);
+      if (chord) key(chord); else send({ t: 'text', text: ch });
+    }
+  } else if (value.length < sentUpTo) {
+    // Deleting in the field has to delete in the terminal too, or the two drift apart
+    // and what finally runs is not what is on screen here.
+    for (let i = value.length; i < sentUpTo; i++) key('backspace');
+  }
+  sentUpTo = value.length;
+});
+kbdEl.addEventListener('focus', () => { sentUpTo = kbdEl.value.length; });
+
+// Android's send arrow does not always produce a keydown; it produces this.
+kbdEl.addEventListener('beforeinput', (e) => {
+  if (e.inputType === 'insertLineBreak') {
+    e.preventDefault();
+    submitLine();
+  }
+});
+
+// A tap is a click on a cell. The whole window is here, so tapping a tab switches tab
+// and tapping a row of the git panel selects it, exactly as a mouse would.
+wrapEl.addEventListener('click', (e) => {
+  if (e.target.closest('#keys') || e.target.closest('#bar')) return;
+  const rect = screenEl.getBoundingClientRect();
+  const m = cellSize();
+  const col = Math.floor((e.clientX - rect.left - 4) / m.w);
+  const row = Math.floor((e.clientY - rect.top - 4) / m.h);
+  if (col >= 0 && row >= 0 && col < cols && row < rows) send({ t: 'click', col: col, row: row });
+});
 
 // Try the cookie we may already have; the door appears only if it is refused.
 connect();

@@ -22,8 +22,12 @@ use std::sync::{mpsc, Arc, Mutex};
 use base64::Engine;
 use sha1::{Digest, Sha1};
 
+use winit::event_loop::EventLoopProxy;
+
 use crate::config::Theme;
+use crate::control::{bridge, ControlRequest};
 use crate::pocket::{diff, Snapshot};
+use crate::UserEvent;
 
 /// Loopback port. One above the share server's 33344, and fixed rather than ephemeral
 /// so a person can reach it on the machine itself while testing.
@@ -109,10 +113,17 @@ const MAX_FAILURES: u32 = 5;
 impl Session {
     /// Binds and starts accepting. Returns immediately; nothing is served until the
     /// first `publish`, because there is nothing to serve.
-    pub fn start(theme: Theme) -> Result<Session, String> {
+    pub fn start(theme: Theme, proxy: EventLoopProxy<UserEvent>) -> Result<Session, String> {
         let token = random_token()?;
-        let listener = TcpListener::bind(("127.0.0.1", PORT))
-            .map_err(|e| format!("cannot listen on {PORT}: {e}"))?;
+        let listener = TcpListener::bind(("127.0.0.1", PORT)).map_err(|e| {
+            // The port is fixed, so this is nearly always the other window rather than
+            // a stranger. Saying which it is saves someone hunting for a process.
+            if e.kind() == std::io::ErrorKind::AddrInUse {
+                "another window is already sharing - stop that one first".to_string()
+            } else {
+                format!("cannot listen on {PORT}: {e}")
+            }
+        })?;
 
         let shared = Arc::new(Mutex::new(Shared {
             clients: Vec::new(),
@@ -138,7 +149,8 @@ impl Session {
                         let Ok(stream) = stream else { continue };
                         let (shared, token, next_id) =
                             (shared.clone(), token.clone(), next_id.clone());
-                        std::thread::spawn(move || serve(stream, &token, &shared, &next_id));
+                        let proxy = proxy.clone();
+                        std::thread::spawn(move || serve(stream, &token, &shared, &next_id, &proxy));
                     }
                 })
                 .map_err(|e| format!("cannot start server thread: {e}"))?;
@@ -455,7 +467,13 @@ fn dns_exists_upstream(host: &str) -> bool {
         .is_some_and(|answers| answers.iter().any(|a| a.get("type").and_then(|t| t.as_u64()) == Some(1)))
 }
 
-fn serve(mut stream: TcpStream, token: &str, shared: &Arc<Mutex<Shared>>, next_id: &Arc<AtomicU64>) {
+fn serve(
+    mut stream: TcpStream,
+    token: &str,
+    shared: &Arc<Mutex<Shared>>,
+    next_id: &Arc<AtomicU64>,
+    proxy: &EventLoopProxy<UserEvent>,
+) {
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(15)));
 
     let mut head = String::new();
@@ -500,7 +518,7 @@ fn serve(mut stream: TcpStream, token: &str, shared: &Arc<Mutex<Shared>>, next_i
             drop(reader);
             pair(&mut stream, &body, shared, token)
         }
-        p if p.starts_with("/ws") => upgrade(stream, &headers, shared, next_id),
+        p if p.starts_with("/ws") => upgrade(stream, &headers, shared, next_id, proxy),
         _ => respond(&mut stream, "404 Not Found", "text/plain", b"no"),
     }
 }
@@ -598,6 +616,7 @@ fn upgrade(
     headers: &[String],
     shared: &Arc<Mutex<Shared>>,
     next_id: &Arc<AtomicU64>,
+    proxy: &EventLoopProxy<UserEvent>,
 ) {
     // The PIN is checked here and not only at `/pair`: a socket is the thing that
     // actually shows the screen, so it is the thing that has to be behind the door.
@@ -676,9 +695,7 @@ fn upgrade(
         s.clients.push(Client { id, name, session, tx });
     }
 
-    // Read until the viewer goes away. Phase 2 is still read-only, so anything they
-    // send is discarded — but the frames still have to be PARSED, because a close
-    // frame is how a browser says goodbye and a ping expects a pong.
+    // Read until the viewer goes away, acting on what they send.
     let mut conn = stream;
     loop {
         match read_frame(&mut conn) {
@@ -691,6 +708,15 @@ fn upgrade(
                         break;
                     }
                 }
+                0x1 => {
+                    if let Some(req) = request_from(&payload) {
+                        // Straight onto the proxy bridge: this is the same path
+                        // `runnir @` takes, so a phone drives the terminal through
+                        // exactly the machinery a script does — including the leader
+                        // layer, the overlays, and the guardian.
+                        let _ = bridge(req, proxy);
+                    }
+                }
                 _ => {}
             },
             Ok(None) => {}
@@ -700,6 +726,49 @@ fn upgrade(
 
     if let Ok(mut s) = shared.lock() {
         s.clients.retain(|c| c.id != id);
+    }
+}
+
+/// What a phone asked for, as a control request.
+///
+/// Only three shapes are accepted, and the omissions are deliberate:
+///
+/// * `key` — a chord, taking the path a real keypress takes. This is how Enter always
+///   arrives, and Enter is where `guardian` asks "run this?". A phone must not be able
+///   to run a dangerous command without that question, so **newlines are refused in
+///   `text` below** and the only way to submit a line is a key.
+/// * `text` — printable characters, for typing and pasting, with control characters
+///   stripped. Without this every keystroke on a phone keyboard would be a chord
+///   lookup, and autocorrect would be impossible to represent at all.
+/// * `click` — a cell. The whole window is on the phone, so tapping a tab or a row of
+///   the git panel means the same thing it means with a mouse.
+///
+/// Anything else is ignored rather than guessed at: this is input arriving from the
+/// internet, and the list of what it may do belongs here, in one place.
+fn request_from(payload: &[u8]) -> Option<ControlRequest> {
+    let msg: serde_json::Value = serde_json::from_slice(payload).ok()?;
+    match msg.get("t")?.as_str()? {
+        "key" => Some(ControlRequest::Key {
+            chord: msg.get("chord")?.as_str()?.to_string(),
+        }),
+        "text" => {
+            let text: String = msg
+                .get("text")?
+                .as_str()?
+                .chars()
+                // A newline here would reach the child without passing Enter, and
+                // Enter is where the guardian stands.
+                .filter(|c| !c.is_control())
+                .take(4096)
+                .collect();
+            (!text.is_empty()).then_some(ControlRequest::SendText { text, target: None })
+        }
+        "click" => Some(ControlRequest::Click {
+            col: msg.get("col")?.as_u64()? as usize,
+            row: msg.get("row")?.as_u64()? as usize,
+            button: None,
+        }),
+        _ => None,
     }
 }
 
@@ -860,6 +929,42 @@ mod tests {
         // A cookie belonging to something else must not be mistaken for ours.
         let decoy = vec!["Cookie: notpocket=zzz".to_string()];
         assert_eq!(cookie_session(&decoy), None);
+    }
+
+    #[test]
+    fn a_newline_cannot_arrive_as_text() {
+        // Enter is where the guardian asks "run this?". Text that could carry a
+        // newline would reach the child without passing it, so the filter here is a
+        // safety property and not tidiness.
+        let req = request_from(br#"{"t":"text","text":"rm -rf /\n"}"#).unwrap();
+        match req {
+            ControlRequest::SendText { text, .. } => assert_eq!(text, "rm -rf /"),
+            other => panic!("expected text, got {other:?}"),
+        }
+        assert!(
+            request_from(br#"{"t":"text","text":"\n"}"#).is_none(),
+            "a newline on its own leaves nothing to send"
+        );
+        assert!(request_from(br#"{"t":"text","text":"\u0003"}"#).is_none(), "nor does a control byte");
+    }
+
+    #[test]
+    fn only_three_shapes_are_accepted() {
+        assert!(matches!(
+            request_from(br#"{"t":"key","chord":"ctrl+c"}"#),
+            Some(ControlRequest::Key { .. })
+        ));
+        assert!(matches!(
+            request_from(br#"{"t":"click","col":4,"row":9}"#),
+            Some(ControlRequest::Click { col: 4, row: 9, .. })
+        ));
+        // Everything else is ignored rather than guessed at - this is input from the
+        // internet, and what it may do is decided in one place.
+        assert!(request_from(br#"{"t":"launch","cmd":"sh"}"#).is_none());
+        assert!(request_from(br#"{"t":"transfer","path":"/etc/passwd"}"#).is_none());
+        assert!(request_from(br#"{"cmd":"key","args":{"chord":"a"}}"#).is_none());
+        assert!(request_from(b"not json at all").is_none());
+        assert!(request_from(b"{}").is_none());
     }
 
     #[test]

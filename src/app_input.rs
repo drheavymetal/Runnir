@@ -2311,7 +2311,7 @@ impl Gpu {
     /// answers.
     fn open_pocket(&mut self, config: &Config) {
         if self.pocket.is_none() {
-            match crate::pocket_server::Session::start(config.theme.clone()) {
+            match crate::pocket_server::Session::start(config.theme.clone(), self.proxy.clone()) {
                 Ok(session) => self.pocket = Some(session),
                 Err(e) => {
                     self.status = Some(format!("cannot share: {e}"));
@@ -7896,7 +7896,7 @@ impl Gpu {
                         "viewers": session.viewers().len(),
                     }))
                 } else {
-                    match crate::pocket_server::Session::start(config.theme.clone()) {
+                    match crate::pocket_server::Session::start(config.theme.clone(), self.proxy.clone()) {
                         Ok(session) => {
                             let url = session.url();
                             let pin = session.pin();
