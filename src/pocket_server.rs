@@ -78,6 +78,10 @@ struct Client {
     id: u64,
     name: Option<String>,
     tx: mpsc::SyncSender<Vec<u8>>,
+    /// The viewer's socket, kept so it can be SHUT DOWN rather than merely forgotten.
+    /// Dropping the row from this list stops the screen; it does not stop the keyboard,
+    /// and the keyboard is the half that matters.
+    conn: TcpStream,
 }
 
 struct Shared {
@@ -184,7 +188,10 @@ impl Session {
                         let (shared, token, next_id) =
                             (shared.clone(), token.clone(), next_id.clone());
                         let proxy = proxy.clone();
-                        std::thread::spawn(move || serve(stream, &token, &shared, &next_id, &proxy));
+                        let stop_for_conn = stop.clone();
+                        std::thread::spawn(move || {
+                            serve(stream, &token, &shared, &next_id, &proxy, &stop_for_conn)
+                        });
                     }
                 })
                 .map_err(|e| format!("cannot start server thread: {e}"))?;
@@ -216,6 +223,7 @@ impl Session {
             *state = Tunnel::Opening;
         }
         let (state, child, path) = (self.tunnel.clone(), self.child.clone(), self.public_path());
+        let stopped = self.stop.clone();
         std::thread::Builder::new()
             .name("runnir-pocket-tunnel".into())
             .spawn(move || {
@@ -231,27 +239,42 @@ impl Session {
                 // So the draining loop lives here instead of in a thread of its own:
                 // it keeps cloudflared's stderr moving (a full pipe would block it)
                 // and it keeps this thread alive for exactly as long as the child.
-                let (mut proc, host, mut stderr) = match spawn_tunnel() {
+                let (proc, host, mut stderr) = match spawn_tunnel() {
                     Ok(started) => started,
                     Err(e) => {
                         *state.lock().unwrap() = Tunnel::Failed(e);
                         return;
                     }
                 };
+                // Handed over BEFORE the wait, not after. Opening takes up to two
+                // minutes, and a stop during that window used to find `None` here and
+                // kill nothing: cloudflared then finished connecting and sat holding a
+                // public hostname for a session that no longer existed.
+                *child.lock().unwrap() = Some(proc);
+
                 let url = format!("https://{host}{path}");
                 // Probed WITHOUT the fragment: it is not part of a request, and an
                 // HTTP client handed one either strips it or chokes on it.
                 let probe = format!("https://{host}{}", path.split('#').next().unwrap_or("/"));
-                match wait_until_reachable(&host, &probe) {
+                let reached = wait_until_reachable(&host, &probe);
+
+                // The session may have been stopped while we waited. Its Drop already
+                // killed whatever was in `child`; publishing a URL now would put a live
+                // link on a panel that is gone.
+                if stopped.load(Ordering::Relaxed) {
+                    return;
+                }
+                match reached {
                     Ok(()) => *state.lock().unwrap() = Tunnel::Live(url),
                     Err(why) => {
                         *state.lock().unwrap() = Tunnel::Failed(why);
-                        let _ = proc.kill();
-                        let _ = proc.wait();
+                        if let Some(mut proc) = child.lock().unwrap().take() {
+                            let _ = proc.kill();
+                            let _ = proc.wait();
+                        }
                         return;
                     }
                 }
-                *child.lock().unwrap() = Some(proc);
 
                 let mut sink = String::new();
                 while stderr.read_line(&mut sink).unwrap_or(0) > 0 {
@@ -306,7 +329,13 @@ impl Session {
     /// They still hold the link and the PIN, so this is not a ban — see `rotate_pin`.
     pub fn drop_viewer(&self, id: u64) {
         let Ok(mut shared) = self.shared.lock() else { return };
-        shared.clients.retain(|c| c.id != id);
+        if let Some(pos) = shared.clients.iter().position(|c| c.id == id) {
+            let client = shared.clients.remove(pos);
+            // Shut the socket, do not just forget the row. Forgetting it stops frames
+            // going out and leaves their input coming in — which is the wrong half of
+            // a feature whose whole purpose is to remove somebody.
+            let _ = client.conn.shutdown(std::net::Shutdown::Both);
+        }
     }
 
     /// Who is watching, for the status bar.
@@ -350,7 +379,11 @@ impl Session {
 
         let theme = shared.theme.clone();
         let rows = diff(shared.last.as_ref(), &snapshot, &theme);
-        if rows.is_empty() && shared.last.is_some() {
+        // A moved cursor changes no cell — the block inversion is the renderer's, not
+        // the grid's — so a diff of rows alone left the phone's cursor frozen wherever
+        // it had last been while arrows and Home walked it across the desktop.
+        let cursor_moved = shared.last.as_ref().map(|l| l.cursor) != Some(snapshot.cursor);
+        if rows.is_empty() && !cursor_moved && shared.last.is_some() {
             return;
         }
 
@@ -371,7 +404,17 @@ impl Session {
             Err(_) => return,
         };
 
-        shared.clients.retain(|c| c.tx.try_send(frame.clone()).is_ok());
+        // A viewer too far behind is dropped — and its socket is shut, not merely
+        // forgotten. Left open, the page saw no close, kept saying "live", and went on
+        // sending keystrokes at a screen frozen minutes ago: driving blind, which is
+        // worse than visibly disconnected.
+        shared.clients.retain(|c| {
+            if c.tx.try_send(frame.clone()).is_ok() {
+                return true;
+            }
+            let _ = c.conn.shutdown(std::net::Shutdown::Both);
+            false
+        });
         shared.last = Some(snapshot);
     }
 
@@ -384,7 +427,12 @@ impl Drop for Session {
         self.stop.store(true, Ordering::Relaxed);
         let _ = TcpStream::connect(("127.0.0.1", PORT));
         if let Ok(mut shared) = self.shared.lock() {
-            shared.clients.clear();
+            // Same reason as `drop_viewer`: stopping means the phones stop TYPING, not
+            // just stop seeing. Without this, `shift+q` closed the panel, freed the
+            // port and left every paired phone driving the terminal.
+            for client in shared.clients.drain(..) {
+                let _ = client.conn.shutdown(std::net::Shutdown::Both);
+            }
         }
         if let Ok(mut child) = self.child.lock() {
             if let Some(mut proc) = child.take() {
@@ -525,6 +573,7 @@ fn serve(
     shared: &Arc<Mutex<Shared>>,
     next_id: &Arc<AtomicU64>,
     proxy: &EventLoopProxy<UserEvent>,
+    stop: &Arc<AtomicBool>,
 ) {
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(15)));
 
@@ -558,7 +607,7 @@ fn serve(
             // prompt without them is mostly missing glyphs.
             respond_cached(&mut stream, "font/ttf", crate::font::EMBEDDED_NERD_REGULAR)
         }
-        p if p.starts_with("/ws") => upgrade(stream, &headers, shared, next_id, proxy),
+        p if p.starts_with("/ws") => upgrade(stream, &headers, shared, next_id, proxy, stop),
         _ => respond(&mut stream, "404 Not Found", "text/plain", b"no"),
     }
 }
@@ -579,6 +628,7 @@ fn upgrade(
     shared: &Arc<Mutex<Shared>>,
     next_id: &Arc<AtomicU64>,
     proxy: &EventLoopProxy<UserEvent>,
+    stop: &Arc<AtomicBool>,
 ) {
     // A WebSocket upgrade may be made by any page that knows the URL, and the URL is
     // the one part of this the tunnel can read. `Origin` is the standard check: a
@@ -646,9 +696,25 @@ fn upgrade(
         let _ = writer.write_all(&[0x88, 0x00]);
     });
 
-    // Nothing is sent until the PIN arrives, and the PIN arrives INSIDE the encrypted
-    // channel. That is the point of moving pairing here from an HTTP route: a POST
-    // carried it in the clear past the edge, and a cookie did the same on every
+    // A fresh challenge per connection, sent before anything else. It is inside the
+    // encrypted channel, so only a holder of the key can read it, and it makes a
+    // captured pairing frame useless on any other connection.
+    let Ok(challenge) = random_token() else { return };
+    {
+        let hello = format!("{{\"t\":\"hello\",\"challenge\":\"{challenge}\"}}");
+        match seal(&cipher, hello.as_bytes()) {
+            Some(frame) => {
+                if tx.try_send(binary_frame(&frame)).is_err() {
+                    return;
+                }
+            }
+            None => return,
+        }
+    }
+
+    // Nothing else is sent until the PIN arrives, and the PIN arrives INSIDE the
+    // encrypted channel. That is the point of moving pairing here from an HTTP route: a
+    // POST carried it in the clear past the edge, and a cookie did the same on every
     // reconnect afterwards.
     let mut paired = false;
     let mut conn = stream;
@@ -672,6 +738,17 @@ fn upgrade(
                 // there is nothing useful to answer it with.
                 let Some(plain) = open_sealed(&cipher, &payload) else { break };
                 if paired {
+                    // Belt to the socket shutdown's braces: a frame already in flight
+                    // when the session ended must not be acted on either. Failing
+                    // closed on a poisoned lock is deliberate - if the state cannot be
+                    // read, nobody is authorised.
+                    let authorised = shared
+                        .lock()
+                        .map(|s| s.clients.iter().any(|c| c.id == id))
+                        .unwrap_or(false);
+                    if !authorised {
+                        break;
+                    }
                     if let Some(req) = request_from(&plain) {
                         // The same bridge `runnir @` uses, so a phone drives the
                         // terminal through the machinery a script does - leader layer,
@@ -680,7 +757,7 @@ fn upgrade(
                     }
                     continue;
                 }
-                match try_pair(&plain, shared, id, &tx) {
+                match try_pair(&plain, shared, id, &tx, &conn, stop, &challenge) {
                     Pairing::Ok => paired = true,
                     Pairing::Wrong(left) => {
                         let body = format!("{{\"t\":\"denied\",\"left\":{left}}}");
@@ -705,7 +782,8 @@ fn upgrade(
 
 enum Pairing {
     Ok,
-    /// Wrong PIN, with the attempts remaining. Zero means the session is over.
+    /// Wrong PIN, with the attempts remaining. Zero means the session is over — and
+    /// that now means the whole session, not this connection.
     Wrong(u32),
     Gone,
 }
@@ -716,12 +794,25 @@ fn try_pair(
     shared: &Arc<Mutex<Shared>>,
     id: u64,
     tx: &mpsc::SyncSender<Vec<u8>>,
+    conn: &TcpStream,
+    stop: &Arc<AtomicBool>,
+    challenge: &str,
 ) -> Pairing {
     let msg: serde_json::Value = match serde_json::from_slice(plain) {
         Ok(v) => v,
         Err(_) => return Pairing::Gone,
     };
     if msg.get("t").and_then(|t| t.as_str()) != Some("pair") {
+        return Pairing::Gone;
+    }
+    // The pairing frame must quote THIS connection's challenge.
+    //
+    // Without it, a sealed `pair` frame was valid for ever and on any connection: the
+    // edge terminates TLS, so it sees every byte, and replaying that one frame on a
+    // connection of its own got it past the PIN without ever knowing the PIN. The
+    // factor deliberately kept out of the link was worth nothing against exactly the
+    // party the link hides it from.
+    if msg.get("challenge").and_then(|c| c.as_str()) != Some(challenge) {
         return Pairing::Gone;
     }
     let offered = msg.get("pin").and_then(|v| v.as_str()).unwrap_or("");
@@ -735,7 +826,19 @@ fn try_pair(
 
     if !pin_matches(&s.pin, offered) {
         s.failures += 1;
-        return Pairing::Wrong(MAX_FAILURES.saturating_sub(s.failures));
+        let left = MAX_FAILURES.saturating_sub(s.failures);
+        if left == 0 {
+            // END THE SESSION. Closing only this connection let an attacker reconnect
+            // and try again, one guess per TCP connection, through a million PINs -
+            // while the code and the manual both claimed the server stopped. A limit
+            // that does not stop anything is worse than no limit, because it is
+            // budgeted for.
+            stop.store(true, Ordering::Relaxed);
+            for client in s.clients.drain(..) {
+                let _ = client.conn.shutdown(std::net::Shutdown::Both);
+            }
+        }
+        return Pairing::Wrong(left);
     }
     s.failures = 0;
 
@@ -756,7 +859,8 @@ fn try_pair(
             }
         }
     }
-    s.clients.push(Client { id, name, tx: tx.clone() });
+    let Ok(conn) = conn.try_clone() else { return Pairing::Gone };
+    s.clients.push(Client { id, name, tx: tx.clone(), conn });
     Pairing::Ok
 }
 
@@ -768,24 +872,58 @@ fn header(headers: &[String], name: &str) -> Option<String> {
     })
 }
 
+/// The actions the phone's menu offers, and the only ones it may name.
+///
+/// Not a safety boundary — see `request_from` — but a limit on what the wire exposes,
+/// so adding a control action does not silently publish it to the internet.
+const PHONE_ACTIONS: &[&str] = &[
+    "focus_left",
+    "focus_right",
+    "focus_up",
+    "focus_down",
+    "toggle_zoom",
+    "prev_tab",
+    "next_tab",
+    "new_tab",
+    "git_panel",
+    "docker_panel",
+    "toggle_explorer",
+    "tidal_panel",
+    "command_palette",
+    "show_docs",
+];
+
 /// What a phone asked for, as a control request.
 ///
 /// Only four shapes are accepted, and the omissions are deliberate:
 ///
-/// * `key` — a chord, taking the path a real keypress takes. This is how Enter always
-///   arrives, and Enter is where `guardian` asks "run this?". A phone must not be able
-///   to run a dangerous command without that question, so **newlines are refused in
-///   `text` below** and the only way to submit a line is a key.
+/// * `key` — a chord, taking the path a real keypress takes.
 /// * `text` — printable characters, for typing and pasting, with control characters
 ///   stripped. Without this every keystroke on a phone keyboard would be a chord
 ///   lookup, and autocorrect would be impossible to represent at all.
 /// * `click` — a cell. The whole window is on the phone, so tapping a tab or a row of
 ///   the git panel means the same thing it means with a mouse.
 /// * `wheel` — the scrollback, which keys alone cannot move without losing your place.
-/// * `action` — a named action by its config id, for the phone's menu.
+/// * `action` — one of `PHONE_ACTIONS`, which is the phone's menu and nothing else.
 ///
-/// Anything else is ignored rather than guessed at: this is input arriving from the
-/// internet, and the list of what it may do belongs here, in one place.
+/// ## What this list is, and what it is not
+///
+/// It is not a security boundary. **A paired phone has the reach of a person sitting at
+/// the keyboard**, because it can type: it can run any command, and it can walk into
+/// any prompt a keystroke opens. The door is the PIN; past the door there is no inner
+/// fence, and pretending otherwise would be the more dangerous mistake.
+///
+/// An earlier version of this comment claimed the newline filter meant a phone could
+/// not "run a dangerous command without that question". It cannot, through `text` —
+/// but `guardian` is a brake on reflexes, not a boundary, and an audit found two ways
+/// around it in minutes (`ctrl+m` encodes a carriage return, and any prompt overlay
+/// takes keys before the guardian is consulted). The `ctrl+m` hole is fixed, in
+/// `guardian::submits_line`; the general point stands and is written down here so the
+/// next person does not build on a promise this cannot keep.
+///
+/// The whitelist earns its place for a smaller reason: it keeps the wire surface to
+/// what the client actually needs, so a new control verb is not automatically exposed
+/// to the internet the day somebody adds one.
 fn request_from(payload: &[u8]) -> Option<ControlRequest> {
     let msg: serde_json::Value = serde_json::from_slice(payload).ok()?;
     match msg.get("t")?.as_str()? {
@@ -812,11 +950,13 @@ fn request_from(payload: &[u8]) -> Option<ControlRequest> {
         // Named actions, for the phone's own menu. This is what lets a phone switch
         // pane or open a panel WITHOUT arming the leader layer — which would put a
         // which-key menu on the desk's screen and then wait for a letter the phone
-        // cannot comfortably type. It adds no reach: everything here is already
-        // typeable by whoever is through the door.
-        "action" => Some(ControlRequest::Action {
-            id: msg.get("id")?.as_str()?.chars().take(64).collect(),
-        }),
+        // cannot comfortably type.
+        "action" => {
+            let id: String = msg.get("id")?.as_str()?.chars().take(64).collect();
+            PHONE_ACTIONS
+                .contains(&id.as_str())
+                .then(|| ControlRequest::Action { id })
+        }
         "wheel" => Some(ControlRequest::Wheel {
             col: msg.get("col")?.as_u64()? as usize,
             row: msg.get("row")?.as_u64()? as usize,
@@ -1054,6 +1194,20 @@ mod tests {
             "a newline on its own leaves nothing to send"
         );
         assert!(request_from(br#"{"t":"text","text":"\u0003"}"#).is_none(), "nor does a control byte");
+    }
+
+    #[test]
+    fn the_menu_is_the_only_action_list() {
+        assert!(matches!(
+            request_from(br#"{"t":"action","id":"focus_left"}"#),
+            Some(ControlRequest::Action { .. })
+        ));
+        // Not a boundary - a paired phone can type - but the wire should expose the
+        // menu and not every verb the terminal happens to have.
+        assert!(request_from(br#"{"t":"action","id":"quit"}"#).is_none());
+        assert!(request_from(br#"{"t":"action","id":"pipe_scrollback"}"#).is_none());
+        assert!(request_from(br#"{"t":"action","id":"launch_claude"}"#).is_none());
+        assert!(request_from(br#"{"t":"action","id":""}"#).is_none());
     }
 
     #[test]

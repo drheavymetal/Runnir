@@ -3152,10 +3152,13 @@ impl Gpu {
     /// in runnir was the one thing `runnir @ key` could not exercise, and a test could
     /// never have caught it going missing.
     fn guard_enter(&mut self, key: &Key, mods: ModifiersState, config: &Config) -> bool {
-        if !config.behaviour.command_guardian
-            || !matches!(key, Key::Named(NamedKey::Enter))
-            || !mods.is_empty()
-        {
+        // What the SHELL reads as "run it", not what a keycap says.
+        //
+        // Ctrl+M encodes to 0x0D and Ctrl+J to 0x0A (see `keys::encode_key`), which a
+        // line-oriented program cannot tell from Enter — so a guardian that only knows
+        // about `NamedKey::Enter` is a guardian anyone steps around by holding Ctrl.
+        // That was true from a real keyboard as well as from a phone.
+        if !config.behaviour.command_guardian || !crate::guardian::submits_line(key, mods) {
             return false;
         }
         let line = {

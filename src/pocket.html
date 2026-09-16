@@ -607,8 +607,18 @@ function showDoor(message) {
 // The PIN goes over the ENCRYPTED socket, not an HTTP route. A POST carried it in the
 // clear past the edge, and the cookie it returned did the same on every reconnect.
 // Keeping it here means the tunnel never sees the one secret that is not in the link.
+// The challenge this connection was given. A pairing frame that does not quote it is
+// refused, which is what stops a captured one being replayed on another connection.
+let challenge = null;
+let pendingPair = null;
+
 function sendPair(pin, name) {
-  send({ t: 'pair', pin: pin, name: name || null });
+  if (!challenge) {
+    // The hello has not arrived yet; send it the moment it does.
+    pendingPair = { pin: pin, name: name || null };
+    return;
+  }
+  send({ t: 'pair', pin: pin, name: name || null, challenge: challenge });
 }
 
 function pair() {
@@ -640,11 +650,19 @@ function connect() {
     return;
   }
   const proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
-  ws = new WebSocket(proto + location.host + base + '/ws');
-  ws.binaryType = 'arraybuffer';
+  // Close whatever was open first. `connect()` used to overwrite the global and leave
+  // the old socket alive, and since the handlers below referenced the GLOBAL, a failure
+  // on the stale one closed the healthy one instead - each orphan spawning another
+  // reconnect.
+  if (ws) { try { ws.onclose = null; ws.onerror = null; ws.close(); } catch (e) {} }
+  const sock = new WebSocket(proto + location.host + base + '/ws');
+  ws = sock;
+  sock.binaryType = 'arraybuffer';
   paired = false;
+  challenge = null;
+  pendingPair = null;
 
-  ws.onopen = () => {
+  sock.onopen = () => {
     reconnectDelay = 500;
     let pin = null, name = null;
     try {
@@ -659,7 +677,7 @@ function connect() {
     }
   };
 
-  ws.onmessage = async (e) => {
+  sock.onmessage = async (e) => {
     let msg;
     try {
       msg = await openMsg(e.data);
@@ -667,7 +685,16 @@ function connect() {
       // Anything that does not decrypt is not from our terminal. The likeliest cause
       // is a stale link whose key belongs to a session that has been replaced.
       showDoor('this link no longer matches the terminal');
-      try { ws.close(); } catch (_) {}
+      try { sock.close(); } catch (_) {}
+      return;
+    }
+    if (msg.t === 'hello') {
+      challenge = msg.challenge;
+      if (pendingPair) {
+        const p = pendingPair;
+        pendingPair = null;
+        sendPair(p.pin, p.name);
+      }
       return;
     }
     if (msg.t === 'denied') {
@@ -677,6 +704,7 @@ function connect() {
         : 'too many wrong tries - the terminal stopped sharing');
       return;
     }
+    lastFrameAt = Date.now();
     if (!paired) {
       paired = true;
       pairEl.classList.remove('show');
@@ -687,7 +715,10 @@ function connect() {
     apply(msg);
   };
 
-  ws.onclose = () => {
+  sock.onclose = () => {
+    // Only the CURRENT socket gets to schedule a reconnect; a late close from one we
+    // already replaced must not start a second loop.
+    if (ws !== sock) return;
     statusEl.textContent = 'reconnecting';
     barEl.classList.remove('live');
     // Backing off matters: a terminal that closed is not coming back, and a page left
@@ -696,7 +727,7 @@ function connect() {
     setTimeout(connect, reconnectDelay);
     reconnectDelay = Math.min(reconnectDelay * 2, 10000);
   };
-  ws.onerror = () => { try { ws.close(); } catch (_) {} };
+  sock.onerror = () => { try { sock.close(); } catch (_) {} };
 }
 
 // A phone that sleeps drops the socket - that cannot be prevented from in here, and
@@ -713,6 +744,20 @@ document.addEventListener('visibilitychange', () => {
 // Traffic every twenty seconds, so an idle socket is not reaped by anything in the
 // middle. The server ignores what it does not recognise, which is exactly what this is.
 setInterval(() => { if (paired) send({ t: 'ping' }); }, 20000);
+
+// An open socket is not proof of a live mirror: the terminal can drop a viewer that
+// fell behind, and TCP will happily hold the connection open afterwards. Without this
+// the page kept saying "live" over a frozen screen while keystrokes went on arriving at
+// the real terminal - the one failure mode worse than being disconnected.
+let lastFrameAt = Date.now();
+setInterval(() => {
+  if (!paired) return;
+  if (Date.now() - lastFrameAt < 45000) return;
+  statusEl.textContent = 'stalled - reconnecting';
+  barEl.classList.remove('live');
+  paired = false;
+  try { ws.close(); } catch (e) { connect(); }
+}, 5000);
 
 // ---- input -----------------------------------------------------------------
 // Everything below goes out on the socket that is already open and arrives through

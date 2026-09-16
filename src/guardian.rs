@@ -10,6 +10,32 @@
 //! raw device, reformatting, dropping a table, force-pushing, a fork bomb). False
 //! positives are cheap (one keypress to confirm); a missed `rm -rf /` is not.
 
+/// Whether this keypress is what a shell will read as "run the line".
+///
+/// Not what the keycap says: what arrives at the child. `encode_key` turns Ctrl+M into
+/// 0x0D and Ctrl+J into 0x0A, and a line-oriented program cannot tell either from
+/// Enter. A guardian that only recognised `NamedKey::Enter` was therefore one Ctrl away
+/// from being skipped — from a phone, and from a real keyboard just as easily.
+///
+/// Pure and separate from the window so it can be tested, which is the whole point:
+/// this is the condition the single safety feature in runnir hangs off.
+pub fn submits_line(key: &winit::keyboard::Key, mods: winit::keyboard::ModifiersState) -> bool {
+    use winit::keyboard::{Key, NamedKey};
+    match key {
+        Key::Named(NamedKey::Enter) => mods.is_empty(),
+        Key::Character(c) => {
+            mods.control_key()
+                && !mods.alt_key()
+                && !mods.super_key()
+                && matches!(
+                    c.chars().next().map(|c| c.to_ascii_lowercase()),
+                    Some('m') | Some('j')
+                )
+        }
+        _ => false,
+    }
+}
+
 /// The reason a command line is considered dangerous, or `None` if it looks safe.
 /// The string is shown to the user, so it names the specific hazard.
 pub fn danger(line: &str) -> Option<&'static str> {
@@ -314,5 +340,44 @@ mod tests {
     fn empty_line_is_safe() {
         assert!(danger("").is_none());
         assert!(danger("   ").is_none());
+    }
+}
+
+#[cfg(test)]
+mod submit_tests {
+    use super::submits_line;
+    use winit::keyboard::{Key, ModifiersState, NamedKey};
+
+    fn ch(c: &str) -> Key {
+        Key::Character(c.into())
+    }
+
+    #[test]
+    fn ctrl_m_and_ctrl_j_submit_a_line_just_like_enter() {
+        // These encode to 0x0D and 0x0A, which a shell cannot distinguish from Enter.
+        // Before this was recognised, `text` + `ctrl+m` ran anything the guardian was
+        // meant to ask about - and the test that claimed to guard that property passed
+        // the whole time, because it only tested the newline filter.
+        assert!(submits_line(&Key::Named(NamedKey::Enter), ModifiersState::empty()));
+        assert!(submits_line(&ch("m"), ModifiersState::CONTROL));
+        assert!(submits_line(&ch("M"), ModifiersState::CONTROL));
+        assert!(submits_line(&ch("j"), ModifiersState::CONTROL));
+    }
+
+    #[test]
+    fn ordinary_typing_does_not_submit() {
+        assert!(!submits_line(&ch("m"), ModifiersState::empty()));
+        assert!(!submits_line(&ch("a"), ModifiersState::CONTROL));
+        assert!(!submits_line(&Key::Named(NamedKey::Space), ModifiersState::empty()));
+        // Modified Enter is a different key to most shells and readline setups, and the
+        // guardian has always let it through; that is unchanged.
+        assert!(!submits_line(&Key::Named(NamedKey::Enter), ModifiersState::SHIFT));
+    }
+
+    #[test]
+    fn other_modifiers_alongside_ctrl_do_not_count() {
+        // Alt+Ctrl+M is not a carriage return; it is an escape sequence.
+        assert!(!submits_line(&ch("m"), ModifiersState::CONTROL | ModifiersState::ALT));
+        assert!(!submits_line(&ch("m"), ModifiersState::CONTROL | ModifiersState::SUPER));
     }
 }

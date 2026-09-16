@@ -24,6 +24,7 @@
 
 use crate::config::{Rgb, Theme};
 use crate::grid::{Cell, Color, Flags, Grid, PlanRow, SPACER};
+use crate::selection::Selection;
 
 /// One layer to compose: a grid and where its top-left cell lands, **in cells**.
 ///
@@ -44,6 +45,14 @@ pub struct Layer<'a> {
     /// draws at 0.62. Carried so the phone shows the same "which pane is live" cue the
     /// screen does.
     pub dim: bool,
+    /// The context tint (root, docker, ssh) the renderer blends into this pane's
+    /// background. It is the cue that says "you are root" or "this is not your
+    /// machine", so a phone without it is a phone that cannot tell.
+    pub tint: Option<(u8, u8, u8)>,
+    /// What is selected in this layer, if anything. Copy mode draws its cursor ONLY as
+    /// a selection, so without this a phone in copy mode sees nothing move at all and
+    /// yanks whatever it could not see.
+    pub selection: Option<&'a Selection>,
 }
 
 /// The whole window as cells, ready to diff and send.
@@ -55,6 +64,11 @@ pub struct Snapshot {
     pub cells: Vec<Cell>,
     /// Cells this snapshot dimmed, parallel to `cells`.
     pub dim: Vec<bool>,
+    /// The tint under each cell, parallel to `cells`: a default background resolves
+    /// against it, exactly as the renderer blends it into the pane's base.
+    pub tint: Vec<Option<(u8, u8, u8)>>,
+    /// Cells inside a selection, parallel to `cells`.
+    pub selected: Vec<bool>,
     /// Cursor position in window coordinates, if one is visible.
     pub cursor: Option<(usize, usize)>,
 }
@@ -66,6 +80,8 @@ impl Snapshot {
             rows,
             cells: vec![Cell::default(); cols * rows],
             dim: vec![false; cols * rows],
+            tint: vec![None; cols * rows],
+            selected: vec![false; cols * rows],
             cursor: None,
         }
     }
@@ -76,6 +92,14 @@ impl Snapshot {
 
     fn dim_row(&self, row: usize) -> &[bool] {
         &self.dim[row * self.cols..(row + 1) * self.cols]
+    }
+
+    fn tint_row(&self, row: usize) -> &[Option<(u8, u8, u8)>] {
+        &self.tint[row * self.cols..(row + 1) * self.cols]
+    }
+
+    fn selected_row(&self, row: usize) -> &[bool] {
+        &self.selected[row * self.cols..(row + 1) * self.cols]
     }
 }
 
@@ -133,6 +157,9 @@ pub fn compose(layers: &[Layer], cols: usize, rows: usize) -> Snapshot {
                 // is already giving the wide glyph two columns of its own.
                 out.cells[y * cols + x] = cell;
                 out.dim[y * cols + x] = layer.dim;
+                out.tint[y * cols + x] = layer.tint;
+                out.selected[y * cols + x] =
+                    layer.selection.is_some_and(|s| s.contains(layer.grid, (abs, lcol)));
             }
         }
 
@@ -197,6 +224,8 @@ pub fn layers_from<'a>(
             transparent: p.transparent,
             cursor: p.cursor.and_then(|_| cursor_screen_pos(p.grid)),
             dim: behind_overlay || !p.focused,
+            tint: p.tint,
+            selection: p.selection,
         })
         .collect();
 
@@ -208,6 +237,8 @@ pub fn layers_from<'a>(
             transparent: p.transparent,
             cursor: None,
             dim: false,
+            tint: p.tint,
+            selection: p.selection,
         }));
     }
 
@@ -221,12 +252,17 @@ pub fn layers_from<'a>(
 /// inside a fold, which only happens to finished output and is therefore rare.
 fn cursor_screen_pos(grid: &Grid) -> Option<(usize, usize)> {
     let (row, col) = grid.cursor();
-    if !grid.has_folds() {
-        return Some((row, col));
-    }
     let abs = grid.total_rows() - grid.rows() + row;
-    grid.display_plan()
-        .iter()
+    // Same arithmetic as `render.rs::pane_instances`, for the same reason and including
+    // the `None`. The shortcut this used to take — returning the viewport row directly
+    // when there were no folds — ignored the scroll offset, so scrolling back painted a
+    // cursor on an arbitrary line of history while the desktop correctly drew none.
+    let plan: Vec<PlanRow> = if grid.has_folds() {
+        grid.display_plan()
+    } else {
+        (0..grid.rows()).map(|r| PlanRow::Real(grid.abs_row(r))).collect()
+    };
+    plan.iter()
         .position(|p| matches!(p, PlanRow::Real(a) if *a == abs))
         .map(|screen_row| (screen_row, col))
 }
@@ -271,11 +307,28 @@ pub struct RowUpdate {
 ///
 /// `REVERSE` is applied here rather than left to the page: it is a property of the
 /// cell, and a client that forgot it would silently show selected text as unselected.
-fn colours(cell: &Cell, theme: &Theme, dim: bool) -> ((u8, u8, u8), (u8, u8, u8)) {
+fn colours(
+    cell: &Cell,
+    theme: &Theme,
+    dim: bool,
+    tint: Option<(u8, u8, u8)>,
+    selected: bool,
+) -> ((u8, u8, u8), (u8, u8, u8)) {
+    // A default background resolves against the pane's tinted base, the way the
+    // renderer blends `Context::tint` in: red for root, blue for docker, a colour per
+    // host for ssh. Without it a phone cannot tell a root shell from an ordinary one.
+    let base_bg = match tint {
+        Some(t) => Rgb(
+            ((theme.background.0 as u16 + t.0 as u16) / 2) as u8,
+            ((theme.background.1 as u16 + t.1 as u16) / 2) as u8,
+            ((theme.background.2 as u16 + t.2 as u16) / 2) as u8,
+        ),
+        None => theme.background,
+    };
     let resolve = |c: Color, is_fg: bool| -> Rgb {
         match c {
             Color::Default if is_fg => theme.foreground,
-            Color::Default => theme.background,
+            Color::Default => base_bg,
             Color::Rgb(r, g, b) => Rgb(r, g, b),
             Color::Indexed(i) => crate::render::xterm256(i, &theme.ansi),
         }
@@ -293,6 +346,11 @@ fn colours(cell: &Cell, theme: &Theme, dim: bool) -> ((u8, u8, u8), (u8, u8, u8)
         let f = if dim { 0.62 } else { 0.7 };
         fg = Rgb(scale(fg.0, f), scale(fg.1, f), scale(fg.2, f));
     }
+    // Last, as the renderer does: a selection wins over whatever the cell asked for.
+    // Copy mode has no other cursor, so this is the only thing that shows where it is.
+    if selected {
+        bg = theme.selection;
+    }
     ((fg.0, fg.1, fg.2), (bg.0, bg.1, bg.2))
 }
 
@@ -300,15 +358,17 @@ fn colours(cell: &Cell, theme: &Theme, dim: bool) -> ((u8, u8, u8), (u8, u8, u8)
 pub fn row_runs(snapshot: &Snapshot, row: usize, theme: &Theme) -> Vec<Run> {
     let cells = snapshot.row(row);
     let dims = snapshot.dim_row(row);
+    let tints = snapshot.tint_row(row);
+    let selected = snapshot.selected_row(row);
     let mut runs: Vec<Run> = Vec::new();
 
-    for (cell, &dim) in cells.iter().zip(dims) {
+    for (i, (cell, &dim)) in cells.iter().zip(dims).enumerate() {
         // The wide glyph to its left already occupies this column in any monospaced
         // font; emitting the spacer too would push the rest of the row one cell right.
         if cell.ch == SPACER {
             continue;
         }
-        let (fg, bg) = colours(cell, theme, dim);
+        let (fg, bg) = colours(cell, theme, dim, tints[i], selected[i]);
         let flags = cell.pen.flags.bits();
         match runs.last_mut() {
             Some(last) if last.fg == fg && last.bg == bg && last.flags == flags => {
@@ -344,7 +404,12 @@ pub fn diff(prev: Option<&Snapshot>, next: &Snapshot, theme: &Theme) -> Vec<RowU
 
     for row in 0..next.rows {
         let changed = match prev {
-            Some(p) if same_shape => p.row(row) != next.row(row) || p.dim_row(row) != next.dim_row(row),
+            Some(p) if same_shape => {
+                p.row(row) != next.row(row)
+                    || p.dim_row(row) != next.dim_row(row)
+                    || p.tint_row(row) != next.tint_row(row)
+                    || p.selected_row(row) != next.selected_row(row)
+            }
             _ => true,
         };
         if changed {
@@ -378,8 +443,8 @@ mod tests {
         let over = grid_with("XY", 2);
         let snap = compose(
             &[
-                Layer { grid: &under, col: 0, row: 0, transparent: false, cursor: None, dim: false },
-                Layer { grid: &over, col: 2, row: 0, transparent: false, cursor: None, dim: false },
+                Layer { grid: &under, col: 0, row: 0, transparent: false, cursor: None, dim: false, tint: None, selection: None },
+                Layer { grid: &over, col: 2, row: 0, transparent: false, cursor: None, dim: false, tint: None, selection: None },
             ],
             6,
             1,
@@ -394,8 +459,8 @@ mod tests {
         let over = grid_with("  Z   ", 6);
         let snap = compose(
             &[
-                Layer { grid: &under, col: 0, row: 0, transparent: false, cursor: None, dim: false },
-                Layer { grid: &over, col: 0, row: 0, transparent: true, cursor: None, dim: false },
+                Layer { grid: &under, col: 0, row: 0, transparent: false, cursor: None, dim: false, tint: None, selection: None },
+                Layer { grid: &over, col: 0, row: 0, transparent: true, cursor: None, dim: false, tint: None, selection: None },
             ],
             6,
             1,
@@ -408,7 +473,7 @@ mod tests {
     fn a_layer_is_clipped_to_the_window() {
         let wide = grid_with("abcdef", 6);
         let snap = compose(
-            &[Layer { grid: &wide, col: 4, row: 0, transparent: false, cursor: None, dim: false }],
+            &[Layer { grid: &wide, col: 4, row: 0, transparent: false, cursor: None, dim: false, tint: None, selection: None }],
             6,
             1,
         );
@@ -420,7 +485,7 @@ mod tests {
     fn a_layer_below_the_window_is_dropped() {
         let g = grid_with("abc", 3);
         let snap = compose(
-            &[Layer { grid: &g, col: 0, row: 5, transparent: false, cursor: None, dim: false }],
+            &[Layer { grid: &g, col: 0, row: 5, transparent: false, cursor: None, dim: false, tint: None, selection: None }],
             3,
             2,
         );
@@ -431,7 +496,7 @@ mod tests {
     fn the_cursor_lands_in_window_coordinates() {
         let g = grid_with("abc", 3);
         let snap = compose(
-            &[Layer { grid: &g, col: 10, row: 4, transparent: false, cursor: Some((0, 2)), dim: false }],
+            &[Layer { grid: &g, col: 10, row: 4, transparent: false, cursor: Some((0, 2)), dim: false, tint: None, selection: None }],
             20,
             10,
         );
@@ -444,7 +509,7 @@ mod tests {
         g.write_str(0, 0, "aa", Pen { fg: Color::Indexed(1), ..Pen::default() });
         g.write_str(0, 2, "bb", Pen { fg: Color::Indexed(2), ..Pen::default() });
         let snap = compose(
-            &[Layer { grid: &g, col: 0, row: 0, transparent: false, cursor: None, dim: false }],
+            &[Layer { grid: &g, col: 0, row: 0, transparent: false, cursor: None, dim: false, tint: None, selection: None }],
             6,
             1,
         );
@@ -459,7 +524,7 @@ mod tests {
         let mut g = Grid::new(1, 1);
         g.write_str(0, 0, "x", Pen { flags: Flags::REVERSE, ..Pen::default() });
         let snap = compose(
-            &[Layer { grid: &g, col: 0, row: 0, transparent: false, cursor: None, dim: false }],
+            &[Layer { grid: &g, col: 0, row: 0, transparent: false, cursor: None, dim: false, tint: None, selection: None }],
             1,
             1,
         );
@@ -470,10 +535,34 @@ mod tests {
     }
 
     #[test]
+    fn a_tint_reaches_the_phone() {
+        // The tint is how a root or ssh pane announces itself. A phone without it
+        // cannot tell whose machine it is typing into.
+        let g = grid_with("whoami", 6);
+        let plain = compose(
+            &[Layer { grid: &g, col: 0, row: 0, transparent: false, cursor: None, dim: false, tint: None, selection: None }],
+            6,
+            1,
+        );
+        let rooted = compose(
+            &[Layer { grid: &g, col: 0, row: 0, transparent: false, cursor: None, dim: false, tint: Some((70, 20, 20)), selection: None }],
+            6,
+            1,
+        );
+        let t = theme();
+        assert_ne!(
+            row_runs(&plain, 0, &t)[0].bg,
+            row_runs(&rooted, 0, &t)[0].bg,
+            "a tinted pane must not look like an untinted one"
+        );
+        assert!(diff(Some(&plain), &rooted, &t).len() > 0, "a tint change is a change");
+    }
+
+    #[test]
     fn a_first_diff_sends_every_row() {
         let g = grid_with("hello", 5);
         let snap = compose(
-            &[Layer { grid: &g, col: 0, row: 0, transparent: false, cursor: None, dim: false }],
+            &[Layer { grid: &g, col: 0, row: 0, transparent: false, cursor: None, dim: false, tint: None, selection: None }],
             5,
             3,
         );
@@ -485,12 +574,12 @@ mod tests {
         let before = grid_with("aaa", 3);
         let after = grid_with("aba", 3);
         let first = compose(
-            &[Layer { grid: &before, col: 0, row: 0, transparent: false, cursor: None, dim: false }],
+            &[Layer { grid: &before, col: 0, row: 0, transparent: false, cursor: None, dim: false, tint: None, selection: None }],
             3,
             2,
         );
         let second = compose(
-            &[Layer { grid: &after, col: 0, row: 0, transparent: false, cursor: None, dim: false }],
+            &[Layer { grid: &after, col: 0, row: 0, transparent: false, cursor: None, dim: false, tint: None, selection: None }],
             3,
             2,
         );
@@ -503,12 +592,12 @@ mod tests {
     fn a_resize_resends_everything() {
         let g = grid_with("ab", 2);
         let small = compose(
-            &[Layer { grid: &g, col: 0, row: 0, transparent: false, cursor: None, dim: false }],
+            &[Layer { grid: &g, col: 0, row: 0, transparent: false, cursor: None, dim: false, tint: None, selection: None }],
             2,
             1,
         );
         let big = compose(
-            &[Layer { grid: &g, col: 0, row: 0, transparent: false, cursor: None, dim: false }],
+            &[Layer { grid: &g, col: 0, row: 0, transparent: false, cursor: None, dim: false, tint: None, selection: None }],
             4,
             2,
         );
