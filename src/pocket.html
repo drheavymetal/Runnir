@@ -480,16 +480,18 @@ function toggleFit() {
 function layout() {
   const dock = document.getElementById('dock');
   const vv = window.visualViewport;
-  // `interactive-widget=resizes-content` makes the browser shrink the page for the
-  // keyboard, which is what `bottom: 0` then means. Where that is not honoured, the
-  // visual viewport still reports the truth and the difference is made up by hand -
-  // the first attempt did all of this by hand and the keyboard's suggestion strip,
-  // which is not part of the reported height, kept covering the field anyway.
-  const covered = vv ? Math.max(0, window.innerHeight - vv.height - vv.offsetTop) : 0;
-  dock.style.bottom = covered + 'px';
+  // The dock's position is left to CSS (`bottom: 0`) and to the browser, which shrinks
+  // the page for the keyboard because of `interactive-widget=resizes-content`.
+  //
+  // It used to be nudged by `innerHeight - visualViewport.height`, as a fallback for
+  // browsers that ignore that hint. That arithmetic is fine until the two disagree for
+  // any other reason, and then it pushes the dock a whole screen upwards - which is
+  // exactly what happened: the keys ended up behind the top bar and the typing field
+  // was off-screen entirely. A fallback that can misplace the only way to type is worse
+  // than no fallback.
+  const visible = vv ? vv.height : window.innerHeight;
   wrapEl.style.top = '30px';
-  wrapEl.style.height =
-    ((vv ? vv.height : window.innerHeight) - 30 - dock.offsetHeight) + 'px';
+  wrapEl.style.height = Math.max(80, visible - 30 - dock.offsetHeight) + 'px';
   revealCursor();
 }
 
