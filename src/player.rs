@@ -225,13 +225,21 @@ pub fn plan(pref: &str, bit_perfect: bool, hw_devices: &[String]) -> Vec<Attempt
         if named { vec![pref.to_string()] } else { hw_devices.to_vec() };
 
     if bit_perfect {
+        // Both bit-exact rungs of a device, before moving on to the next device.
+        //
+        // These used to be two passes over all the devices, so that "a second card
+        // cannot take an exact match away from the first one". The effect was the
+        // opposite: a Scarlett 2i2 only accepts S32_LE, so a 16-bit source failed its
+        // exact rung, the built-in card's digital output took the exact rung on the
+        // NEXT pass, and the music left the interface the person plugged in and came
+        // out of the motherboard.
+        //
+        // Nothing was being taken away, either: a narrower sample in a wider container
+        // is zero-padding, which is bit-exact — the same reason this chain already
+        // accepts 24 into 32. So there is no reason to prefer another card's exact
+        // match over this card's padded one, and every reason not to.
         for d in &heads {
             out.push(Attempt { device: d.clone(), exact: true, same_rate: true });
-        }
-        // Second pass: same devices, but a wider container is acceptable. Kept as a
-        // separate pass so a second card cannot take an exact match away from the first
-        // one just by being listed earlier.
-        for d in &heads {
             out.push(Attempt { device: d.clone(), exact: false, same_rate: true });
         }
     }
@@ -2043,6 +2051,34 @@ mod tests {
     }
 
     #[test]
+    fn a_device_that_needs_a_wider_container_keeps_the_music() {
+        // A Focusrite Scarlett 2i2 accepts only S32_LE. Playing a 16-bit source, its
+        // exact rung fails and its padded rung succeeds — and padding is bit-exact.
+        // The built-in card's digital output CAN take 16 bits exactly, so ordering the
+        // rungs device-first is what keeps the music on the interface somebody chose to
+        // plug in rather than sending it out of the motherboard.
+        let chain = plan("auto", true, &devices());
+        let first_hw00 = chain.iter().position(|a| a.device == "hw:0,0").unwrap();
+        let first_hw20 = chain.iter().position(|a| a.device == "hw:2,0").unwrap();
+        assert!(first_hw00 < first_hw20, "the preferred device comes first");
+
+        // Every bit-exact rung of the first device is tried before the second device is
+        // touched at all.
+        let both_of_first: Vec<usize> = chain
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| a.device == "hw:0,0" && a.same_rate)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(both_of_first.len(), 2, "exact, then wider container");
+        assert!(
+            both_of_first.iter().all(|i| *i < first_hw20),
+            "a second card must not take the music before the first one has been \
+             offered the container it can actually accept"
+        );
+    }
+
+    #[test]
     fn a_machine_with_only_hdmi_still_plays_through_it() {
         let only_hdmi = vec![Device {
             name: "hw:0,3".into(),
@@ -2059,14 +2095,27 @@ mod tests {
     }
 
     #[test]
-    fn the_chain_tries_every_card_exactly_before_bending_for_any_of_them() {
+    fn the_chain_bends_the_container_before_it_changes_card() {
+        // This test used to assert the opposite: both cards got an exact attempt before
+        // either got a padded one, on the grounds that otherwise "the first card could
+        // take a lossy path while the second would have played the stream untouched".
+        //
+        // That reasoning had a false premise. A padded container is NOT a lossy path —
+        // it is zero-padding, which is bit-exact, and this chain already accepts 24 into
+        // 32 for exactly that reason. So the old order traded nothing for nothing, and
+        // cost a real user their audio interface: a Scarlett 2i2 takes only S32_LE, its
+        // exact rung failed on a 16-bit stream, and the motherboard's digital output
+        // won the next pass.
         let plan = plan("auto", true, &devices());
-        // Both cards get an exact attempt before either gets a padded one — otherwise
-        // the first card listed could take a lossy path while the second would have
-        // played the stream untouched.
         assert_eq!(plan[0], Attempt { device: "hw:0,0".into(), exact: true, same_rate: true });
-        assert_eq!(plan[1], Attempt { device: "hw:2,0".into(), exact: true, same_rate: true });
-        assert!(!plan[2].exact);
+        assert_eq!(plan[1], Attempt { device: "hw:0,0".into(), exact: false, same_rate: true });
+        assert_eq!(plan[2], Attempt { device: "hw:2,0".into(), exact: true, same_rate: true });
+
+        // What must still hold: nothing RESAMPLES until every device has been offered a
+        // bit-exact rung. That is the distinction that actually matters to fidelity.
+        let first_resample = plan.iter().position(|a| !a.same_rate).unwrap();
+        let last_exact = plan.iter().rposition(|a| a.same_rate).unwrap();
+        assert!(last_exact < first_resample, "bit-exact rungs come first, all of them");
     }
 
     #[test]
