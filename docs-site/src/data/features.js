@@ -123,6 +123,39 @@ export const FEATURES = [
       en: 'Needs cloudflared installed. And worth saying plainly: it re-transmits licensed audio to whoever holds the URL. The link dies when it is stopped or with the last window.',
     },
   },
+  {
+    key: 'spotify-connect', section: 'distinctive', status: 'dev',
+    title: { es: 'La terminal como dispositivo de Spotify', en: 'The terminal as a Spotify device' },
+    natural: {
+      es: 'runnir se anuncia a Spotify como un dispositivo propio, así que el móvil dice «Reproduciendo en runnir» y la terminal aparece en la lista de dispositivos de la cuenta. Sin esto runnir era un cliente privado: sonaba, y para el resto de Spotify no estaba pasando nada en ningún sitio. No se anuncia por la red local sino por la conexión de Spotify, de modo que sale en el móvil estés donde estés, no solo desde el sofá. Con el dispositivo puesto, todo pasa por él: cargar el reproductor por detrás dejaría al móvil enseñando un altavoz parado mientras la terminal suena. Pausar en la terminal se ve como pausa en el móvil, y al revés.',
+      en: 'runnir announces itself to Spotify as a device of its own, so the phone says "Playing on runnir" and the terminal turns up in the account\u2019s device list. Without it runnir was a private client: it played, and as far as the rest of Spotify was concerned nothing was happening anywhere. It is announced over Spotify\u2019s own connection rather than the local network, so it shows up on the phone from anywhere, not only from the sofa. With the device present everything goes through it: loading the player behind its back would leave the phone showing an idle speaker while the terminal plays. Pausing in the terminal reads as paused on the phone, and the other way round.',
+    },
+    config: [
+      { k: 'spotify.connect_device', v: 'true', d: { es: 'Anunciar la terminal como dispositivo. Apagarlo devuelve el comportamiento anterior: suena, pero nadie se entera.', en: 'Announce the terminal as a device. Turning it off restores the old behaviour: it plays, and nobody is told.' } },
+      { k: 'spotify.device_name', v: '"runnir"', d: { es: 'El nombre que ve el móvil.', en: 'The name the phone sees.' } },
+    ],
+    note: {
+      es: 'El dispositivo vive lo que viva el reproductor, que se va con la última ventana: nada suena sin runnir en pantalla, y un altavoz que responde por una terminal que nadie ha abierto rompería esa regla. Dos límites que conviene saber: el dispositivo no existe hasta que la terminal ha reproducido una canción de Spotify (la sesión se abre con la primera), y no ofrece control de volumen remoto a propósito — todo lo que hay debajo es exclusivo y sin remuestrear, y la única forma de que un deslizador llegue a esas muestras es multiplicándolas. Mandarle audio desde el móvil funciona y el sonido sale por la máquina, pero la terminal todavía no se entera: el panel, la barra de estado y MPRIS solo conocen su propia cola.',
+      en: 'The device lives as long as the player does, and the player goes with the last window: nothing plays without runnir on screen, and a speaker answering for a terminal nobody has opened would break that. Two limits worth knowing: the device does not exist until the terminal has played one Spotify track (the session opens with the first), and it deliberately offers no remote volume \u2014 everything below it is exclusive and unresampled, and the only way a slider reaches those samples is by multiplying them. Sending audio to it from the phone works and the sound comes out of the machine, but the terminal does not yet know about it: the panel, the status bar and MPRIS only know their own queue.',
+    },
+  },
+  {
+    key: 'spotify-jam', section: 'distinctive', status: 'dev',
+    title: { es: 'Una Jam desde la terminal', en: 'A Jam from the terminal' },
+    natural: {
+      es: 'Una Jam de Spotify hospedada por la terminal: abres una y reparte un enlace para que otra gente escuche contigo lo que está sonando aquí. Esto solo es posible porque la terminal es un dispositivo — una Jam la hospeda un dispositivo, no una aplicación. El enlace sale en el pie del panel de música y es clicable. La misma tecla abre y cierra, porque el panel siempre dice en qué estado está.',
+      en: 'A Spotify Jam hosted by the terminal: open one and it hands out a link that lets other people listen along to whatever is playing here. It is only possible because the terminal is a device \u2014 a Jam is hosted by a device, not by an application. The link appears in the music panel\u2019s footer and is clickable. One key opens and closes it, because the panel always says which state it is in.',
+    },
+    keys: [
+      'Leader N J',
+      { es: 'Shift+J dentro del panel de música', en: 'Shift+J inside the music panel' },
+    ],
+    example: 'runnir --spotify-jam',
+    note: {
+      es: 'Necesita Premium y que la terminal sea un dispositivo, así que hay que haber reproducido algo antes; si le das antes, lo dice con esas palabras. La Jam se cierra cuando cierras la terminal, igual que el enlace público: una sesión de escucha en la cuenta de alguien, hospedada por una terminal que cerró hace una hora, es la misma sorpresa vestida de Spotify. Spotify no publica API para esto, así que los endpoints están mapeados contra el servicio real y hay un test con la respuesta grabada; runnir --spotify-jam abre una, imprime el enlace y la cierra, y es lo que avisará el día que la forma cambie. Lo que todavía no hace: el contador de gente se lee al crear la sesión y no se refresca, no hay código QR en la terminal, y solo hospeda — no puedes unirte desde aquí a la Jam de otro.',
+      en: 'Needs Premium and needs the terminal to be a device, so something has to have played first; ask before that and it says so in as many words. The Jam ends when the terminal does, like the public link: a listening session on somebody\u2019s account, hosted by a terminal that closed an hour ago, is the same surprise wearing Spotify\u2019s clothes. Spotify publishes no API for this, so the endpoints are mapped against the real service and a test holds the recorded answer; runnir --spotify-jam opens one, prints the link and ends it, and is what will say so the day the shape changes. What it does not do yet: the member count is read when the session opens and never refreshed, there is no QR code in the terminal, and it only hosts \u2014 you cannot join somebody else\u2019s Jam from here.',
+    },
+  },
   // ------------------------------------------------------------------ NUCLEO
   {
     key: 'tabs', section: 'core', status: 'shipped',
