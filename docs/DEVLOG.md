@@ -5132,7 +5132,52 @@ Traffic every twenty seconds keeps an idle socket from being reaped in between.
 - `x` (drop a viewer) and `shift+r` (rotate the PIN) are built and tested by unit, but
   have never been exercised against two real phones at once.
 
+## 2026-09-16 - Pocket phase 4: the title, the scrollback and pasting
+
+The last of the planned phases, and the smallest.
+
+**The window's title travels with every frame**, so the page can say which machine is in
+the hand and the browser tab is not called "runnir" four times over.
+
+**Two fingers scroll the scrollback**, one finger moves the view over a screen that does
+not fit. Split by finger count rather than by whether the view happens to overflow: a
+gesture that changes meaning depending on the zoom is a gesture nobody trusts. Sub-row
+movement is carried rather than truncated, so a slow drag accumulates instead of
+rounding to nothing — the same fix the touchpad needed in July. `wheel` joins the
+whitelist of what a phone may send; `⇞` and `⇟` are in the key row for the same job.
+
+**Paste puts the text in the FIELD, not in the terminal.** You see what you are about to
+run, and Enter is still pressed by you — which is where the guardian asks about it. A
+paste that executed itself would be the one way around that question. Newlines become
+spaces, because each one would otherwise be a separate command.
+
+### Two small things worth keeping
+
+`src/docs.rs` is a Rust string literal, so a double quote inside the manual text ends it
+and the error arrives as `prefix 'in' is unknown` — a message about Rust tokens, in the
+middle of prose. Single quotes in manual text.
+
+And `git commit -m` in fish ate two words of the phase 3 message: backticks are
+substituted even inside double quotes, exactly as this file's own Gotchas say. `-F` with
+a file avoids the whole class.
+
+### Where the feature stands
+
+Phases 0 to 3 are done and phase 4 with them. Verified on Pedro's own phone through a
+real tunnel: reading, typing, panels, ctrl+c, the keyboard, pasting and the scrollback.
+
+Left open:
+- `x` (drop a viewer) and `shift+r` (rotate the PIN) are unit-tested but have never been
+  exercised against two phones at once.
+- `docs-site` has the feature and the binding written, but this checkout has no
+  `node_modules`, so `npm run build` was not run.
+- One window can share at a time, by construction: the port is fixed.
+
 ## Gotchas (do not re-learn)
+
+- **`src/docs.rs` is a Rust string literal.** A double quote in manual prose ends it, and
+  the compiler complains about unknown token prefixes rather than about the text. Use
+  single quotes there.
 
 - **A phone keyboard fires no `keydown` for ordinary letters** — only `input` — and its
   send arrow fires `beforeinput`/`insertLineBreak`. Anything that reads modifiers or

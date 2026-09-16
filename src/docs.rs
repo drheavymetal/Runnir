@@ -939,6 +939,61 @@ minutes or prints progress - a shell, compose up, compose pull - goes to a real
 pane instead, because a pane already has colour, Ctrl-C and scrollback. A command
 that reaches another machine asks first, with the host named.
 
+# Pocket — this window on a phone (leader r shift+P)
+
+leader r shift+P puts the WHOLE window in a phone's browser: the panes, the tab bar and
+whatever panel is open, in their real colours, with the cursor where it is. Scan the QR,
+type the six digits the panel shows, and you are looking at the machine you left behind.
+
+  leader r shift+P         open the panel (and start sharing)
+  runnir @ pocket          the same from a script; answers with the link and the PIN
+  runnir @ pocket --stop   stop sharing
+
+In the panel:
+
+  q or esc                 close the panel, KEEP sharing
+  shift+q                  stop sharing; every phone is disconnected
+  x                        drop the selected viewer
+  shift+r                  new PIN — this is what denies access
+  j / k                    move through the list of who is watching
+
+While anybody is connected the status bar says so, permanently. A remote control nobody
+can see is a door nobody remembers leaving open.
+
+The door has two parts. The link carries a random token, and the PIN is shown ONLY in
+the window — it never travels in the link, because a tunnel URL is a public URL and ends
+up in screenshots, history and clipboards. Five wrong PINs stop the session outright
+rather than failing one attempt: one person is expected, and they can read six digits
+off the screen in front of them.
+
+Dropping a viewer (x) ends their session but is not a ban — they still hold the link and
+the digits. Rotating the PIN (shift+r) is the action that means 'not coming back in';
+phones already connected are unaffected, so it is safe to use while somebody you invited
+is still reading.
+
+From the phone you can type, tap and scroll. A tap is a click on that cell, so tapping a
+tab switches tab and tapping a row of the git panel selects it — and because it is the
+same window, it switches on the desk too. Two fingers scroll the scrollback. There is a
+row for the keys a phone has not got: esc, tab, ctrl, arrows, page up and down, and ^C.
+
+Enter always travels as a key, and the server refuses newlines inside pasted text, so a
+dangerous command still raises the same 'Run this?' the keyboard would. Paste puts the
+text in the field rather than running it, for the same reason.
+
+What is NOT mirrored is anything that is not a cell: inline images, the transfer QR, the
+player's waveform. They are textures, and on the phone they are blank rectangles.
+
+The phone never resizes the window. The geometry belongs to the desk, and a reflow
+because somebody unlocked a phone would rearrange the screen of whoever is sitting at
+the keyboard. Use the fit button to swap between fitting the width (tiny text, whole
+window) and the height (fills the screen, scrolls sideways), or turn the phone.
+
+One window can share at a time. A second one says so rather than failing obscurely.
+
+A phone that goes to sleep drops the connection — nothing in a web page can prevent
+that — and the page reconnects the moment you look at it again, redrawing the whole
+screen, so nothing is lost but the seconds you were away.
+
 # Remote control
 
 A running runnir listens on a per-user socket and exports its path to the panes as

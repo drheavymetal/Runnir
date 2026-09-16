@@ -77,6 +77,9 @@ struct Shared {
     /// Dropping one ends that session; it does not deny access, because the holder can
     /// pair again. Rotating the PIN is what denies access.
     sessions: Vec<(String, Option<String>)>,
+    /// What the window is called right now, sent with every frame and with the
+    /// snapshot a new viewer gets, so a phone always knows which machine it is holding.
+    title: String,
     /// Wrong PINs since the last success. The whole server stops at the limit rather
     /// than that one attempt failing: one person is expected here, and they can read
     /// six digits off a screen in front of them.
@@ -129,6 +132,7 @@ impl Session {
             clients: Vec::new(),
             last: None,
             theme,
+            title: String::new(),
             pin: random_pin()?,
             sessions: Vec::new(),
             failures: 0,
@@ -291,8 +295,9 @@ impl Session {
 
     /// Sends what changed since the last call. Called from the frame: never blocks,
     /// never writes to a socket, and does nothing at all when nobody is connected.
-    pub fn publish(&self, snapshot: Snapshot) {
+    pub fn publish(&self, snapshot: Snapshot, title: &str) {
         let Ok(mut shared) = self.shared.lock() else { return };
+        shared.title = title.to_string();
         if shared.clients.is_empty() {
             // Keep the baseline anyway: the next viewer gets a full snapshot on
             // arrival, so a stale `last` would only make the FIRST diff after that
@@ -311,6 +316,7 @@ impl Session {
             "cols": snapshot.cols,
             "rows": snapshot.rows,
             "cursor": snapshot.cursor,
+            "title": title,
             "updates": rows,
         });
         let frame = match serde_json::to_vec(&payload) {
@@ -682,10 +688,12 @@ fn upgrade(
         let Ok(mut s) = shared.lock() else { return };
         if let Some(snapshot) = s.last.clone() {
             let theme = s.theme.clone();
+            let title = s.title.clone();
             let payload = serde_json::json!({
                 "cols": snapshot.cols,
                 "rows": snapshot.rows,
                 "cursor": snapshot.cursor,
+                "title": title,
                 "updates": diff(None, &snapshot, &theme),
             });
             if let Ok(v) = serde_json::to_vec(&payload) {
@@ -767,6 +775,12 @@ fn request_from(payload: &[u8]) -> Option<ControlRequest> {
             col: msg.get("col")?.as_u64()? as usize,
             row: msg.get("row")?.as_u64()? as usize,
             button: None,
+        }),
+        "wheel" => Some(ControlRequest::Wheel {
+            col: msg.get("col")?.as_u64()? as usize,
+            row: msg.get("row")?.as_u64()? as usize,
+            // Signed the way a wheel is: positive is up, away from the user.
+            lines: msg.get("lines").and_then(|v| v.as_f64()).map(|l| l as f32),
         }),
         _ => None,
     }
@@ -965,6 +979,24 @@ mod tests {
         assert!(request_from(br#"{"cmd":"key","args":{"chord":"a"}}"#).is_none());
         assert!(request_from(b"not json at all").is_none());
         assert!(request_from(b"{}").is_none());
+    }
+
+    #[test]
+    fn a_wheel_carries_its_direction() {
+        match request_from(br#"{"t":"wheel","col":5,"row":9,"lines":-3}"#) {
+            Some(ControlRequest::Wheel { col, row, lines }) => {
+                assert_eq!((col, row), (5, 9));
+                // Signed the way a wheel is; a client that lost the sign would scroll
+                // the wrong way and look like a broken gesture rather than a bug.
+                assert_eq!(lines, Some(-3.0));
+            }
+            other => panic!("expected a wheel, got {other:?}"),
+        }
+        // Missing `lines` is allowed - the terminal's own default applies.
+        assert!(matches!(
+            request_from(br#"{"t":"wheel","col":0,"row":0}"#),
+            Some(ControlRequest::Wheel { lines: None, .. })
+        ));
     }
 
     #[test]

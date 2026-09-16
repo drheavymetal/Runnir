@@ -441,7 +441,7 @@ impl Gpu {
             let cols = (screen.0 / cw).floor().max(1.0) as usize;
             let rows = (screen.1 / ch).floor().max(1.0) as usize;
             let layers = crate::pocket::layers_from(&panes, overlay.as_ref(), cell);
-            session.publish(crate::pocket::compose(&layers, cols, rows));
+            session.publish(crate::pocket::compose(&layers, cols, rows), &title);
         }
 
         let flash = self.bell_alpha();

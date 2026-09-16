@@ -43,6 +43,16 @@
   #bar .dot { width: 7px; height: 7px; border-radius: 50%; background: #e04f4f; flex: none; }
   #bar.live .dot { background: #3fb950; }
   #bar .spacer { flex: 1; }
+  /* The window's own title, so you know which machine is in your hand. Truncated
+     rather than wrapped: the bar is one line and a long title would push the controls
+     off the screen. */
+  #title {
+    color: #d7dae0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 38%;
+  }
   #bar button {
     background: #1b1d23;
     color: #b9bdc6;
@@ -178,6 +188,7 @@
 <div id="bar">
   <span class="dot"></span>
   <span id="status">connecting</span>
+  <span id="title"></span>
   <span class="spacer"></span>
   <span id="size"></span>
   <button id="zoomout">A&minus;</button>
@@ -197,6 +208,9 @@
     <button data-chord="right">&rarr;</button>
     <button data-chord="backspace">&#9003;</button>
     <button data-chord="ctrl+c">^C</button>
+    <button data-chord="pageup">&#8670;</button>
+    <button data-chord="pagedown">&#8671;</button>
+    <button id="paste">paste</button>
   </div>
   <div id="typeline">
     <input id="kbd" autocomplete="off" autocapitalize="off" autocorrect="off"
@@ -286,7 +300,13 @@ function apply(msg) {
   }
   placeCursor(msg.cursor);
   revealCursor();
+  if (msg.title !== undefined && msg.title !== shownTitle) {
+    shownTitle = msg.title;
+    document.getElementById('title').textContent = msg.title;
+    document.title = msg.title ? msg.title + ' · runnir' : 'runnir';
+  }
 }
+let shownTitle = null;
 
 /// Keep the cursor in view.
 ///
@@ -549,6 +569,27 @@ document.getElementById('enter').addEventListener('click', () => {
   kbdEl.focus();
 });
 
+// Pasting puts the text in the FIELD rather than sending it. Two reasons, and the
+// second is the important one: you see what you are about to run, and Enter still has
+// to be pressed - which is where the guardian asks about it. A paste that executed
+// itself would be the one way around that question.
+document.getElementById('paste').addEventListener('click', async () => {
+  let text = '';
+  try {
+    text = await navigator.clipboard.readText();
+  } catch (e) {
+    // Firefox and any insecure origin refuse the read; asking is better than a button
+    // that silently does nothing.
+    text = window.prompt('Paste here:') || '';
+  }
+  if (!text) return;
+  // Newlines would each be a command. Joined with spaces, what lands is one line you
+  // can read before submitting it.
+  kbdEl.value += text.replace(/\s*\n+\s*/g, ' ');
+  kbdEl.dispatchEvent(new Event('input'));
+  kbdEl.focus();
+});
+
 // Special keys are chords; ordinary characters ride the `input` event below, because a
 // phone keyboard does not produce usable keydowns for them.
 // Backspace and Delete are deliberately ABSENT: intercepting them called
@@ -654,6 +695,35 @@ wrapEl.addEventListener('click', (e) => {
   const row = Math.floor((e.clientY - rect.top - 4) / m.h);
   if (col >= 0 && row >= 0 && col < cols && row < rows) send({ t: 'click', col: col, row: row });
 });
+
+// Two fingers scroll the terminal's scrollback; one finger moves the view over a
+// screen that does not fit. Splitting it by finger count rather than by whether the
+// view happens to overflow keeps the gesture meaning the same thing every time - a
+// scroll that changes meaning depending on the zoom is a scroll nobody trusts.
+let pinch = null;
+wrapEl.addEventListener('touchstart', (e) => {
+  if (e.touches.length === 2) {
+    pinch = { y: (e.touches[0].clientY + e.touches[1].clientY) / 2, carry: 0 };
+  }
+}, { passive: true });
+
+wrapEl.addEventListener('touchmove', (e) => {
+  if (!pinch || e.touches.length !== 2) return;
+  e.preventDefault();
+  const y = (e.touches[0].clientY + e.touches[1].clientY) / 2;
+  const m = cellSize();
+  pinch.carry += y - pinch.y;
+  pinch.y = y;
+  // Sub-row movement is kept rather than truncated, so a slow drag accumulates into
+  // motion instead of being rounded away to nothing.
+  const lines = Math.trunc(pinch.carry / m.h);
+  if (lines !== 0) {
+    pinch.carry -= lines * m.h;
+    send({ t: 'wheel', col: Math.floor(cols / 2), row: Math.floor(rows / 2), lines: lines });
+  }
+}, { passive: false });
+
+wrapEl.addEventListener('touchend', () => { pinch = null; }, { passive: true });
 
 // Try the cookie we may already have; the door appears only if it is refused.
 connect();
