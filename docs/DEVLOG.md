@@ -4978,7 +4978,97 @@ only touch the system resolver once the record is known to exist. That a freshly
 warning did not prevent it is the argument for the window enforcing it in code rather than
 documenting it: **the QR does not appear until the name resolves from outside.**
 
+## 2026-09-16 - Pocket phases 1 and 2: the window on a phone, behind a PIN
+
+`runnir @ pocket` or `leader r shift+p` puts the whole window in a browser: panes, tab
+bar, and any panel that is open, with their colours and the cursor. The panel shows a QR
+and six digits; the phone types them and watches.
+
+Verified end to end against a real window driven over the control socket — 170x63,
+17 foreground colours, the command palette composed over the shell beneath it, and the
+same thing again through a public tunnel with the pairing in front of it.
+
+### What the scope change bought, and what it cost
+
+The design started at "the focused pane only" and Pedro changed it to the whole window
+after seeing a prototype. That turned out to be nearly free, because everything runnir
+draws is already a `Grid` with an origin — `build_chrome` returns them, `PaneDraw` is
+one, the overlays go through `pane_instances` — and `app_draw` stacks them all into one
+`Vec<PaneDraw>` in painter's order. Composing is a loop over that vector.
+
+It cost one thing: the snapshot must be taken **inside the frame**. A pane could have
+been read from any thread through its `Arc<Mutex<Grid>>`; the chrome and the overlays
+are built per frame and exist nowhere else. And it removed `Grid::revision` from the
+plan entirely — with the frame as the trigger, the row diff already answers "did
+anything change".
+
+### Three traps, each of which cost real time
+
+**`PR_SET_PDEATHSIG` fires on the parent THREAD, not the parent process.** The tunnel
+was spawned from a worker that returned as soon as it had a URL, so the kernel killed
+cloudflared moments after it started working. The symptom was a link that answered once
+and then `530`, with a `<defunct>` child nobody had reaped — and it looked exactly like
+Cloudflare rate-limiting a free tunnel. `share.rs` never hit it because its spawn
+happens on a thread that does not end. The draining loop now lives on the spawning
+thread, which gives it a lifetime tied to the child's.
+
+**The DNS trap, for the third time in one day, now in shipped code.** `wait_until_reachable`
+asked the system resolver immediately, cached the NXDOMAIN, and then spent ninety seconds
+re-reading its own no before giving up. It now probes 1.1.1.1 over DoH — addressed by IP
+literal, so asking needs no lookup and cannot poison any cache — and touches the local
+resolver only once the record is known to exist. Opening went from failing at 100 s to
+succeeding at 12 s. Writing the gotcha down three entries ago did not prevent it; only
+the code does.
+
+**A heredoc ate the escapes and the compiler did not care.** `"...\r\n..."` written
+through a shell heredoc became real newlines in the Rust literal, producing an HTTP
+response whose headers were mangled — `Set-Cookie` silently absent, the browser simply
+never paired. It compiles, it runs, and only a raw `curl -i` shows it. Anything that
+generates code through a shell has to be re-read as bytes afterwards, not trusted
+because `cargo build` was happy.
+
+### Decisions worth not re-litigating
+
+- **The phone is a mirror, not a second seat.** One window, one focus, one active tab.
+  Tapping a tab on the phone changes it on the desk, because the tab bar is in the
+  snapshot like everything else. That is right for a remote control and wrong for a
+  viewer; this is a remote control.
+- **The phone does not resize anything.** The geometry belongs to the desk. 170 columns
+  on a phone was measured as readable before this was decided.
+- **Colours resolve in Rust**, not on the page: a phone with its own palette would show
+  different output from the screen. Reverse video and the unfocused-pane dim too.
+- **`q` closes the panel, `shift+q` stops the sharing.** The reflex key after reading a
+  PIN off the screen must not be the one that cuts off somebody mid-command.
+- **The page is served by runnir**, not by `docs-site`. The optical receiver lives on the
+  website because there is no connection between its two ends; here there is one, and
+  putting Pages in the middle would buy CORS, a coupled deployment, and a link that dies
+  when the website does.
+- **The font is served from the binary.** A phone has no Nerd Font, and a modern prompt
+  is mostly Nerd Font. Same bytes `font.rs` draws with, so there is no version skew
+  between the hand and the screen.
+- **The control socket answers with the PIN.** It is 0600 in a 0700 runtime dir and
+  anything that can ask can already type into the terminal, so withholding it would
+  protect nothing and make the feature untestable.
+
+### Still to do
+
+- **Phase 3, writing.** Keys and taps over the open socket (`key --chord`,
+  `click --col --row`, both of which `control.rs` already executes), the key bar a phone
+  does not have, and the guardian on that path from the first commit.
+- Nobody has held a phone to phases 1 and 2 yet. The whole flow is verified, but by a
+  script rather than a thumb.
+- `x` drops a viewer and `shift+r` rotates the PIN; neither has been exercised against a
+  second real client.
+
 ## Gotchas (do not re-learn)
+
+- **`PR_SET_PDEATHSIG` fires when the parent THREAD exits, not the parent process.** A
+  child spawned from a short-lived worker dies as soon as that worker returns. Keep the
+  spawning thread alive for the child's lifetime (draining its output is a good reason
+  to) or do not use the flag.
+- **Generating Rust through a shell heredoc silently eats `\r\n` and `\"`.** The result
+  compiles and runs with mangled HTTP headers or broken JSON. Re-read what was written
+  before trusting a green build.
 
 - **A phone has no Nerd Font.** Anything runnir shows a browser has to ship the font with
   it, and `font.rs` already embeds the right one - serve those bytes, never a CDN.
