@@ -5704,7 +5704,41 @@ keystroke; nothing carries a sequence number. The tunnel's own TLS makes capture
 part, and an attacker positioned to defeat that has better options. Worth knowing before
 somebody assumes otherwise.
 
+## 2026-09-16 - The phone could not reach the leader layer, which is most of runnir
+
+Pedro's first real use of the mirror found it at once: tabs and panes could not be
+switched from the phone. Both mechanisms turned out to work; neither was reachable.
+
+**Keys worked all along.** Verified by script: `leader` then `1` switches tab, `leader`
+then `h` moves pane focus. What was missing is that **a phone keyboard cannot type the
+leader chord**. `alt+shift+space` has no Alt and no way to hold Shift and Space together,
+and a programmable `f13` is worse. So the whole leader layer — tabs on `1..9`, panes on
+`hjkl`, every panel behind a letter — was simply unreachable, which in runnir is most of
+the application.
+
+The fix is a `leader` button in the phone's key row. And because the chord is a setting,
+the terminal now **tells the page which one it is** with every frame rather than the page
+assuming the default; an empty leader (the layer turned off in config) hides the button
+instead of offering one that does nothing. The which-key panel that follows a press is on
+the phone too, because it is part of the window.
+
+**Tapping the tab bar also worked, and was equally unusable.** A sweep of row 0 found
+columns 35-39 switching tab correctly. The catch is size: fitted to width, a 170-column
+window on a phone gives each cell about 2 px, and a fingertip covers roughly seventeen
+columns. Hitting a tab is not a matter of aiming better — it cannot be done.
+
+Worth generalising, because it applies to everything this mirror will ever offer: **a
+target measured in cells is a target measured in single-digit pixels once a desktop
+window is fitted to a phone.** Anything that has to be hit from a phone belongs on a
+button, not on the grid. The grid is for reading and for typing into.
+
 ## Gotchas (do not re-learn)
+
+- **A phone cannot type a leader chord.** No Alt, no Shift+Space, and `f13` is worse. Any
+  feature reached through a modifier layer needs a button when it goes to a phone.
+- **A cell-sized target is a few pixels once a desktop window is fitted to a phone**, and
+  a fingertip covers a dozen-odd columns. Anything that must be hit from a phone belongs
+  on a button, not on the grid.
 
 - **A URL fragment never reaches the server**, which makes it the one place to put a key
   that a proxy must not see. It also means anything reading the URL server-side (a

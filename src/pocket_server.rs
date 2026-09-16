@@ -93,6 +93,10 @@ struct Shared {
     pin: String,
     /// The session key, ready to use. Every frame in both directions goes through it.
     cipher: Aes256Gcm,
+    /// The leader chord this window is configured with. The phone needs it to reach
+    /// the layer that everything in runnir is behind, and it is a setting, so it cannot
+    /// be assumed to be the default.
+    leader: String,
     /// What the window is called right now, sent with every frame and with the
     /// snapshot a new viewer gets, so a phone always knows which machine it is holding.
     title: String,
@@ -154,6 +158,7 @@ impl Session {
             last: None,
             theme,
             title: String::new(),
+            leader: String::new(),
             pin: random_pin()?,
             cipher: Aes256Gcm::new_from_slice(&key_bytes)
                 .map_err(|e| format!("cannot build the cipher: {e}"))?,
@@ -319,9 +324,12 @@ impl Session {
 
     /// Sends what changed since the last call. Called from the frame: never blocks,
     /// never writes to a socket, and does nothing at all when nobody is connected.
-    pub fn publish(&self, snapshot: Snapshot, title: &str) {
+    pub fn publish(&self, snapshot: Snapshot, title: &str, leader: &str) {
         let Ok(mut shared) = self.shared.lock() else { return };
         shared.title = title.to_string();
+        if shared.leader != leader {
+            shared.leader = leader.to_string();
+        }
         if shared.clients.is_empty() {
             // Keep the baseline anyway: the next viewer gets a full snapshot on
             // arrival, so a stale `last` would only make the FIRST diff after that
@@ -341,6 +349,7 @@ impl Session {
             "rows": snapshot.rows,
             "cursor": snapshot.cursor,
             "title": title,
+            "leader": shared.leader,
             "updates": rows,
         });
         let frame = match serde_json::to_vec(&payload) {
