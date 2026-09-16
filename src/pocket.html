@@ -124,120 +124,58 @@
   }
   #pairerr { color: #e06c6c; font-size: 12px; min-height: 1.2em; }
 
-  /* The phone's own menu. It fires named actions directly, so nothing is armed on the
-     desk's screen and nothing has to be typed blind afterwards. */
+  /* The phone's own menu, as a popup. It floats over the mirror instead of pushing it
+     up: a sheet that takes height is a sheet that shrinks the thing you opened it to
+     act on, and with the keyboard up there was nothing left. */
   #menu {
     position: fixed;
-    left: 0; right: 0;
-    background: #14161c;
-    border-top: 1px solid #2c2f37;
-    padding: 10px;
-    padding-bottom: 12px;
+    inset: 0;
     display: none;
-    z-index: 3;
+    align-items: center;
+    justify-content: center;
+    padding: 18px;
+    background: rgba(0, 0, 0, 0.6);
+    z-index: 5;
   }
-  #menu.show { display: block; }
-  #menu .group { margin-bottom: 10px; }
-  #menu .group:last-child { margin-bottom: 0; }
-  #menu h3 {
-    margin: 0 0 6px;
+  #menu.show { display: flex; }
+
+  #sheet {
+    width: min(420px, 100%);
+    max-height: 100%;
+    overflow-y: auto;
+    background: #14161c;
+    border: 1px solid #2f333d;
+    border-radius: 14px;
+    padding: 14px;
+    box-shadow: 0 18px 50px rgba(0, 0, 0, 0.6);
+  }
+  #sheet .group + .group { margin-top: 14px; }
+  #sheet h3 {
+    margin: 0 0 8px;
     font-size: 11px;
     font-weight: 600;
     color: #7f8593;
     text-transform: uppercase;
-    letter-spacing: 0.08em;
+    letter-spacing: 0.1em;
   }
-  #menu .row { display: flex; flex-wrap: wrap; gap: 6px; }
-  #menu button {
+  /* A grid, so a label never lands on top of the row above it. */
+  #sheet .row {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(74px, 1fr));
+    gap: 8px;
+  }
+  #sheet button {
     background: #1e212a;
     color: #d0d4dd;
     border: 1px solid #32363f;
-    border-radius: 8px;
+    border-radius: 9px;
     font: inherit;
     font-size: 14px;
-    min-height: 46px;
-    padding: 0 14px;
-    flex: 1 1 auto;
-    min-width: 62px;
+    min-height: 48px;
+    padding: 0 10px;
   }
+  #sheet button:active { background: #2a3d63; border-color: #3d5a8f; }
 
-  /* The keys a phone keyboard does not have, and the terminal cannot do without. */
-  #dock {
-    position: fixed;
-    left: 0; right: 0;
-    bottom: 0;
-    background: rgba(13, 13, 15, 0.96);
-    border-top: 1px solid #23252b;
-    z-index: 2;
-  }
-  #keys {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 6px;
-    padding: 6px;
-  }
-  #typeline {
-    display: flex;
-    gap: 6px;
-    padding: 0 6px 6px;
-    padding-bottom: max(6px, env(safe-area-inset-bottom));
-  }
-  #typeline button {
-    background: #3d7eff;
-    color: #fff;
-    border: 0;
-    border-radius: 7px;
-    font: inherit;
-    font-size: 17px;
-    min-width: 56px;
-    min-height: 44px;
-  }
-  #keys button {
-    background: #1b1d23;
-    color: #c3c7d0;
-    border: 1px solid #2c2f37;
-    border-radius: 7px;
-    padding: 0 12px;
-    font: inherit;
-    font-size: 13px;
-    flex: none;
-    /* 44 px is the smallest target a fingertip hits reliably; below that you aim. */
-    min-width: 46px;
-    min-height: 44px;
-  }
-  #keys button.on { background: #3d7eff; color: #fff; border-color: #3d7eff; }
-
-  /* The leader is the way into tabs, panes and every panel, so it is first, wider and
-     the only coloured key. Everything else on this row is a single keystroke; this one
-     opens the layer the whole application lives behind. */
-  #menu-btn {
-    background: #2a3d63;
-    color: #cfe0ff;
-    border-color: #3d5a8f;
-    font-weight: 600;
-    min-width: 88px;
-    order: -1;
-  }
-
-  /* Visible, because you have to see what you are typing. It was off-screen at first
-     purely to raise the phone's keyboard, and that made the one thing a person looks at
-     while typing invisible. */
-  #kbd {
-    flex: 1;
-    min-width: 0;
-    background: #16181e;
-    border: 1px solid #2c2f37;
-    border-radius: 6px;
-    color: #d7dae0;
-    font: inherit;
-    font-size: 16px;
-    padding: 0 11px;
-    min-height: 44px;
-  }
-
-  /* Height is set from visualViewport in JS: a phone keyboard shrinks the visual
-     viewport without changing the layout viewport, so `100%` keeps the page the size of
-     the whole screen and everything the keyboard covers simply becomes unreachable. */
   #wrap {
     position: absolute;
     top: 30px;
@@ -262,32 +200,35 @@
 <div id="wrap"><div id="screen"><div id="cursor" hidden></div></div></div>
 
 <div id="menu">
-  <div class="group">
-    <h3>pane</h3>
-    <div class="row">
-      <button data-action="focus_left">&larr;</button>
-      <button data-action="focus_down">&darr;</button>
-      <button data-action="focus_up">&uarr;</button>
-      <button data-action="focus_right">&rarr;</button>
-      <button data-action="toggle_zoom">zoom</button>
+  <div id="sheet">
+    <div class="group">
+      <h3>pane</h3>
+      <div class="row">
+        <button data-action="focus_left">&larr;</button>
+        <button data-action="focus_down">&darr;</button>
+        <button data-action="focus_up">&uarr;</button>
+        <button data-action="focus_right">&rarr;</button>
+        <button data-action="toggle_zoom">zoom</button>
+      </div>
     </div>
-  </div>
-  <div class="group">
-    <h3>tab</h3>
-    <div class="row">
-      <button data-action="prev_tab">&lsaquo; prev</button>
-      <button data-action="next_tab">next &rsaquo;</button>
-      <button data-action="new_tab">new</button>
+    <div class="group">
+      <h3>tab</h3>
+      <div class="row">
+        <button data-action="prev_tab">&lsaquo; prev</button>
+        <button data-action="next_tab">next &rsaquo;</button>
+        <button data-action="new_tab">new</button>
+      </div>
     </div>
-  </div>
-  <div class="group">
-    <h3>panels</h3>
-    <div class="row">
-      <button data-action="git_panel">git</button>
-      <button data-action="docker_panel">docker</button>
-      <button data-action="toggle_explorer">files</button>
-      <button data-action="tidal_panel">music</button>
-      <button data-action="command_palette">palette</button>
+    <div class="group">
+      <h3>panels</h3>
+      <div class="row">
+        <button data-action="git_panel">git</button>
+        <button data-action="docker_panel">docker</button>
+        <button data-action="toggle_explorer">files</button>
+        <button data-action="tidal_panel">music</button>
+        <button data-action="command_palette">palette</button>
+        <button data-action="show_docs">help</button>
+      </div>
     </div>
   </div>
 </div>
@@ -538,7 +479,6 @@ function toggleFit() {
 /// is the only thing that reports the truth here.
 function layout() {
   const dock = document.getElementById('dock');
-  const menu = document.getElementById('menu');
   const vv = window.visualViewport;
   // `interactive-widget=resizes-content` makes the browser shrink the page for the
   // keyboard, which is what `bottom: 0` then means. Where that is not honoured, the
@@ -547,12 +487,9 @@ function layout() {
   // which is not part of the reported height, kept covering the field anyway.
   const covered = vv ? Math.max(0, window.innerHeight - vv.height - vv.offsetTop) : 0;
   dock.style.bottom = covered + 'px';
-  const menuOpen = menu.classList.contains('show');
-  menu.style.bottom = (covered + dock.offsetHeight) + 'px';
   wrapEl.style.top = '30px';
   wrapEl.style.height =
-    ((vv ? vv.height : window.innerHeight) - 30 - dock.offsetHeight
-      - (menuOpen ? menu.offsetHeight : 0)) + 'px';
+    ((vv ? vv.height : window.innerHeight) - 30 - dock.offsetHeight) + 'px';
   revealCursor();
 }
 
@@ -795,12 +732,21 @@ function toggleMenu(show) {
   const on = show === undefined ? !menuEl.classList.contains('show') : show;
   menuEl.classList.toggle('show', on);
   menuBtn.classList.toggle('on', on);
-  layout();
+  if (on) kbdEl.blur();
 }
 
 menuBtn.addEventListener('click', () => toggleMenu());
 
-for (const btn of menuEl.querySelectorAll('button[data-action]')) {
+// Tapping outside closes it. Guarded on the target so a tap that lands on the sheet
+// itself - including a miss between two buttons - does not dismiss what you opened.
+menuEl.addEventListener('click', (e) => { if (e.target === menuEl) toggleMenu(false); });
+
+// The keyboard has no business being up while a menu of buttons is: it covers half of
+// them and the field behind is not what is being used.
+const sheetEl = document.getElementById('sheet');
+sheetEl.addEventListener('pointerdown', (e) => e.preventDefault());
+
+for (const btn of sheetEl.querySelectorAll('button[data-action]')) {
   btn.addEventListener('pointerdown', (e) => e.preventDefault());
   btn.addEventListener('click', () => {
     send({ t: 'action', id: btn.dataset.action });
