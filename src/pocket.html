@@ -134,9 +134,9 @@
   }
   #keys {
     display: flex;
-    gap: 5px;
+    flex-wrap: wrap;
+    gap: 6px;
     padding: 6px;
-    overflow-x: auto;
   }
   #typeline {
     display: flex;
@@ -144,18 +144,42 @@
     padding: 0 6px 6px;
     padding-bottom: max(6px, env(safe-area-inset-bottom));
   }
+  #typeline button {
+    background: #3d7eff;
+    color: #fff;
+    border: 0;
+    border-radius: 7px;
+    font: inherit;
+    font-size: 17px;
+    min-width: 56px;
+    min-height: 44px;
+  }
   #keys button {
     background: #1b1d23;
     color: #c3c7d0;
     border: 1px solid #2c2f37;
-    border-radius: 6px;
-    padding: 9px 12px;
+    border-radius: 7px;
+    padding: 0 12px;
     font: inherit;
-    font-size: 12px;
+    font-size: 13px;
     flex: none;
-    min-width: 42px;
+    /* 44 px is the smallest target a fingertip hits reliably; below that you aim. */
+    min-width: 46px;
+    min-height: 44px;
   }
   #keys button.on { background: #3d7eff; color: #fff; border-color: #3d7eff; }
+
+  /* The leader is the way into tabs, panes and every panel, so it is first, wider and
+     the only coloured key. Everything else on this row is a single keystroke; this one
+     opens the layer the whole application lives behind. */
+  #leader {
+    background: #2a3d63;
+    color: #cfe0ff;
+    border-color: #3d5a8f;
+    font-weight: 600;
+    min-width: 88px;
+    order: -1;
+  }
 
   /* Visible, because you have to see what you are typing. It was off-screen at first
      purely to raise the phone's keyboard, and that made the one thing a person looks at
@@ -168,8 +192,9 @@
     border-radius: 6px;
     color: #d7dae0;
     font: inherit;
-    font-size: 15px;
-    padding: 9px 11px;
+    font-size: 16px;
+    padding: 0 11px;
+    min-height: 44px;
   }
 
   /* Height is set from visualViewport in JS: a phone keyboard shrinks the visual
@@ -425,6 +450,12 @@ if (window.visualViewport) {
 }
 window.addEventListener('resize', () => { layout(); if (!manual) fit(); });
 layout();
+// Again once fonts and wrapping have settled: the key row may be one line or two, and
+// the first measurement happens before the browser knows which.
+window.addEventListener('load', () => { layout(); if (!manual) fit(); });
+if (document.fonts && document.fonts.ready) {
+  document.fonts.ready.then(() => { layout(); if (!manual) fit(); });
+}
 
 document.getElementById('zoomin').onclick = () => { manual = true; setFont(fontSize + 1); };
 document.getElementById('zoomout').onclick = () => { manual = true; setFont(fontSize - 1); };
