@@ -21,6 +21,10 @@ portable-pty = "0.9.0"
 qrcode = { version = "0.14.1", default-features = false }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
+# End-to-end encryption for the pocket mirror. The key travels in the URL fragment,
+# which browsers never send to a server, so the tunnel carries opaque bytes and
+# Cloudflare sees nothing it could read.
+aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc", "getrandom"] }
 # The WebSocket handshake, and only that. Same RustCrypto family as the sha2 already
 # here, sharing the `digest` already compiled - see the pocket design for why the wire
 # is a WebSocket and not SSE.

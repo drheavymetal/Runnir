@@ -435,35 +435,26 @@ function showDoor(message) {
   pinEl.focus();
 }
 
-async function pair() {
+// The PIN goes over the ENCRYPTED socket, not an HTTP route. A POST carried it in the
+// clear past the edge, and the cookie it returned did the same on every reconnect.
+// Keeping it here means the tunnel never sees the one secret that is not in the link.
+function sendPair(pin, name) {
+  send({ t: 'pair', pin: pin, name: name || null });
+}
+
+function pair() {
   const pin = pinEl.value.trim();
   const name = document.getElementById('who').value.trim();
   errEl.textContent = '';
-  let res;
+  // Remembered for THIS tab only, and never written anywhere the server can see. It is
+  // what makes a reconnect after the phone sleeps silent instead of asking again.
   try {
-    res = await fetch(base + '/pair', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ pin: pin, name: name || null })
-    });
-  } catch (e) {
-    errEl.textContent = 'the terminal is not answering';
-    return;
-  }
-  if (res.ok) {
-    pairEl.classList.remove('show');
-    connect();
-    return;
-  }
-  const body = await res.json().catch(() => ({}));
-  if (body.error === 'too many') {
-    // The server stopped itself. Saying "wrong pin" here would send someone hunting
-    // for digits that no longer open anything.
-    errEl.textContent = 'too many wrong tries - the terminal stopped sharing';
-    document.getElementById('go').disabled = true;
-    return;
-  }
-  errEl.textContent = 'wrong pin' + (body.left !== undefined ? ' - ' + body.left + ' left' : '');
+    sessionStorage.setItem('pocket-pin', pin);
+    if (name) sessionStorage.setItem('pocket-name', name);
+  } catch (e) { /* private mode: paired for this connection only */ }
+  pairEl.classList.remove('show');
+  if (ws && ws.readyState === 1) sendPair(pin, name);
+  else connect();
 }
 
 document.getElementById('go').onclick = pair;
@@ -472,30 +463,62 @@ pinEl.addEventListener('keydown', (e) => { if (e.key === 'Enter') pair(); });
 // tap nobody needs.
 pinEl.addEventListener('input', () => { if (pinEl.value.length === 6) pair(); });
 
+let paired = false;
+
 function connect() {
+  if (!aesKey) {
+    showDoor('this link is missing its key - scan the QR again');
+    return;
+  }
   const proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
-  let opened = false;
   ws = new WebSocket(proto + location.host + base + '/ws');
+  ws.binaryType = 'arraybuffer';
+  paired = false;
 
   ws.onopen = () => {
-    opened = true;
-    statusEl.textContent = 'live';
-    barEl.classList.add('live');
     reconnectDelay = 500;
+    let pin = null, name = null;
+    try {
+      pin = sessionStorage.getItem('pocket-pin');
+      name = sessionStorage.getItem('pocket-name');
+    } catch (e) { /* no storage: ask */ }
+    if (pin) {
+      statusEl.textContent = 'pairing';
+      sendPair(pin, name);
+    } else {
+      showDoor('');
+    }
   };
-  ws.onmessage = (e) => {
-    const msg = JSON.parse(e.data);
+
+  ws.onmessage = async (e) => {
+    let msg;
+    try {
+      msg = await openMsg(e.data);
+    } catch (err) {
+      // Anything that does not decrypt is not from our terminal. The likeliest cause
+      // is a stale link whose key belongs to a session that has been replaced.
+      showDoor('this link no longer matches the terminal');
+      try { ws.close(); } catch (_) {}
+      return;
+    }
+    if (msg.t === 'denied') {
+      try { sessionStorage.removeItem('pocket-pin'); } catch (_) {}
+      showDoor(msg.left > 0
+        ? 'wrong pin - ' + msg.left + ' left'
+        : 'too many wrong tries - the terminal stopped sharing');
+      return;
+    }
+    if (!paired) {
+      paired = true;
+      pairEl.classList.remove('show');
+      statusEl.textContent = 'live';
+      barEl.classList.add('live');
+    }
     lastCursor = msg.cursor;
     apply(msg);
   };
+
   ws.onclose = () => {
-    // A socket that never opened was refused, which from here means the cookie is
-    // gone or the PIN was rotated. Reconnecting for ever against a closed door would
-    // look like a network problem instead of the door it is.
-    if (!opened) {
-      showDoor('that pin no longer works');
-      return;
-    }
     statusEl.textContent = 'reconnecting';
     barEl.classList.remove('live');
     // Backing off matters: a terminal that closed is not coming back, and a page left
@@ -514,22 +537,60 @@ function connect() {
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState !== 'visible') return;
   reconnectDelay = 500;
-  if (!ws || ws.readyState > 1) connect();
+  if (aesKey && (!ws || ws.readyState > 1)) connect();
   layout();
 });
 
 // Traffic every twenty seconds, so an idle socket is not reaped by anything in the
 // middle. The server ignores what it does not recognise, which is exactly what this is.
-setInterval(() => {
-  if (ws && ws.readyState === 1) ws.send('{"t":"ping"}');
-}, 20000);
+setInterval(() => { if (paired) send({ t: 'ping' }); }, 20000);
 
 // ---- input -----------------------------------------------------------------
 // Everything below goes out on the socket that is already open and arrives through
 // the same bridge `runnir @` uses, so a phone drives the terminal through exactly the
 // machinery a script does - leader layer, overlays and the guardian included.
 
-function send(obj) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj)); }
+// ---- encryption -------------------------------------------------------------
+// The key arrives in the URL fragment, which browsers never send to a server, so the
+// tunnel carries nothing it can read. The QR is what delivers it.
+let aesKey = null;
+
+async function loadKey() {
+  const m = location.hash.match(/k=([A-Za-z0-9_-]+)/);
+  if (!m) return null;
+  const b64 = m[1].replace(/-/g, '+').replace(/_/g, '/');
+  const raw = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+  return crypto.subtle.importKey('raw', raw, 'AES-GCM', false, ['encrypt', 'decrypt']);
+}
+
+async function sealMsg(obj) {
+  const nonce = crypto.getRandomValues(new Uint8Array(12));
+  const data = new TextEncoder().encode(JSON.stringify(obj));
+  const ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv: nonce }, aesKey, data));
+  const out = new Uint8Array(12 + ct.length);
+  out.set(nonce, 0);
+  out.set(ct, 12);
+  return out;
+}
+
+async function openMsg(buffer) {
+  const arr = new Uint8Array(buffer);
+  const plain = await crypto.subtle.decrypt(
+    { name: 'AES-GCM', iv: arr.slice(0, 12) }, aesKey, arr.slice(12));
+  return JSON.parse(new TextDecoder().decode(plain));
+}
+
+// Encryption is async and keystrokes are ordered, so sends are chained rather than
+// fired off in parallel - two promises resolving out of order would transpose letters.
+let sendChain = Promise.resolve();
+function send(obj) {
+  sendChain = sendChain
+    .then(async () => {
+      if (!ws || ws.readyState !== 1 || !aesKey) return;
+      ws.send(await sealMsg(obj));
+    })
+    .catch(() => {});
+}
 function key(chord) { send({ t: 'key', chord: chord }); }
 
 const kbdEl = document.getElementById('kbd');
@@ -725,8 +786,10 @@ wrapEl.addEventListener('touchmove', (e) => {
 
 wrapEl.addEventListener('touchend', () => { pinch = null; }, { passive: true });
 
-// Try the cookie we may already have; the door appears only if it is refused.
-connect();
+// The key comes from the fragment; without it there is nothing to connect with.
+loadKey()
+  .then((k) => { aesKey = k; connect(); })
+  .catch(() => showDoor('this link is missing its key - scan the QR again'));
 </script>
 </body>
 </html>

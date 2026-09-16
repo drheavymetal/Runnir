@@ -13,12 +13,33 @@
 //!
 //! A queue that grows without bound is the other failure, so it is capped. A viewer
 //! that cannot keep up is dropped rather than allowed to consume the window's memory.
+//!
+//! ## Why the tunnel cannot read any of this
+//!
+//! A quick tunnel terminates TLS at Cloudflare's edge, so everything would otherwise be
+//! in the clear to them. Every frame is therefore encrypted with AES-256-GCM under a key
+//! that **travels in the URL fragment** — the part after `#`, which browsers never send
+//! to a server. The QR carries it; the tunnel never sees it; what crosses the edge is
+//! opaque bytes.
+//!
+//! The honest limit, because it should not be discovered later: Cloudflare serves the
+//! page that does the decrypting, so this defends against capture and logging, not
+//! against an edge that rewrites the JavaScript it is handing over. Not needing to trust
+//! anybody means not putting anybody in the middle — a private network rather than a
+//! tunnel.
+//!
+//! Nonces are 12 random bytes per message rather than a counter. A counter would have to
+//! be unique per key, and the key belongs to the SESSION while counters would belong to
+//! each connection: two viewers would reuse the same nonces, which is the one thing
+//! AES-GCM does not survive. Random costs 12 bytes a frame and cannot be got wrong.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 
+use aes_gcm::aead::{Aead, KeyInit, Payload};
+use aes_gcm::{Aes256Gcm, Nonce};
 use base64::Engine;
 use sha1::{Digest, Sha1};
 
@@ -56,9 +77,6 @@ pub struct Viewer {
 struct Client {
     id: u64,
     name: Option<String>,
-    /// The cookie this viewer paired with, so dropping them can revoke it too.
-    /// Without this, a kicked phone reconnects on the credential it already holds.
-    session: String,
     tx: mpsc::SyncSender<Vec<u8>>,
 }
 
@@ -73,10 +91,8 @@ struct Shared {
     /// public URL and ends up in screenshots, history and clipboards; this is the
     /// factor that only ever exists on a screen in the room.
     pin: String,
-    /// Cookies handed out to whoever typed the PIN, each with the name they gave.
-    /// Dropping one ends that session; it does not deny access, because the holder can
-    /// pair again. Rotating the PIN is what denies access.
-    sessions: Vec<(String, Option<String>)>,
+    /// The session key, ready to use. Every frame in both directions goes through it.
+    cipher: Aes256Gcm,
     /// What the window is called right now, sent with every frame and with the
     /// snapshot a new viewer gets, so a phone always knows which machine it is holding.
     title: String,
@@ -100,6 +116,9 @@ pub enum Tunnel {
 
 pub struct Session {
     token: String,
+    /// Base64url of the 32-byte key, for the link's fragment. Kept as text because that
+    /// is the only form it is ever handed out in.
+    key_b64: String,
     shared: Arc<Mutex<Shared>>,
     stop: Arc<AtomicBool>,
     next_id: Arc<AtomicU64>,
@@ -118,6 +137,8 @@ impl Session {
     /// first `publish`, because there is nothing to serve.
     pub fn start(theme: Theme, proxy: EventLoopProxy<UserEvent>) -> Result<Session, String> {
         let token = random_token()?;
+        let key_bytes = random_bytes::<32>()?;
+        let key_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key_bytes);
         let listener = TcpListener::bind(("127.0.0.1", PORT)).map_err(|e| {
             // The port is fixed, so this is nearly always the other window rather than
             // a stranger. Saying which it is saves someone hunting for a process.
@@ -134,7 +155,8 @@ impl Session {
             theme,
             title: String::new(),
             pin: random_pin()?,
-            sessions: Vec::new(),
+            cipher: Aes256Gcm::new_from_slice(&key_bytes)
+                .map_err(|e| format!("cannot build the cipher: {e}"))?,
             failures: 0,
         }));
         let stop = Arc::new(AtomicBool::new(false));
@@ -162,6 +184,7 @@ impl Session {
 
         Ok(Session {
             token,
+            key_b64,
             shared,
             stop,
             next_id,
@@ -208,7 +231,10 @@ impl Session {
                     }
                 };
                 let url = format!("https://{host}{path}");
-                match wait_until_reachable(&host, &url) {
+                // Probed WITHOUT the fragment: it is not part of a request, and an
+                // HTTP client handed one either strips it or chokes on it.
+                let probe = format!("https://{host}{}", path.split('#').next().unwrap_or("/"));
+                match wait_until_reachable(&host, &probe) {
                     Ok(()) => *state.lock().unwrap() = Tunnel::Live(url),
                     Err(why) => {
                         *state.lock().unwrap() = Tunnel::Failed(why);
@@ -232,11 +258,13 @@ impl Session {
     }
 
     fn public_path(&self) -> String {
-        format!("/r/{}/", self.token)
+        // The fragment is part of what the QR must carry and NOT part of what is
+        // requested: browsers never send it, which is exactly why the key rides there.
+        format!("/r/{}/#k={}", self.token, self.key_b64)
     }
 
     pub fn url(&self) -> String {
-        format!("http://127.0.0.1:{PORT}/r/{}/", self.token)
+        format!("http://127.0.0.1:{PORT}/r/{}/#k={}", self.token, self.key_b64)
     }
 
     /// The six digits the window shows. Read every time rather than cached, because
@@ -256,7 +284,6 @@ impl Session {
         if let Ok(pin) = random_pin() {
             shared.pin = pin;
         }
-        shared.sessions.clear();
         shared.failures = 0;
         shared.pin.clone()
     }
@@ -271,10 +298,7 @@ impl Session {
     /// They still hold the link and the PIN, so this is not a ban — see `rotate_pin`.
     pub fn drop_viewer(&self, id: u64) {
         let Ok(mut shared) = self.shared.lock() else { return };
-        if let Some(pos) = shared.clients.iter().position(|c| c.id == id) {
-            let client = shared.clients.remove(pos);
-            shared.sessions.retain(|(sid, _)| *sid != client.session);
-        }
+        shared.clients.retain(|c| c.id != id);
     }
 
     /// Who is watching, for the status bar.
@@ -320,7 +344,10 @@ impl Session {
             "updates": rows,
         });
         let frame = match serde_json::to_vec(&payload) {
-            Ok(v) => text_frame(&v),
+            Ok(v) => match seal(&shared.cipher, &v) {
+                Some(sealed) => binary_frame(&sealed),
+                None => return,
+            },
             Err(_) => return,
         };
 
@@ -338,7 +365,6 @@ impl Drop for Session {
         let _ = TcpStream::connect(("127.0.0.1", PORT));
         if let Ok(mut shared) = self.shared.lock() {
             shared.clients.clear();
-            shared.sessions.clear();
         }
         if let Ok(mut child) = self.child.lock() {
             if let Some(mut proc) = child.take() {
@@ -512,73 +538,9 @@ fn serve(
             // prompt without them is mostly missing glyphs.
             respond_cached(&mut stream, "font/ttf", crate::font::EMBEDDED_NERD_REGULAR)
         }
-        "/pair" => {
-            // The body is read HERE because `reader` borrows the stream, and `pair`
-            // needs it mutably to answer. Bytes travel; the borrow does not.
-            let len = content_length(&headers).min(1024);
-            let mut body = vec![0u8; len];
-            if reader.read_exact(&mut body).is_err() {
-                respond(&mut stream, "400 Bad Request", "text/plain", b"short body");
-                return;
-            }
-            drop(reader);
-            pair(&mut stream, &body, shared, token)
-        }
         p if p.starts_with("/ws") => upgrade(stream, &headers, shared, next_id, proxy),
         _ => respond(&mut stream, "404 Not Found", "text/plain", b"no"),
     }
-}
-
-/// Exchanges six digits for a session cookie.
-fn pair(stream: &mut TcpStream, body: &[u8], shared: &Arc<Mutex<Shared>>, token: &str) {
-    let parsed: serde_json::Value = serde_json::from_slice(body).unwrap_or_default();
-    let offered = parsed.get("pin").and_then(|v| v.as_str()).unwrap_or("");
-    let name = parsed
-        .get("name")
-        .and_then(|v| v.as_str())
-        .map(|n| n.trim().chars().take(24).collect::<String>())
-        .filter(|n| !n.is_empty());
-
-    let Ok(mut shared) = shared.lock() else { return };
-
-    if !pin_matches(&shared.pin, offered) {
-        shared.failures += 1;
-        let left = MAX_FAILURES.saturating_sub(shared.failures);
-        if left == 0 {
-            // Not "this attempt failed": the session is over. Somebody guessing at the
-            // door of a shell does not get a sixth go.
-            drop(shared);
-            let body = b"{\"error\":\"too many\"}";
-            let head = format!(
-                "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
-                body.len()
-            );
-            let _ = stream.write_all(head.as_bytes());
-            let _ = stream.write_all(body);
-            return;
-        }
-        let body = format!("{{\"error\":\"wrong pin\",\"left\":{left}}}");
-        respond(stream, "403 Forbidden", "application/json", body.as_bytes());
-        return;
-    }
-
-    shared.failures = 0;
-    let Ok(sid) = random_token() else {
-        respond(stream, "500 Internal Server Error", "text/plain", b"no randomness");
-        return;
-    };
-    shared.sessions.push((sid.clone(), name.clone()));
-    let name_json = serde_json::to_string(&name).unwrap_or_else(|_| "null".into());
-    let body = format!("{{\"ok\":true,\"name\":{name_json}}}");
-    // Scoped to this session's path, so a second runnir on the same host cannot read
-    // it. `SameSite=Strict` because nothing ever links here from anywhere else.
-    let head = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
-         Set-Cookie: pocket={sid}; Path=/r/{token}/; HttpOnly; SameSite=Strict\r\n\r\n",
-        body.len()
-    );
-    let _ = stream.write_all(head.as_bytes());
-    let _ = stream.write_all(body.as_bytes());
 }
 
 /// Whether the offered digits are the expected ones, without short-circuiting.
@@ -591,32 +553,6 @@ fn pin_matches(expected: &str, given: &str) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-fn content_length(headers: &[String]) -> usize {
-    headers
-        .iter()
-        .find_map(|h| {
-            let (k, v) = h.split_once(':')?;
-            k.trim()
-                .eq_ignore_ascii_case("content-length")
-                .then(|| v.trim().parse::<usize>().ok())?
-        })
-        .unwrap_or(0)
-}
-
-/// The session cookie a request carries, if any.
-fn cookie_session(headers: &[String]) -> Option<String> {
-    headers.iter().find_map(|h| {
-        let (k, v) = h.split_once(':')?;
-        if !k.trim().eq_ignore_ascii_case("cookie") {
-            return None;
-        }
-        v.split(';').find_map(|pair| {
-            let (name, value) = pair.split_once('=')?;
-            (name.trim() == "pocket").then(|| value.trim().to_string())
-        })
-    })
-}
-
 fn upgrade(
     mut stream: TcpStream,
     headers: &[String],
@@ -624,22 +560,24 @@ fn upgrade(
     next_id: &Arc<AtomicU64>,
     proxy: &EventLoopProxy<UserEvent>,
 ) {
-    // The PIN is checked here and not only at `/pair`: a socket is the thing that
-    // actually shows the screen, so it is the thing that has to be behind the door.
-    let (session, name) = match cookie_session(headers).and_then(|sid| {
-        let shared = shared.lock().ok()?;
-        shared
-            .sessions
-            .iter()
-            .find(|(s, _)| *s == sid)
-            .map(|(s, n)| (s.clone(), n.clone()))
-    }) {
-        Some(pair) => pair,
-        None => {
-            respond(&mut stream, "401 Unauthorized", "text/plain", b"pair first");
+    // A WebSocket upgrade may be made by any page that knows the URL, and the URL is
+    // the one part of this the tunnel can read. `Origin` is the standard check: a
+    // browser sets it and cannot be talked out of it, so a page on some other site
+    // cannot open this socket even holding the link.
+    //
+    // Absent is allowed on purpose - that is a non-browser client (a script, a test),
+    // which is not the thing this defends against. Present and foreign is refused.
+    if let Some(origin) = header(headers, "origin") {
+        let host = header(headers, "host").unwrap_or_default();
+        let ok = origin
+            .strip_prefix("https://")
+            .or_else(|| origin.strip_prefix("http://"))
+            .is_some_and(|o| o == host);
+        if !ok {
+            respond(&mut stream, "403 Forbidden", "text/plain", b"bad origin");
             return;
         }
-    };
+    }
 
     let key = headers.iter().find_map(|h| {
         let (k, v) = h.split_once(':')?;
@@ -665,6 +603,11 @@ fn upgrade(
     }
     let _ = stream.set_read_timeout(None);
 
+    let cipher = match shared.lock() {
+        Ok(s) => s.cipher.clone(),
+        Err(_) => return,
+    };
+
     let id = next_id.fetch_add(1, Ordering::Relaxed);
     let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(MAX_QUEUED);
 
@@ -683,52 +626,55 @@ fn upgrade(
         let _ = writer.write_all(&[0x88, 0x00]);
     });
 
-    // Everything this viewer needs to draw a screen, before any diff reaches them.
-    {
-        let Ok(mut s) = shared.lock() else { return };
-        if let Some(snapshot) = s.last.clone() {
-            let theme = s.theme.clone();
-            let title = s.title.clone();
-            let payload = serde_json::json!({
-                "cols": snapshot.cols,
-                "rows": snapshot.rows,
-                "cursor": snapshot.cursor,
-                "title": title,
-                "updates": diff(None, &snapshot, &theme),
-            });
-            if let Ok(v) = serde_json::to_vec(&payload) {
-                let _ = tx.try_send(text_frame(&v));
-            }
-        }
-        s.clients.push(Client { id, name, session, tx });
-    }
-
-    // Read until the viewer goes away, acting on what they send.
+    // Nothing is sent until the PIN arrives, and the PIN arrives INSIDE the encrypted
+    // channel. That is the point of moving pairing here from an HTTP route: a POST
+    // carried it in the clear past the edge, and a cookie did the same on every
+    // reconnect afterwards.
+    let mut paired = false;
     let mut conn = stream;
     loop {
-        match read_frame(&mut conn) {
-            Ok(Some((opcode, payload))) => match opcode {
-                0x8 => break,
-                0x9 => {
-                    let mut pong = vec![0x8A, payload.len().min(125) as u8];
-                    pong.extend_from_slice(&payload[..payload.len().min(125)]);
-                    if conn.write_all(&pong).is_err() {
-                        break;
-                    }
+        let (opcode, payload) = match read_frame(&mut conn) {
+            Ok(Some(frame)) => frame,
+            Ok(None) => continue,
+            Err(_) => break,
+        };
+        match opcode {
+            0x8 => break,
+            0x9 => {
+                let mut pong = vec![0x8A, payload.len().min(125) as u8];
+                pong.extend_from_slice(&payload[..payload.len().min(125)]);
+                if conn.write_all(&pong).is_err() {
+                    break;
                 }
-                0x1 => {
-                    if let Some(req) = request_from(&payload) {
-                        // Straight onto the proxy bridge: this is the same path
-                        // `runnir @` takes, so a phone drives the terminal through
-                        // exactly the machinery a script does — including the leader
-                        // layer, the overlays, and the guardian.
+            }
+            0x2 => {
+                // Anything that does not authenticate is not a client of ours, and
+                // there is nothing useful to answer it with.
+                let Some(plain) = open_sealed(&cipher, &payload) else { break };
+                if paired {
+                    if let Some(req) = request_from(&plain) {
+                        // The same bridge `runnir @` uses, so a phone drives the
+                        // terminal through the machinery a script does - leader layer,
+                        // overlays and the guardian included.
                         let _ = bridge(req, proxy);
                     }
+                    continue;
                 }
-                _ => {}
-            },
-            Ok(None) => {}
-            Err(_) => break,
+                match try_pair(&plain, shared, id, &tx) {
+                    Pairing::Ok => paired = true,
+                    Pairing::Wrong(left) => {
+                        let body = format!("{{\"t\":\"denied\",\"left\":{left}}}");
+                        if let Some(frame) = seal(&cipher, body.as_bytes()) {
+                            let _ = tx.try_send(binary_frame(&frame));
+                        }
+                        if left == 0 {
+                            break;
+                        }
+                    }
+                    Pairing::Gone => break,
+                }
+            }
+            _ => {}
         }
     }
 
@@ -737,9 +683,74 @@ fn upgrade(
     }
 }
 
+enum Pairing {
+    Ok,
+    /// Wrong PIN, with the attempts remaining. Zero means the session is over.
+    Wrong(u32),
+    Gone,
+}
+
+/// Checks the PIN and, if it is right, registers the viewer and sends them a screen.
+fn try_pair(
+    plain: &[u8],
+    shared: &Arc<Mutex<Shared>>,
+    id: u64,
+    tx: &mpsc::SyncSender<Vec<u8>>,
+) -> Pairing {
+    let msg: serde_json::Value = match serde_json::from_slice(plain) {
+        Ok(v) => v,
+        Err(_) => return Pairing::Gone,
+    };
+    if msg.get("t").and_then(|t| t.as_str()) != Some("pair") {
+        return Pairing::Gone;
+    }
+    let offered = msg.get("pin").and_then(|v| v.as_str()).unwrap_or("");
+    let name = msg
+        .get("name")
+        .and_then(|v| v.as_str())
+        .map(|n| n.trim().chars().take(24).collect::<String>())
+        .filter(|n| !n.is_empty());
+
+    let Ok(mut s) = shared.lock() else { return Pairing::Gone };
+
+    if !pin_matches(&s.pin, offered) {
+        s.failures += 1;
+        return Pairing::Wrong(MAX_FAILURES.saturating_sub(s.failures));
+    }
+    s.failures = 0;
+
+    // Everything this viewer needs to draw a screen, before any diff reaches them.
+    if let Some(snapshot) = s.last.clone() {
+        let theme = s.theme.clone();
+        let title = s.title.clone();
+        let payload = serde_json::json!({
+            "cols": snapshot.cols,
+            "rows": snapshot.rows,
+            "cursor": snapshot.cursor,
+            "title": title,
+            "updates": diff(None, &snapshot, &theme),
+        });
+        if let Ok(v) = serde_json::to_vec(&payload) {
+            if let Some(frame) = seal(&s.cipher, &v) {
+                let _ = tx.try_send(binary_frame(&frame));
+            }
+        }
+    }
+    s.clients.push(Client { id, name, tx: tx.clone() });
+    Pairing::Ok
+}
+
+/// One header, by name.
+fn header(headers: &[String], name: &str) -> Option<String> {
+    headers.iter().find_map(|h| {
+        let (k, v) = h.split_once(':')?;
+        k.trim().eq_ignore_ascii_case(name).then(|| v.trim().to_string())
+    })
+}
+
 /// What a phone asked for, as a control request.
 ///
-/// Only three shapes are accepted, and the omissions are deliberate:
+/// Only four shapes are accepted, and the omissions are deliberate:
 ///
 /// * `key` — a chord, taking the path a real keypress takes. This is how Enter always
 ///   arrives, and Enter is where `guardian` asks "run this?". A phone must not be able
@@ -750,6 +761,7 @@ fn upgrade(
 ///   lookup, and autocorrect would be impossible to represent at all.
 /// * `click` — a cell. The whole window is on the phone, so tapping a tab or a row of
 ///   the git panel means the same thing it means with a mouse.
+/// * `wheel` — the scrollback, which keys alone cannot move without losing your place.
 ///
 /// Anything else is ignored rather than guessed at: this is input arriving from the
 /// internet, and the list of what it may do belongs here, in one place.
@@ -816,10 +828,11 @@ fn read_frame(conn: &mut TcpStream) -> std::io::Result<Option<(u8, Vec<u8>)>> {
     Ok(Some((opcode, payload)))
 }
 
-/// A server-to-client text frame. Never masked, which is the rule for this direction.
-fn text_frame(payload: &[u8]) -> Vec<u8> {
+/// A server-to-client BINARY frame. Never masked, which is the rule for this
+/// direction. Binary because what travels is ciphertext, not text.
+fn binary_frame(payload: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(payload.len() + 10);
-    out.push(0x81);
+    out.push(0x82);
     match payload.len() {
         n if n < 126 => out.push(n as u8),
         n if n < 65536 => {
@@ -877,12 +890,42 @@ fn random_pin() -> Result<String, String> {
     }
 }
 
-fn random_token() -> Result<String, String> {
-    let mut bytes = [0u8; 16];
+fn random_bytes<const N: usize>() -> Result<[u8; N], String> {
+    let mut bytes = [0u8; N];
     std::fs::File::open("/dev/urandom")
         .and_then(|mut f| f.read_exact(&mut bytes))
         .map_err(|e| format!("no randomness available: {e}"))?;
+    Ok(bytes)
+}
+
+fn random_token() -> Result<String, String> {
+    let bytes = random_bytes::<16>()?;
     Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// Wraps a message for the wire: 12 random nonce bytes, then the sealed payload.
+fn seal(cipher: &Aes256Gcm, plaintext: &[u8]) -> Option<Vec<u8>> {
+    let nonce_bytes = random_bytes::<12>().ok()?;
+    let nonce = Nonce::from_slice(&nonce_bytes);
+    let sealed = cipher
+        .encrypt(nonce, Payload { msg: plaintext, aad: b"" })
+        .ok()?;
+    let mut out = Vec::with_capacity(12 + sealed.len());
+    out.extend_from_slice(&nonce_bytes);
+    out.extend_from_slice(&sealed);
+    Some(out)
+}
+
+/// Unwraps one. Returns `None` for anything that does not authenticate, which is the
+/// only answer a tampered or replayed-with-changes frame ever gets.
+fn open_sealed(cipher: &Aes256Gcm, frame: &[u8]) -> Option<Vec<u8>> {
+    if frame.len() < 12 + 16 {
+        return None;
+    }
+    let (nonce_bytes, sealed) = frame.split_at(12);
+    cipher
+        .decrypt(Nonce::from_slice(nonce_bytes), Payload { msg: sealed, aad: b"" })
+        .ok()
 }
 
 const PAGE: &str = include_str!("pocket.html");
@@ -892,14 +935,49 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_text_frame_uses_the_shortest_length_form() {
-        assert_eq!(text_frame(b"hi")[..2], [0x81, 2]);
-        let medium = text_frame(&vec![b'x'; 200]);
-        assert_eq!(medium[0], 0x81);
+    fn a_frame_uses_the_shortest_length_form() {
+        assert_eq!(binary_frame(b"hi")[..2], [0x82, 2]);
+        let medium = binary_frame(&vec![b'x'; 200]);
+        assert_eq!(medium[0], 0x82);
         assert_eq!(medium[1], 126);
         assert_eq!(u16::from_be_bytes([medium[2], medium[3]]), 200);
-        let large = text_frame(&vec![b'x'; 70000]);
+        let large = binary_frame(&vec![b'x'; 70000]);
         assert_eq!(large[1], 127);
+    }
+
+    #[test]
+    fn a_sealed_message_survives_the_round_trip_and_nothing_else_does() {
+        let key = random_bytes::<32>().unwrap();
+        let cipher = Aes256Gcm::new_from_slice(&key).unwrap();
+        let sealed = seal(&cipher, b"hello phone").unwrap();
+        assert_eq!(open_sealed(&cipher, &sealed).as_deref(), Some(&b"hello phone"[..]));
+
+        // A different key is a different conversation.
+        let other = Aes256Gcm::new_from_slice(&random_bytes::<32>().unwrap()).unwrap();
+        assert!(open_sealed(&other, &sealed).is_none());
+
+        // One flipped bit anywhere fails the tag rather than decrypting to something.
+        let mut tampered = sealed.clone();
+        let last = tampered.len() - 1;
+        tampered[last] ^= 1;
+        assert!(open_sealed(&cipher, &tampered).is_none());
+        let mut nonce_tampered = sealed.clone();
+        nonce_tampered[0] ^= 1;
+        assert!(open_sealed(&cipher, &nonce_tampered).is_none());
+
+        // Too short to hold a nonce and a tag is refused before anything is attempted.
+        assert!(open_sealed(&cipher, &[0u8; 8]).is_none());
+    }
+
+    #[test]
+    fn two_seals_of_the_same_message_differ() {
+        // Random nonces, so identical screens do not produce identical ciphertext -
+        // which would tell an observer that nothing changed between two frames.
+        let cipher = Aes256Gcm::new_from_slice(&random_bytes::<32>().unwrap()).unwrap();
+        let a = seal(&cipher, b"same").unwrap();
+        let b = seal(&cipher, b"same").unwrap();
+        assert_ne!(a, b);
+        assert_eq!(open_sealed(&cipher, &a), open_sealed(&cipher, &b));
     }
 
     #[test]
@@ -930,19 +1008,6 @@ mod tests {
         assert!(!pin_matches("012345", "0123456"), "nor is a longer string");
         assert!(!pin_matches("012345", ""), "nor is nothing at all");
         assert!(!pin_matches("012345", "012346"));
-    }
-
-    #[test]
-    fn a_cookie_is_found_among_others() {
-        let headers = vec![
-            "Host: localhost".to_string(),
-            "Cookie: theme=dark; pocket=abc123; other=1".to_string(),
-        ];
-        assert_eq!(cookie_session(&headers).as_deref(), Some("abc123"));
-        assert_eq!(cookie_session(&["Host: x".to_string()]), None);
-        // A cookie belonging to something else must not be mistaken for ours.
-        let decoy = vec!["Cookie: notpocket=zzz".to_string()];
-        assert_eq!(cookie_session(&decoy), None);
     }
 
     #[test]

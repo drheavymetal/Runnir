@@ -5652,7 +5652,66 @@ Left open:
   `node_modules`, so `npm run build` was not run.
 - One window can share at a time, by construction: the port is fixed.
 
+## 2026-09-16 - The tunnel stops being able to read any of it
+
+A quick tunnel terminates TLS at Cloudflare's edge, so until now the mirror, the
+keystrokes and the PIN were all in the clear to them. Pedro asked whether that could be
+closed. It can, mostly, and the "mostly" is the part worth writing down.
+
+**Every frame is AES-256-GCM, under a key that travels in the URL fragment.** Browsers
+never send the fragment to a server, so the key reaches the phone through the QR and
+never crosses the edge. What crosses is opaque bytes. Verified with an independent
+client: the wire does not contain readable JSON, and the same bytes decrypt to the right
+screen.
+
+**Pairing moved inside the encrypted socket, and the cookies are gone.** This is the
+bigger half. A `POST /pair` carried the PIN in the clear past the edge, and the cookie it
+handed back did the same on every reconnect afterwards — so the one secret that is
+deliberately NOT in the link was visible to the one party the link is hidden from. Now
+the first encrypted message is `{"t":"pair", …}`, and the phone remembers the PIN in its
+own `sessionStorage`, which no server ever sees. The HTTP route and `Set-Cookie` are
+deleted rather than left unused.
+
+**And the `Origin` check that was missing.** A browser sets that header and cannot be
+talked out of it, so a page on another site cannot open this socket even holding the
+link. Absent is allowed on purpose — that is a script or a test, which is not what this
+defends against.
+
+### The limit, stated rather than discovered later
+
+Cloudflare serves the page that does the decrypting. So this defends against capture and
+logging, and **not** against an edge that rewrites the JavaScript it is handing over.
+That is inherent to doing crypto in a browser when the code comes through the party you
+are hiding from. Not having to trust anybody means not putting anybody in the middle: a
+private network instead of a tunnel. Pedro chose the tunnel with that said out loud.
+
+### Nonces are random, and that is not laziness
+
+12 random bytes per message rather than a counter. A counter has to be unique per KEY,
+and the key belongs to the session while counters would belong to each connection — two
+viewers would reuse nonces, which is the one thing AES-GCM does not survive. At 96 bits
+the birthday bound is far beyond any number of frames a terminal will ever send, and it
+cannot be got wrong by a future change that adds a second connection.
+
+There is a test that the same plaintext seals differently twice: identical ciphertext for
+identical frames would tell an observer that nothing changed on screen, which is a
+side channel for free.
+
+### Not defended against
+
+Replay. An attacker who could capture and re-send an encrypted frame could repeat a
+keystroke; nothing carries a sequence number. The tunnel's own TLS makes capture the hard
+part, and an attacker positioned to defeat that has better options. Worth knowing before
+somebody assumes otherwise.
+
 ## Gotchas (do not re-learn)
+
+- **A URL fragment never reaches the server**, which makes it the one place to put a key
+  that a proxy must not see. It also means anything reading the URL server-side (a
+  reachability probe, a redirect) must strip it first.
+- **AES-GCM nonces must be unique per KEY, not per connection.** If the key is shared by
+  several connections, per-connection counters collide. Random 96-bit nonces cannot be
+  got wrong by a later change.
 
 - **`src/docs.rs` is a Rust string literal.** A double quote in manual prose ends it, and
   the compiler complains about unknown token prefixes rather than about the text. Use
