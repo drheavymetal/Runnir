@@ -5789,7 +5789,58 @@ is excellent at a keyboard and unusable through glass, and worse, driving it rem
 a visible effect on the machine being driven. What travels well is the SCREEN; what has
 to be re-offered is every way of reaching things.
 
+## 2026-09-16 - Three rounds of fixing a layout blind, and the browser that was there all along
+
+The phone's dock ended up behind the top bar and the typing field went off-screen
+entirely — no way to type at all. It took three attempts to fix because all three were
+made without looking at the page. The actual causes, in the order they were found:
+
+**A range edit ate the CSS.** Replacing the menu's style block by slicing from one marker
+to another took `#dock`, `#keys`, `#typeline` and `#kbd` with it, because they sat
+between the two markers. Without `position: fixed; bottom: 0` the dock is an ordinary
+div at the top of the flow, which is exactly where it appeared. The build was clean and
+the tests passed, because none of them look at CSS.
+
+**`.row` meant two different things.** The mirror's own lines are `.row { height: 1.2em }`
+and the menu borrowed the same class name, so its rows were 17 px tall while its buttons
+asked for 48 — every heading landed on top of the row above it. Renamed to `.sheet-row`.
+A class name that describes a *shape* rather than a *thing* will be taken by something
+else eventually.
+
+**And the fallback that caused the original report** was arithmetic positioning the dock
+from `innerHeight - visualViewport.height`, which is fine until those disagree for any
+reason other than the keyboard, at which point it moves the dock a whole screen. Deleted;
+CSS and `interactive-widget=resizes-content` do it correctly.
+
+### The lesson that matters more than any of them
+
+**There is a headless browser on this machine, and the page could have been rendered and
+LOOKED AT from the first report.** Three rounds of reasoning about CSS from source, each
+shipped and each wrong, against one screenshot that showed the answer immediately.
+
+The recipe, for next time:
+
+```
+helium-browser --headless=new --no-sandbox --remote-debugging-port=9222 \
+    --window-size=420,900 "<url>" &
+# then over CDP: Runtime.evaluate to seed sessionStorage with the PIN and reload,
+# Page.captureScreenshot for the image.
+```
+
+It is the same rule this file already has for the terminal itself — verify in a real
+instance, not by reading the code — and it applies to the web page runnir serves just as
+much as to the window it draws.
+
 ## Gotchas (do not re-learn)
+
+- **Render the page and look at it.** `helium-browser --headless=new --screenshot`, plus
+  CDP to seed the PIN into sessionStorage, shows a layout bug in one shot. Reasoning
+  about CSS from source got it wrong three times in a row first.
+- **Editing a file by slicing between two markers takes everything in between.** It cost
+  the whole dock stylesheet here and a set of server functions earlier the same day.
+  Check what was removed, not just that it compiles.
+- **`.row` is a shape, not a thing.** The mirror's rows and the menu's rows shared the
+  class and the 1.2em height leaked into buttons asking for 48 px.
 
 - **Driving a modal layer remotely changes the screen being driven.** Arming the leader
   from a phone puts a which-key menu on the desk. Remote input should reach actions

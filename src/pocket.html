@@ -149,7 +149,7 @@
     padding: 14px;
     box-shadow: 0 18px 50px rgba(0, 0, 0, 0.6);
   }
-  #sheet .group + .group { margin-top: 14px; }
+  #sheet .sheet-group + .sheet-group { margin-top: 14px; }
   #sheet h3 {
     margin: 0 0 8px;
     font-size: 11px;
@@ -159,10 +159,11 @@
     letter-spacing: 0.1em;
   }
   /* A grid, so a label never lands on top of the row above it. */
-  #sheet .row {
+  #sheet .sheet-row {
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(74px, 1fr));
     gap: 8px;
+    height: auto;
   }
   #sheet button {
     background: #1e212a;
@@ -175,6 +176,79 @@
     padding: 0 10px;
   }
   #sheet button:active { background: #2a3d63; border-color: #3d5a8f; }
+
+  /* The dock: the keys a phone keyboard has not got, and the field to type into.
+     Fixed to the bottom, where a thumb is. */
+  #dock {
+    position: fixed;
+    left: 0; right: 0;
+    bottom: 0;
+    background: rgba(13, 13, 15, 0.96);
+    border-top: 1px solid #23252b;
+    z-index: 2;
+  }
+  #keys {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    padding: 6px;
+  }
+  #keys button {
+    background: #1b1d23;
+    color: #c3c7d0;
+    border: 1px solid #2c2f37;
+    border-radius: 7px;
+    padding: 0 12px;
+    font: inherit;
+    font-size: 13px;
+    flex: none;
+    /* 44 px is the smallest target a fingertip hits reliably; below that you aim. */
+    min-width: 46px;
+    min-height: 44px;
+  }
+  #keys button.on { background: #3d7eff; color: #fff; border-color: #3d7eff; }
+
+  /* The menu is the way into panes, tabs and panels, so it is first and the only
+     coloured key on the row. */
+  #menu-btn {
+    background: #2a3d63;
+    color: #cfe0ff;
+    border-color: #3d5a8f;
+    font-weight: 600;
+    min-width: 88px;
+    order: -1;
+  }
+
+  #typeline {
+    display: flex;
+    gap: 6px;
+    padding: 0 6px 6px;
+    padding-bottom: max(6px, env(safe-area-inset-bottom));
+  }
+  #typeline button {
+    background: #3d7eff;
+    color: #fff;
+    border: 0;
+    border-radius: 7px;
+    font: inherit;
+    font-size: 17px;
+    min-width: 56px;
+    min-height: 44px;
+  }
+
+  /* Visible, because you have to see what you are typing. */
+  #kbd {
+    flex: 1;
+    min-width: 0;
+    background: #16181e;
+    border: 1px solid #2c2f37;
+    border-radius: 6px;
+    color: #d7dae0;
+    font: inherit;
+    font-size: 16px;
+    padding: 0 11px;
+    min-height: 44px;
+  }
 
   #wrap {
     position: absolute;
@@ -201,9 +275,9 @@
 
 <div id="menu">
   <div id="sheet">
-    <div class="group">
+    <div class="sheet-group">
       <h3>pane</h3>
-      <div class="row">
+      <div class="sheet-row">
         <button data-action="focus_left">&larr;</button>
         <button data-action="focus_down">&darr;</button>
         <button data-action="focus_up">&uarr;</button>
@@ -211,17 +285,17 @@
         <button data-action="toggle_zoom">zoom</button>
       </div>
     </div>
-    <div class="group">
+    <div class="sheet-group">
       <h3>tab</h3>
-      <div class="row">
+      <div class="sheet-row">
         <button data-action="prev_tab">&lsaquo; prev</button>
         <button data-action="next_tab">next &rsaquo;</button>
         <button data-action="new_tab">new</button>
       </div>
     </div>
-    <div class="group">
+    <div class="sheet-group">
       <h3>panels</h3>
-      <div class="row">
+      <div class="sheet-row">
         <button data-action="git_panel">git</button>
         <button data-action="docker_panel">docker</button>
         <button data-action="toggle_explorer">files</button>
