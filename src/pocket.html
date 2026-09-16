@@ -71,6 +71,46 @@
     pointer-events: none;
   }
 
+  /* The door. Shown when there is no session cookie yet, or when the one we had
+     stopped working - which is what a rotated PIN looks like from out here. */
+  #pair {
+    position: absolute;
+    inset: 0;
+    display: none;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 14px;
+    padding: 24px;
+    background: #0d0d0f;
+    z-index: 3;
+  }
+  #pair.show { display: flex; }
+  #pair h1 { margin: 0; font-size: 15px; font-weight: 600; color: #d7dae0; }
+  #pair p { margin: 0; font-size: 12px; color: #8a8f9a; text-align: center; max-width: 30ch; line-height: 1.5; }
+  #pair input {
+    background: #16181e;
+    border: 1px solid #2c2f37;
+    border-radius: 8px;
+    color: #d7dae0;
+    font: inherit;
+    padding: 12px 14px;
+    width: min(320px, 100%);
+    text-align: center;
+  }
+  #pin { font-size: 26px; letter-spacing: 0.4em; text-indent: 0.4em; }
+  #pair button {
+    background: #3d7eff;
+    color: #fff;
+    border: 0;
+    border-radius: 8px;
+    font: inherit;
+    font-weight: 600;
+    padding: 12px 22px;
+    width: min(320px, 100%);
+  }
+  #pairerr { color: #e06c6c; font-size: 12px; min-height: 1.2em; }
+
   #wrap {
     position: absolute;
     inset: 0;
@@ -91,6 +131,15 @@
   <button id="fit">fit</button>
 </div>
 <div id="wrap"><div id="screen"></div><div id="cursor" hidden></div></div>
+
+<div id="pair">
+  <h1>runnir</h1>
+  <p>Type the six digits shown in the terminal window.</p>
+  <input id="pin" inputmode="numeric" pattern="[0-9]*" maxlength="6" autocomplete="off" placeholder="000000">
+  <input id="who" maxlength="24" autocomplete="off" placeholder="your name (optional)">
+  <button id="go">Connect</button>
+  <div id="pairerr"></div>
+</div>
 
 <script>
 'use strict';
@@ -219,12 +268,64 @@ document.getElementById('zoomout').onclick = () => { manual = true; setFont(font
 document.getElementById('fit').onclick = fit;
 window.addEventListener('resize', () => { if (!manual) fit(); });
 
+const pairEl = document.getElementById('pair');
+const pinEl = document.getElementById('pin');
+const errEl = document.getElementById('pairerr');
+const base = location.pathname.replace(/\/$/, '');
+
+function showDoor(message) {
+  pairEl.classList.add('show');
+  errEl.textContent = message || '';
+  statusEl.textContent = 'not paired';
+  barEl.classList.remove('live');
+  pinEl.value = '';
+  pinEl.focus();
+}
+
+async function pair() {
+  const pin = pinEl.value.trim();
+  const name = document.getElementById('who').value.trim();
+  errEl.textContent = '';
+  let res;
+  try {
+    res = await fetch(base + '/pair', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ pin: pin, name: name || null })
+    });
+  } catch (e) {
+    errEl.textContent = 'the terminal is not answering';
+    return;
+  }
+  if (res.ok) {
+    pairEl.classList.remove('show');
+    connect();
+    return;
+  }
+  const body = await res.json().catch(() => ({}));
+  if (body.error === 'too many') {
+    // The server stopped itself. Saying "wrong pin" here would send someone hunting
+    // for digits that no longer open anything.
+    errEl.textContent = 'too many wrong tries - the terminal stopped sharing';
+    document.getElementById('go').disabled = true;
+    return;
+  }
+  errEl.textContent = 'wrong pin' + (body.left !== undefined ? ' - ' + body.left + ' left' : '');
+}
+
+document.getElementById('go').onclick = pair;
+pinEl.addEventListener('keydown', (e) => { if (e.key === 'Enter') pair(); });
+// Six digits is the whole input; waiting for a button press after the last one is a
+// tap nobody needs.
+pinEl.addEventListener('input', () => { if (pinEl.value.length === 6) pair(); });
+
 function connect() {
   const proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
-  const base = location.pathname.replace(/\/$/, '');
+  let opened = false;
   ws = new WebSocket(proto + location.host + base + '/ws');
 
   ws.onopen = () => {
+    opened = true;
     statusEl.textContent = 'live';
     barEl.classList.add('live');
     reconnectDelay = 500;
@@ -235,6 +336,13 @@ function connect() {
     apply(msg);
   };
   ws.onclose = () => {
+    // A socket that never opened was refused, which from here means the cookie is
+    // gone or the PIN was rotated. Reconnecting for ever against a closed door would
+    // look like a network problem instead of the door it is.
+    if (!opened) {
+      showDoor('that pin no longer works');
+      return;
+    }
     statusEl.textContent = 'reconnecting';
     barEl.classList.remove('live');
     // Backing off matters: a terminal that closed is not coming back, and a page left
@@ -245,6 +353,7 @@ function connect() {
   ws.onerror = () => { try { ws.close(); } catch (_) {} };
 }
 
+// Try the cookie we may already have; the door appears only if it is refused.
 connect();
 </script>
 </body>

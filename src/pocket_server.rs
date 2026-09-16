@@ -52,6 +52,9 @@ pub struct Viewer {
 struct Client {
     id: u64,
     name: Option<String>,
+    /// The cookie this viewer paired with, so dropping them can revoke it too.
+    /// Without this, a kicked phone reconnects on the credential it already holds.
+    session: String,
     tx: mpsc::SyncSender<Vec<u8>>,
 }
 
@@ -62,6 +65,30 @@ struct Shared {
     /// before this one, and a new viewer is sent a complete snapshot on arrival.
     last: Option<Snapshot>,
     theme: Theme,
+    /// Six digits shown in the window and NEVER in the link. A quick tunnel URL is a
+    /// public URL and ends up in screenshots, history and clipboards; this is the
+    /// factor that only ever exists on a screen in the room.
+    pin: String,
+    /// Cookies handed out to whoever typed the PIN, each with the name they gave.
+    /// Dropping one ends that session; it does not deny access, because the holder can
+    /// pair again. Rotating the PIN is what denies access.
+    sessions: Vec<(String, Option<String>)>,
+    /// Wrong PINs since the last success. The whole server stops at the limit rather
+    /// than that one attempt failing: one person is expected here, and they can read
+    /// six digits off a screen in front of them.
+    failures: u32,
+}
+
+/// Where the public link is in its life. The window shows all three, because a tunnel
+/// that is still opening looks identical to one that failed if the panel only knows
+/// how to show a URL.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Tunnel {
+    /// No public link asked for: loopback only.
+    Off,
+    Opening,
+    Live(String),
+    Failed(String),
 }
 
 pub struct Session {
@@ -69,7 +96,15 @@ pub struct Session {
     shared: Arc<Mutex<Shared>>,
     stop: Arc<AtomicBool>,
     next_id: Arc<AtomicU64>,
+    tunnel: Arc<Mutex<Tunnel>>,
+    /// Killed explicitly rather than left to notice its parent died: an orphaned
+    /// cloudflared holds a public hostname pointing at a port nobody is serving.
+    /// `share.rs` found one alive three hours after its daemon had been replaced.
+    child: Arc<Mutex<Option<std::process::Child>>>,
 }
+
+/// How many wrong PINs end the whole session.
+const MAX_FAILURES: u32 = 5;
 
 impl Session {
     /// Binds and starts accepting. Returns immediately; nothing is served until the
@@ -83,6 +118,9 @@ impl Session {
             clients: Vec::new(),
             last: None,
             theme,
+            pin: random_pin()?,
+            sessions: Vec::new(),
+            failures: 0,
         }));
         let stop = Arc::new(AtomicBool::new(false));
         let next_id = Arc::new(AtomicU64::new(1));
@@ -111,11 +149,116 @@ impl Session {
             shared,
             stop,
             next_id,
+            tunnel: Arc::new(Mutex::new(Tunnel::Off)),
+            child: Arc::new(Mutex::new(None)),
         })
+    }
+
+    /// Asks for a public link, in the background.
+    ///
+    /// Opening one takes the better part of a minute — cloudflared has to connect, DNS
+    /// has to appear, and the edge has to start routing — and this is called from the
+    /// UI thread. So it returns at once and the window watches `tunnel()` instead of
+    /// freezing with a spinner it cannot animate.
+    pub fn open_tunnel(&self) {
+        {
+            let Ok(mut state) = self.tunnel.lock() else { return };
+            if matches!(*state, Tunnel::Opening | Tunnel::Live(_)) {
+                return;
+            }
+            *state = Tunnel::Opening;
+        }
+        let (state, child, path) = (self.tunnel.clone(), self.child.clone(), self.public_path());
+        std::thread::Builder::new()
+            .name("runnir-pocket-tunnel".into())
+            .spawn(move || {
+                // This thread must OUTLIVE the tunnel, not merely start it.
+                //
+                // `PR_SET_PDEATHSIG` fires when the parent THREAD dies, not the parent
+                // process — a distinction the man page makes and that costs an
+                // afternoon to rediscover. Spawning here and returning killed
+                // cloudflared moments after it had successfully published a URL, and
+                // the only symptom was a link that worked once and then answered 530
+                // with a `<defunct>` child nobody had reaped.
+                //
+                // So the draining loop lives here instead of in a thread of its own:
+                // it keeps cloudflared's stderr moving (a full pipe would block it)
+                // and it keeps this thread alive for exactly as long as the child.
+                let (mut proc, host, mut stderr) = match spawn_tunnel() {
+                    Ok(started) => started,
+                    Err(e) => {
+                        *state.lock().unwrap() = Tunnel::Failed(e);
+                        return;
+                    }
+                };
+                let url = format!("https://{host}{path}");
+                match wait_until_reachable(&host, &url) {
+                    Ok(()) => *state.lock().unwrap() = Tunnel::Live(url),
+                    Err(why) => {
+                        *state.lock().unwrap() = Tunnel::Failed(why);
+                        let _ = proc.kill();
+                        let _ = proc.wait();
+                        return;
+                    }
+                }
+                *child.lock().unwrap() = Some(proc);
+
+                let mut sink = String::new();
+                while stderr.read_line(&mut sink).unwrap_or(0) > 0 {
+                    sink.clear();
+                }
+            })
+            .ok();
+    }
+
+    pub fn tunnel(&self) -> Tunnel {
+        self.tunnel.lock().map(|t| t.clone()).unwrap_or(Tunnel::Off)
+    }
+
+    fn public_path(&self) -> String {
+        format!("/r/{}/", self.token)
     }
 
     pub fn url(&self) -> String {
         format!("http://127.0.0.1:{PORT}/r/{}/", self.token)
+    }
+
+    /// The six digits the window shows. Read every time rather than cached, because
+    /// rotating has to change what the window displays in the same frame.
+    pub fn pin(&self) -> String {
+        self.shared.lock().map(|s| s.pin.clone()).unwrap_or_default()
+    }
+
+    /// Ends every existing session and issues a new PIN.
+    ///
+    /// This is the action that means "you are not coming back in". Dropping a viewer
+    /// does not: they still hold the link and the digits. Phones already connected are
+    /// unaffected — they are through the door — which is what makes this usable while
+    /// somebody you invited is still reading.
+    pub fn rotate_pin(&self) -> String {
+        let Ok(mut shared) = self.shared.lock() else { return String::new() };
+        if let Ok(pin) = random_pin() {
+            shared.pin = pin;
+        }
+        shared.sessions.clear();
+        shared.failures = 0;
+        shared.pin.clone()
+    }
+
+    /// Whether the server shut itself down after too many wrong PINs, so the window
+    /// does not keep a dead session in its status bar.
+    pub fn is_dead(&self) -> bool {
+        self.stop.load(Ordering::Relaxed)
+    }
+
+    /// Ends one viewer's session: their socket closes and their cookie stops working.
+    /// They still hold the link and the PIN, so this is not a ban — see `rotate_pin`.
+    pub fn drop_viewer(&self, id: u64) {
+        let Ok(mut shared) = self.shared.lock() else { return };
+        if let Some(pos) = shared.clients.iter().position(|c| c.id == id) {
+            let client = shared.clients.remove(pos);
+            shared.sessions.retain(|(sid, _)| *sid != client.session);
+        }
     }
 
     /// Who is watching, for the status bar.
@@ -171,14 +314,145 @@ impl Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
-        // A window that went away must not leave a port answering.
+        // A window that went away must not leave a port answering, and must not leave
+        // a public hostname pointing at it either.
         self.stop.store(true, Ordering::Relaxed);
         let _ = TcpStream::connect(("127.0.0.1", PORT));
         if let Ok(mut shared) = self.shared.lock() {
             shared.clients.clear();
+            shared.sessions.clear();
+        }
+        if let Ok(mut child) = self.child.lock() {
+            if let Some(mut proc) = child.take() {
+                let _ = proc.kill();
+                let _ = proc.wait();
+            }
         }
         let _ = &self.next_id;
     }
+}
+
+/// Starts cloudflared and reads the hostname it announces.
+///
+/// Returns the still-open stderr so the CALLER can keep draining it on the thread that
+/// spawned the child — see `open_tunnel` for why that thread must not end.
+type Started = (std::process::Child, String, BufReader<std::process::ChildStderr>);
+
+fn spawn_tunnel() -> Result<Started, String> {
+    let mut cmd = std::process::Command::new("cloudflared");
+    cmd.args(["tunnel", "--no-autoupdate", "--url", &format!("http://localhost:{PORT}")])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
+    // Die with the window, whatever kills it: neither Drop nor any teardown runs when
+    // the process is signalled, and that is how a terminal usually ends.
+    #[cfg(target_os = "linux")]
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        cmd.pre_exec(|| {
+            // SAFETY: async-signal-safe, and touches nothing but this new process.
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::getppid() == 1 {
+                std::process::exit(0);
+            }
+            Ok(())
+        });
+    }
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("cloudflared did not start ({e}) - is it installed?"))?;
+    let Some(stderr) = child.stderr.take() else {
+        let _ = child.kill();
+        return Err("cloudflared gave no output".into());
+    };
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(40);
+    let mut reader = BufReader::new(stderr);
+    let mut host = None;
+    while std::time::Instant::now() < deadline {
+        let mut line = String::new();
+        match reader.read_line(&mut line) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        if let Some(found) = line
+            .split_whitespace()
+            .find(|w| w.starts_with("https://") && w.contains("trycloudflare.com"))
+        {
+            host = Some(found.trim_start_matches("https://").trim_end_matches('/').to_string());
+            break;
+        }
+    }
+    match host {
+        Some(host) => Ok((child, host, reader)),
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            Err("cloudflared never announced a URL".into())
+        }
+    }
+}
+
+/// Waits until the link actually works, which is later than it looks twice over.
+///
+/// cloudflared prints the URL several seconds before the edge routes to it — `share.rs`
+/// learned that one. The DNS record appears later still, and that one is worse: asking
+/// before it exists earns a real NXDOMAIN that the asker's resolver caches for its
+/// negative TTL, so retrying is just re-reading a cached no. This code was written
+/// without that guard, pressed the button, and sat for ninety seconds doing exactly
+/// that — the third time the same trap was walked into in one day.
+///
+/// Hence the order: ask **1.1.1.1 over DoH** first, which cannot poison anything
+/// because its own address is a literal and needs no lookup, and only touch the system
+/// resolver once the record is known to exist. Nothing is published until a request
+/// really succeeds, because a QR that scans to nothing is worse than no QR.
+fn wait_until_reachable(host: &str, url: &str) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+
+    while std::time::Instant::now() < deadline {
+        if dns_exists_upstream(host) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
+
+    let mut last = String::from("the name never appeared in public DNS");
+    while std::time::Instant::now() < deadline {
+        match std::net::ToSocketAddrs::to_socket_addrs(&(host, 443)) {
+            Ok(_) => match ureq::get(url).call() {
+                // Any answer means the edge is routing to us; a 404 from an
+                // unauthenticated path proves it as well as a 200 would.
+                Ok(_) | Err(ureq::Error::StatusCode(_)) => return Ok(()),
+                Err(e) => last = format!("the edge is not routing yet ({e})"),
+            },
+            Err(e) => last = format!("this machine cannot resolve it ({e})"),
+        }
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
+    Err(last)
+}
+
+/// Whether the name exists according to a resolver that is not ours.
+///
+/// Queried by IP literal on purpose: no lookup happens to ask the question, so asking
+/// early costs nothing and cannot leave a negative answer behind in any cache.
+fn dns_exists_upstream(host: &str) -> bool {
+    let url = format!("https://1.1.1.1/dns-query?name={host}&type=A");
+    let Ok(mut resp) = ureq::get(&url).header("accept", "application/dns-json").call() else {
+        return false;
+    };
+    let Ok(body) = resp.body_mut().read_to_string() else {
+        return false;
+    };
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&body) else {
+        return false;
+    };
+    parsed
+        .get("Answer")
+        .and_then(|a| a.as_array())
+        .is_some_and(|answers| answers.iter().any(|a| a.get("type").and_then(|t| t.as_u64()) == Some(1)))
 }
 
 fn serve(mut stream: TcpStream, token: &str, shared: &Arc<Mutex<Shared>>, next_id: &Arc<AtomicU64>) {
@@ -214,12 +488,109 @@ fn serve(mut stream: TcpStream, token: &str, shared: &Arc<Mutex<Shared>>, next_i
             // prompt without them is mostly missing glyphs.
             respond_cached(&mut stream, "font/ttf", crate::font::EMBEDDED_NERD_REGULAR)
         }
-        p if p.starts_with("/ws") => {
-            let name = query_param(p, "name");
-            upgrade(stream, &headers, shared, next_id, name)
+        "/pair" => {
+            // The body is read HERE because `reader` borrows the stream, and `pair`
+            // needs it mutably to answer. Bytes travel; the borrow does not.
+            let len = content_length(&headers).min(1024);
+            let mut body = vec![0u8; len];
+            if reader.read_exact(&mut body).is_err() {
+                respond(&mut stream, "400 Bad Request", "text/plain", b"short body");
+                return;
+            }
+            drop(reader);
+            pair(&mut stream, &body, shared, token)
         }
+        p if p.starts_with("/ws") => upgrade(stream, &headers, shared, next_id),
         _ => respond(&mut stream, "404 Not Found", "text/plain", b"no"),
     }
+}
+
+/// Exchanges six digits for a session cookie.
+fn pair(stream: &mut TcpStream, body: &[u8], shared: &Arc<Mutex<Shared>>, token: &str) {
+    let parsed: serde_json::Value = serde_json::from_slice(body).unwrap_or_default();
+    let offered = parsed.get("pin").and_then(|v| v.as_str()).unwrap_or("");
+    let name = parsed
+        .get("name")
+        .and_then(|v| v.as_str())
+        .map(|n| n.trim().chars().take(24).collect::<String>())
+        .filter(|n| !n.is_empty());
+
+    let Ok(mut shared) = shared.lock() else { return };
+
+    if !pin_matches(&shared.pin, offered) {
+        shared.failures += 1;
+        let left = MAX_FAILURES.saturating_sub(shared.failures);
+        if left == 0 {
+            // Not "this attempt failed": the session is over. Somebody guessing at the
+            // door of a shell does not get a sixth go.
+            drop(shared);
+            let body = b"{\"error\":\"too many\"}";
+            let head = format!(
+                "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(head.as_bytes());
+            let _ = stream.write_all(body);
+            return;
+        }
+        let body = format!("{{\"error\":\"wrong pin\",\"left\":{left}}}");
+        respond(stream, "403 Forbidden", "application/json", body.as_bytes());
+        return;
+    }
+
+    shared.failures = 0;
+    let Ok(sid) = random_token() else {
+        respond(stream, "500 Internal Server Error", "text/plain", b"no randomness");
+        return;
+    };
+    shared.sessions.push((sid.clone(), name.clone()));
+    let name_json = serde_json::to_string(&name).unwrap_or_else(|_| "null".into());
+    let body = format!("{{\"ok\":true,\"name\":{name_json}}}");
+    // Scoped to this session's path, so a second runnir on the same host cannot read
+    // it. `SameSite=Strict` because nothing ever links here from anywhere else.
+    let head = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+         Set-Cookie: pocket={sid}; Path=/r/{token}/; HttpOnly; SameSite=Strict\r\n\r\n",
+        body.len()
+    );
+    let _ = stream.write_all(head.as_bytes());
+    let _ = stream.write_all(body.as_bytes());
+}
+
+/// Whether the offered digits are the expected ones, without short-circuiting.
+///
+/// With five attempts before the server stops, timing is not the threat here. It is
+/// written this way because it costs nothing, and because a credential comparison that
+/// returns early is the kind of thing nobody wants to have to defend later.
+fn pin_matches(expected: &str, given: &str) -> bool {
+    let (a, b) = (expected.as_bytes(), given.as_bytes());
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+fn content_length(headers: &[String]) -> usize {
+    headers
+        .iter()
+        .find_map(|h| {
+            let (k, v) = h.split_once(':')?;
+            k.trim()
+                .eq_ignore_ascii_case("content-length")
+                .then(|| v.trim().parse::<usize>().ok())?
+        })
+        .unwrap_or(0)
+}
+
+/// The session cookie a request carries, if any.
+fn cookie_session(headers: &[String]) -> Option<String> {
+    headers.iter().find_map(|h| {
+        let (k, v) = h.split_once(':')?;
+        if !k.trim().eq_ignore_ascii_case("cookie") {
+            return None;
+        }
+        v.split(';').find_map(|pair| {
+            let (name, value) = pair.split_once('=')?;
+            (name.trim() == "pocket").then(|| value.trim().to_string())
+        })
+    })
 }
 
 fn upgrade(
@@ -227,8 +598,24 @@ fn upgrade(
     headers: &[String],
     shared: &Arc<Mutex<Shared>>,
     next_id: &Arc<AtomicU64>,
-    name: Option<String>,
 ) {
+    // The PIN is checked here and not only at `/pair`: a socket is the thing that
+    // actually shows the screen, so it is the thing that has to be behind the door.
+    let (session, name) = match cookie_session(headers).and_then(|sid| {
+        let shared = shared.lock().ok()?;
+        shared
+            .sessions
+            .iter()
+            .find(|(s, _)| *s == sid)
+            .map(|(s, n)| (s.clone(), n.clone()))
+    }) {
+        Some(pair) => pair,
+        None => {
+            respond(&mut stream, "401 Unauthorized", "text/plain", b"pair first");
+            return;
+        }
+    };
+
     let key = headers.iter().find_map(|h| {
         let (k, v) = h.split_once(':')?;
         k.trim().eq_ignore_ascii_case("sec-websocket-key").then(|| v.trim().to_string())
@@ -286,12 +673,12 @@ fn upgrade(
                 let _ = tx.try_send(text_frame(&v));
             }
         }
-        s.clients.push(Client { id, name, tx });
+        s.clients.push(Client { id, name, session, tx });
     }
 
-    // Read until the viewer goes away. Phase 1 is read-only, so anything they send is
-    // discarded — but the frames still have to be PARSED, because a close frame is how
-    // a browser says goodbye and a ping expects a pong.
+    // Read until the viewer goes away. Phase 2 is still read-only, so anything they
+    // send is discarded — but the frames still have to be PARSED, because a close
+    // frame is how a browser says goodbye and a ping expects a pong.
     let mut conn = stream;
     loop {
         match read_frame(&mut conn) {
@@ -365,45 +752,6 @@ fn text_frame(payload: &[u8]) -> Vec<u8> {
     out
 }
 
-fn query_param(path: &str, key: &str) -> Option<String> {
-    let query = path.split_once('?')?.1;
-    query.split('&').find_map(|pair| {
-        let (k, v) = pair.split_once('=')?;
-        (k == key).then(|| percent_decode(v))
-    })
-}
-
-fn percent_decode(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'%' if i + 2 < bytes.len() => {
-                match u8::from_str_radix(&s[i + 1..i + 3], 16) {
-                    Ok(b) => {
-                        out.push(b);
-                        i += 3;
-                    }
-                    Err(_) => {
-                        out.push(bytes[i]);
-                        i += 1;
-                    }
-                }
-            }
-            b'+' => {
-                out.push(b' ');
-                i += 1;
-            }
-            b => {
-                out.push(b);
-                i += 1;
-            }
-        }
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
 fn respond(stream: &mut TcpStream, status: &str, content_type: &str, body: &[u8]) {
     let head = format!(
         "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\
@@ -422,6 +770,28 @@ fn respond_cached(stream: &mut TcpStream, content_type: &str, body: &[u8]) {
     );
     let _ = stream.write_all(head.as_bytes());
     let _ = stream.write_all(body);
+}
+
+/// Six digits, uniformly.
+///
+/// Rejection sampling rather than `% 1_000_000`: a modulo over 2^32 favours the low
+/// end of the range, which is exactly the kind of quiet bias that is never noticed and
+/// never wanted in a credential.
+fn random_pin() -> Result<String, String> {
+    let mut f = std::fs::File::open("/dev/urandom")
+        .map_err(|e| format!("no randomness available: {e}"))?;
+    loop {
+        let mut bytes = [0u8; 4];
+        f.read_exact(&mut bytes)
+            .map_err(|e| format!("no randomness available: {e}"))?;
+        let n = u32::from_le_bytes(bytes);
+        // The largest multiple of 1_000_000 that fits in a u32; anything above it
+        // would make the first 294_967_296 values twice as likely.
+        const LIMIT: u32 = 4_294_000_000;
+        if n < LIMIT {
+            return Ok(format!("{:06}", n % 1_000_000));
+        }
+    }
 }
 
 fn random_token() -> Result<String, String> {
@@ -461,11 +831,35 @@ mod tests {
     }
 
     #[test]
-    fn a_query_name_survives_encoding() {
-        assert_eq!(query_param("/ws?name=Pedro", "name").as_deref(), Some("Pedro"));
-        assert_eq!(query_param("/ws?name=Jos%C3%A9", "name").as_deref(), Some("José"));
-        assert_eq!(query_param("/ws?name=two+words", "name").as_deref(), Some("two words"));
-        assert_eq!(query_param("/ws", "name"), None);
+    fn a_pin_is_six_digits_and_not_the_same_one_twice() {
+        let a = random_pin().unwrap();
+        assert_eq!(a.len(), 6, "six digits, zero-padded - {a:?}");
+        assert!(a.chars().all(|c| c.is_ascii_digit()));
+        // Not a strong statement about randomness, just that it is not a constant.
+        let differs = (0..20).any(|_| random_pin().unwrap() != a);
+        assert!(differs);
+    }
+
+    #[test]
+    fn a_pin_comparison_rejects_prefixes_and_padding() {
+        assert!(pin_matches("012345", "012345"));
+        assert!(!pin_matches("012345", "01234"), "a prefix is not a match");
+        assert!(!pin_matches("012345", "0123456"), "nor is a longer string");
+        assert!(!pin_matches("012345", ""), "nor is nothing at all");
+        assert!(!pin_matches("012345", "012346"));
+    }
+
+    #[test]
+    fn a_cookie_is_found_among_others() {
+        let headers = vec![
+            "Host: localhost".to_string(),
+            "Cookie: theme=dark; pocket=abc123; other=1".to_string(),
+        ];
+        assert_eq!(cookie_session(&headers).as_deref(), Some("abc123"));
+        assert_eq!(cookie_session(&["Host: x".to_string()]), None);
+        // A cookie belonging to something else must not be mistaken for ours.
+        let decoy = vec!["Cookie: notpocket=zzz".to_string()];
+        assert_eq!(cookie_session(&decoy), None);
     }
 
     #[test]
