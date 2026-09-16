@@ -306,10 +306,14 @@ fn main() {
         // The player process itself. Started by a window that finds no daemon running,
         // never by a person — which is why it is not in --help.
         Some("--player-daemon") => {
-            let (cfg, creds) = match tidal_creds() {
-                Ok(v) => v,
-                Err(e) => return eprintln!("runnir: {e}"),
-            };
+            // TIDAL credentials are OPTIONAL here. They were required, so a machine
+            // signed into Spotify and nothing else had a player that refused to start
+            // — the window then reported "player not available" and hung waiting for
+            // a process that had already given up. It is the same TIDAL-shaped door
+            // that was taken off the panel, one layer further down, and the panel's
+            // fix never reached it.
+            let cfg = Config::load().tidal;
+            let creds = tidal_creds().ok().map(|(_, creds)| creds);
             return daemon::main(cfg, creds);
         }
         // `runnir --tidal-browse <words>` — exercises the whole catalogue layer in one

@@ -1495,7 +1495,9 @@ impl Jukebox {
     /// only thing here that knows a UI exists at all.
     pub fn start(
         cfg: TidalCfg,
-        creds: tidal::Creds,
+        // `None` when there are no TIDAL credentials, which is an ordinary state for
+        // somebody who uses Spotify. Only the TIDAL branch needs them.
+        creds: Option<tidal::Creds>,
         wake: Box<dyn Fn() + Send>,
     ) -> Jukebox {
         let (tx, rx) = std::sync::mpsc::channel();
@@ -1545,7 +1547,7 @@ fn run(
     state: std::sync::Arc<std::sync::Mutex<Snapshot>>,
     wake: Box<dyn Fn() + Send>,
     mut cfg: TidalCfg,
-    creds: tidal::Creds,
+    creds: Option<tidal::Creds>,
 ) {
     let publish = |f: &dyn Fn(&mut Snapshot)| {
         if let Ok(mut s) = state.lock() {
@@ -1596,7 +1598,7 @@ fn play_queue(
     state: &std::sync::Arc<std::sync::Mutex<Snapshot>>,
     wake: &dyn Fn(),
     cfg: &mut TidalCfg,
-    creds: &tidal::Creds,
+    creds: &Option<tidal::Creds>,
 ) -> bool {
     // Held across the whole queue rather than per track. See `play_parts`: reopening
     // between tracks cost a gap and a busy-wait on the device's own release.
@@ -1686,7 +1688,7 @@ fn play_one(
     state: &std::sync::Arc<std::sync::Mutex<Snapshot>>,
     wake: &dyn Fn(),
     cfg: &mut TidalCfg,
-    creds: &tidal::Creds,
+    creds: &Option<tidal::Creds>,
     sink: &mut Option<Sink>,
     spotify: &mut Option<crate::spotify::Engine>,
 ) -> Outcome {
@@ -1707,6 +1709,13 @@ fn play_one(
     }
     let Some(session) = tidal::Session::load() else {
         return Outcome::Failed("not signed in".into());
+    };
+    // Reached only on the TIDAL branch, so this is where their absence is a problem
+    // and the only place it should be reported.
+    let Some(creds) = creds.as_ref() else {
+        return Outcome::Failed(
+            "no TIDAL credentials — add them under [tidal], or play this from Spotify".into(),
+        );
     };
     let session = match tidal::ensure_fresh(creds, &session) {
         Ok(s) => s,

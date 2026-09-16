@@ -113,7 +113,7 @@ const KEEPALIVE: std::time::Duration = std::time::Duration::from_secs(10);
 // ---- the daemon ------------------------------------------------------------
 
 /// Runs the player until the last window goes away. Never returns in the normal case.
-pub fn main(cfg: TidalCfg, creds: tidal::Creds) {
+pub fn main(cfg: TidalCfg, creds: Option<tidal::Creds>) {
     let Some(path) = socket_path() else {
         return eprintln!("runnir: no XDG_RUNTIME_DIR, so there is nowhere safe for the player");
     };
