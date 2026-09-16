@@ -706,6 +706,55 @@ announces itself on MPRIS like any other player. The status bar carries what is 
 between the directory and the clock, scrolling the title when it does not fit, and in
 the accent colour only when nothing touched the samples.
 
+# Spotify — signing in
+
+Two sign-ins, because playing and searching are two different doors:
+
+  runnir --spotify-login          the one that plays
+  runnir --spotify-login --api    the one that searches
+
+Both open a browser, Spotify sends you back to 127.0.0.1, and the session is saved. No
+pasting anything by hand — unlike TIDAL, Spotify accepts a loopback redirect.
+
+With only the first one you get music and a panel that cannot search. With only the
+second, lists that cannot play. Do both.
+
+  leader n p   choose between TIDAL and Spotify; the choice is remembered, and the
+               next window opens on it
+
+## The catalogue id, and why it is worth five minutes
+
+The default client id is the desktop one librespot ships, and it needs no registration —
+which is exactly the problem for the catalogue. Every librespot-based program on earth
+uses it, and the Web API rate-limits it as a SINGLE client: measured here as
+`429 Retry-After: 40` on the third request of a fresh session, hours apart, with no
+requests of our own in between. Playback never touches the Web API, so only searching
+suffers.
+
+Register one at developer.spotify.com, add `http://127.0.0.1:8899/login` as a redirect
+URI, and put it in the config:
+
+  [spotify]
+  api_client_id = '...'      your own, for search and your shelves
+  callback_port = 8898       leave this alone unless client_id is yours too
+
+`callback_port` is NOT a free choice with the default `client_id`. Spotify checks the
+redirect against the ones registered for that client, and the desktop client has
+`http://127.0.0.1:8898/login` — which is why every librespot program uses that number.
+Changing it without also setting your own `client_id` gets the sign-in refused as
+`INVALID_CLIENT`, an error that does not mention the port at all.
+
+## What Spotify will not hand over
+
+Not a limitation of runnir, and worth knowing before hunting for a bug:
+
+  * No FLAC. Every Connect endpoint that is not one of Spotify's own apps receives Ogg
+    Vorbis 320, so the badge says OGG 320 and bit-perfect is off the table. The honest
+    ceiling is exclusive and not resampled, at 44.1/16.
+  * No lyrics.
+  * No playlist contents through the documented API, and no artist top tracks.
+    Playlists are fetched another way and work; artists show their albums instead.
+
 # TIDAL — bit-perfect, and the output chain
 
 Bit-perfect is the best case, never a requirement: the music plays on whatever hardware
