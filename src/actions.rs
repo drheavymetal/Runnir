@@ -89,6 +89,8 @@ pub enum Action {
     OpticalTransfer,
     /// Put this window on a phone, and show the QR and PIN that let one in.
     Pocket,
+    /// Where the sound comes out: the system's mixer, or a device to itself.
+    MusicOutput,
     /// Arrange the window around a deploy: watches, and the deploy staged.
     WarRoom,
     /// Take the war room down, keeping any pane the user typed in.
@@ -198,6 +200,7 @@ impl Action {
             Map => "map",
             OpticalTransfer => "optical_transfer",
             Pocket => "pocket",
+            MusicOutput => "music_output",
             WarRoom => "war_room",
             WarRoomClose => "war_room_close",
             SetImageWatchDir => "set_image_watch_dir",
@@ -298,6 +301,7 @@ impl Action {
             Map => "Map: the session zoomed out to one headline per pane",
             OpticalTransfer => "Send a file to a phone by camera (QR stream)",
             Pocket => "Put this window on a phone (share the screen)",
+            MusicOutput => "Music: where the sound comes out",
             WarRoom => "War room: arrange the window around a deploy",
             WarRoomClose => "War room: close it, keeping panes you typed in",
             SetImageWatchDir => "Auto-preview images: set / clear watched dir",
@@ -401,6 +405,7 @@ impl Action {
             "map" => Map,
             "optical_transfer" => OpticalTransfer,
             "pocket" => Pocket,
+            "music_output" => MusicOutput,
             "war_room" => WarRoom,
             "war_room_close" => WarRoomClose,
             "set_image_watch_dir" => SetImageWatchDir,
@@ -514,6 +519,7 @@ impl Action {
             Map,
             OpticalTransfer,
             Pocket,
+            MusicOutput,
             WarRoom,
             WarRoomClose,
             SetImageWatchDir,
@@ -1126,6 +1132,9 @@ fn default_leader_bindings() -> HashMap<Chord, LeaderNode> {
         // `p` for provider. Here as well as inside the panel, because inside it the
         // search box owns the keyboard from the moment it opens.
         leaf(g, "p", MusicProvider);
+        // `o` for output, beside the provider: the two questions the panel used to hide
+        // in the config file.
+        leaf(g, "o", MusicOutput);
         leaf(g, "space", TidalToggle);
         // Forward and back rather than next/previous: `n` is taken by this group's own
         // key and `p` reads as "pause" to about half the people who try it.

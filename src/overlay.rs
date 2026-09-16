@@ -43,8 +43,8 @@ pub enum Overlay {
     Transfer(TransferPanel),
     /// This window on a phone: the link as a QR, the PIN, and who is watching.
     Pocket(PocketPanel),
-    /// Which music service the panel shops in, chosen from a list.
-    MusicProvider(ProviderPicker),
+    /// A short list: which music service, which audio output.
+    Choice(ChoicePicker),
 }
 
 impl Overlay {
@@ -54,7 +54,7 @@ impl Overlay {
         match self {
             Overlay::Palette(p) => p.render(cols, rows, theme),
             Overlay::Pocket(p) => p.render(cols, rows, theme),
-            Overlay::MusicProvider(p) => p.render(cols, rows, theme),
+            Overlay::Choice(p) => p.render(cols, rows, theme),
             Overlay::Docs(d) => d.render(cols, rows, theme),
             Overlay::Prompt(p) => p.render(cols, rows, theme),
             Overlay::Ai(a) => a.render(cols, rows, theme),
@@ -7620,25 +7620,49 @@ fn qr_half_blocks(data: &str) -> Option<Vec<String>> {
     Some(out)
 }
 
-// ---- which music service ---------------------------------------------------
+// ---- small choices, made from a list -----------------------------------------
 
-/// Picks the music provider, and says which one is in use.
-///
-/// It replaced a blind toggle. Two services is few enough that flipping between them
-/// looks like it should be fine, but a toggle never tells you where you are going or
-/// where you were — and with the panel closed it did not tell you anything at all.
-pub struct ProviderPicker {
-    options: Vec<crate::music::Source>,
-    cursor: usize,
-    /// What the window is set to right now, marked in the list.
-    current: crate::music::Source,
+/// What a `ChoicePicker` is choosing, so the handler knows what to do with the answer.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ChoiceKind {
+    /// TIDAL or Spotify.
+    MusicProvider,
+    /// The exclusive device, or the system's audio.
+    MusicOutput,
 }
 
-impl ProviderPicker {
-    pub fn new(current: crate::music::Source) -> Self {
-        let options = vec![crate::music::Source::Tidal, crate::music::Source::Spotify];
-        let cursor = options.iter().position(|o| *o == current).unwrap_or(0);
-        Self { options, cursor, current }
+/// A short list with the current value marked.
+///
+/// It replaced a blind toggle for the music provider, and the same shape then answered
+/// the second question runnir had been hiding in the config file. Two options is still
+/// a list: it shows where you are before you move, and a toggle cannot.
+pub struct ChoicePicker {
+    pub kind: ChoiceKind,
+    title: &'static str,
+    /// What is true right now, shown under the title. For the output list this is the
+    /// rung the current track actually landed on — which is the answer to "did
+    /// exclusive work?", given in the place where the question was asked.
+    note: Option<String>,
+    /// Label and the one line that explains what picking it means.
+    options: Vec<(String, String)>,
+    cursor: usize,
+    current: usize,
+}
+
+impl ChoicePicker {
+    pub fn new(
+        kind: ChoiceKind,
+        title: &'static str,
+        options: Vec<(String, String)>,
+        current: usize,
+    ) -> Self {
+        let cursor = current.min(options.len().saturating_sub(1));
+        Self { kind, title, note: None, options, cursor, current }
+    }
+
+    pub fn with_note(mut self, note: String) -> Self {
+        self.note = Some(note);
+        self
     }
 
     pub fn up(&mut self) {
@@ -7649,29 +7673,40 @@ impl ProviderPicker {
         self.cursor = (self.cursor + 1).min(self.options.len().saturating_sub(1));
     }
 
-    pub fn selected(&self) -> crate::music::Source {
-        self.options[self.cursor.min(self.options.len() - 1)]
+    /// The index chosen.
+    pub fn selected(&self) -> usize {
+        self.cursor.min(self.options.len().saturating_sub(1))
     }
 
     fn render(&self, cols: usize, rows: usize, theme: &Theme) -> Vec<Panel> {
-        let w = 44.min(cols.saturating_sub(2));
-        let h = (self.options.len() + 5).min(rows.saturating_sub(2));
+        let widest = self
+            .options
+            .iter()
+            .map(|(l, d)| l.chars().count().max(d.chars().count()) + 8)
+            .max()
+            .unwrap_or(30);
+        let w = widest.clamp(38, 64).min(cols.saturating_sub(2));
+        let head = if self.note.is_some() { 3 } else { 2 };
+        let h = (self.options.len() * 2 + head + 2).min(rows.saturating_sub(2));
         let mut g = panel_grid(w, h, theme);
 
-        write(&mut g, 0, 2, "Music service", accent());
-        for (i, option) in self.options.iter().enumerate() {
-            let row = 2 + i;
-            if row >= h - 1 {
+        write(&mut g, 0, 2, self.title, accent());
+        if let Some(note) = &self.note {
+            write(&mut g, 1, 2, &field_view(note, w.saturating_sub(4)), dim());
+        }
+        for (i, (label, detail)) in self.options.iter().enumerate() {
+            let row = head + i * 2;
+            if row + 1 >= h - 1 {
                 break;
             }
-            // The mark says which one is in force, which is the question a toggle
-            // could never answer.
-            let mark = if *option == self.current { "●" } else { " " };
-            let line = format!(" {mark} {}", option.label());
+            // The mark says which one is in force, which is the question a toggle could
+            // never answer.
+            let mark = if i == self.current { "\u{25cf}" } else { " " };
             let pen = if i == self.cursor { selected() } else { normal() };
-            write(&mut g, row, 2, &field_view(&line, w.saturating_sub(4)), pen);
+            write(&mut g, row, 2, &field_view(&format!(" {mark} {label}"), w.saturating_sub(4)), pen);
+            write(&mut g, row + 1, 2, &field_view(&format!("    {detail}"), w.saturating_sub(4)), dim());
         }
-        write(&mut g, h - 1, 2, "enter choose · esc cancel", dim());
+        write(&mut g, h - 1, 2, "enter choose \u{b7} esc cancel", dim());
 
         vec![Panel {
             grid: g,

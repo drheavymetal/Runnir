@@ -864,6 +864,7 @@ impl Gpu {
             Action::RepoVerbs => self.show_repo_verbs(config),
             Action::TidalPanel => self.show_tidal_panel(config),
             Action::MusicProvider => self.music_switch_provider(config),
+            Action::MusicOutput => self.music_output_picker(config),
             Action::TidalToggle => self.tidal_send(crate::player::Cmd::Toggle, config),
             Action::TidalNext => self.tidal_send(crate::player::Cmd::Next, config),
             Action::TidalPrev => self.tidal_send(crate::player::Cmd::Prev, config),
@@ -3244,7 +3245,7 @@ impl Gpu {
             Some(Overlay::Map(_)) => "map",
             Some(Overlay::Transfer(_)) => "transfer",
             Some(Overlay::Pocket(_)) => "pocket",
-            Some(Overlay::MusicProvider(_)) => "music_provider",
+            Some(Overlay::Choice(_)) => "choice",
             Some(_) => "other",
         };
         let mut out = json!({
@@ -3513,14 +3514,23 @@ impl Gpu {
             // something clever would mostly be a key pressed by accident while
             // holding a phone in the other hand.
             Overlay::Pocket(_) => self.pocket_panel_key(key),
-            Overlay::MusicProvider(p) => match key {
+            Overlay::Choice(p) => match key {
                 Key::Named(NamedKey::Escape) => self.overlay = None,
                 Key::Named(NamedKey::ArrowUp) => p.up(),
                 Key::Named(NamedKey::ArrowDown) => p.down(),
                 Key::Named(NamedKey::Enter) => {
-                    let picked = p.selected();
+                    let (kind, picked) = (p.kind, p.selected());
                     self.overlay = None;
-                    self.keep_music_provider(picked, config);
+                    match kind {
+                        overlay::ChoiceKind::MusicProvider => {
+                            let source = match picked {
+                                1 => crate::music::Source::Spotify,
+                                _ => crate::music::Source::Tidal,
+                            };
+                            self.keep_music_provider(source, config);
+                        }
+                        overlay::ChoiceKind::MusicOutput => self.keep_music_output(picked, config),
+                    }
                 }
                 Key::Character(c) => match c.as_str() {
                     "k" => p.up(),
@@ -4247,6 +4257,7 @@ impl Gpu {
             Action::RepoVerbs => self.show_repo_verbs(config),
             Action::TidalPanel => self.show_tidal_panel(config),
             Action::MusicProvider => self.music_switch_provider(config),
+            Action::MusicOutput => self.music_output_picker(config),
             Action::TidalToggle => self.tidal_send(crate::player::Cmd::Toggle, config),
             Action::TidalNext => self.tidal_send(crate::player::Cmd::Next, config),
             Action::TidalPrev => self.tidal_send(crate::player::Cmd::Prev, config),
@@ -7638,7 +7649,118 @@ impl Gpu {
             Some(Overlay::Tidal(p)) => p.provider,
             _ => config.music_provider(),
         };
-        self.overlay = Some(Overlay::MusicProvider(overlay::ProviderPicker::new(current)));
+        let options = vec![
+            ("TIDAL".to_string(), "lossless, and bit-perfect where the hardware allows".to_string()),
+            ("Spotify".to_string(), "Ogg 320 — the only thing it serves to a program like this".to_string()),
+        ];
+        let at = match current {
+            crate::music::Source::Tidal => 0,
+            crate::music::Source::Spotify => 1,
+        };
+        self.overlay = Some(Overlay::Choice(overlay::ChoicePicker::new(
+            overlay::ChoiceKind::MusicProvider,
+            "Music service",
+            options,
+            at,
+        )));
+        self.window.request_redraw();
+    }
+
+    /// Opens the audio-output list, built from the devices plugged in RIGHT NOW.
+    ///
+    /// Rebuilt on every open rather than cached: an interface that was not connected
+    /// when the window started is exactly the one somebody opens this to choose, and a
+    /// list that cannot show it is a list that sends them to the config file.
+    fn music_output_picker(&mut self, config: &Config) {
+        let devices = crate::player::hw_devices_public();
+        let current = config.spotify.output.clone();
+
+        let mut options = vec![
+            (
+                "System audio".to_string(),
+                "through the desktop mixer — pick the device there".to_string(),
+            ),
+            (
+                "Exclusive, automatic".to_string(),
+                "the first device that takes the stream untouched".to_string(),
+            ),
+        ];
+        let mut at = match current.as_str() {
+            "default" => 0,
+            "auto" | "" => 1,
+            _ => 1,
+        };
+        for device in &devices {
+            if current == device.name {
+                at = options.len();
+            }
+            let note = if device.is_display {
+                format!("{} · exclusive (a display, never chosen automatically)", device.name)
+            } else {
+                format!("{} · exclusive", device.name)
+            };
+            options.push((device.label.clone(), note));
+        }
+
+        // What is happening RIGHT NOW, not what was asked for. Asking for exclusive and
+        // getting it are different things — a card another program is holding sends the
+        // chain down a rung — and this is where somebody is standing when they wonder
+        // which of the two happened.
+        let note = self.jukebox.as_ref().and_then(|j| {
+            let snapshot = j.snapshot();
+            let signal = &snapshot.signal;
+            (!signal.device.is_empty()).then(|| match signal.rung {
+                Some(rung) => format!("now: {} · {}", signal.device, rung.label()),
+                None => format!("now: {}", signal.device),
+            })
+        });
+
+        let picker = overlay::ChoicePicker::new(
+            overlay::ChoiceKind::MusicOutput,
+            "Audio output",
+            options,
+            at,
+        );
+        self.overlay = Some(Overlay::Choice(match note {
+            Some(n) => picker.with_note(n),
+            None => picker.with_note("nothing playing yet — pick where it should go".into()),
+        }));
+        self.window.request_redraw();
+    }
+
+    /// Applies a chosen output and remembers it for both services.
+    ///
+    /// Written to TIDAL and Spotify together on purpose: "where does the sound come
+    /// out" is a fact about the room, not about which shop the track came from, and
+    /// keeping two answers to it is how somebody ends up with music on the wrong
+    /// device after switching service.
+    fn keep_music_output(&mut self, picked: usize, config: &Config) {
+        let devices = crate::player::hw_devices_public();
+        let (output, said) = match picked {
+            0 => ("default".to_string(), "system audio".to_string()),
+            1 => ("auto".to_string(), "exclusive, automatic".to_string()),
+            n => match devices.get(n - 2) {
+                Some(d) => (d.name.clone(), format!("exclusive: {}", d.label)),
+                None => ("auto".to_string(), "exclusive, automatic".to_string()),
+            },
+        };
+
+        let mut cfg = config.clone();
+        cfg.tidal.output = output.clone();
+        cfg.spotify.output = output.clone();
+        // Asking for the system mixer is a decision to let it handle the sound, so
+        // bit-perfect stops being a claim runnir can make. Leaving it set would put an
+        // exclusive-looking badge on audio going through PipeWire.
+        let exclusive = output != "default";
+        cfg.tidal.bit_perfect = exclusive;
+        cfg.spotify.bit_perfect = exclusive;
+
+        self.status = Some(match cfg.save_json() {
+            Ok(()) => format!("output: {said} — takes effect on the next track"),
+            Err(e) => format!("output: {said} (save failed: {e})"),
+        });
+        self.status_expiry = Some(Instant::now() + Duration::from_secs(4));
+        self.pending_config = Some(cfg);
         self.window.request_redraw();
     }
 
