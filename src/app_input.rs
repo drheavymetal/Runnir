@@ -863,6 +863,7 @@ impl Gpu {
             Action::CatchUp => self.show_catch_up(),
             Action::RepoVerbs => self.show_repo_verbs(config),
             Action::TidalPanel => self.show_tidal_panel(config),
+            Action::MusicProvider => self.music_switch_provider(config),
             Action::TidalToggle => self.tidal_send(crate::player::Cmd::Toggle, config),
             Action::TidalNext => self.tidal_send(crate::player::Cmd::Next, config),
             Action::TidalPrev => self.tidal_send(crate::player::Cmd::Prev, config),
@@ -3772,6 +3773,26 @@ impl Gpu {
                         "b" => command = Some(crate::player::Cmd::Prev),
                         "s" => command = Some(crate::player::Cmd::Stop),
                         "q" => self.overlay = None,
+                        // `p` for provider. Switching CLEARS the list rather than
+                        // keeping it: rows from the shop you just left, sitting under
+                        // the name of the one you are now in, is the same class of lie
+                        // as a crumb that outlives its list.
+                        "p" => {
+                            p.provider = match p.provider {
+                                crate::music::Source::Tidal => crate::music::Source::Spotify,
+                                crate::music::Source::Spotify => crate::music::Source::Tidal,
+                            };
+                            p.rows.clear();
+                            p.crumb = None;
+                            p.message = None;
+                            p.pending = None;
+                            // The queue belongs to the player rather than to a shop, so
+                            // that one source is left alone. Everything else has to be
+                            // asked for again, from somewhere else.
+                            if p.source != crate::overlay::Source::Queue {
+                                load = Some(p.source);
+                            }
+                        }
                         _ => {}
                     },
                     _ => {}
@@ -4118,6 +4139,7 @@ impl Gpu {
             Action::CatchUp => self.show_catch_up(),
             Action::RepoVerbs => self.show_repo_verbs(config),
             Action::TidalPanel => self.show_tidal_panel(config),
+            Action::MusicProvider => self.music_switch_provider(config),
             Action::TidalToggle => self.tidal_send(crate::player::Cmd::Toggle, config),
             Action::TidalNext => self.tidal_send(crate::player::Cmd::Next, config),
             Action::TidalPrev => self.tidal_send(crate::player::Cmd::Prev, config),
@@ -7199,7 +7221,9 @@ impl Gpu {
             self.jukebox = None;
         }
         if self.jukebox.is_none() {
-            if !config.tidal.configured() {
+            // The daemon starts for EITHER provider. Refusing without TIDAL credentials
+            // put the whole player — Spotify included — behind a TIDAL door.
+            if !music_ready(config) {
                 return None;
             }
             let proxy = self.proxy.clone();
@@ -7242,7 +7266,7 @@ impl Gpu {
                     }
                 }
                 None => {
-                    if attempt == 0 && config.tidal.configured() {
+                    if attempt == 0 && music_ready(config) {
                         continue; // connecting failed; try once more
                     }
                     return self.toast_no_tidal();
@@ -7253,21 +7277,33 @@ impl Gpu {
 
     fn toast_no_tidal(&mut self) {
         self.toast(
-            "No TIDAL credentials — add [tidal] client_id and client_secret to the config",
-            6,
+            "No music provider signed in — run: runnir --spotify-login, or add [tidal] credentials",
+            7,
         );
     }
 
     /// Opens the panel onto whatever the player is already doing.
     fn show_tidal_panel(&mut self, config: &Config) {
-        if !config.tidal.configured() {
+        // The door used to be TIDAL's, like everything else about this panel. Asking for
+        // TIDAL credentials before opening a panel somebody wants to use for Spotify is
+        // the same mistake one layer up from the ones already fixed inside it.
+        let (tidal_ready, spotify_ready) = (tidal_ready(config), spotify_ready(config));
+        if !tidal_ready && !spotify_ready {
+            // Names both doors, because the one that is missing is not always the one
+            // the person was reaching for.
             return self.toast_no_tidal();
         }
-        if crate::tidal::Session::load().is_none() {
-            return self.toast("Not signed in to TIDAL — run: runnir --tidal-login", 6);
-        }
         let snapshot = self.player(config).map(|j| j.snapshot()).unwrap_or_default();
-        self.overlay = Some(Overlay::Tidal(overlay::TidalPanel::new(snapshot)));
+        let mut panel = overlay::TidalPanel::new(snapshot);
+        // Open on a shop that can actually answer. The configured preference wins only
+        // when it is usable: a panel that opens on an error message is worse than one
+        // that opens somewhere else and says so in its title.
+        if panel.provider == crate::music::Source::Tidal && !tidal_ready {
+            panel.provider = crate::music::Source::Spotify;
+        } else if panel.provider == crate::music::Source::Spotify && !spotify_ready {
+            panel.provider = crate::music::Source::Tidal;
+        }
+        self.overlay = Some(Overlay::Tidal(panel));
         self.window.request_redraw();
     }
 
@@ -7422,48 +7458,173 @@ impl Gpu {
             return;
         }
         let seq = self.tidal_request(None);
+        let provider = match &self.overlay {
+            Some(Overlay::Tidal(p)) => p.provider,
+            _ => crate::music::Source::Tidal,
+        };
         let proxy = self.proxy.clone();
         std::thread::spawn(move || {
-            let answer = crate::tidal::current()
-                .and_then(|session| match source {
-                    Source::Favourites => crate::tidal::favourite_tracks(&session)
-                        .map(|t| crate::tidal::Found { tracks: t, ..Default::default() }),
-                    Source::Albums => crate::tidal::favourite_albums(&session)
-                        .map(|a| crate::tidal::Found { albums: a, ..Default::default() }),
-                    Source::Playlists => crate::tidal::my_playlists(&session)
-                        .map(|p| crate::tidal::Found { playlists: p, ..Default::default() }),
-                    _ => Ok(crate::tidal::Found::default()),
-                });
+            let answer = match provider {
+                crate::music::Source::Tidal => crate::tidal::current().and_then(|session| {
+                    match source {
+                        Source::Favourites => crate::tidal::favourite_tracks(&session)
+                            .map(|t| crate::music::Found {
+                                tracks: t.into_iter().map(Into::into).collect(),
+                                ..Default::default()
+                            }),
+                        Source::Albums => crate::tidal::favourite_albums(&session)
+                            .map(|a| crate::music::Found {
+                                albums: a.into_iter().map(Into::into).collect(),
+                                ..Default::default()
+                            }),
+                        Source::Playlists => crate::tidal::my_playlists(&session)
+                            .map(|p| crate::music::Found {
+                                playlists: p.into_iter().map(Into::into).collect(),
+                                ..Default::default()
+                            }),
+                        _ => Ok(crate::music::Found::default()),
+                    }
+                }),
+                crate::music::Source::Spotify => {
+                    crate::spotify::current(crate::spotify::Which::Api).and_then(|session| {
+                        match source {
+                            // Spotify calls them saved rather than favourite, which is
+                            // the same shelf under a different word.
+                            Source::Favourites => crate::spotify::saved_tracks(&session)
+                                .map(|t| crate::music::Found {
+                                    tracks: t.into_iter().map(Into::into).collect(),
+                                    ..Default::default()
+                                }),
+                            Source::Albums => crate::spotify::saved_albums(&session)
+                                .map(|a| crate::music::Found {
+                                    albums: a.into_iter().map(Into::into).collect(),
+                                    ..Default::default()
+                                }),
+                            Source::Playlists => crate::spotify::my_playlists(&session)
+                                .map(|p| crate::music::Found {
+                                    playlists: p.into_iter().map(Into::into).collect(),
+                                    ..Default::default()
+                                }),
+                            _ => Ok(crate::music::Found::default()),
+                        }
+                    })
+                }
+            };
             let _ = proxy.send_event(UserEvent::Tidal(seq, answer.map(TidalAnswer::Found)));
         });
+    }
+
+    /// Switches which shop the panel's lists come from, opening the panel first if it is
+    /// not already open.
+    ///
+    /// Opening it is the point: "switch to Spotify" from a bare terminal should land
+    /// somewhere, not change a setting invisibly and leave the screen as it was.
+    fn music_switch_provider(&mut self, config: &crate::config::Config) {
+        if !matches!(self.overlay, Some(Overlay::Tidal(_))) {
+            self.show_tidal_panel(config);
+        }
+        let mut reload = None;
+        if let Some(Overlay::Tidal(p)) = &mut self.overlay {
+            p.provider = match p.provider {
+                crate::music::Source::Tidal => crate::music::Source::Spotify,
+                crate::music::Source::Spotify => crate::music::Source::Tidal,
+            };
+            // Rows from the shop you just left, sitting under the name of the one you
+            // are now in, is the same class of lie as a crumb that outlives its list.
+            p.rows.clear();
+            p.crumb = None;
+            p.message = None;
+            p.pending = None;
+            // The queue belongs to the player rather than to a shop, so that one source
+            // is left alone. Everything else has to be asked for again, somewhere else.
+            if p.source != crate::overlay::Source::Queue {
+                reload = Some(p.source);
+            }
+        }
+        if let Some(source) = reload {
+            self.tidal_load(source);
+        }
+        self.window.request_redraw();
     }
 
     /// Opens a container row: an album, an artist or a playlist becomes a list of its
     /// tracks, with a crumb naming where you are.
     fn tidal_open(&mut self, row: crate::overlay::TidalRow) {
         use crate::overlay::TidalRow;
-        let (crumb, work): (String, Box<dyn Fn(&crate::tidal::Session) -> Result<Vec<crate::tidal::Track>, String> + Send>) =
-            match row {
-                TidalRow::Album(a) => {
-                    let id = a.id;
-                    (format!("{} — {}", a.artist, a.title), Box::new(move |s| crate::tidal::album_tracks(s, id)))
-                }
-                TidalRow::Artist(a) => {
-                    let id = a.id;
-                    (a.name.clone(), Box::new(move |s| crate::tidal::artist_top_tracks(s, id)))
-                }
-                TidalRow::Playlist(p) => {
-                    let uuid = p.uuid.clone();
-                    (p.title.clone(), Box::new(move |s| crate::tidal::playlist_tracks(s, &uuid)))
-                }
-                TidalRow::Track(_) | TidalRow::Heading(_) => return,
-            };
+        use crate::music::Source;
+        // Each provider gets a closure that already knows how to find its own session.
+        // Passing one session in, the way this used to, was only possible while there
+        // was one kind of session to pass.
+        type Work = Box<dyn Fn() -> Result<Vec<crate::music::Track>, String> + Send>;
+        let (crumb, work): (String, Work) = match row {
+            TidalRow::Album(a) => {
+                let crumb = format!("{} — {}", a.artist, a.title);
+                let (id, source) = (a.id.clone(), a.source);
+                (
+                    crumb,
+                    match source {
+                        Source::Tidal => Box::new(move || {
+                            let id: u64 = id.parse().map_err(|_| "not a TIDAL album".to_string())?;
+                            crate::tidal::current()
+                                .and_then(|s| crate::tidal::album_tracks(&s, id))
+                                .map(|t| t.into_iter().map(Into::into).collect())
+                        }),
+                        Source::Spotify => Box::new(move || {
+                            crate::spotify::current(crate::spotify::Which::Api)
+                                .and_then(|s| crate::spotify::album_tracks(&s, &id))
+                                .map(|t| t.into_iter().map(Into::into).collect())
+                        }),
+                    },
+                )
+            }
+            TidalRow::Artist(a) => {
+                let (id, source, name) = (a.id.clone(), a.source, a.name.clone());
+                (
+                    name,
+                    match source {
+                        Source::Tidal => Box::new(move || {
+                            let id: u64 = id.parse().map_err(|_| "not a TIDAL artist".to_string())?;
+                            crate::tidal::current()
+                                .and_then(|s| crate::tidal::artist_top_tracks(&s, id))
+                                .map(|t| t.into_iter().map(Into::into).collect())
+                        }),
+                        // Spotify refuses an artist's top tracks to a client id
+                        // registered now, so the album list answers instead — a
+                        // different question with a reliable answer. Opening an album
+                        // from there gets the tracks.
+                        Source::Spotify => Box::new(move || {
+                            crate::spotify::current(crate::spotify::Which::Api)
+                                .and_then(|s| crate::spotify::artist_albums(&s, &id))
+                                .map(|_| Vec::new())
+                        }),
+                    },
+                )
+            }
+            TidalRow::Playlist(p) => {
+                let (id, source, title) = (p.id.clone(), p.source, p.title.clone());
+                (
+                    title,
+                    match source {
+                        Source::Tidal => Box::new(move || {
+                            crate::tidal::current()
+                                .and_then(|s| crate::tidal::playlist_tracks(&s, &id))
+                                .map(|t| t.into_iter().map(Into::into).collect())
+                        }),
+                        Source::Spotify => Box::new(move || {
+                            crate::spotify::current(crate::spotify::Which::Api)
+                                .and_then(|s| crate::spotify::playlist_tracks(&s, &id))
+                                .map(|t| t.into_iter().map(Into::into).collect())
+                        }),
+                    },
+                )
+            }
+            TidalRow::Track(_) | TidalRow::Heading(_) => return,
+        };
         let seq = self.tidal_request(Some(crumb));
         let proxy = self.proxy.clone();
         std::thread::spawn(move || {
-            let answer = crate::tidal::current()
-                .and_then(|session| work(&session))
-                .map(|tracks| TidalAnswer::Found(crate::tidal::Found { tracks, ..Default::default() }));
+            let answer = work()
+                .map(|tracks| TidalAnswer::Found(crate::music::Found { tracks, ..Default::default() }));
             let _ = proxy.send_event(UserEvent::Tidal(seq, answer));
         });
     }
@@ -7486,7 +7647,7 @@ impl Gpu {
             // crumb — the opened album or playlist — against the track title, so the
             // cache never hit, and on the one day those two strings matched it would
             // have shown the previous track's words.
-            if p.lyrics.is_some() && p.lyrics_for == Some(track.id) {
+            if p.lyrics.is_some() && p.lyrics_for.as_deref() == Some(track.key().as_str()) {
                 return;
             }
             // Not the ones we are about to fetch: showing the last track's words while
@@ -7503,11 +7664,19 @@ impl Gpu {
             p.pending_lyrics = Some(seq);
         }
         let proxy = self.proxy.clone();
-        let id = track.id;
+        let key = track.key();
+        // Only TIDAL has words. Spotify's Web API has no lyrics endpoint at all, so the
+        // panel says which provider cannot do it rather than drawing an empty pane and
+        // letting someone wonder whether it is still loading.
+        let Some(id) = track.tidal_id() else {
+            let answer = Err(format!("{} does not serve lyrics", track.source.label()));
+            let _ = proxy.send_event(UserEvent::Tidal(seq, answer));
+            return;
+        };
         std::thread::spawn(move || {
             let answer = crate::tidal::current()
                 .and_then(|session| crate::tidal::lyrics(&session, id))
-                .map(|l| TidalAnswer::Lyrics(id, l));
+                .map(|l| TidalAnswer::Lyrics(key, l));
             let _ = proxy.send_event(UserEvent::Tidal(seq, answer));
         });
     }
@@ -7531,15 +7700,27 @@ impl Gpu {
     /// carry, and for the same reason.
     fn tidal_search(&mut self, query: String) {
         let seq = self.tidal_request(None);
+        let mut provider = crate::music::Source::Tidal;
         if let Some(Overlay::Tidal(p)) = &mut self.overlay {
             p.crumb = None;
+            provider = p.provider;
         }
         let proxy = self.proxy.clone();
         std::thread::spawn(move || {
-            let found = crate::tidal::current()
-                .and_then(|session| crate::tidal::search(&session, &query, 30))
-                .map(TidalAnswer::Found);
-            let _ = proxy.send_event(UserEvent::Tidal(seq, found));
+            let found = match provider {
+                crate::music::Source::Tidal => crate::tidal::current()
+                    .and_then(|session| crate::tidal::search(&session, &query, 30))
+                    .map(|f| crate::music::Found::from(f)),
+                // 30 is what TIDAL is asked for; Spotify caps the page size per endpoint
+                // and refuses anything above its cap with a 400, so the number asked for
+                // here is a ceiling that the request lowers itself.
+                crate::music::Source::Spotify => {
+                    crate::spotify::current(crate::spotify::Which::Api)
+                        .and_then(|session| crate::spotify::search(&session, &query, 30))
+                        .map(|f| crate::music::Found::from(f))
+                }
+            };
+            let _ = proxy.send_event(UserEvent::Tidal(seq, found.map(TidalAnswer::Found)));
         });
     }
 
@@ -7608,8 +7789,8 @@ impl Gpu {
             // daemon — left the rows stale, and Enter on a stale row then replayed a
             // queue that no longer existed.
             let moved = p.snapshot.generation != snapshot.generation;
-            let playing = snapshot.now_playing().map(|t| t.id);
-            let was_playing = p.snapshot.now_playing().map(|t| t.id);
+            let playing = snapshot.now_playing().map(|t| t.key());
+            let was_playing = p.snapshot.now_playing().map(|t| t.key());
             p.snapshot = snapshot;
             if p.source == overlay::Source::Queue && moved {
                 p.reload_queue();
@@ -8290,4 +8471,28 @@ fn human_away(d: Duration) -> String {
         90..=3599 => format!("{} min", secs / 60),
         _ => format!("{}h{:02}m", secs / 3600, (secs % 3600) / 60),
     }
+}
+
+
+/// Whether TIDAL can answer: configured AND signed in. Configuration alone was the old
+/// test, and it let the panel open onto a wall.
+fn tidal_ready(config: &Config) -> bool {
+    config.tidal.configured() && crate::tidal::Session::load().is_some()
+}
+
+/// Whether Spotify can answer. The AUDIO session is the one asked about, because that is
+/// what playback needs; a missing catalogue session shows up as an error in one list,
+/// which is recoverable, rather than as silence.
+fn spotify_ready(config: &Config) -> bool {
+    config.spotify.configured()
+        && crate::spotify::Session::load(crate::spotify::Which::Audio, &config.spotify).is_some()
+}
+
+/// Whether there is any music to be had at all.
+///
+/// One question, asked in one place. It used to be `config.tidal.configured()` in three,
+/// which is how the player stayed behind a TIDAL door long after it stopped being a
+/// TIDAL player.
+fn music_ready(config: &Config) -> bool {
+    tidal_ready(config) || spotify_ready(config)
 }

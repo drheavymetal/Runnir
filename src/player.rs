@@ -83,8 +83,17 @@ pub struct SignalPath {
     /// in a 32-bit container".
     pub padded: Option<(u32, u32)>,
     pub resampled: Option<(u32, u32)>,
-    /// TIDAL's word for what it served, which is not always what was asked for.
+    /// The provider's word for what it served, which is not always what was asked for.
     pub quality: String,
+    /// The SOURCE was lossy, whatever the device did with it afterwards.
+    ///
+    /// The rungs describe the path from the decoder to the DAC, and that path can be
+    /// flawless while the thing travelling down it has already thrown away half the
+    /// music: Spotify serves every Connect endpoint Ogg Vorbis 320. Without this, a
+    /// Spotify track landing on an exclusive device would be labelled BIT-PERFECT, in
+    /// the accent colour that means "nothing touched the samples" — which would be the
+    /// fourth lie this badge has told, and the previous three were all this shape.
+    pub lossy: bool,
     /// Every device that was tried and would not take it, with what it said.
     ///
     /// Without this, landing on the laptop speakers instead of the DAC is indis-
@@ -102,16 +111,20 @@ impl SignalPath {
             return String::new();
         }
         match self.rung {
+            Some(rung) if self.lossy && rung.is_bit_exact() => {
+                format!("{}/{} exclusive", self.decoded_bits, fmt_khz(self.decoded_rate))
+            }
             Some(rung) => format!("{}/{} {}", self.decoded_bits, fmt_khz(self.decoded_rate), rung.label()),
             None => format!("{}/{}", self.decoded_bits, fmt_khz(self.decoded_rate)),
         }
     }
 
-    /// True when the path changed no sample value. The status bar colours by this:
-    /// bit-exact reads as accent, anything else as ordinary text, so "am I getting
-    /// what I pay for" is answered without reading a word.
+    /// True when the path changed no sample value AND there were real samples to keep.
+    /// The status bar colours by this: bit-exact reads as accent, anything else as
+    /// ordinary text, so "am I getting what I pay for" is answered without reading a
+    /// word. A lossy source can never earn it, however good the device is.
     pub fn is_bit_exact(&self) -> bool {
-        self.rung.is_some_and(|r| r.is_bit_exact())
+        !self.lossy && self.rung.is_some_and(|r| r.is_bit_exact())
     }
 
     /// The status-bar line. Deliberately assembled here rather than in the drawing code
@@ -131,7 +144,12 @@ impl SignalPath {
             s.push_str(&format!(" · resampled {} → {}", fmt_khz(from), fmt_khz(to)));
         }
         if let Some(rung) = self.rung {
-            s.push_str(&format!(" · {}", rung.label()));
+            // A bit-exact rung under a lossy source is still worth saying — an exclusive
+            // device that does not resample is the best this source can have — but it is
+            // not the claim BIT-PERFECT makes, and borrowing the word would be a lie
+            // about the music rather than about the wire.
+            let label = if self.lossy && rung.is_bit_exact() { "exclusive (lossy source)" } else { rung.label() };
+            s.push_str(&format!(" · {label}"));
         }
         s
     }
@@ -142,6 +160,37 @@ fn fmt_khz(rate: u32) -> String {
         format!("{} kHz", rate / 1000)
     } else {
         format!("{:.1} kHz", rate as f64 / 1000.0)
+    }
+}
+
+/// The sample shape a device was opened with. Providers that hand over floats (Spotify
+/// through librespot) need to know what to convert to; symphonia's path never asks,
+/// because it converts into whatever buffer `write` allocates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Width {
+    S16,
+    /// Packed 24: three bytes per sample, no typed ALSA IO.
+    S24Packed,
+    /// 24 bits justified into the low three bytes of a 32-bit word.
+    S24In32,
+    S32,
+}
+
+/// What the output chain needs to know, with no opinion about where the music came
+/// from. TIDAL and Spotify drive the same DAC through the same rungs; making the chain
+/// take a `Tidal` was only ever true because TIDAL was the only provider there was.
+#[derive(Clone, Debug, Default)]
+pub struct Output {
+    /// `"auto"`, a device name like `"hw:2,0"`, or `"default"` for PipeWire.
+    pub device: String,
+    pub bit_perfect: bool,
+    /// Ask PipeWire to hand the card over before opening it exclusively.
+    pub release_device: bool,
+}
+
+impl From<&TidalCfg> for Output {
+    fn from(c: &TidalCfg) -> Self {
+        Output { device: c.output.clone(), bit_perfect: c.bit_perfect, release_device: c.release_device }
     }
 }
 
@@ -472,7 +521,7 @@ pub fn play_parts(
     parts: Vec<Part>,
     hint_ext: &str,
     quality: &str,
-    cfg: &TidalCfg,
+    cfg: &Output,
     output: bool,
     sink: &mut Option<Sink>,
     conductor: &mut dyn FnMut(Progress<'_>) -> Flow,
@@ -588,6 +637,12 @@ pub fn play_parts(
         // Asked AFTER the write, so the answer is about audio that has already been
         // handed over: a pause here stops the next packet, not the one being heard.
         let levels = levels_of(&decoded);
+        // A signal is a reason to stop like any other, and the only one where carrying
+        // on costs the user their sound card: the process is about to be exited by the
+        // release thread, and the device has to be closed before that happens.
+        if crate::reserve::shutting_down() {
+            break;
+        }
         let mut flow = conductor(Progress {
             frames: played.frames,
             rate: played.signal.decoded_rate,
@@ -597,6 +652,14 @@ pub fn play_parts(
         while flow == Flow::Pause {
             if let Some(sink) = sink.as_mut() {
                 sink.set_paused(true);
+            }
+            // A pause holds the device open on purpose — closing it between tracks is
+            // what cost a second and a half of silence in August — so a signal arriving
+            // during one finds the card held by a loop that is not writing anything.
+            // This is the case the packet loop's check cannot cover.
+            if crate::reserve::shutting_down() {
+                flow = Flow::Stop;
+                break;
             }
             std::thread::sleep(PAUSE_POLL);
             // A paused player is silent, and a wave that keeps its last shape while
@@ -702,8 +765,7 @@ pub fn hw_devices_public() -> Vec<Device> {
 
 #[cfg(target_os = "linux")]
 mod linux {
-    use super::{Attempt, Rung, SignalPath, Want, plan};
-    use crate::config::Tidal as TidalCfg;
+    use super::{Attempt, Output, Rung, SignalPath, Want, plan};
     use alsa::pcm::{Access, Format, HwParams, PCM, State};
     use alsa::{Direction, ValueOr};
     use symphonia::core::audio::sample::i24;
@@ -724,9 +786,9 @@ mod linux {
 
     impl Sink {
         /// Walks the chain until something opens, and records which rung that was.
-        pub fn open(cfg: &TidalCfg, want: &Want, quality: &str) -> Result<Sink, String> {
+        pub fn open(cfg: &Output, want: &Want, quality: &str) -> Result<Sink, String> {
             let devices = hw_devices();
-            let attempts = plan(&cfg.output, cfg.bit_perfect, &devices);
+            let attempts = plan(&cfg.device, cfg.bit_perfect, &devices);
             // Taken ONCE, for the card the chain would rather use, and held for the
             // whole walk down it. Asking per attempt meant releasing it again between
             // rungs — PipeWire took the card back in the gap, and the next attempt
@@ -775,6 +837,16 @@ mod linux {
 
         /// Writes one decoded buffer. Returns the number of underruns recovered from,
         /// because a run that stuttered is not a run that worked.
+        /// What this device took, so a provider holding floats knows what to make.
+        pub fn width(&self) -> super::Width {
+            match self.format {
+                Format::S16LE => super::Width::S16,
+                Format::S243LE => super::Width::S24Packed,
+                Format::S24LE => super::Width::S24In32,
+                _ => super::Width::S32,
+            }
+        }
+
         pub fn write(
             &mut self,
             decoded: &symphonia::core::audio::GenericAudioBufferRef<'_>,
@@ -826,23 +898,23 @@ mod linux {
             }
         }
 
-        fn write_i16(&mut self, buf: &[i16]) -> Result<u32, String> {
+        pub fn write_i16(&mut self, buf: &[i16]) -> Result<u32, String> {
             let io = self.pcm.io_i16().map_err(|e| e.to_string())?;
             write_all(&self.pcm, buf, self.channels as usize, |b| io.writei(b))
         }
 
-        fn write_i32(&mut self, buf: &[i32]) -> Result<u32, String> {
+        pub fn write_i32(&mut self, buf: &[i32]) -> Result<u32, String> {
             let io = self.pcm.io_i32().map_err(|e| e.to_string())?;
             write_all(&self.pcm, buf, self.channels as usize, |b| io.writei(b))
         }
 
         /// 24-in-32. ALSA has its own accessor for this and refuses the plain one.
-        fn write_i32_s24(&mut self, buf: &[i32]) -> Result<u32, String> {
+        pub fn write_i32_s24(&mut self, buf: &[i32]) -> Result<u32, String> {
             let io = self.pcm.io_i32_s24().map_err(|e| e.to_string())?;
             write_all(&self.pcm, buf, self.channels as usize, |b| io.writei(b))
         }
 
-        fn write_packed24(&mut self, bytes: &[u8]) -> Result<u32, String> {
+        pub fn write_packed24(&mut self, bytes: &[u8]) -> Result<u32, String> {
             let io = self.pcm.io_bytes();
             // Three bytes per sample times the channels: what ALSA counts as one frame,
             // and what a short write has to be advanced by.
@@ -895,6 +967,15 @@ mod linux {
             } else {
                 let _ = self.pcm.prepare();
             }
+        }
+    }
+
+    impl Drop for Sink {
+        fn drop(&mut self) {
+            // The PCM handle goes with this struct; the reservation goes with the field
+            // declared after it. What this records is only that the device is no longer
+            // open, so a signal waiting to exit knows it may.
+            crate::reserve::device_closed();
         }
     }
 
@@ -1016,6 +1097,10 @@ mod linux {
             Rung::BitPerfect
         };
 
+        // Counted from here to the drop below. A signal arriving in between has to wait
+        // for this to reach zero before the process exits, or the card is released while
+        // ALSA still has it and PipeWire cannot take it back.
+        crate::reserve::device_opened();
         Ok(Sink {
             format,
             channels: want.channels,
@@ -1034,6 +1119,9 @@ mod linux {
                 padded,
                 resampled,
                 quality: String::new(),
+                // The chain cannot know: the same device, rung and numbers describe a
+                // FLAC and a Vorbis. Whoever opened it says so.
+                lossy: false,
                 refused: Vec::new(),
             },
             pcm,
@@ -1235,8 +1323,7 @@ pub fn devices_under(root: &std::path::Path) -> Vec<Device> {
 
 #[cfg(not(target_os = "linux"))]
 mod other {
-    use super::{SignalPath, Want};
-    use crate::config::Tidal as TidalCfg;
+    use super::{Output, SignalPath, Want};
 
     /// No output backend outside Linux yet. Browsing and the catalogue work; playback
     /// says so plainly instead of failing somewhere deeper with a stranger message.
@@ -1245,13 +1332,28 @@ mod other {
     }
 
     impl Sink {
-        pub fn open(_: &TidalCfg, _: &Want, _: &str) -> Result<Sink, String> {
+        pub fn open(_: &Output, _: &Want, _: &str) -> Result<Sink, String> {
             Err("audio output on this platform is not implemented (ALSA is Linux-only)".into())
         }
         pub fn write(
             &mut self,
             _: &symphonia::core::audio::GenericAudioBufferRef<'_>,
         ) -> Result<u32, String> {
+            Err("no audio output".into())
+        }
+        pub fn width(&self) -> super::Width {
+            super::Width::S16
+        }
+        pub fn write_i16(&mut self, _: &[i16]) -> Result<u32, String> {
+            Err("no audio output".into())
+        }
+        pub fn write_i32(&mut self, _: &[i32]) -> Result<u32, String> {
+            Err("no audio output".into())
+        }
+        pub fn write_i32_s24(&mut self, _: &[i32]) -> Result<u32, String> {
+            Err("no audio output".into())
+        }
+        pub fn write_packed24(&mut self, _: &[u8]) -> Result<u32, String> {
             Err("no audio output".into())
         }
         pub fn drain(&mut self) {}
@@ -1275,8 +1377,8 @@ mod other {
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub enum Cmd {
     /// Replace the queue and start at `at`.
-    Play { tracks: Vec<tidal::Track>, at: usize },
-    Enqueue(tidal::Track),
+    Play { tracks: Vec<crate::music::Track>, at: usize },
+    Enqueue(crate::music::Track),
     /// Play if paused, pause if playing.
     Toggle,
     Next,
@@ -1300,7 +1402,7 @@ pub enum Cmd {
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct Snapshot {
-    pub queue: Vec<tidal::Track>,
+    pub queue: Vec<crate::music::Track>,
     pub index: usize,
     pub playing: bool,
     pub paused: bool,
@@ -1328,7 +1430,7 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
-    pub fn now_playing(&self) -> Option<&tidal::Track> {
+    pub fn now_playing(&self) -> Option<&crate::music::Track> {
         self.queue.get(self.index)
     }
 
@@ -1499,6 +1601,10 @@ fn play_queue(
     // Held across the whole queue rather than per track. See `play_parts`: reopening
     // between tracks cost a gap and a busy-wait on the device's own release.
     let mut sink: Option<Sink> = None;
+    // The same reasoning, one provider over: connecting to Spotify costs a second or
+    // two, so the engine outlives the track. Built on first use, because a queue that
+    // never plays a Spotify track should never open a Spotify session.
+    let mut spotify: Option<crate::spotify::Engine> = None;
     loop {
         let (track, index) = {
             let Ok(s) = state.lock() else { return false };
@@ -1508,7 +1614,7 @@ fn play_queue(
             }
         };
 
-        let outcome = play_one(&track, rx, state, wake, cfg, creds, &mut sink);
+        let outcome = play_one(&track, rx, state, wake, cfg, creds, &mut sink, &mut spotify);
         match outcome {
             Outcome::Quit => return true,
             Outcome::Stopped => {
@@ -1560,7 +1666,9 @@ fn play_queue(
     }
 }
 
-enum Outcome {
+/// How a track ended. Shared with the Spotify engine, which has to answer the queue in
+/// the same words the TIDAL path does.
+pub enum Outcome {
     Ended,
     Stopped,
     /// Play the same track again from the top.
@@ -1573,19 +1681,30 @@ enum Outcome {
 /// Resolves and plays one track, obeying commands as they arrive.
 #[allow(clippy::too_many_arguments)]
 fn play_one(
-    track: &tidal::Track,
+    track: &crate::music::Track,
     rx: &std::sync::mpsc::Receiver<Cmd>,
     state: &std::sync::Arc<std::sync::Mutex<Snapshot>>,
     wake: &dyn Fn(),
     cfg: &mut TidalCfg,
     creds: &tidal::Creds,
     sink: &mut Option<Sink>,
+    spotify: &mut Option<crate::spotify::Engine>,
 ) -> Outcome {
     set(state, wake, |s| {
         s.buffering = true;
         s.playing = true;
         s.position_secs = 0.0;
     });
+    if track.source == crate::music::Source::Spotify {
+        return play_one_spotify(track, rx, state, wake, spotify);
+    }
+    // Back on TIDAL, so whatever Spotify is holding has to go. Two engines cannot both
+    // have an exclusive device, and the one that is not playing should not be the one
+    // keeping the card — this is the same "exactly one process owns the ALSA device"
+    // rule the daemon exists for, applied one level down.
+    if let Some(engine) = spotify.as_mut() {
+        engine.release();
+    }
     let Some(session) = tidal::Session::load() else {
         return Outcome::Failed("not signed in".into());
     };
@@ -1593,7 +1712,13 @@ fn play_one(
         Ok(s) => s,
         Err(e) => return Outcome::Failed(e),
     };
-    let info = match tidal::stream_info(&session, track.id, cfg.quality.as_api()) {
+    // A track that is not TIDAL's has no number to ask TIDAL about. Reaching here with
+    // one would mean `play_one` failed to branch, which is a bug and not a stream that
+    // will not play — so it says so rather than asking for track 0.
+    let Some(tidal_id) = track.tidal_id() else {
+        return Outcome::Failed(format!("{} is not a TIDAL track", track.title));
+    };
+    let info = match tidal::stream_info(&session, tidal_id, cfg.quality.as_api()) {
         Ok(i) => i,
         Err(e) => return Outcome::Failed(e),
     };
@@ -1613,18 +1738,11 @@ fn play_one(
         s.wave.clear();
     });
 
-    // What the conductor decided, read after the loop returns. A closure cannot return
-    // this through `Flow`, which only says what the audio loop should do next.
-    let mut verdict = Outcome::Ended;
-    let mut paused = false;
-    let mut published_signal = false;
-    let mut last_tick = u64::MAX;
-    let mut wave_clock = 0u32;
     // The track plays under the config it started with. A `Reconfigure` arriving now is
-    // held and applied to the NEXT track — the device for this one is already open, and
-    // swapping it underneath would be a gap in the middle of a song.
-    let mut pending_cfg: Option<TidalCfg> = None;
+    // held by the conductor and applied to the NEXT track — the device for this one is
+    // already open, and swapping it underneath would be a gap in the middle of a song.
     let playing_cfg = cfg.clone();
+    let mut conductor = Conductor::new(rx, state, wake);
 
     // Caught, because a panic here kills the player thread and leaves the state saying
     // "playing" forever: silent, with nothing on screen to explain it. A crash has to
@@ -1634,98 +1752,14 @@ fn play_one(
         parts,
         hint_for(&info),
         &info.quality,
-        &playing_cfg,
+        &(&playing_cfg).into(),
         true,
         sink,
-        &mut |progress| {
-            // Every command waiting right now, not just one: a burst of key presses
-            // must not be answered one packet at a time.
-            while let Ok(cmd) = rx.try_recv() {
-                match cmd {
-                    Cmd::Toggle => {
-                        paused = !paused;
-                        set(state, wake, |s| s.paused = paused);
-                    }
-                    Cmd::Next => {
-                        verdict = Outcome::Ended;
-                        return Flow::Skip;
-                    }
-                    Cmd::Prev => {
-                        // Past the grace period "previous" means the start of THIS
-                        // track; within it, the one before. Every player behaves this
-                        // way because a mis-pressed previous should be cheap to undo.
-                        let secs = progress.frames as f64 / progress.rate.max(1) as f64;
-                        verdict = if secs > PREV_RESTARTS_AFTER {
-                            Outcome::Restart
-                        } else {
-                            Outcome::Previous
-                        };
-                        return Flow::Skip;
-                    }
-                    Cmd::Stop => {
-                        verdict = Outcome::Stopped;
-                        return Flow::Stop;
-                    }
-                    Cmd::Quit => {
-                        verdict = Outcome::Quit;
-                        return Flow::Stop;
-                    }
-                    Cmd::Play { tracks, at } => {
-                        set(state, wake, |s| {
-                            s.queue = tracks.clone();
-                            s.index = at.min(tracks.len().saturating_sub(1));
-                        });
-                        verdict = Outcome::Restart; // the new index is already right
-                        return Flow::Skip;
-                    }
-                    Cmd::Enqueue(t) => set(state, wake, |s| s.queue.push(t.clone())),
-                    Cmd::Reconfigure(next) => pending_cfg = Some(*next),
-                    Cmd::Share(_) => {}
-                }
-            }
-
-            let secs = progress.frames as f64 / progress.rate.max(1) as f64;
-            // A packet is 20-40 ms of audio, so this runs about forty times a second.
-            // Everything is RECORDED every time; what is paced is the waking, because
-            // a wake is a full window repaint. The clock only needs a wake when the
-            // second changes, but the wave needs to move to look alive — so it sets
-            // its own, slower, rhythm.
-            let tick = secs as u64;
-            let mut worth_drawing = tick != last_tick;
-            last_tick = tick;
-            if wave_clock >= WAVE_EVERY {
-                wave_clock = 0;
-                worth_drawing = true;
-            }
-            wave_clock += 1;
-            if let Ok(mut s) = state.lock() {
-                s.position_secs = secs;
-                // Replaced, not appended: the columns are a picture of the sound
-                // happening now and each one moves where it stands.
-                s.wave = progress.levels.clone();
-                if !published_signal {
-                    if let Some(signal) = progress.signal {
-                        s.signal = signal.clone();
-                        published_signal = true;
-                        worth_drawing = true;
-                        // Sound is coming out: whatever it was waiting for is done.
-                        s.buffering = false;
-                    }
-                }
-                if worth_drawing {
-                    s.generation += 1;
-                }
-            }
-            if worth_drawing {
-                wake();
-            }
-
-            if paused { Flow::Pause } else { Flow::Continue }
-        },
+        &mut |progress| conductor.tick(progress),
     )
     ));
 
-    if let Some(next) = pending_cfg {
+    if let Some(next) = conductor.pending_cfg.take() {
         *cfg = next;
     }
     match result {
@@ -1738,7 +1772,185 @@ fn play_one(
             Outcome::Failed(format!("internal error: {what}"))
         }
         Ok(Err(e)) => Outcome::Failed(e),
-        Ok(Ok(_)) => verdict,
+        Ok(Ok(_)) => conductor.verdict,
+    }
+}
+
+/// The Spotify half of `play_one`.
+///
+/// Short, because everything that makes it a queue rather than a stream — the commands,
+/// the position, the wave, the pacing — is the shared `Conductor`, and everything that
+/// makes it audio is the engine. What is left here is the part that is genuinely
+/// different: the session is built on first use rather than per track, and a failure to
+/// build it is a failure of this track rather than of the queue.
+fn play_one_spotify(
+    track: &crate::music::Track,
+    rx: &std::sync::mpsc::Receiver<Cmd>,
+    state: &std::sync::Arc<std::sync::Mutex<Snapshot>>,
+    wake: &dyn Fn(),
+    spotify: &mut Option<crate::spotify::Engine>,
+) -> Outcome {
+    set(state, wake, |s| {
+        s.playing = true;
+        s.paused = false;
+        s.buffering = true;
+        s.position_secs = 0.0;
+        s.error = None;
+        // The wave belongs to the track being heard, not to the player.
+        s.wave.clear();
+    });
+
+    if spotify.is_none() {
+        let cfg = crate::config::Config::load().spotify;
+        match crate::spotify::Engine::new(&cfg) {
+            Ok(e) => *spotify = Some(e),
+            Err(e) => return Outcome::Failed(e),
+        }
+    }
+    let Some(engine) = spotify.as_mut() else {
+        return Outcome::Failed("no Spotify engine".into());
+    };
+
+    let mut conductor = Conductor::new(rx, state, wake);
+    let outcome = engine.play(&track.id, &mut |progress| conductor.tick(progress));
+    // A verdict the conductor reached — "next", "previous", "the queue was replaced" —
+    // outranks the engine simply reporting that the track stopped, because the engine
+    // stopped it BECAUSE of that verdict.
+    match outcome {
+        Outcome::Ended | Outcome::Stopped => conductor.verdict,
+        other => other,
+    }
+}
+
+/// Everything `play_one` does BETWEEN packets: answer the commands that have arrived,
+/// publish the position and the wave, and say what the audio loop should do next.
+///
+/// Extracted because there are two audio loops now. Duplicating it for Spotify would
+/// mean two copies of "previous restarts the track after three seconds", two copies of
+/// the pacing rules, and a guarantee that a fix to one would miss the other. The loops
+/// differ in where the samples come from; what they do about a key press does not.
+pub struct Conductor<'a> {
+    rx: &'a std::sync::mpsc::Receiver<Cmd>,
+    state: &'a std::sync::Arc<std::sync::Mutex<Snapshot>>,
+    wake: &'a dyn Fn(),
+    /// What the conductor decided, read after the loop returns: `Flow` can only say what
+    /// the audio should do next, not why.
+    pub verdict: Outcome,
+    pub paused: bool,
+    published_signal: bool,
+    last_tick: u64,
+    wave_clock: u32,
+    pub pending_cfg: Option<TidalCfg>,
+}
+
+impl<'a> Conductor<'a> {
+    pub fn new(
+        rx: &'a std::sync::mpsc::Receiver<Cmd>,
+        state: &'a std::sync::Arc<std::sync::Mutex<Snapshot>>,
+        wake: &'a dyn Fn(),
+    ) -> Conductor<'a> {
+        Conductor {
+            rx,
+            state,
+            wake,
+            verdict: Outcome::Ended,
+            paused: false,
+            published_signal: false,
+            last_tick: u64::MAX,
+            wave_clock: 0,
+            pending_cfg: None,
+        }
+    }
+
+    pub fn tick(&mut self, progress: Progress<'_>) -> Flow {
+        // Every command waiting right now, not just one: a burst of key presses must
+        // not be answered one packet at a time.
+        while let Ok(cmd) = self.rx.try_recv() {
+            match cmd {
+                Cmd::Toggle => {
+                    self.paused = !self.paused;
+                    let paused = self.paused;
+                    set(self.state, self.wake, |s| s.paused = paused);
+                }
+                Cmd::Next => {
+                    self.verdict = Outcome::Ended;
+                    return Flow::Skip;
+                }
+                Cmd::Prev => {
+                    // Past the grace period "previous" means the start of THIS track;
+                    // within it, the one before. Every player behaves this way because a
+                    // mis-pressed previous should be cheap to undo.
+                    let secs = progress.frames as f64 / progress.rate.max(1) as f64;
+                    self.verdict = if secs > PREV_RESTARTS_AFTER {
+                        Outcome::Restart
+                    } else {
+                        Outcome::Previous
+                    };
+                    return Flow::Skip;
+                }
+                Cmd::Stop => {
+                    self.verdict = Outcome::Stopped;
+                    return Flow::Stop;
+                }
+                Cmd::Quit => {
+                    self.verdict = Outcome::Quit;
+                    return Flow::Stop;
+                }
+                Cmd::Play { tracks, at } => {
+                    set(self.state, self.wake, |s| {
+                        s.queue = tracks.clone();
+                        s.index = at.min(tracks.len().saturating_sub(1));
+                    });
+                    self.verdict = Outcome::Restart; // the new index is already right
+                    return Flow::Skip;
+                }
+                Cmd::Enqueue(t) => set(self.state, self.wake, |s| s.queue.push(t.clone())),
+                Cmd::Reconfigure(next) => self.pending_cfg = Some(*next),
+                Cmd::Share(_) => {}
+            }
+        }
+
+        let secs = progress.frames as f64 / progress.rate.max(1) as f64;
+        // A packet is 20-40 ms of audio, so this runs about forty times a second.
+        // Everything is RECORDED every time; what is paced is the waking, because a wake
+        // is a full window repaint. The clock only needs a wake when the second changes,
+        // but the wave needs to move to look alive — so it sets its own, slower, rhythm.
+        let tick = secs as u64;
+        let mut worth_drawing = tick != self.last_tick;
+        self.last_tick = tick;
+        if self.wave_clock >= WAVE_EVERY {
+            self.wave_clock = 0;
+            worth_drawing = true;
+        }
+        self.wave_clock += 1;
+        if let Ok(mut s) = self.state.lock() {
+            s.position_secs = secs;
+            // Replaced, not appended: the columns are a picture of the sound happening
+            // now and each one moves where it stands.
+            s.wave = progress.levels.clone();
+            if !self.published_signal {
+                if let Some(signal) = progress.signal {
+                    // A signal path with nothing in it is the default one, which the
+                    // Spotify engine hands over until its device opens. Publishing that
+                    // would say "no device" and then never correct itself.
+                    if signal.decoded_rate != 0 {
+                        s.signal = signal.clone();
+                        self.published_signal = true;
+                        worth_drawing = true;
+                        // Sound is coming out: whatever it was waiting for is done.
+                        s.buffering = false;
+                    }
+                }
+            }
+            if worth_drawing {
+                s.generation += 1;
+            }
+        }
+        if worth_drawing {
+            (self.wake)();
+        }
+
+        if self.paused { Flow::Pause } else { Flow::Continue }
     }
 }
 
@@ -1988,7 +2200,7 @@ mod tests {
     #[test]
     fn a_short_title_does_not_move_and_a_long_one_does() {
         let mut snap = Snapshot {
-            queue: vec![crate::tidal::Track {
+            queue: vec![crate::music::Track {
                 artist: "Opeth".into(),
                 title: "Bleak".into(),
                 ..Default::default()
@@ -2015,7 +2227,7 @@ mod tests {
     #[test]
     fn pausing_shows_the_pause_mark_and_freezes_where_the_text_had_got_to() {
         let mut snap = Snapshot {
-            queue: vec![crate::tidal::Track {
+            queue: vec![crate::music::Track {
                 artist: "Fleetwood Mac".into(),
                 title: "Everywhere".into(),
                 ..Default::default()
@@ -2053,7 +2265,7 @@ mod tests {
     fn nothing_playing_puts_nothing_in_the_bar() {
         assert_eq!(Snapshot::default().status_line(40), None);
         let stopped = Snapshot {
-            queue: vec![crate::tidal::Track::default()],
+            queue: vec![crate::music::Track::default()],
             playing: false,
             ..Default::default()
         };

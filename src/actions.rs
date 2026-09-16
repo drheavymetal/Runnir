@@ -67,8 +67,14 @@ pub enum Action {
     CatchUp,
     /// The verbs this repository is actually worked with.
     RepoVerbs,
-    /// The TIDAL panel: what is playing, the queue, and search.
+    /// The music panel: what is playing, the queue, and search.
     TidalPanel,
+    /// Switch which shop the panel's lists come from.
+    ///
+    /// On the leader layer rather than only inside the panel, because inside the panel
+    /// the search box has the keyboard the moment it opens — so a bare letter is
+    /// unreachable at exactly the moment somebody wants it.
+    MusicProvider,
     /// Transport. Bound on the leader layer so they work with no panel open — the
     /// music does not belong to the panel, and neither does controlling it.
     TidalToggle,
@@ -181,6 +187,7 @@ impl Action {
             CatchUp => "catch_up",
             RepoVerbs => "repo_verbs",
             TidalPanel => "tidal_panel",
+            MusicProvider => "music_provider",
             TidalToggle => "tidal_toggle",
             TidalNext => "tidal_next",
             TidalPrev => "tidal_prev",
@@ -278,7 +285,8 @@ impl Action {
             ToggleExplorer => "File explorer sidebar (tree of the project)",
             CatchUp => "Catch up: one headline per pane after time away",
             RepoVerbs => "How this repo is worked (learned verbs)",
-            TidalPanel => "TIDAL: what is playing, the queue, search",
+            TidalPanel => "Music: what is playing, the queue, search",
+            MusicProvider => "Switch provider (TIDAL / Spotify)",
             TidalToggle => "Play / pause",
             TidalNext => "Next track",
             TidalPrev => "Previous track",
@@ -380,6 +388,7 @@ impl Action {
             "catch_up" => CatchUp,
             "repo_verbs" => RepoVerbs,
             "tidal_panel" => TidalPanel,
+            "music_provider" => MusicProvider,
             "tidal_toggle" => TidalToggle,
             "tidal_next" => TidalNext,
             "tidal_prev" => TidalPrev,
@@ -491,6 +500,7 @@ impl Action {
             CatchUp,
             RepoVerbs,
             TidalPanel,
+            MusicProvider,
             TidalToggle,
             TidalNext,
             TidalPrev,
@@ -1102,6 +1112,9 @@ fn default_leader_bindings() -> HashMap<Chord, LeaderNode> {
     // bindings, and a feature does not get to evict memory that old.
     group(&mut m, "n", "Music", |g| {
         leaf(g, "n", TidalPanel);
+        // `p` for provider. Here as well as inside the panel, because inside it the
+        // search box owns the keyboard from the moment it opens.
+        leaf(g, "p", MusicProvider);
         leaf(g, "space", TidalToggle);
         // Forward and back rather than next/previous: `n` is taken by this group's own
         // key and `p` reads as "pause" to about half the people who try it.

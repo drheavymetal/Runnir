@@ -1160,11 +1160,11 @@ impl Grid {
     fn scroll_up_impl(&mut self, n: usize, feed: bool) {
         let n = n.min(self.scroll_bot - self.scroll_top + 1);
 
-        // Only a full-screen linefeed scroll of the primary screen feeds
-        // scrollback. A region scroll (htop's process list, a vim split), anything
-        // on the alternate screen, or a delete/scroll-up control must not: one
-        // minute of htop would otherwise evict everything worth keeping.
-        if feed && self.scroll_top == 0 && self.scroll_bot == self.rows - 1 && self.parked.is_none() {
+        // Linefeeds that push rows off the top of the primary screen feed
+        // scrollback, even when a bottom margin keeps a composer/status area
+        // fixed (Codex inserts its history this way). Interior regions, the
+        // alternate screen and delete/scroll-up controls still discard rows.
+        if feed && self.scroll_top == 0 && self.parked.is_none() {
             for row in 0..n {
                 let start = row * self.cols;
                 self.scrollback.push_back(self.cells[start..start + self.cols].to_vec());
@@ -2656,9 +2656,39 @@ mod tests {
     }
 
     #[test]
-    fn region_scroll_never_pollutes_scrollback() {
+    fn top_region_linefeeds_preserve_history_above_the_composer() {
+        let mut g = Grid::new(8, 5);
+        feed(&mut g, "one\r\ntwo\r\nthree\r\nprompt\r\nstatus");
+        // Codex inserts finalized history with DECSTBM + CRLF above its composer.
+        feed(&mut g, "\x1b[1;3r\x1b[3;1H\r\nfour\x1b[r");
+        assert_eq!(g.scrollback_text(), vec!["one", "two", "three", "four", "prompt", "status"]);
+        assert!(g.scroll_display(1), "the wheel must have history to scroll into");
+        assert_eq!(g.abs_cell(g.row_at_view(0).unwrap(), 0).ch, 'o');
+        // More output must keep a scrolled-back view pinned to the same text.
+        feed(&mut g, "\x1b[1;3r\x1b[3;1H\r\nfive\x1b[r");
+        assert_eq!(g.display_offset, 2);
+        assert_eq!(g.abs_cell(g.row_at_view(0).unwrap(), 0).ch, 'o');
+        g.scroll_to_bottom();
+        assert_eq!(g.dump(), "three\nfour\nfive\nprompt\nstatus");
+    }
+
+    #[test]
+    fn alternate_top_region_does_not_archive_output() {
+        let mut g = Grid::new(8, 5);
+        feed(&mut g, "keep\r\n");
+        let before = g.scrollback_text();
+        feed(&mut g, "\x1b[?1049h\x1b[1;3r");
+        for _ in 0..20 {
+            feed(&mut g, "junk\r\n");
+        }
+        feed(&mut g, "\x1b[r\x1b[?1049l");
+        assert_eq!(g.scrollback_text(), before);
+    }
+
+    #[test]
+    fn interior_region_scroll_never_pollutes_scrollback() {
         let mut g = Grid::new(4, 4);
-        feed(&mut g, "\x1b[1;3r");
+        feed(&mut g, "\x1b[2;3r\x1b[2;1H");
         let before = g.total_rows();
         for _ in 0..20 {
             feed(&mut g, "x\r\n");

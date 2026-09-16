@@ -648,11 +648,15 @@ Config: explorer.side (left/right), explorer.width in COLUMNS (not a fraction: a
 fraction on an ultrawide gives a 90-column tree), explorer.show_hidden. All three
 are in the settings panel too.
 
-# TIDAL — the console player (leader n)
+# Music — the console player (leader n)
 
-runnir plays TIDAL itself, straight to the DAC. Not a browser in a box: the stream is
-decoded here and written to the sound card with nothing in between when the hardware
+runnir plays the music itself, straight to the DAC. Not a browser in a box: the stream
+is decoded here and written to the sound card with nothing in between when the hardware
 allows it.
+
+Two shops: TIDAL and Spotify. The panel title says which one the lists are coming from,
+and leader n p switches. The QUEUE is not switched with it — it belongs to the player,
+not to a shop, and it can hold tracks from both at once.
 
 leader n n opens the panel. Sources down the left — Search, Queue, Favourites, Albums,
 Playlists — and what they hold in the middle. h l or Tab move between the two columns,
@@ -662,8 +666,11 @@ j k move in either, and moving over a source loads it.
   Enter        on a track, play the whole list from there; on an album,
                artist or playlist, open it
   a            add to the queue
+  p            switch provider (also leader n p, which works while the
+               search box has the keyboard — a bare letter does not)
   L            the words for what is PLAYING, following the song when
-               TIDAL has timed lyrics for it
+               TIDAL has timed lyrics for it. Spotify has no lyrics
+               endpoint at all, and says so rather than drawing a blank
   space f b s  play/pause, forward, back, stop
   Escape       leaves the search box, then the words, then the panel
   q            close
@@ -671,10 +678,20 @@ j k move in either, and moving over a source loads it.
 The mouse works: one click selects, a second on the same thing acts. A click outside
 puts the panel away — which never stops the music.
 
-Every row is coloured by the tier TIDAL really offers, with a three-letter tag: MAX in
-gold for hi-res lossless, LSL in green for lossless, AAC in grey for lossy. Worth
+Every row is coloured by the tier the provider really offers, with a three-letter tag:
+MAX in gold for hi-res lossless, LSL in green for lossless, AAC in grey for lossy. Worth
 reading before pressing play — plenty of albums you would expect in hi-res are only
 lossless, and the colour says so without opening anything.
+
+On Spotify every row says the same thing, because every row IS the same thing: Ogg
+Vorbis 320 is what Spotify serves to anything that is not one of its own apps. The badge
+therefore never claims BIT-PERFECT there, however good the device is — an exclusive
+device that does not resample is the best a lossy source can be, and it is labelled as
+exactly that. What Spotify calls Lossless goes only to its own players.
+
+Two more things Spotify does not hand over to a program like this one: the contents of a
+playlist and an artist's top tracks. Playlists are fetched another way and work; artists
+show their ALBUMS instead, which is a different question with a reliable answer.
 
 Along the bottom: how far through the track, with a mark at the exact position, and
 underneath it what is playing and the signal path. In the top corner, the sound itself

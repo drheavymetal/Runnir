@@ -766,8 +766,9 @@ mod tests {
         // The wire format IS the type, so a field added without thought would break
         // every window talking to an older daemon. This is the test that notices.
         let snapshot = Snapshot {
-            queue: vec![crate::tidal::Track {
-                id: 7,
+            queue: vec![crate::music::Track {
+                source: crate::music::Source::Tidal,
+                id: "7".into(),
                 title: "Bleak".into(),
                 artist: "Opeth".into(),
                 album: "Blackwater Park".into(),
@@ -799,8 +800,8 @@ mod tests {
             Cmd::Prev,
             Cmd::Stop,
             Cmd::Quit,
-            Cmd::Enqueue(crate::tidal::Track { id: 1, ..Default::default() }),
-            Cmd::Play { tracks: vec![crate::tidal::Track::default()], at: 0 },
+            Cmd::Enqueue(crate::music::Track { id: "1".into(), ..Default::default() }),
+            Cmd::Play { tracks: vec![crate::music::Track::default()], at: 0 },
         ] {
             let line = serde_json::to_string(&cmd).expect("serialisable");
             let back: Cmd = serde_json::from_str(&line).expect("readable");

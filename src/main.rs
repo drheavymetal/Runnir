@@ -21,6 +21,7 @@ mod keys;
 mod layout;
 mod media;
 mod mouse;
+mod music;
 mod mpris;
 mod optical;
 mod overlay;
@@ -36,6 +37,7 @@ mod share;
 mod session;
 mod settings;
 mod shell_integration;
+mod spotify;
 mod tab;
 mod themes;
 mod tidal;
@@ -211,6 +213,80 @@ fn main() {
             return tidal_login_paste(&creds);
         }
         Some("--tidal-login") => return tidal_login(args.get(2).map(String::as_str)),
+        // `runnir --spotify-login` — browser, loopback listener, code exchange. Unlike
+        // TIDAL this is the ordinary path rather than the one that does not work:
+        // Spotify accepts a loopback redirect, so nothing has to be pasted by hand.
+        Some("--spotify-login") if args.get(2).map(String::as_str) == Some("--api") => {
+            return spotify_login(spotify::Which::Api);
+        }
+        Some("--spotify-login") => return spotify_login(spotify::Which::Audio),
+        // `runnir --spotify-play <uri|url>` — play one track and report the rung it
+        // came out on. The same job `--tidal-play` does, and for the same reason:
+        // whether the DAC took the stream is not something a test can answer.
+        // `runnir --spotify-browse <words>` — walks the whole catalogue layer in one go:
+        // the four search types, then the user's own shelves, then the tracks behind the
+        // first album and the first playlist. The same job `--tidal-browse` does, and the
+        // reason is the same: a panel that draws six kinds of list is six ways to be
+        // wrong about the JSON, and none of them are visible from a unit test.
+        // `runnir --spotify-playlist <uri>` — the contents of a playlist, over the
+        // client protocol, because the Web API refuses them to a client id registered
+        // now. Its own command because it is its own door, and the day Spotify reopens
+        // the Web API one this is how the two get compared.
+        Some("--spotify-playlist") => {
+            let what = args[2..].join(" ");
+            if what.is_empty() {
+                return eprintln!("usage: runnir --spotify-playlist <spotify:playlist:... | URL>");
+            }
+            let cfg = config::Config::load().spotify;
+            // More than one is allowed, and is the point: the session is cached, so the
+            // second is the one that says whether caching it worked.
+            for (n, what) in args[2..].iter().enumerate() {
+                let uri = spotify::uri_from(what);
+                let started = std::time::Instant::now();
+                match spotify::playlist_tracks_deep(&cfg, &uri) {
+                    Ok(tracks) => {
+                        println!(
+                            "{} tracks in {:.2}s{}",
+                            tracks.len(),
+                            started.elapsed().as_secs_f64(),
+                            if n == 0 { " (first: includes connecting)" } else { "" }
+                        );
+                        for t in tracks.iter().take(if n == 0 { 5 } else { 2 }) {
+                            println!("  {} — {} [{}:{:02}]", t.artist, t.title, t.seconds / 60, t.seconds % 60);
+                        }
+                    }
+                    Err(e) => eprintln!("runnir: {e}"),
+                }
+            }
+            return;
+        }
+        Some("--spotify-browse") => {
+            let what = args[2..].join(" ");
+            if what.is_empty() {
+                return eprintln!("usage: runnir --spotify-browse <search words>");
+            }
+            return spotify_browse(&what);
+        }
+        Some("--spotify-play") => {
+            // `--seconds N` stops through the drops rather than waiting for the track to
+            // end, so a diagnostic run gives the card back the way a real one does.
+            let mut rest: Vec<&str> = args[2..].iter().map(String::as_str).collect();
+            let mut limit = None;
+            if let Some(i) = rest.iter().position(|a| *a == "--seconds") {
+                match rest.get(i + 1).and_then(|v| v.parse::<u64>().ok()) {
+                    Some(n) => {
+                        limit = Some(std::time::Duration::from_secs(n));
+                        rest.drain(i..=i + 1);
+                    }
+                    None => return eprintln!("usage: --seconds <whole number of seconds>"),
+                }
+            }
+            let what = rest.join(" ");
+            if what.is_empty() {
+                return eprintln!("usage: runnir --spotify-play [--seconds N] <spotify:track:... | https://open.spotify.com/track/...>");
+            }
+            return spotify_play(&what, limit);
+        }
         // `runnir --tidal-play <track-id|search words>` — fetch, decode and play one
         // track, then report the signal path it came out on. This is how the audio
         // chain gets verified: whether the DAC really took the stream untouched is not
@@ -449,8 +525,9 @@ fn demo_scene(path: &str) {
 /// The music panel, drawn over a plain terminal, with a library invented for it.
 fn tidal_scene(path_out: &str, state: &str) {
     use crate::render::Rect;
-    let track = |title: &str, artist: &str, secs: u32, quality: &str| tidal::Track {
-        id: title.len() as u64,
+    let track = |title: &str, artist: &str, secs: u32, quality: &str| music::Track {
+        source: music::Source::Tidal,
+        id: title.len().to_string(),
         title: title.into(),
         artist: artist.into(),
         album: String::new(),
@@ -497,33 +574,44 @@ fn tidal_scene(path_out: &str, state: &str) {
         overlay::TidalRow::Track(track("Rollin' Stone", "Muddy Waters", 189, "LOSSLESS")),
         overlay::TidalRow::Track(track("Got My Mojo Working", "Muddy Waters", 168, "HIGH")),
         overlay::TidalRow::Heading("ALBUMS".into()),
-        overlay::TidalRow::Album(tidal::Album {
-            id: 1,
+        overlay::TidalRow::Album(music::Album {
+            source: music::Source::Tidal,
+            id: "1".into(),
             title: "Folk Singer".into(),
             artist: "Muddy Waters".into(),
             tracks: 9,
-            year: Some(1964),
+            year: "1964".into(),
             quality: "HI_RES_LOSSLESS".into(),
         }),
-        overlay::TidalRow::Album(tidal::Album {
-            id: 2,
+        overlay::TidalRow::Album(music::Album {
+            source: music::Source::Tidal,
+            id: "2".into(),
             title: "The Best Of Muddy Waters".into(),
             artist: "Muddy Waters".into(),
             tracks: 12,
-            year: Some(1958),
+            year: "1958".into(),
             quality: "LOSSLESS".into(),
         }),
         overlay::TidalRow::Heading("ARTISTS".into()),
-        overlay::TidalRow::Artist(tidal::Artist { id: 3, name: "Muddy Waters".into() }),
+        overlay::TidalRow::Artist(music::Artist {
+            source: music::Source::Tidal,
+            id: "3".into(),
+            name: "Muddy Waters".into(),
+        }),
         overlay::TidalRow::Heading("PLAYLISTS".into()),
-        overlay::TidalRow::Playlist(tidal::Playlist {
-            uuid: "x".into(),
+        overlay::TidalRow::Playlist(music::Playlist {
+            source: music::Source::Tidal,
+            id: "x".into(),
             title: "Blues Essentials".into(),
             tracks: 40,
             owner: "TIDAL".into(),
             mine: false,
         }),
     ];
+    // The invented library is TIDAL's, so the panel has to be too — otherwise the
+    // screenshot claims one shop while showing another's rows, which is exactly the
+    // kind of quiet lie these scenes exist to catch.
+    panel.provider = music::Source::Tidal;
     panel.cursor = 1;
     if state == "queue" {
         panel.source = overlay::Source::Queue;
@@ -745,6 +833,122 @@ fn tidal_creds() -> Result<(config::Tidal, tidal::Creds), String> {
 ///
 /// PKCE needs the code the browser was redirected with, so it runs in two commands:
 /// this one prints the URL, and the same command with the pasted URL finishes it.
+/// Signs in to Spotify. The browser opens, the loopback listener catches the code, and
+/// the session lands on disk — no pasting, which is the one thing TIDAL never allowed.
+fn spotify_login(which: spotify::Which) {
+    let cfg = config::Config::load().spotify;
+    if which == spotify::Which::Api && cfg.api_client_id.is_empty() {
+        eprintln!(
+            "runnir: no api_client_id in [spotify]. Register an app at \
+             developer.spotify.com (five minutes, free), give it the redirect \
+             http://127.0.0.1:{}/login, and put its client id there. Without one the \
+             catalogue shares the desktop id, which the Web API rate-limits across every \
+             librespot program there is.",
+            cfg.api_callback_port
+        );
+        return;
+    }
+    match spotify::login(which, &cfg) {
+        Ok(_) => println!("signed in to Spotify for {}", match which {
+            spotify::Which::Audio => "playback",
+            spotify::Which::Api => "the catalogue",
+        }),
+        Err(e) => eprintln!("runnir: {e}"),
+    }
+}
+
+/// Plays one track and says where the audio went.
+fn spotify_play(what: &str, limit: Option<std::time::Duration>) {
+    let cfg = config::Config::load().spotify;
+    let uri = spotify::uri_from(what);
+    let mut announce = |p: &spotify::Playing| {
+        if !p.title.is_empty() {
+            println!("  {} — {}", p.artist, p.title);
+        }
+        println!("  {}", p.badge);
+    };
+    match spotify::play_uri(&cfg, &uri, limit, &mut announce) {
+        Ok(()) => {}
+        Err(e) => eprintln!("runnir: {e}"),
+    }
+    // Stopping cleanly because of a signal is still stopping because of a signal, and a
+    // shell that sees 0 will think the track finished. The same applies to
+    // `--tidal-play`, which has never been signalled in anger.
+    if let Some(sig) = reserve::signalled() {
+        std::process::exit(128 + sig);
+    }
+}
+
+/// Walks the catalogue and prints what came back, so the shapes can be checked against
+/// a real account before a panel is built on top of them.
+fn spotify_browse(words: &str) {
+    let session = match spotify::current(spotify::Which::Api) {
+        Ok(s) => s,
+        Err(e) => return eprintln!("runnir: {e}"),
+    };
+
+    let found = match spotify::search(&session, words, 5) {
+        Ok(f) => f,
+        Err(e) => return eprintln!("runnir: {e}"),
+    };
+    println!("search \"{words}\"");
+    for t in &found.tracks {
+        println!("  track    {}  {} — {} [{}] {}", t.uri, t.artist, t.title, mmss(t.seconds), if t.explicit { "E" } else { "" });
+    }
+    for a in &found.albums {
+        println!("  album    {}  {} — {} ({}, {} tracks)", a.uri, a.artist, a.title, a.year, a.tracks);
+    }
+    for a in &found.artists {
+        println!("  artist   {}  {}", a.uri, a.name);
+    }
+    for p in &found.playlists {
+        println!("  playlist {}  {} by {} ({} tracks)", p.uri, p.title, p.owner, p.tracks);
+    }
+
+    // The shelves. Each one is a paginated listing, which is the part that has been
+    // wrong before: a library that quietly ends at fifty looks exactly like a small one.
+    match spotify::my_playlists(&session) {
+        Ok(p) => println!("\nyour playlists: {} (all pages)", p.len()),
+        Err(e) => println!("\nyour playlists: {e}"),
+    }
+    match spotify::saved_tracks(&session) {
+        Ok(t) => println!("saved tracks:   {} (all pages)", t.len()),
+        Err(e) => println!("saved tracks:   {e}"),
+    }
+    match spotify::saved_albums(&session) {
+        Ok(a) => println!("saved albums:   {} (all pages)", a.len()),
+        Err(e) => println!("saved albums:   {e}"),
+    }
+
+    if let Some(album) = found.albums.first() {
+        match spotify::album_tracks(&session, &album.uri) {
+            Ok(t) => println!("\n{} — {}: {} tracks, first is {:?}", album.artist, album.title, t.len(), t.first().map(|t| t.title.clone())),
+            Err(e) => println!("\nalbum tracks: {e}"),
+        }
+    }
+    if let Some(artist) = found.artists.first() {
+        match spotify::artist_albums(&session, &artist.uri) {
+            Ok(a) => println!("{} albums: {} (first: {:?})", artist.name, a.len(), a.first().map(|a| a.title.clone())),
+            Err(e) => println!("artist albums: {e}"),
+        }
+        // Asked on purpose even though it is known to be refused: this line is the
+        // record of whether the restriction still stands.
+        if let Err(e) = spotify::artist_top_tracks(&session, &artist.uri) {
+            println!("  (top tracks: {e})");
+        }
+    }
+    if let Some(pl) = found.playlists.first() {
+        match spotify::playlist_tracks(&session, &pl.uri) {
+            Ok(t) => println!("playlist {:?}: {} tracks (claimed {})", pl.title, t.len(), pl.tracks),
+            Err(e) => println!("playlist tracks: {e}"),
+        }
+    }
+}
+
+fn mmss(seconds: u32) -> String {
+    format!("{}:{:02}", seconds / 60, seconds % 60)
+}
+
 fn tidal_login(pasted: Option<&str>) {
     let (_, creds) = match tidal_creds() {
         Ok(v) => v,
@@ -1115,7 +1319,7 @@ fn tidal_play(what: &str) {
         },
         player::hint_for(&info),
         &info.quality,
-        &cfg,
+        &(&cfg).into(),
         true,
         &mut None,
         &mut |progress| {
@@ -1165,7 +1369,7 @@ fn tidal_decode(files: &[&str], play: bool) {
         .unwrap_or("flac");
     let ext = if matches!(ext, "m4s" | "m4a" | "mp4") { "mp4" } else { ext };
 
-    match player::play_parts(parts, ext, "", &cfg, play, &mut None, &mut |_| player::Flow::Continue) {
+    match player::play_parts(parts, ext, "", &(&cfg).into(), play, &mut None, &mut |_| player::Flow::Continue) {
         Ok(played) => {
             let seconds = played.frames as f64 / played.signal.decoded_rate.max(1) as f64;
             println!("  {}", played.signal.badge());
@@ -1677,11 +1881,12 @@ fn notify(body: &str) {
 /// set of lyrics are drawn by different halves of the panel, and collapsing them into
 /// one type would mean each side checking whether the answer was meant for it.
 pub enum TidalAnswer {
-    Found(tidal::Found),
-    /// The track the words are for, and the words. The id travels with them because
-    /// the answer can arrive after the song has changed, and words for the wrong song
-    /// are worse than none.
-    Lyrics(u64, tidal::Lyrics),
+    Found(music::Found),
+    /// The track the words are for, and the words. The identity travels with them
+    /// because the answer can arrive after the song has changed, and words for the wrong
+    /// song are worse than none. It is `Track::key()` rather than a number: an id on its
+    /// own stopped being an identity the moment there were two providers.
+    Lyrics(String, tidal::Lyrics),
 }
 
 /// Turns a search result into the rows a list draws, headings and all.
@@ -1689,7 +1894,7 @@ pub enum TidalAnswer {
 /// The order is deliberate: tracks first because they are what a search is usually
 /// for, then albums, artists and playlists. Headings only appear when there is more
 /// than one kind, since a single-kind list needs no label.
-fn rows_of(found: &tidal::Found) -> Vec<overlay::TidalRow> {
+fn rows_of(found: &music::Found) -> Vec<overlay::TidalRow> {
     let kinds = [
         !found.tracks.is_empty(),
         !found.albums.is_empty(),
@@ -1707,19 +1912,19 @@ fn rows_of(found: &tidal::Found) -> Vec<overlay::TidalRow> {
     };
     if !found.tracks.is_empty() {
         heading(&mut rows, "TRACKS");
-        rows.extend(found.tracks.iter().cloned().map(overlay::TidalRow::Track));
+        rows.extend(found.tracks.iter().cloned().map(|t| overlay::TidalRow::Track(t.into())));
     }
     if !found.albums.is_empty() {
         heading(&mut rows, "ALBUMS");
-        rows.extend(found.albums.iter().cloned().map(overlay::TidalRow::Album));
+        rows.extend(found.albums.iter().cloned().map(|x| overlay::TidalRow::Album(x.into())));
     }
     if !found.artists.is_empty() {
         heading(&mut rows, "ARTISTS");
-        rows.extend(found.artists.iter().cloned().map(overlay::TidalRow::Artist));
+        rows.extend(found.artists.iter().cloned().map(|x| overlay::TidalRow::Artist(x.into())));
     }
     if !found.playlists.is_empty() {
         heading(&mut rows, "PLAYLISTS");
-        rows.extend(found.playlists.iter().cloned().map(overlay::TidalRow::Playlist));
+        rows.extend(found.playlists.iter().cloned().map(|x| overlay::TidalRow::Playlist(x.into())));
     }
     rows
 }

@@ -4553,8 +4553,505 @@ green, no warnings.
 **Not changed**: `player.rs` keeps its own `ensure_fresh` with the credentials the daemon was
 started with. It was already correct, and it is the hot path for playback.
 
+## DESIGN, NOT YET BUILT — Spotify beside TIDAL, and the terminal as a Connect device (2026-09-14)
+
+**Why.** Pedro cancelled TIDAL and moved to Spotify. The player, the panel, the daemon,
+MPRIS and the whole output chain stay exactly as useful as they were; what has to change
+is where the bytes come from. TIDAL is NOT removed — it is left alone, in place and
+working, so that a migration and a new backend do not land as one commit nobody can
+bisect.
+
+**What Spotify cannot do, said first.** There is no endpoint anywhere in the official
+Web API that returns audio. That is not an oversight to route around: the Web API is
+metadata and remote control of Connect, and the only first-party way to hear a track
+outside their own apps is the Web Playback SDK, which is a browser with Widevine. So
+playback means `librespot` — MIT, Rust, and a reimplementation of the client rather than
+a wrapper over one.
+
+**And bit-perfect is over.** Spotify's Lossless tier is served only to their own apps,
+which ask for and decrypt FLAC through a proprietary pipeline. Every Connect endpoint —
+every third-party streamer, librespot included — still receives Ogg Vorbis 320. There is
+no DRM barrier in the way; the Connect backend simply does not hand FLAC to outside
+devices, and librespot's decoder is already prepared for the day it does. The honest
+ceiling is therefore *exclusive, not resampled*, at 44.1/16, and the badge has to say so
+(see below). Everything the chain learned — the reservation protocol, the rungs, the
+refusals, keeping the device open across tracks — still pays for itself; it is the claim
+at the top that shrinks, not the machinery underneath.
+
+**The licence question is already settled.** librespot is MIT and runnir is GPL-3.0-only.
+MIT goes into GPL-3 without argument, which is the same direction that let `optical.rs`
+vendor decimen's format.
+
+### The one login that opens both halves
+
+`librespot-oauth` runs authorization code + PKCE against a local callback server, and the
+token it returns is good **both** for the Web API and for opening a session with
+`librespot-core`. That is precisely what TIDAL refused: no first-party client there would
+redirect to loopback (`error 11102` with both redirects proved it was the client, not the
+redirect), and the login ended up being a URL pasted by hand. `tidal.rs::wait_for_callback`
+was built, tested, and then unreachable for six weeks. It finally has a caller.
+
+⚠️ **Unverified, and phase 0 answers it**: whether a `client_id` registered at
+developer.spotify.com also opens a librespot session, or whether the audio half needs the
+desktop client id librespot ships. If they differ, the config carries two ids and says why.
+The default is librespot's, because it needs no registration at all.
+
+**Answered, 2026-09-14, and not the way the question was asked.** The token does work
+against the Web API — the scopes are honoured and the call is authenticated. What it runs
+into is a `429` with `Retry-After: 40` on the THIRD request of a fresh session, which is
+not a quota anyone here has spent: the desktop client id is shared by every
+librespot-based program on earth and the Web API rate-limits it as one client. Playback is
+unaffected, because playback never touches the Web API.
+
+So the two ids are needed after all, for a reason the design did not anticipate:
+
+- **audio** — the desktop client id, which is the one known to open a session.
+- **catalogue** — a `client_id` of its own from developer.spotify.com, not for
+  permission but for a rate limit that belongs to this machine. Its redirect is its own
+  too, which is what makes `callback_port` a real setting rather than a fixed 8898.
+
+Phase 1 therefore starts by splitting the field, and the panel is unusable in practice
+without a registered id. Worth saying plainly in whatever the user reads: this is a
+five-minute registration, and it is the difference between a catalogue that answers and
+one that returns 429 to the third keystroke.
+
+### Stack, and the tokio it drags in
+
+The TIDAL design said "no GStreamer, no tokio" and that was right for TIDAL. librespot is
+async and brings tokio ^1, so the sentence needs amending rather than defending:
+
+**The runtime lives in the daemon process only**, `current_thread`, started only when the
+provider is Spotify. No window ever builds one, `app_input.rs` never awaits anything, and
+the UI thread's relationship with the player is the socket it already has. The daemon was
+built in August so that exactly one process owns the ALSA device; it now also owns the one
+async runtime. Binary size and compile time are the cost and both get measured in phase 0,
+not estimated here.
+
+### Where the seam is
+
+librespot fetches, decrypts and DECODES. It hands samples to its own `Sink` trait —
+`write(AudioPacket, &mut Converter)`, plus `start`/`stop`. So the seam is one type:
+
+    librespot player → our Sink impl → player::Sink (ALSA) → the DAC
+
+Everything downstream of that arrow is untouched: `plan()`, `Attempt`, `Rung`, the
+PipeWire reservation, the refusal list, the device kept open between tracks. The only
+change inside `player.rs` is that `Sink::write` must also accept a plain interleaved
+sample buffer, because today it accepts a symphonia `GenericAudioBufferRef` and nothing
+else. symphonia stays exactly where it is, for TIDAL.
+
+**The badge stops promising what it cannot deliver.** Quality reads `OGG 320`, the rung
+stays as true as it ever was, and the accent colour that means "nothing touched the
+samples" is reserved for the case where nothing did — which for Spotify means no resample
+after the decoder, never bit-perfect. This is the fourth time this file records the same
+rule: report what arrived, not what was asked for.
+
+### The catalogue is ordinary, with two holes
+
+Web API over `ureq` on worker threads, like TIDAL: search of four types, playlists,
+saved tracks and albums, artist top tracks. Paginated from the first commit, because the
+audit already taught this feature that a playlist of 444 tracks reads as one of 100 when a
+caller takes the first page and stops.
+
+Two things the panel has that Spotify will not give it:
+
+- **No lyrics.** The Web API has no lyrics endpoint. `L` names the provider and says so,
+  rather than drawing an empty pane.
+- **Sharing stays TIDAL-only** for now. librespot does not hand back a re-sendable
+  encrypted file the way `playbackinfopostpaywall` did, and rebroadcasting this is harder
+  to defend besides. Decide it when the panel is provider-agnostic, not before.
+
+Ids are URIs (`spotify:track:...`), not `u64`. That is the one shape change the panel's
+row types have to absorb.
+
+### Announcing the terminal as a Connect device
+
+`librespot-discovery` publishes over zeroconf; `librespot-connect` brings the Spirc state
+machine. From the phone, the music goes to the terminal.
+
+**This collides with a rule set in August and the rule wins.** The daemon dies with the
+last window: nothing plays without runnir on screen. A zeroconf advert that outlives the
+UI would make the terminal a speaker that answers when nobody has opened it. So the advert
+lives and dies with the daemon — coherent with the existing policy, and nearly free
+because that lifetime already exists.
+
+### Keys: the room was already made
+
+The leader group is called **Music**, not TIDAL — deliberately, in July. So:
+
+- transport (`space`, `f`, `b`, `s`) acts on whatever is PLAYING, whichever provider it
+  came from. Two providers never sound at once; there is one device and one daemon.
+- `leader n n` opens the panel for the active provider (`music.provider` in config).
+- The provider is a heading in the panel's own source column, not another leader letter.
+  Letters are the scarce thing; the column already scrolls.
+
+### Phases, risky half first
+
+0. **No UI.** `runnir --spotify-login` and `--spotify-play <uri>`: authenticate, resolve,
+   and get sound out through the existing chain. Answers the three unknowns — whether the
+   OAuth token opens a session, whether the Sink seam holds, what tokio costs.
+1. Catalogue over the Web API, paginated, with the row types widened to URI ids.
+2. Panel, daemon, MPRIS and status bar made provider-agnostic.
+3. Connect device over zeroconf, with the daemon's lifetime.
+4. Audit rounds (Fable finds, Opus fixes), then `docs-site` and the F1 manual.
+
+## 2026-09-14 - Phase 0: Spotify plays, and the badge does not lie about it
+
+It works. Signed in, resolved, and out through the chain the DAC is already on:
+
+    Muddy Waters - My Home Is In The Delta
+    OGG 320 16/44.1 kHz · hw:0,0 · 16→32 zero-pad · exclusive (lossy source)
+
+Heard, not inferred: Pedro asked whether the music was mine while the second run was
+playing. The first run landed on `hw:2,0` — the board's analogue jack — which is a
+working path to a socket nobody is listening to, so it proved the chain and not the
+sound. Forcing `hw:0,0` (the Scarlett) is what made it audible.
+
+### The three unknowns the phase existed for
+
+**Does an OAuth token open a librespot session?** Yes, and one token does both halves:
+the same access token authenticates the session and is accepted by the Web API. The
+sign-in is a browser and a loopback listener, with nothing pasted by hand — which is
+worth pausing on, because `tidal.rs::wait_for_callback` was written in August, tested,
+and then unreachable, since no first-party TIDAL client would redirect to loopback
+(`error 11102` refused the app redirect and the loopback one alike, which is what proved
+the client was the problem and not the redirect). Six weeks later it has a caller.
+
+**Does the sink seam hold?** Yes, and nothing downstream of it changed. `plan()`, the
+rungs, the reservation, the refusal list, the device held open across tracks — all of it
+is the August machinery, reached through one `impl Sink`. What it took was making the
+chain provider-blind: it takes an `Output` instead of a `Tidal`, and it reports the
+`Width` it opened with, because a provider holding floats has to know what to convert to.
+
+**What does the runtime cost?** 500 → 651 packages, and the release binary 46.1 → 56.8 MB
+(+11.2 MB, +23%). A full release build is ~105 s on this machine. The runtime itself is
+`current_thread` and is built at one call site; no window holds one.
+
+### A fourth answer, to a question nobody asked
+
+The token works against the Web API and then gets `429 Retry-After: 40` on the **third**
+request of a fresh session. That is not a quota anyone here has spent: the desktop client
+id is shared by every librespot program on earth and Spotify rate-limits it as one
+client. Playback never touches the Web API, so playback does not care — but the
+catalogue is the Web API, so phase 1 starts by splitting the setting in two: the desktop
+id for the session, a registered id of one's own for the catalogue. That also makes
+`callback_port` a real setting instead of a fixed number.
+
+### Two things read out of librespot rather than found by running it
+
+**librespot stops the sink on every pause** (`handle_pause` → `ensure_sink_stopped(false)`),
+not only at the end of a queue. A sink that closes the device there gives the card back
+and has to take it again on resume — landing on the `EBUSY` of its own release, which is
+the gap this program already diagnosed once, between tracks, in August. So `stop` pauses
+the PCM and keeps the device, and `start` is its exact inverse (`set_paused(false)`, not
+`resume()`, because only the first undoes a hardware pause). Holding an exclusive device
+through a pause is not selfish: the reservation answers `RequestRelease` with yes.
+
+**The badge would have said BIT-PERFECT over Ogg Vorbis 320.** The rungs describe the
+path from decoder to DAC, and that path can be flawless while what travels down it has
+already thrown half the music away. `SignalPath` carries `lossy`, `is_bit_exact` never
+grants it to a lossy source, and a bit-exact rung under one reads `exclusive (lossy
+source)` — a real thing to be, and not the other one. That makes four badge lies caught
+in this file; all four were the same shape, and this is the first caught before it shipped.
+
+### And one found by running it
+
+The first run printed `PCM 0/0 kHz ·` with an empty device. `PlayerEvent::Playing` is
+emitted when playback starts, which is *before* the first packet reaches the sink — and
+the device is opened BY that first packet, because only then is the shape known. The
+announcement was reading the signal path before anything had filled it in. It now waits
+for the device, up to five seconds, and says "no device opened" rather than printing
+zeros if none ever does.
+
+### Cost of entry, for the record
+
+`librespot-core`'s build script would not compile at all: `vergen-gitcl` depends on
+`vergen 9.0.6` *and* `vergen-lib 0.1.6`, while `vergen 9.1.0` — which the resolver
+prefers — moved to `vergen-lib 9.1.0`. Two crates of the same name by semver, one trait
+each, and an error inside a dependency's build script that says nothing about versions.
+Pinned with `cargo update -p vergen --precise 9.0.6`.
+
+### Not done, deliberately
+
+Sharing stays TIDAL-only: librespot hands back decoded samples, not a re-sendable
+encrypted file the way `playbackinfopostpaywall` did. Lyrics have no Web API endpoint, so
+`L` will have to name the provider and say so. TIDAL is untouched and still works.
+
+## 2026-09-14 - The reservation gives the name back and NOT the card, if the card has UCM
+
+Found by accident, on the first run that used a card Pedro actually listens to. After
+playing one Spotify track on `hw:0,0` (a Focusrite Scarlett 2i2), the interface vanished
+from the desktop's sound settings. It was still there for ALSA and still a card for
+PipeWire — with `Active Profile: off` and no sink at all.
+
+**The release protocol worked.** wireplumber owned `ReserveDevice1.Audio0/1/2` again, so
+the name went back exactly as August's fix intended, and nothing of ours was holding the
+PCM. What did not come back is the PROFILE. WirePlumber hands a card over by switching it
+to `off`, and taking the name back is evidently not the same event as restoring what the
+card was doing before.
+
+**Worse, the profile it had could not be reassigned by hand.** The card listed only `off`
+and `pro-audio`; the UCM profile it was using — `HiFi`, the one behind
+`alsa_output...HiFi__Line__sink` — was not in the list at all, because the UCM had been
+unloaded with the handover. `systemctl --user restart wireplumber` brought both back, and
+then the default sink had to be pointed at it again (it had fallen to HDMI).
+
+**This is not a Spotify bug, and it is not new.** It is the same chain TIDAL has been
+using since August; the reservation code is untouched. It was never seen because the
+device it was developed against is a HiBy R4, which has no UCM profiles. A USB interface
+with UCM does, and that is the case that breaks.
+
+### Answered the same day, and it was neither of the guesses
+
+The question looked like "should we verify the card came back, or refuse to reserve UCM
+cards at all". It was the wrong question, because the failure is not about UCM and not
+about verification. Measured both ways on the same card, same track, same device:
+
+    clean exit (through the drops)   Active Profile: HiFi   1 sink
+    SIGTERM                          Active Profile: off    0 sinks
+
+**A signalled process runs no destructors.** The ordering that makes a clean exit work is
+already right — in `Sink`, `pcm` is declared before `_reservation`, so the handle closes
+before the name goes — but a signal does not use that ordering at all. The kernel
+releases the file descriptor and the bus name in the same instant, PipeWire sees the name
+freed and goes to take back a card that ALSA has not finished letting go of, fails, and
+leaves it at `off`. The UCM part is why it *looked* unfixable afterwards: the profile the
+card had been using is unloaded with the handover, so it is not even offered for
+reassignment until wireplumber restarts.
+
+It was never a Spotify bug and it was never new. `kill` is how a daemon usually ends, and
+the player daemon holds a card — so every time the last window closed with exclusive
+playback running, the sound card went with it.
+
+**The fix is a guard installed by `take`, and nowhere else.** A handler that writes one
+byte to a pipe (about all that is safe inside a signal handler), a thread that reads it
+and then: sets a flag, waits for the open device count to reach zero, waits out ALSA's
+own release, and exits. The playback loops check the flag between packets — and, the case
+that is easy to miss, *inside the pause loop*, because a pause deliberately holds the
+device open while writing nothing, so the packet-loop check never runs.
+
+Three deliberate restrictions:
+
+- **Installed lazily, from `take`.** A runnir that never reserves a card handles signals
+  exactly as it always did.
+- **The signal mask is untouched.** It is inherited across fork and exec, and a blocked
+  SIGTERM would silently break the `PR_SET_PDEATHSIG` that keeps a daemon's children from
+  outliving it — trading this bug for the `cloudflared` one already in the Gotchas.
+- **The exit code still says 130.** The fix works well enough that the loop notices the
+  signal and returns *normally*, which made the process exit 0 — so an interrupted run
+  became indistinguishable from a finished one. `reserve::signalled()` puts that back.
+
+Verified after the fix: SIGTERM and SIGINT both leave `Active Profile: HiFi` with its
+sink, exit 130, and take 135 ms to do it.
+
+## 2026-09-14 - Phase 1: the catalogue, and how much of it Spotify will actually hand over
+
+The catalogue layer works against the real account: search of four types in one request,
+the user's own shelves paginated to the end (39 playlists, 4073 saved tracks, 396 saved
+albums), an album's tracks, an artist's albums. `runnir --spotify-browse <words>` walks
+all of it, the way `--tidal-browse` does, because six kinds of list is six ways to be
+wrong about JSON and none of them are visible from a unit test.
+
+Getting there cost three findings, and all three are about the same thing: a client id
+registered today is not the client id the documentation describes.
+
+### One sign-in was not enough, and the reason is a quota
+
+The desktop client id is rate-limited on the Web API as a single client, because every
+librespot program on earth shares it: `429 Retry-After: 40` on the third request of a
+fresh session, still 429 hours later with nothing of ours in between. It never recovers,
+so it cannot even be a fallback.
+
+So there are two ids and, for now, two sign-ins: `client_id` for playback (the desktop
+one, which is the one known to open a session) and `api_client_id` for the catalogue.
+Leave the second empty and both collapse to the first — which is what should happen the
+day somebody proves their own id can also open a playback session. Registered in five
+minutes at developer.spotify.com, which is exactly the door TIDAL never had: there, no
+first-party client would take a loopback redirect and the login ended up being a URL
+pasted by hand.
+
+### Half the Web API is closed to a new app, and 403 is not about permissions
+
+Measured on this account, every scope granted, against the user's own data:
+
+    OK   profile, search, saved tracks, saved albums, your playlists,
+         your top tracks, Connect devices, one track, one album,
+         an album's tracks, one artist, an artist's albums, a playlist object
+    403  the contents of a playlist  ← even one the user owns
+    403  an artist's top tracks
+    403  followed artists
+    403  anything asked for in bulk (?ids=)
+
+`/me/playlists` answers and `/playlists/{id}` answers; `/playlists/{id}/tracks` is 403
+for a playlist the signed-in user created. That is not a scope and not a sign-in, so the
+error says which endpoint is closed rather than "Forbidden" — being told "forbidden"
+sends someone to check permissions that are already correct.
+
+Two consequences. An artist's top tracks are replaced with an artist's ALBUMS, which is a
+slightly different question that gets a reliable answer, and the top-tracks call is still
+made in `--spotify-browse` purely as the record of whether the restriction still stands.
+And playlist CONTENTS have no Web API path at all — see below.
+
+Also: the playlist object no longer carries `tracks.total`, so every playlist reports 0
+tracks. The parser treats a missing count as unknown rather than as zero-and-therefore-
+empty, and the panel will have to not draw a number it does not have.
+
+### The page size is capped per endpoint, the caps disagree, and they are not documented
+
+    /me/tracks               50  ok
+    /artists/{id}/albums     20  ->  400 Invalid limit      10 ok
+    /search                  50  ->  400 Invalid limit
+
+`400`, not a truncated page: a fixed number that is right today is an EMPTY LIST the day
+Spotify moves it. So the number is discovered — ask for what we want, halve on `Invalid
+limit`, remember what worked, keyed by endpoint with the ids stripped out. Using the
+smallest cap everywhere instead would turn 4073 saved tracks from 82 requests into 408.
+
+### Pagination, written first rather than found again
+
+Every listing follows `next` to the end. The TIDAL audit caught the other version of this
+— playlists, albums and favourites each read one page and stopped, so a playlist of 444
+tracks played as one of 100 — and a library that silently ends at fifty looks exactly like
+a small library. Capped at 100 pages, because a `next` that never ends would hang a panel
+with nothing to show for it.
+
+### What is left, and where it belongs
+
+Playlist contents are the one real hole, and there are 39 of them on this account. The
+remaining path is not the Web API at all: librespot's own metadata layer talks the client
+protocol, where `Playlist` carries its contents, and that is a door the Web API
+restrictions do not close. It needs a live librespot session, which is a thing phase 2
+builds anyway for the daemon — so it is written down here and built there, rather than
+standing up a throwaway session for a diagnostic command.
+
+## 2026-09-14 - Phase 2: the panel stops being TIDAL's
+
+The player, the queue, the panel, MPRIS, the status bar and the share page were written
+in terms of `tidal::Track`, `tidal::Album`, `tidal::Playlist`. That was honest while
+there was one shop. `music::` is the same five fields without the shop attached, plus the
+one field that decides a path — and the fork lives in `play_one`, which is the only place
+that has to care.
+
+**`id` becomes a string and identity becomes `key()`.** A Spotify id is not a number, and
+two providers can spell an id the same way and mean different songs. MPRIS hands that out
+as a track id and the lyrics cache keys on it, so an unqualified id was a collision
+waiting for the day both were signed in.
+
+**The conductor came out of `play_one` as a type.** There are two audio loops now.
+Duplicating it would have meant two copies of "previous restarts the track after three
+seconds", two copies of the pacing rules, and a guarantee that a fix to one would miss
+the other. The loops differ in where the samples come from; what they do about a key
+press does not.
+
+**The Spotify engine is built once and kept**, like the ALSA device is kept across
+tracks: connecting costs a second or two, and paying that per track puts a gap in every
+album. Switching providers releases the other one first — two engines cannot both hold an
+exclusive device, which is the daemon's "exactly one process owns the card" rule applied
+one level down.
+
+**The wave is measured in the sink**, where the TIDAL one is measured, so what is drawn
+is what is being heard rather than a second guess at it. RMS over a 60 dB scale, cut into
+as many slices as there are columns so the bars rise and fall in place.
+
+### What the panel says now
+
+The title names the shop, with `·p` beside it — the key that switches. It was never
+decoration: a list of songs looks identical whoever is selling them.
+
+That came out of the headless scene rather than out of reading the code. The first
+version added a provider label under the title and the screenshot showed it sitting
+beside the hard-coded word TIDAL, contradicting it — a demo drawing a TIDAL library while
+announcing Spotify, because the panel reads its default provider from the config and this
+machine is signed in to both. Two fixes, and the second one matters more: the scene now
+pins its provider, because a screenshot that claims one shop while showing another's rows
+is exactly the quiet lie these scenes exist to catch. That is the third time
+`--demo <file> tidal` has found something reading the code did not.
+
+Switching provider clears the list, the crumb and the pending request. Rows from the shop
+you just left, sitting under the name of the one you are now in, is the same class of lie
+as a crumb that outlives its list. The QUEUE is not cleared: it belongs to the player, not
+to a shop, and it can hold both at once.
+
+### Left standing, deliberately
+
+Playlist CONTENTS from Spotify. The Web API refuses them to a client id registered now,
+even for a playlist the user owns, and librespot's metadata layer is the remaining door —
+it talks the client protocol, where `Playlist` carries its contents. The engine already
+holds a live librespot session, so the door is now behind a wall that has been built; the
+work is fetching the item list and resolving the tracks without doing it one round trip at
+a time.
+
+And the whole of this is verified by tests and one headless screenshot. Nobody has yet
+played a Spotify track FROM the panel, through the daemon, on this machine. That is the
+next thing, and the rule this file already records applies: verify on a real instance,
+because the bugs that turn up are layout, DPI and keys under Hyprland.
+
+## 2026-09-14 - Playlists, through the door the Web API closed
+
+Working, and faster than the effort suggested:
+
+    53 tracks in 1.04s   (first: includes connecting)
+    171 tracks in 0.74s  (session cached)
+
+The Web API refuses `/playlists/{id}/tracks` to a client id registered now — measured on
+a playlist the signed-in user created, with every scope granted. librespot speaks the
+protocol the desktop client speaks, and there a playlist carries its own item list. That
+door is not the one Spotify closed.
+
+**A playlist item carries only a URI**, so every track is a round trip. Sixteen in flight
+at a time: enough that a long playlist does not resolve one at a time, few enough that
+opening one does not look like a flood. The tracks come back with their album and artist
+names already attached, which is the part that made this cheap — the obvious alternative,
+resolving names through the Web API in batches, is 403 as well.
+
+**The Web API is still asked first**, which is the opposite order to the effort. It costs
+one request, and it is how anyone will find out the day Spotify reopens it. Only the
+REFUSAL falls through: a timeout or a 500 says nothing about whether this client is
+allowed, and answering those by opening a second session to Spotify would turn a blip
+into a minute of reconnecting.
+
+⚠️ **The fallback triggers on matching the error text**, which is a thread thin enough to
+snap silently — reword the 403 message and playlists stop working, with nothing failing.
+There is now a test whose only job is to keep the message and the condition together.
+
+### An amendment to the design in this file
+
+The design said the tokio runtime would live in the player daemon and nowhere else. That
+held until this: the panel resolves its own lists, in its own worker threads, in the
+WINDOW process, and the only remaining door to playlist contents speaks the client
+protocol. So the window gets a runtime too, and a session cached beside it — connecting
+costs about a second and three playlists should not cost three.
+
+Two connections for one account is fine. Spotify allows it, and neither is a Connect
+device, so nothing appears on anyone's phone because somebody opened a playlist.
+
+### A tokio trap worth remembering
+
+`Session::new` registers with the reactor, so building one OUTSIDE `block_on` panics with
+"there is no reactor running, must be called from the context of a Tokio 1.x runtime" —
+a message about tokio, while the code around it is about Spotify. It sends you looking in
+the wrong place. Construct inside the runtime, always.
+
 ## Gotchas (do not re-learn)
 
+- `librespot_core::Session::new` must be built INSIDE a tokio runtime: it registers with
+  the reactor, and constructing one outside panics with "there is no reactor running",
+  which is a message about tokio in the middle of code about Spotify.
+- A Spotify client id registered TODAY is not the one the docs describe. Half the Web
+  API answers 403 to it — playlist contents (even the user's own), artist top tracks,
+  followed artists, anything asked in bulk — and page-size caps are per endpoint,
+  undocumented, and enforced with `400 Invalid limit` rather than a short page. Discover
+  the cap and remember it; never hard-code one.
+- The desktop client id every librespot program shares is permanently rate-limited on the
+  Web API: 429 on the third request of a fresh session, and it does not recover. It is
+  fine for playback, which never touches the Web API, and useless as a catalogue fallback.
+- Releasing a reserved card returns the NAME, not the card. WirePlumber hands a card
+  over by setting its profile to `off`, and taking the reservation name back does not
+  restore it: the device disappears from the desktop's sound settings with no error
+  anywhere. If the card has UCM profiles, the one it was using is not even offered for
+  reassignment until wireplumber is restarted, because the UCM went with the handover.
+  Never assume the card came back — read its profile afterwards, the way August's
+  lesson said to read the state instead of trusting a happy path.
 - Detecting a bad peer ASYNCHRONOUSLY means the first command still goes to it. The
   stale-daemon check rode in on the first snapshot, which lands after `connect` has
   returned, so exactly one command per window went to the wrong process — and the first
