@@ -387,7 +387,7 @@ fn escape(s: &str) -> String {
 
 /// Spawns `cloudflared` and waits for it to publish a URL.
 fn open_tunnel() -> Result<(std::process::Child, String), String> {
-    let mut cmd = std::process::Command::new("cloudflared");
+    let mut cmd = std::process::Command::new(crate::platform::find_tool("cloudflared"));
     cmd.args(["tunnel", "--no-autoupdate", "--url", &format!("http://localhost:{PORT}")])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())

@@ -244,6 +244,27 @@ mod imp {
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_tool_is_preferred_from_the_local_install() {
+        // `install.sh` puts runnir here, so this is a file that certainly exists on a
+        // machine that has one - and the launcher's PATH does not include the directory.
+        let Some(home) = dirs::home_dir() else { return };
+        let local = home.join(".local/bin/runnir");
+        if local.is_file() {
+            assert_eq!(find_tool("runnir"), local.into_os_string());
+        }
+    }
+
+    #[test]
+    fn an_unknown_tool_falls_back_to_the_bare_name() {
+        // PATH still gets its chance: this only PREFERS the local install, and a system
+        // package must keep working for anyone who has one.
+        assert_eq!(
+            find_tool("definitely-not-a-real-tool-xyz"),
+            std::ffi::OsString::from("definitely-not-a-real-tool-xyz")
+        );
+    }
+
     /// The env vars are process-global, so these tests never touch them: they cover
     /// the PATH probe, which is the part that decides what an unconfigured machine
     /// gets. `sh` is on PATH everywhere this builds.
@@ -278,4 +299,26 @@ mod tests {
             }
         }
     }
+}
+
+/// Finds a helper program, looking where runnir itself is installed as well as on PATH.
+///
+/// A window launched from a desktop entry does NOT have `~/.local/bin` on its PATH: a
+/// graphical session never reads the shell profile that adds it. So a tool installed
+/// there — which is exactly where `install.sh` puts runnir and its helpers, and
+/// therefore where somebody will have put cloudflared — is invisible to a `Command::new`
+/// by bare name, while working perfectly when the same feature is tried from a terminal.
+///
+/// That asymmetry is a genuinely confusing thing to debug: the feature works for the
+/// person who installed the tool and fails for the same person the next time they open
+/// the app from their launcher.
+pub fn find_tool(name: &str) -> std::ffi::OsString {
+    if let Some(home) = dirs::home_dir() {
+        let local = home.join(".local/bin").join(name);
+        if local.is_file() {
+            return local.into_os_string();
+        }
+    }
+    // Not found there: let PATH answer, so a system install still wins normally.
+    name.into()
 }

@@ -383,7 +383,7 @@ impl Drop for Session {
 type Started = (std::process::Child, String, BufReader<std::process::ChildStderr>);
 
 fn spawn_tunnel() -> Result<Started, String> {
-    let mut cmd = std::process::Command::new("cloudflared");
+    let mut cmd = std::process::Command::new(crate::platform::find_tool("cloudflared"));
     cmd.args(["tunnel", "--no-autoupdate", "--url", &format!("http://localhost:{PORT}")])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
