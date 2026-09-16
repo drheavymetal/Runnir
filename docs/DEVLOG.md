@@ -4773,6 +4773,20 @@ one a hand reaches for by reflex, and `q` after reading a PIN off the screen sho
 the panel away, not tear down what somebody in the kitchen is using. The destructive one
 is one modifier further.
 
+The panel lists who is connected, so it can also drop **one** of them: select the row,
+`x`, and that viewer's socket closes.
+
+**And dropping one is worthless on its own**, which is the part worth writing down before
+somebody builds the button and believes it. A dropped viewer still holds the link, the
+PIN and — unless it is invalidated — the session cookie that already passed the PIN. So
+`x` invalidates that session's cookie, and the panel offers **rotating the PIN** (`shift+r`)
+right next to it, because that is the action that actually means "you are not coming back
+in". The QR changes with it, and phones still connected are unaffected: they already
+passed the door.
+
+The honest framing for the panel's own text: `x` ends a session, rotating the PIN ends
+*access*. A person who is bothering you needs the second one.
+
 `runnir @ pocket --stop` does the same thing from a script, and stopping is also implied
 by closing the window, which is the property the whole design is built on.
 
