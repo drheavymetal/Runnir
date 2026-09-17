@@ -5946,6 +5946,37 @@ daemon mid-Jam and then asking for a new one — a different id came back.
 `leader n j`, or `J` in the music panel. Shifted there because `j` is "down" and always
 will be.
 
+## 2026-09-17 - The website was six weeks behind its own code, and nobody could tell
+
+`docs-site` had pocket, Connect and the Jam written in its data since 16-09, but the
+site had not been deployed since 03-08: everything anyone read at
+runnir.drheavymetal.com was July's feature set. A deploy is not implied by a build, and
+nothing in the repo says which one production is serving. Checked by fetching the live
+bundle and grepping it for strings only the new content has - the honest way to ask,
+because the source tree cannot answer it.
+
+The audit that came with it found real holes, not just the stale deploy:
+
+- **No Spotify shop card at all.** The site had Connect and the Jam but never said the
+  panel has two shops, how to sign in twice, or why `api_client_id` is worth five
+  minutes. Added, with the `429 Retry-After: 40` measurement and the `callback_port`
+  trap that answers `INVALID_CLIENT` without mentioning the port.
+- **No `[spotify]` group in the config reference**, which calls itself complete. Added
+  whole, plus `tidal.release_device`, `music_provider` and `behaviour.shell_integration`.
+- **The music actions had no rebindable ids on the site**: `leader n` was one summary
+  row, so `music_jam`, `music_provider`, `music_output` and the `tidal_*` ids existed in
+  `actions.rs` and nowhere a reader could find them. Two groups now: the leader keys and
+  the keys inside the panel.
+- **Nothing about picking the compositor's GPU** (`src/gpu.rs`), which is the fix for a
+  black window on a hybrid laptop - invisible when it works, unexplainable when it does
+  not.
+- The intro's four points still described July: a fifth covers the music and the phone.
+
+Deploy trap, on top of the `CLOUDFLARE_API_TOKEN` one already recorded below: `npx
+wrangler` refuses with "In a non-interactive environment..." when stdin is not a tty,
+even with a saved OAuth login. Wrap it in `script -qec "..." /dev/null` and it refreshes
+the login itself and uploads.
+
 ## Gotchas (do not re-learn)
 - **A Jam is hosted by a DEVICE.** Nothing in the social-connect API works until the
   terminal is a registered Connect device, so `connect_device` is not an optional extra

@@ -135,6 +135,33 @@ export const KEY_GROUPS = [
     ],
   },
   {
+    group: { es: 'Música: el reproductor propio (Leader N)', en: 'Music: the built-in player (Leader N)' },
+    rows: [
+      { keys: ['Leader N N'], id: 'tidal_panel', title: { es: 'Panel de música: lo que suena, la cola, la búsqueda. Sirve para las dos tiendas; el título dice de cuál vienen las listas', en: 'Music panel: what is playing, the queue, search. It serves both shops; the title says which one the lists come from' } },
+      { keys: ['Leader N P'], id: 'music_provider', title: { es: 'Cambiar de proveedor (TIDAL / Spotify). La elección se guarda y la siguiente ventana abre en ella; la cola NO cambia, es del reproductor', en: 'Switch provider (TIDAL / Spotify). The choice is saved and the next window opens on it; the queue does NOT switch, it belongs to the player' } },
+      { keys: ['Leader N O'], id: 'music_output', title: { es: 'Por dónde sale el sonido: la lista de dispositivos, con el que se está usando marcado', en: 'Where the sound comes out: the device list, with the one in use marked' } },
+      { keys: [{ es: 'Leader N Espacio', en: 'Leader N Space' }], id: 'tidal_toggle', title: { es: 'Play / pausa (sin abrir el panel)', en: 'Play / pause (with no panel open)' } },
+      { keys: ['Leader N F', 'Leader N B'], id: 'tidal_next / tidal_prev', title: { es: 'Adelante y atrás. F y B en vez de N y P: la N es la del propio grupo y la P se lee como «pausa»', en: 'Forward and back. F and B rather than N and P: N is the group’s own key and P reads as "pause"' } },
+      { keys: ['Leader N S'], id: 'tidal_stop', title: { es: 'Parar', en: 'Stop' } },
+      { keys: ['Leader N Shift+S'], id: 'tidal_share', title: { es: 'Compartir lo que suena por un enlace público. Con Shift a propósito: publicar algo a internet no debe estar a una letra de «parar»', en: 'Share what is playing over a public link. Shifted on purpose: publishing to the internet should not sit one letter from "stop"' } },
+      { keys: ['Leader N J'], id: 'music_jam', title: { es: 'Jam de Spotify: la misma tecla abre y cierra. Sin Shift, al revés que compartir: una Jam llega solo a quien le des el enlace y termina cuando tú digas', en: 'Spotify Jam: one key opens and closes it. Unshifted, unlike the share: a Jam reaches only the people you hand the link to and ends when you say so' } },
+    ],
+  },
+  {
+    group: { es: 'Música (dentro del panel)', en: 'Music (inside the panel)' },
+    rows: [
+      { keys: ['h l', 'Tab'], id: '', title: { es: 'Moverse entre las fuentes (Búsqueda, Cola, Favoritos, Álbumes, Listas) y lo que contienen', en: 'Move between the sources (Search, Queue, Favourites, Albums, Playlists) and what they hold' } },
+      { keys: ['j k'], id: '', title: { es: 'Moverse dentro de cualquiera de las dos columnas; pasar por una fuente la carga', en: 'Move inside either column; moving over a source loads it' } },
+      { keys: ['/'], id: '', title: { es: 'Buscar: pistas, álbumes, artistas y listas a la vez', en: 'Search: tracks, albums, artists and playlists at once' } },
+      { keys: ['Enter'], id: '', title: { es: 'Sobre una pista, reproducir la lista entera desde ahí; sobre un álbum, artista o lista, abrirlo', en: 'On a track, play the whole list from there; on an album, artist or playlist, open it' } },
+      { keys: ['a'], id: '', title: { es: 'Encolar', en: 'Add to the queue' } },
+      { keys: ['p'], id: '', title: { es: 'Cambiar de proveedor. También Leader N P, que es el que funciona con el buscador abierto — una letra suelta ahí la come el buscador', en: 'Switch provider. Also Leader N P, which is the one that works while the search box has the keyboard — a bare letter there goes into the box' } },
+      { keys: ['L'], id: '', title: { es: 'La letra de lo que SUENA, siguiendo la canción cuando TIDAL la tiene sincronizada. Spotify no tiene endpoint de letras y lo dice, en vez de dibujar un hueco', en: 'The words for what is PLAYING, following the song when TIDAL has it timed. Spotify has no lyrics endpoint at all and says so, rather than drawing a blank' } },
+      { keys: [{ es: 'Espacio f b s', en: 'Space f b s' }], id: '', title: { es: 'Play/pausa, adelante, atrás, parar', en: 'Play/pause, forward, back, stop' } },
+      { keys: ['Esc', 'q'], id: '', title: { es: 'Escape sale del buscador, luego de la letra, luego del panel; q cierra. Un clic fuera lo guarda, y eso nunca para la música', en: 'Escape leaves the search box, then the lyrics, then the panel; q closes. A click outside puts it away, which never stops the music' } },
+    ],
+  },
+  {
     group: { es: 'Sin chord propio (leader o paleta)', en: 'No plain chord (leader or palette)' },
     rows: [
       { keys: ['Leader O C', 'Ctrl+Shift+P -> Settings'], id: 'open_config', title: { es: 'Panel de ajustes', en: 'Settings panel' } },

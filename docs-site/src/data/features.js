@@ -124,6 +124,29 @@ export const FEATURES = [
     },
   },
   {
+    key: 'spotify-player', section: 'distinctive', status: 'dev',
+    title: { es: 'Spotify en el mismo panel', en: 'Spotify in the same panel' },
+    natural: {
+      es: 'El panel de música tiene dos tiendas, TIDAL y Spotify, y el título dice de cuál vienen las listas. Leader N P cambia de una a otra y la elección se recuerda: la siguiente ventana abre donde la dejaste. La COLA no cambia con el proveedor —es del reproductor, no de la tienda— y puede llevar pistas de las dos a la vez. Todo lo demás del panel es idéntico: las mismas fuentes a la izquierda, la misma búsqueda, las mismas teclas.',
+      en: 'The music panel has two shops, TIDAL and Spotify, and the title says which one the lists come from. Leader N P switches, and the choice is remembered: the next window opens where you left it. The QUEUE does not switch with it — it belongs to the player, not to a shop — and can hold tracks from both at once. Everything else about the panel is identical: the same sources down the left, the same search, the same keys.',
+    },
+    keys: [
+      { es: 'Leader N P · cambiar de proveedor', en: 'Leader N P · switch provider' },
+      { es: 'P dentro del panel · lo mismo, salvo con el buscador abierto', en: 'P inside the panel · the same, except while the search box has the keyboard' },
+    ],
+    example: 'runnir --spotify-login       # el que reproduce / the one that plays\nrunnir --spotify-login --api # el que busca / the one that searches',
+    config: [
+      { k: 'music_provider', v: '"tidal"', d: { es: 'La tienda con la que abre el panel: "tidal" o "spotify". Lo escribe el selector, así que rara vez se toca a mano.', en: 'The shop the panel opens on: "tidal" or "spotify". The selector writes it, so it is rarely set by hand.' } },
+      { k: 'spotify.api_client_id', v: '""', d: { es: 'Tu propio id de catálogo, para buscar. Merece cinco minutos: el id por defecto es el de escritorio que trae librespot, no necesita registro y por eso lo usa todo programa basado en librespot del mundo — la Web API lo limita como UN SOLO cliente (medido aquí: 429 Retry-After: 40 en la tercera petición de una sesión recién abierta). La reproducción no toca la Web API, así que solo sufre la búsqueda.', en: 'Your own catalogue id, for search. Worth five minutes: the default is the desktop id librespot ships, it needs no registration, and for that reason every librespot-based program on earth uses it — the Web API rate-limits it as a SINGLE client (measured here: 429 Retry-After: 40 on the third request of a fresh session). Playback never touches the Web API, so only searching suffers.' } },
+      { k: 'spotify.api_callback_port', v: '8899', d: { es: 'Puerto del retorno del inicio de sesión de catálogo. Regístralo como http://127.0.0.1:8899/login en developer.spotify.com junto con tu api_client_id.', en: 'Port the catalogue sign-in returns to. Register it as http://127.0.0.1:8899/login at developer.spotify.com alongside your api_client_id.' } },
+      { k: 'spotify.callback_port', v: '8898', d: { es: 'El del inicio de sesión que reproduce. NO es una elección libre mientras uses el client_id por defecto: Spotify comprueba el redirect contra los registrados para ese cliente, y el de escritorio tiene el 8898. Cambiarlo sin poner también tu propio client_id devuelve INVALID_CLIENT, un error que no menciona el puerto.', en: 'The one for the sign-in that plays. NOT a free choice while you use the default client_id: Spotify checks the redirect against the ones registered for that client, and the desktop one holds 8898. Changing it without setting your own client_id gets INVALID_CLIENT back, an error that never mentions the port.' } },
+    ],
+    note: {
+      es: 'Dos inicios de sesión porque reproducir y buscar son dos puertas distintas: con el primero solo hay música y un panel que no busca; con el segundo, listas que no suenan. Los dos abren el navegador y vuelven a 127.0.0.1 — Spotify sí acepta un redirect de loopback, a diferencia de TIDAL. Lo que Spotify no entrega a un programa como este: nada de FLAC (cualquier punto de Connect que no sea una app suya recibe Ogg Vorbis 320, así que la insignia dice OGG 320 y bit-perfect queda descartado), ni letras, ni el contenido de las listas ni las canciones top de un artista por la API documentada — las listas se obtienen por otro camino y funcionan, y de los artistas se enseñan sus álbumes.',
+      en: 'Two sign-ins, because playing and searching are two different doors: with the first alone you get music and a panel that cannot search; with the second, lists that cannot play. Both open a browser and come back to 127.0.0.1 — Spotify does accept a loopback redirect, unlike TIDAL. What Spotify will not hand a program like this one: no FLAC (every Connect endpoint that is not one of its own apps receives Ogg Vorbis 320, so the badge says OGG 320 and bit-perfect is off the table), no lyrics, and neither playlist contents nor an artist’s top tracks through the documented API — playlists are fetched another way and work, and artists show their albums instead.',
+    },
+  },
+  {
     key: 'spotify-connect', section: 'distinctive', status: 'dev',
     title: { es: 'La terminal como dispositivo de Spotify', en: 'The terminal as a Spotify device' },
     natural: {
@@ -1183,8 +1206,11 @@ export const FEATURES = [
       es: 'El esquema de codificación moderno que piden neovim y las TUIs para distinguir teclas que el terminal clásico no puede (Esc de Ctrl+[, Tab de Ctrl+I) y reportar pulsaciones que antes se perdían. runnir lo implementa con los modos disambiguate y report-all.',
       en: 'The modern encoding scheme neovim and current TUIs ask for to tell apart keys a classic terminal can’t (Esc from Ctrl+[, Tab from Ctrl+I) and to report presses that used to be lost. runnir implements it with the disambiguate and report-all modes.',
     },
-    escape: [R`\e[>1u   push: modo disambiguate`, R`\e[>15u  push: report-all`, R`\e[<u    pop: restaura el modo anterior`, R`\e[?u    consulta el modo activo`],
-    note: { es: 'En desarrollo: CSI u para neovim y TUIs modernas.', en: 'In development: CSI u for neovim and modern TUIs.' },
+    escape: [R`\e[>1u   push: modo disambiguate`, R`\e[>15u  push: report-all`, R`\e[<u    pop: restaura el modo anterior`, R`\e[?u    consulta el modo activo`, R`\e[119;5u  Ctrl+Backspace (forma de Ctrl+W)`],
+    note: {
+      es: 'Ctrl+Backspace es la excepción deliberada: el protocolo lo escribe CSI 127;5u, pero varios editores de línea en TUI (el CLI de Cursor entre ellos) leen eso como «borrar la línea entera» en vez de borrar la palabra. runnir reporta el punto de código 119 (\'w\') cuando Ctrl está pulsado, así que sale CSI 119;5u —la forma kitty de Ctrl+W— que esos mismos editores sí tratan como borrar la palabra de la izquierda. La ruta clásica no cambia: sin el protocolo activo, Ctrl+Backspace y Alt+Backspace siguen mandando ESC-DEL, que es lo que readline, fish y zsh entienden.',
+      en: 'Ctrl+Backspace is the deliberate exception: the protocol spells it CSI 127;5u, but several TUI line editors (Cursor’s CLI among them) read that as "delete the whole line" rather than the word. runnir reports codepoint 119 (\'w\') while Ctrl is held, so it comes out as CSI 119;5u — the kitty form of Ctrl+W — which those same editors do treat as deleting the word to the left. The legacy path is unchanged: without the protocol on, Ctrl+Backspace and Alt+Backspace still send ESC-DEL, which is what readline, fish and zsh understand.',
+    },
   },
   {
     key: 'kitty-graphics', section: 'protocols', status: 'shipped',
@@ -1276,6 +1302,18 @@ export const FEATURES = [
     },
     example: 'cargo run                 # compilar y ejecutar\ncargo build --release     # binario optimizado',
     note: { es: 'Fuente por defecto: JetBrainsMono Nerd Font Mono; se sobrescribe con RUNNIR_FONT.', en: 'Default font: JetBrainsMono Nerd Font Mono; override with RUNNIR_FONT.' },
+  },
+  {
+    key: 'gpu-adapter', section: 'platform', status: 'shipped',
+    title: { es: 'Pinta en la GPU del compositor', en: 'It paints on the compositor’s GPU' },
+    natural: {
+      es: 'En un portátil híbrido las dos GPU no son intercambiables. runnir pregunta a Wayland cuál usa el compositor —el feedback por defecto de zwp_linux_dmabuf_v1 la nombra en main_device—, resuelve ese dispositivo por sysfs hasta los identificadores PCI y elige ese adaptador si puede presentar en la superficie. Importa porque entregarle al compositor un buffer pintado en la OTRA tarjeta exige una importación dmabuf entre GPU, y cuando los dos drivers no se ponen de acuerdo en los modificadores de tiling la ventana sale NEGRA sin error por ningún lado: cada frame se dibuja, se adquiere y se presenta, y el compositor no muestrea nada. Un Hyprland con AQ_DRM_DEVICES apuntando a la NVIDIA dejaba negro a todo cliente Vulkan pintado en la Intel, vkcube incluido.',
+      en: 'On a hybrid laptop the two GPUs are not interchangeable. runnir asks Wayland which one the compositor is on — zwp_linux_dmabuf_v1’s default feedback names it in main_device — resolves that device through sysfs down to its PCI ids, and picks that adapter when it can present to the surface. It matters because handing the compositor a buffer painted on the OTHER card needs a cross-GPU dmabuf import, and when the two drivers disagree about tiling modifiers the window goes BLACK with no error on either side: every frame is drawn, acquired and presented, and the compositor samples nothing out of it. A Hyprland with AQ_DRM_DEVICES pointing at the NVIDIA card turned every Intel-rendered Vulkan client black, vkcube included.',
+    },
+    note: {
+      es: 'El ahorro de batería sobrevive donde significa algo: con el compositor en la integrada no cambia nada, la tarjeta discreta sigue oculta al cargador de Vulkan y sigue dormida. Solo se salta cuando el compositor ES la discreta, que por definición ya está despierta.',
+      en: 'The battery optimisation survives where it means something: with the compositor on the integrated GPU nothing changes, the discrete ICD stays hidden from the Vulkan loader and the card stays asleep. It is only skipped when the compositor IS the discrete card, which is awake by definition.',
+    },
   },
   {
     key: 'headless', section: 'platform', status: 'shipped',

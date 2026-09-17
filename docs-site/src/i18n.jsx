@@ -130,6 +130,13 @@ export const UI = {
         en: 'runnir @ runs actions, presses keys, clicks and turns the wheel in the terminal itself — not in the child process — and every reply carries the UI state as JSON. It is how the panels are tested, without screenshots, and it works just as well for scripting your own workflow.',
       },
     },
+    {
+      title: { es: 'La música y el móvil', en: 'The music and the phone' },
+      body: {
+        es: 'Reproduce TIDAL y Spotify él mismo, decodificando aquí y escribiendo al DAC sin nada en medio cuando el hardware deja, y se anuncia como dispositivo de Spotify: el móvil dice «Reproduciendo en runnir» y puede hospedar una Jam. El móvil también sirve de pantalla —la ventana entera en su navegador, cifrada de extremo a extremo y detrás de un PIN— y de destino: un fichero se manda por la cámara, en códigos QR, sin red ni emparejamiento entre los dos.',
+        en: 'It plays TIDAL and Spotify itself, decoding here and writing to the DAC with nothing in between when the hardware allows, and it announces itself as a Spotify device: the phone says "Playing on runnir" and it can host a Jam. The phone doubles as a screen — the whole window in its browser, end-to-end encrypted and behind a PIN — and as a destination: a file goes over by camera, in QR codes, with no network and no pairing between the two.',
+      },
+    },
   ],
   introForTitle: { es: 'Para quién es', en: 'Who it is for' },
   introFor: [
