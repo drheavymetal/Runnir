@@ -65,6 +65,8 @@ libc = "0.2"
 # pulls in, so there is one wayland-client in the tree, not two.
 [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
 wayland-client = "0.31.14"
+# `zwp_linux_dmabuf_v1` feedback, to ask the compositor which GPU it renders on.
+wayland-protocols = { version = "0.32.13", features = ["client"] }
 
 # macOS process introspection (cwd + foreground name), the /proc equivalent.
 [target.'cfg(target_os = "macos")'.dependencies]
